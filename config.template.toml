@@ -1,0 +1,304 @@
+# ============================================================================
+# OmniNova Claw Configuration
+# Copy to ~/.omninova/config.toml and edit to your needs.
+# All fields have sensible defaults – only uncomment what you want to change.
+# Environment variables (OMNINOVA_*) override values in this file.
+# ============================================================================
+
+# --- Core API ---
+# api_key = "sk-..."
+# api_url = "https://openrouter.ai/api/v1"
+# default_provider = "openrouter"
+# default_model = "anthropic/claude-sonnet-4-20250514"
+# default_temperature = 0.7
+
+# Provider API mode: "chat", "completion", or "responses"
+# provider_api = "chat"
+
+# --- Named Model Providers ---
+# [model_providers.openai]
+# api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+# default_model = "gpt-4o"
+# models = ["gpt-4o", "gpt-4o-mini"]
+# enabled = true
+#
+# [model_providers.ollama]
+# base_url = "http://localhost:11434"
+# default_model = "llama3.2"
+# models = ["llama3.2", "mistral"]
+# enabled = true
+#
+# [model_providers.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
+# base_url = "https://api.anthropic.com"
+# default_model = "claude-sonnet-4-20250514"
+# enabled = true
+
+# --- Provider Behavior ---
+# [provider]
+# reasoning_level = "medium"   # minimal, low, medium, high, xhigh
+
+# --- Agent ---
+# [agent]
+# name = "omninova"
+# system_prompt = "You are a helpful AI assistant."
+# compact_context = true
+# max_tool_iterations = 20
+# max_history_messages = 50
+# parallel_tools = false
+
+# --- Delegate Agents ---
+# [agents.researcher]
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4-20250514"
+# system_prompt = "You are a research assistant."
+# max_depth = 2
+# agentic = true
+# allowed_tools = ["web_search", "http_request", "file_read"]
+# max_iterations = 8
+
+# --- Autonomy ---
+# [autonomy]
+# level = "supervised"          # supervised, semi, autonomous
+# workspace_only = true
+# allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd"]
+# forbidden_paths = ["/etc", "/root", "~/.ssh", "~/.aws"]
+# max_actions_per_hour = 20
+# max_cost_per_day_cents = 500
+# require_approval_for_medium_risk = true
+# block_high_risk_commands = true
+# auto_approve = ["file_read", "memory_recall"]
+
+# --- Security ---
+# [security.otp]
+# enabled = false
+# method = "totp"
+# gated_actions = []
+#
+# [security.estop]
+# enabled = true
+# require_otp_to_resume = false
+#
+# [security.syscall_anomaly]
+# enabled = false
+# strict_mode = false
+#
+# [security.sandbox]
+# enabled = false
+#
+# [security.audit]
+# enabled = false
+
+# --- Runtime ---
+# [runtime]
+# kind = "native"               # native, docker, wasm
+# reasoning_enabled = false
+# reasoning_level = "medium"
+#
+# [runtime.wasm]
+# tools_dir = "tools/wasm"
+# fuel_limit = 2000000
+# memory_limit_mb = 128
+# max_module_size_mb = 64
+# allow_workspace_read = true
+# allow_workspace_write = true
+# allowed_hosts = ["localhost:3000"]
+#
+# [runtime.wasm.security]
+# require_workspace_relative_tools_dir = true
+# reject_symlink_modules = true
+# strict_host_validation = true
+# capability_escalation_mode = "clamp"   # clamp, deny
+# module_hash_policy = "warn"            # warn, enforce, ignore
+
+# --- Memory ---
+# [memory]
+# backend = "sqlite"            # sqlite, markdown, none
+# db_path = "~/.omninova/memory.db"
+#
+# [memory.embedding]
+# provider = "openai"
+# model = "text-embedding-3-small"
+
+# --- Storage ---
+# [storage.provider.config]
+# provider = "sqlite"
+# db_url = "sqlite:~/.omninova/storage.db"
+
+# --- Gateway ---
+# [gateway]
+# host = "127.0.0.1"
+# port = 42617
+# require_pairing = true
+# allow_public_bind = false
+
+# --- Proxy ---
+# [proxy]
+# enabled = false
+# scope = "all"
+# services = ["provider.*", "tool.*"]
+# http_proxy = "http://proxy:3128"
+# https_proxy = "http://proxy:3128"
+# no_proxy = "localhost,127.0.0.1"
+
+# --- Tunnel ---
+# [tunnel]
+# enabled = false
+# provider = "ngrok"
+# auth_token = "..."
+
+# --- Browser Tool ---
+# [browser]
+# enabled = false
+# backend = "playwright"
+# native_headless = false
+# allowed_domains = []
+
+# --- HTTP Request Tool ---
+# [http_request]
+# enabled = false
+# allowed_domains = []
+# max_response_size = 1048576
+# timeout_secs = 30
+
+# --- Web Fetch Tool ---
+# [web_fetch]
+# enabled = false
+# allowed_domains = []
+# max_response_size = 1048576
+# timeout_secs = 30
+
+# --- Web Search Tool ---
+# [web_search]
+# enabled = false
+# provider = "brave"
+# brave_api_key = "..."
+# max_results = 10
+# timeout_secs = 15
+
+# --- Composio ---
+# [composio]
+# enabled = false
+# api_key = "..."
+# entity_id = "default"
+
+# --- Skills ---
+# [skills]
+# open_skills_enabled = false
+# open_skills_dir = "~/.omninova/skills"
+
+# --- Reliability ---
+# [reliability]
+# max_retries = 3
+# retry_backoff_ms = 1000
+# circuit_breaker_enabled = false
+
+# --- Cost ---
+# [cost]
+# tracking_enabled = false
+# max_daily_cents = 500
+# alert_threshold_cents = 400
+
+# --- Channels ---
+# [channels_config.telegram]
+# enabled = false
+# token_env = "TELEGRAM_BOT_TOKEN"
+#
+# [channels_config.discord]
+# enabled = false
+# token_env = "DISCORD_TOKEN"
+#
+# [channels_config.slack]
+# enabled = false
+# token_env = "SLACK_TOKEN"
+
+# --- Observability ---
+# [observability]
+# log_level = "info"
+# prometheus_enabled = false
+# prometheus_port = 9090
+# tracing_enabled = false
+
+# --- Heartbeat ---
+# [heartbeat]
+# enabled = false
+# interval_secs = 60
+
+# --- Cron ---
+# [cron]
+# enabled = false
+# [[cron.jobs]]
+# name = "daily_summary"
+# schedule = "0 9 * * *"
+# action = "Generate a daily summary"
+
+# --- Goal Loop ---
+# [goal_loop]
+# enabled = false
+# interval_secs = 300
+
+# --- Identity ---
+# [identity]
+# name = "OmniNova"
+# bio = "An AI assistant powered by OmniNova Claw."
+
+# --- Multimodal ---
+# [multimodal]
+# vision_enabled = false
+# audio_enabled = false
+
+# --- Transcription ---
+# [transcription]
+# enabled = false
+# provider = "whisper"
+# model = "base"
+
+# --- Hooks ---
+# [hooks]
+# on_start = []
+# on_message = []
+# on_tool_call = []
+# on_error = []
+
+# --- Hardware ---
+# [hardware]
+# platform = "rpi"
+# gpio_enabled = false
+#
+# [peripherals.stm32]
+# serial_port = "/dev/ttyUSB0"
+# baud_rate = 115200
+
+# --- Robot ---
+# [robot]
+# [robot.drive]
+# backend = "mock"
+# max_speed = 0.5
+# max_rotation = 1.0
+#
+# [robot.camera]
+# device = "/dev/video0"
+# width = 640
+# height = 480
+#
+# [robot.safety]
+# min_obstacle_distance = 0.3
+# slow_zone_multiplier = 3.0
+
+# --- Model Routes ---
+# [[model_routes]]
+# hint = "code"
+# provider = "anthropic"
+# model = "claude-sonnet-4-20250514"
+#
+# [[model_routes]]
+# hint = "fast"
+# provider = "openai"
+# model = "gpt-4o-mini"
+
+# --- Embedding Routes ---
+# [[embedding_routes]]
+# hint = "default"
+# provider = "openai"
+# model = "text-embedding-3-small"

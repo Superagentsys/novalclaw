@@ -1,0 +1,19 @@
+[package]
+name = "omninova-tauri"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "omninova_tauri_lib"
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { version = "2.2.0", features = [] }
+tauri-plugin-shell = "2.2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+omninova-core = { path = "../../../crates/omninova-core" }
+tokio = { version = "1.43.0", features = ["full"] }
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }

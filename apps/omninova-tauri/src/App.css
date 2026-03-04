@@ -1,0 +1,133 @@
+#root {
+  width: 100%;
+}
+
+.app-shell {
+  width: 100%;
+}
+
+.setup-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.setup-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.setup-title {
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.setup-subtitle {
+  font-size: 14px;
+  opacity: 0.7;
+  margin-top: 4px;
+}
+
+.setup-section {
+  padding: 20px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.setup-section h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.setup-section h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.setup-grid label,
+.setup-group label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.setup-grid input,
+.setup-section input {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.25);
+  color: inherit;
+}
+
+.setup-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.setup-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.provider-card {
+  padding: 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.provider-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.provider-meta {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.toggle input {
+  width: auto;
+}
+
+.setup-preview {
+  width: 100%;
+  min-height: 240px;
+  border-radius: 12px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.3);
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
