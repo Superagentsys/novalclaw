@@ -193,9 +193,26 @@ fn merge_toml_tables(base: &mut toml::Table, overlay: &toml::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::env::test_env_lock;
+
+    fn clear_common_env_overrides() {
+        let keys = [
+            "OMNINOVA_API_KEY",
+            "API_KEY",
+            "OPENAI_API_KEY",
+            "OMNINOVA_PROVIDER",
+            "OMNINOVA_MODEL",
+            "MODEL",
+        ];
+        for key in keys {
+            std::env::remove_var(key);
+        }
+    }
 
     #[test]
     fn test_default_round_trip() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
         let cfg = Config::default();
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -205,6 +222,8 @@ mod tests {
 
     #[test]
     fn test_load_minimal_toml() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
         let toml_str = r#"
 api_key = "sk-test"
 default_provider = "openai"
@@ -218,6 +237,8 @@ default_model = "gpt-4o"
 
     #[test]
     fn test_load_full_sections() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
         let toml_str = r#"
 api_key = "sk-test"
 

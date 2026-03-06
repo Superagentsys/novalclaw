@@ -675,6 +675,26 @@ pub struct GatewayConfig {
     pub require_pairing: bool,
     #[serde(default)]
     pub allow_public_bind: bool,
+    #[serde(default = "default_gateway_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    #[serde(default = "default_gateway_max_sessions")]
+    pub max_sessions: usize,
+    #[serde(default = "default_gateway_webhook_require_nonce")]
+    pub webhook_require_nonce: bool,
+    #[serde(default = "default_gateway_webhook_max_skew_secs")]
+    pub webhook_max_skew_secs: u64,
+    #[serde(default = "default_gateway_webhook_nonce_ttl_secs")]
+    pub webhook_nonce_ttl_secs: u64,
+    #[serde(default = "default_gateway_webhook_signature_algorithms")]
+    pub webhook_signature_algorithms: Vec<String>,
+    #[serde(default = "default_gateway_webhook_signature_priority")]
+    pub webhook_signature_priority: Vec<String>,
+    #[serde(default)]
+    pub webhook_signature_strict_priority: bool,
+    #[serde(default)]
+    pub webhook_signing_include_timestamp: bool,
+    #[serde(default)]
+    pub webhook_signing_require_timestamp: bool,
 }
 
 fn default_gateway_host() -> String {
@@ -682,6 +702,27 @@ fn default_gateway_host() -> String {
 }
 fn default_gateway_port() -> u16 {
     42617
+}
+fn default_gateway_session_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+fn default_gateway_max_sessions() -> usize {
+    500
+}
+fn default_gateway_webhook_require_nonce() -> bool {
+    false
+}
+fn default_gateway_webhook_max_skew_secs() -> u64 {
+    300
+}
+fn default_gateway_webhook_nonce_ttl_secs() -> u64 {
+    600
+}
+fn default_gateway_webhook_signature_algorithms() -> Vec<String> {
+    vec!["sha256".to_string(), "v1".to_string(), "v0".to_string(), "raw".to_string()]
+}
+fn default_gateway_webhook_signature_priority() -> Vec<String> {
+    vec!["v1".to_string(), "sha256".to_string(), "v0".to_string(), "raw".to_string()]
 }
 
 impl Default for GatewayConfig {
@@ -691,6 +732,16 @@ impl Default for GatewayConfig {
             port: default_gateway_port(),
             require_pairing: true,
             allow_public_bind: false,
+            session_ttl_secs: default_gateway_session_ttl_secs(),
+            max_sessions: default_gateway_max_sessions(),
+            webhook_require_nonce: default_gateway_webhook_require_nonce(),
+            webhook_max_skew_secs: default_gateway_webhook_max_skew_secs(),
+            webhook_nonce_ttl_secs: default_gateway_webhook_nonce_ttl_secs(),
+            webhook_signature_algorithms: default_gateway_webhook_signature_algorithms(),
+            webhook_signature_priority: default_gateway_webhook_signature_priority(),
+            webhook_signature_strict_priority: false,
+            webhook_signing_include_timestamp: false,
+            webhook_signing_require_timestamp: false,
         }
     }
 }

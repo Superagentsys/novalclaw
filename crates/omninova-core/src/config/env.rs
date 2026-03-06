@@ -194,12 +194,19 @@ fn env_opt(key: &str, apply: impl FnOnce(String)) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
 
     #[test]
     fn test_api_key_override() {
+        let _guard = test_env_lock().lock().unwrap();
         let mut cfg = Config::default();
         env::set_var("OMNINOVA_API_KEY", "test-key-123");
         apply_env_overrides(&mut cfg);
@@ -209,6 +216,7 @@ mod tests {
 
     #[test]
     fn test_gateway_port_override() {
+        let _guard = test_env_lock().lock().unwrap();
         let mut cfg = Config::default();
         env::set_var("PORT", "9999");
         apply_env_overrides(&mut cfg);

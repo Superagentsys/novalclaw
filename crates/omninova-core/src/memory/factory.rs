@@ -1,0 +1,23 @@
+use crate::config::Config;
+use crate::memory::backend::{InMemoryMemory, JsonFileMemory, MockMemory};
+use crate::memory::traits::Memory;
+use std::sync::Arc;
+
+pub async fn build_memory_from_config(config: &Config) -> anyhow::Result<Arc<dyn Memory>> {
+    let backend = config.memory.backend.to_lowercase();
+    match backend.as_str() {
+        "mock" | "none" => Ok(Arc::new(MockMemory)),
+        "in_memory" | "memory" => Ok(Arc::new(InMemoryMemory::new())),
+        "json" | "json_file" | "sqlite" => {
+            let path = config
+                .memory
+                .db_path
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config.workspace_dir.join(".omninova-memory.json"));
+            let memory = JsonFileMemory::open(path).await?;
+            Ok(Arc::new(memory))
+        }
+        _ => Ok(Arc::new(InMemoryMemory::new())),
+    }
+}

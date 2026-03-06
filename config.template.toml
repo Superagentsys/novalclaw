@@ -132,6 +132,16 @@
 # port = 42617
 # require_pairing = true
 # allow_public_bind = false
+# session_ttl_secs = 86400
+# max_sessions = 500
+# webhook_require_nonce = false
+# webhook_max_skew_secs = 300
+# webhook_nonce_ttl_secs = 600
+# webhook_signature_algorithms = ["sha256", "v1", "v0", "raw"]
+# webhook_signature_priority = ["v1", "sha256", "v0", "raw"]
+# webhook_signature_strict_priority = false
+# webhook_signing_include_timestamp = false
+# webhook_signing_require_timestamp = false
 
 # --- Proxy ---
 # [proxy]
