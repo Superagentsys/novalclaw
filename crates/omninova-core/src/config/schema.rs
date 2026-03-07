@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde::Deserializer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -13,21 +14,26 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
 
+    #[serde(alias = "apiKey")]
     pub api_key: Option<String>,
+    #[serde(alias = "apiUrl")]
     pub api_url: Option<String>,
+    #[serde(alias = "defaultProvider")]
     pub default_provider: Option<String>,
+    #[serde(alias = "defaultModel")]
     pub default_model: Option<String>,
-    #[serde(default = "default_temperature")]
+    #[serde(default = "default_temperature", alias = "defaultTemperature")]
     pub default_temperature: f64,
+    #[serde(alias = "providerApi")]
     pub provider_api: Option<ProviderApiMode>,
 
-    #[serde(default)]
+    #[serde(default, alias = "modelProviders")]
     pub model_providers: HashMap<String, ModelProviderConfig>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "modelRoutes")]
     pub model_routes: Vec<ModelRouteConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "embeddingRoutes")]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     #[serde(default)]
@@ -55,26 +61,26 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
-    #[serde(default)]
+    #[serde(default, alias = "httpRequest")]
     pub http_request: HttpRequestConfig,
-    #[serde(default)]
+    #[serde(default, alias = "webFetch")]
     pub web_fetch: WebFetchConfig,
-    #[serde(default)]
+    #[serde(default, alias = "webSearch")]
     pub web_search: WebSearchConfig,
     #[serde(default)]
     pub composio: ComposioConfig,
 
     #[serde(default)]
     pub skills: SkillsConfig,
-    #[serde(default)]
+    #[serde(default, alias = "queryClassification")]
     pub query_classification: QueryClassificationConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
     #[serde(default)]
     pub cron: CronConfig,
-    #[serde(default)]
+    #[serde(default, alias = "goalLoop")]
     pub goal_loop: GoalLoopConfig,
-    #[serde(default)]
+    #[serde(default, alias = "channels")]
     pub channels_config: ChannelsConfig,
     #[serde(default)]
     pub reliability: ReliabilityConfig,
@@ -102,11 +108,57 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_agents_compat")]
     pub agents: HashMap<String, DelegateAgentConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "agentsIpc")]
     pub agents_ipc: AgentsIpcConfig,
 
+    #[serde(default)]
+    pub meta: MetaConfig,
+    #[serde(default)]
+    pub env: EnvConfig,
+    #[serde(default)]
+    pub wizard: WizardConfig,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub cli: CliConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub acp: AcpConfig,
+    #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+    #[serde(default, alias = "canvasHost")]
+    pub canvas_host: CanvasHostConfig,
+    #[serde(default)]
+    pub talk: TalkConfig,
+    #[serde(default)]
+    pub web: WebConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
+    #[serde(default)]
+    pub messages: MessagesConfig,
+    #[serde(default)]
+    pub commands: CommandsConfig,
+    #[serde(default)]
+    pub bindings: Vec<BindingEntry>,
+    #[serde(default)]
+    pub broadcast: BroadcastConfig,
+    #[serde(default)]
+    pub agent_defaults_extended: AgentDefaultsExtendedConfig,
+
+    #[serde(alias = "modelSupportVision")]
     pub model_support_vision: Option<bool>,
 
     #[serde(default)]
@@ -170,6 +222,28 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             agents_ipc: AgentsIpcConfig::default(),
+            meta: MetaConfig::default(),
+            env: EnvConfig::default(),
+            wizard: WizardConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
+            logging: LoggingConfig::default(),
+            cli: CliConfig::default(),
+            update: UpdateConfig::default(),
+            ui: UiConfig::default(),
+            auth: AuthConfig::default(),
+            acp: AcpConfig::default(),
+            media: MediaConfig::default(),
+            discovery: DiscoveryConfig::default(),
+            canvas_host: CanvasHostConfig::default(),
+            talk: TalkConfig::default(),
+            web: WebConfig::default(),
+            session: SessionConfig::default(),
+            approvals: ApprovalsConfig::default(),
+            messages: MessagesConfig::default(),
+            commands: CommandsConfig::default(),
+            bindings: Vec::new(),
+            broadcast: BroadcastConfig::default(),
+            agent_defaults_extended: AgentDefaultsExtendedConfig::default(),
             model_support_vision: None,
             robot: None,
         }
@@ -327,6 +401,90 @@ pub struct DelegateAgentConfig {
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     pub max_iterations: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawAgentsCompat {
+    #[serde(default)]
+    pub defaults: Option<AgentDefaultsExtendedConfig>,
+    #[serde(default)]
+    pub list: Vec<OpenClawAgentEntryCompat>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawAgentEntryCompat {
+    pub id: String,
+    #[serde(default)]
+    pub model: Option<OpenClawModelRefCompat>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OpenClawModelRefCompat {
+    Name(String),
+    Detailed(AgentModelConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AgentsCompatInput {
+    DelegateMap(HashMap<String, DelegateAgentConfig>),
+    OpenClaw(OpenClawAgentsCompat),
+}
+
+fn deserialize_agents_compat<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, DelegateAgentConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let input = Option::<AgentsCompatInput>::deserialize(deserializer)?;
+    let Some(input) = input else {
+        return Ok(HashMap::new());
+    };
+    let mapped = match input {
+        AgentsCompatInput::DelegateMap(map) => map,
+        AgentsCompatInput::OpenClaw(openclaw) => {
+            let mut map = HashMap::new();
+            let fallback_provider = openclaw
+                .defaults
+                .as_ref()
+                .and_then(|d| d.model.as_ref())
+                .and_then(|m| m.provider.clone());
+            let fallback_model = openclaw
+                .defaults
+                .as_ref()
+                .and_then(|d| d.model.as_ref())
+                .and_then(|m| m.model.clone());
+            for entry in openclaw.list {
+                let (provider, model) = match entry.model {
+                    Some(OpenClawModelRefCompat::Name(model_name)) => {
+                        (fallback_provider.clone(), Some(model_name))
+                    }
+                    Some(OpenClawModelRefCompat::Detailed(model_cfg)) => {
+                        (model_cfg.provider, model_cfg.model)
+                    }
+                    None => (fallback_provider.clone(), fallback_model.clone()),
+                };
+                map.insert(
+                    entry.id,
+                    DelegateAgentConfig {
+                        provider,
+                        model,
+                        system_prompt: None,
+                        max_depth: None,
+                        agentic: false,
+                        allowed_tools: Vec::new(),
+                        max_iterations: None,
+                    },
+                );
+            }
+            map
+        }
+    };
+    Ok(mapped)
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,4 +1546,461 @@ pub struct AgentsIpcConfig {
     #[serde(default)]
     pub enabled: bool,
     pub transport: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// OpenClaw Compatibility Configs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MetaConfig {
+    pub last_touched_version: Option<String>,
+    pub last_touched_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvConfig {
+    pub shell_env: Option<ShellEnvConfig>,
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellEnvConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WizardConfig {
+    pub last_run_at: Option<String>,
+    pub last_run_version: Option<String>,
+    pub last_run_commit: Option<String>,
+    pub last_run_command: Option<String>,
+    pub last_run_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub flags: Vec<String>,
+    pub stuck_session_warn_ms: Option<u64>,
+    pub otel: Option<OtelConfig>,
+    pub cache_trace: Option<CacheTraceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OtelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub traces: bool,
+    #[serde(default)]
+    pub metrics: bool,
+    #[serde(default)]
+    pub logs: bool,
+    pub sample_rate: Option<f64>,
+    pub flush_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheTraceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub include_messages: bool,
+    #[serde(default)]
+    pub include_prompt: bool,
+    #[serde(default)]
+    pub include_system: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LoggingConfig {
+    pub level: Option<String>,
+    pub file: Option<String>,
+    pub max_file_bytes: Option<u64>,
+    pub console_level: Option<String>,
+    pub console_style: Option<String>,
+    pub redact_sensitive: Option<String>,
+    #[serde(default)]
+    pub redact_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CliConfig {
+    pub banner: Option<CliBannerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CliBannerConfig {
+    pub tagline_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConfig {
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub check_on_start: bool,
+    pub auto: Option<UpdateAutoConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAutoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub stable_delay_hours: Option<u32>,
+    pub stable_jitter_hours: Option<u32>,
+    pub beta_check_interval_hours: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiConfig {
+    pub seam_color: Option<String>,
+    pub assistant: Option<UiAssistantConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiAssistantConfig {
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub profiles: HashMap<String, AuthProfileConfig>,
+    #[serde(default)]
+    pub order: HashMap<String, Vec<String>>,
+    pub cooldowns: Option<AuthCooldownsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthProfileConfig {
+    pub provider: Option<String>,
+    pub mode: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthCooldownsConfig {
+    pub billing_backoff_hours: Option<u32>,
+    #[serde(default)]
+    pub billing_backoff_hours_by_provider: HashMap<String, u32>,
+    pub billing_max_hours: Option<u32>,
+    pub failure_window_hours: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub dispatch: Option<AcpDispatchConfig>,
+    pub backend: Option<String>,
+    pub default_agent: Option<String>,
+    #[serde(default)]
+    pub allowed_agents: Vec<String>,
+    pub max_concurrent_sessions: Option<u32>,
+    pub stream: Option<AcpStreamConfig>,
+    pub runtime: Option<AcpRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpDispatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpStreamConfig {
+    pub coalesce_idle_ms: Option<u64>,
+    pub max_chunk_chars: Option<u32>,
+    #[serde(default)]
+    pub repeat_suppression: bool,
+    pub delivery_mode: Option<String>,
+    pub hidden_boundary_separator: Option<String>,
+    pub max_output_chars: Option<u32>,
+    pub max_session_update_chars: Option<u32>,
+    #[serde(default)]
+    pub tag_visibility: HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpRuntimeConfig {
+    pub ttl_minutes: Option<u32>,
+    pub install_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaConfig {
+    #[serde(default)]
+    pub preserve_filenames: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryConfig {
+    pub wide_area: Option<DiscoveryWideAreaConfig>,
+    pub mdns: Option<DiscoveryMdnsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryWideAreaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryMdnsConfig {
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasHostConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub root: Option<String>,
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub live_reload: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkConfig {
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub providers: HashMap<String, TalkProviderConfig>,
+    pub voice_id: Option<String>,
+    #[serde(default)]
+    pub voice_aliases: HashMap<String, String>,
+    pub model_id: Option<String>,
+    pub output_format: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub interrupt_on_speech: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkProviderConfig {
+    pub voice_id: Option<String>,
+    #[serde(default)]
+    pub voice_aliases: HashMap<String, String>,
+    pub model_id: Option<String>,
+    pub output_format: Option<String>,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub heartbeat_seconds: Option<u32>,
+    pub reconnect: Option<WebReconnectConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebReconnectConfig {
+    pub initial_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    pub factor: Option<f64>,
+    pub jitter: Option<f64>,
+    pub max_attempts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfig {
+    pub retention: Option<String>,
+    pub max_concurrent: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
+    #[serde(default)]
+    pub require_approval: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesConfig {
+    pub max_history: Option<u32>,
+    pub retention: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandsConfig {
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub forbidden: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingEntry {
+    pub agent_id: Option<String>,
+    pub comment: Option<String>,
+    #[serde(rename = "match")]
+    pub match_rule: Option<BindingMatchConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingMatchConfig {
+    pub channel: Option<String>,
+    pub account_id: Option<String>,
+    pub peer: Option<BindingPeerConfig>,
+    pub guild_id: Option<String>,
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingPeerConfig {
+    pub kind: Option<String>,
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcastConfig {
+    pub strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefaultsExtendedConfig {
+    pub model: Option<AgentModelConfig>,
+    pub image_model: Option<AgentModelConfig>,
+    pub pdf_model: Option<AgentModelConfig>,
+    pub pdf_max_bytes_mb: Option<u32>,
+    pub pdf_max_pages: Option<u32>,
+    #[serde(default)]
+    pub models: HashMap<String, ModelAliasConfig>,
+    pub workspace: Option<String>,
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub skip_bootstrap: bool,
+    pub bootstrap_max_chars: Option<u32>,
+    pub bootstrap_total_max_chars: Option<u32>,
+    pub bootstrap_prompt_truncation_warning: Option<String>,
+    pub user_timezone: Option<String>,
+    pub time_format: Option<String>,
+    pub envelope_timezone: Option<String>,
+    pub envelope_timestamp: Option<String>,
+    pub envelope_elapsed: Option<String>,
+    pub context_tokens: Option<u32>,
+    pub context_pruning: Option<ContextPruningConfig>,
+    pub compaction: Option<CompactionConfig>,
+    pub thinking_default: Option<String>,
+    pub verbose_default: Option<String>,
+    pub elevated_default: Option<String>,
+    pub block_streaming_default: Option<String>,
+    pub block_streaming_break: Option<String>,
+    pub timeout_seconds: Option<u32>,
+    pub media_max_mb: Option<f64>,
+    pub image_max_dimension_px: Option<u32>,
+    pub typing_interval_seconds: Option<u32>,
+    pub typing_mode: Option<String>,
+    pub max_concurrent: Option<u32>,
+    pub subagents: Option<SubagentsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAliasConfig {
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub params: HashMap<String, serde_json::Value>,
+    pub streaming: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPruningConfig {
+    pub mode: Option<String>,
+    pub ttl: Option<String>,
+    pub keep_last_assistants: Option<u32>,
+    pub soft_trim_ratio: Option<f64>,
+    pub hard_clear_ratio: Option<f64>,
+    pub min_prunable_tool_chars: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionConfig {
+    pub mode: Option<String>,
+    pub reserve_tokens: Option<u32>,
+    pub keep_recent_tokens: Option<u32>,
+    pub reserve_tokens_floor: Option<u32>,
+    pub max_history_share: Option<f64>,
+    pub identifier_policy: Option<String>,
+    pub identifier_instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentsConfig {
+    pub max_concurrent: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
+    pub max_children_per_agent: Option<u32>,
+    pub archive_after_minutes: Option<u32>,
+    pub model: Option<AgentModelConfig>,
+    pub thinking: Option<String>,
+    pub run_timeout_seconds: Option<u32>,
+    pub announce_timeout_ms: Option<u64>,
 }

@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,11 +13,12 @@ use crate::security::{EstopController, EstopState, resolve_shell_allowlist};
 use crate::tools::{FileEditTool, FileReadTool, ShellTool, Tool};
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -30,6 +31,9 @@ pub struct GatewayRuntime {
     memory: Arc<dyn Memory>,
     webhook_nonces: Arc<RwLock<HashMap<String, i64>>>,
     session_store_guard: Arc<tokio::sync::Mutex<()>>,
+    active_inbound: Arc<AtomicUsize>,
+    active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
+    session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
 }
 
 impl GatewayRuntime {
@@ -39,6 +43,9 @@ impl GatewayRuntime {
             memory: Arc::new(crate::InMemoryMemory::new()),
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
+            active_inbound: Arc::new(AtomicUsize::new(0)),
+            active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
+            session_tree: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -48,6 +55,9 @@ impl GatewayRuntime {
             memory,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
+            active_inbound: Arc::new(AtomicUsize::new(0)),
+            active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
+            session_tree: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -97,7 +107,13 @@ impl GatewayRuntime {
     pub async fn process_inbound(&self, inbound: &InboundMessage) -> anyhow::Result<GatewayInboundResponse> {
         self.ensure_not_stopped().await?;
         let cfg = self.config.read().await.clone();
+        let _slot = acquire_inbound_slot(&cfg, &self.active_inbound)?;
+        let _child_slot =
+            acquire_subagent_guard(&cfg, inbound, &self.active_children_by_parent).await?;
         let route = resolve_agent_route(&cfg, inbound);
+        let lineage = self
+            .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
+            .await?;
         let selection = ProviderSelection {
             provider: route.provider.clone(),
             model: route.model.clone(),
@@ -122,7 +138,16 @@ impl GatewayRuntime {
             }
         }
 
-        let reply = agent.process_message(&inbound.text).await?;
+        let timeout_secs = resolve_agent_timeout_secs(&cfg, &route.agent_name);
+        let reply = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            agent.process_message(&inbound.text),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("agent processing timed out after {timeout_secs}s"),
+        };
         if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
             if let Err(e) = save_session_history(
@@ -131,6 +156,10 @@ impl GatewayRuntime {
                 session_id,
                 agent.export_messages(),
                 agent_cfg.max_history_messages,
+                lineage.parent_session_key.clone(),
+                lineage.parent_agent_id.clone(),
+                route.agent_name.clone(),
+                lineage.spawn_depth,
             )
             .await
             {
@@ -138,6 +167,163 @@ impl GatewayRuntime {
             }
         }
         Ok(GatewayInboundResponse { route, reply })
+    }
+
+    async fn validate_and_resolve_session_lineage(
+        &self,
+        cfg: &Config,
+        inbound: &InboundMessage,
+        route_agent_name: &str,
+    ) -> anyhow::Result<SessionLineageMeta> {
+        let Some(session_id) = inbound.session_id.as_deref() else {
+            return Ok(SessionLineageMeta::default());
+        };
+        let key = session_key(&inbound.channel, session_id);
+        let requested_parent_key = metadata_str(inbound, &["parent_session_id", "parentSessionId"])
+            .map(|parent| session_key(&inbound.channel, parent));
+        let requested_parent_agent_id =
+            metadata_str(inbound, &["parent_agent_id", "parentAgentId"]).map(ToString::to_string);
+        if requested_parent_agent_id.is_some() && requested_parent_key.is_none() {
+            anyhow::bail!("parentAgentId requires parentSessionId");
+        }
+        let requested_depth = metadata_u32(inbound, &["spawn_depth", "spawnDepth"]);
+
+        {
+            let mut tree = self.session_tree.write().await;
+            if let Some(existing) = tree.get_mut(&key) {
+                if let Some(parent_key) = requested_parent_key.as_ref() {
+                    if existing.parent_session_key.as_ref() != Some(parent_key) {
+                        anyhow::bail!("session parent mismatch for '{}'", session_id);
+                    }
+                }
+                if let Some(depth) = requested_depth {
+                    if existing.spawn_depth != depth {
+                        anyhow::bail!("session depth mismatch for '{}'", session_id);
+                    }
+                }
+                if let Some(parent_agent_id) = requested_parent_agent_id.as_ref() {
+                    if existing.parent_agent_id.as_deref() != Some(parent_agent_id.as_str()) {
+                        anyhow::bail!("session parent agent mismatch for '{}'", session_id);
+                    }
+                }
+                if existing.agent_name.as_deref() != Some(route_agent_name) {
+                    anyhow::bail!("session agent mismatch for '{}'", session_id);
+                }
+                existing.updated_at = now_unix_ts();
+                return Ok(existing.clone());
+            }
+        }
+
+        if let Some(record) = load_session_record(cfg, &inbound.channel, session_id).await? {
+            let resolved = SessionLineageMeta {
+                parent_session_key: record.parent_session_key,
+                parent_agent_id: record.parent_agent_id,
+                agent_name: record.agent_name,
+                spawn_depth: record.spawn_depth,
+                updated_at: now_unix_ts(),
+            };
+            if let Some(parent_key) = requested_parent_key.as_ref() {
+                if resolved.parent_session_key.as_ref() != Some(parent_key) {
+                    anyhow::bail!("session parent mismatch for '{}'", session_id);
+                }
+            }
+            if let Some(depth) = requested_depth {
+                if resolved.spawn_depth != depth {
+                    anyhow::bail!("session depth mismatch for '{}'", session_id);
+                }
+            }
+            if let Some(parent_agent_id) = requested_parent_agent_id.as_ref() {
+                if resolved.parent_agent_id.as_deref() != Some(parent_agent_id.as_str()) {
+                    anyhow::bail!("session parent agent mismatch for '{}'", session_id);
+                }
+            }
+            if resolved.agent_name.as_deref() != Some(route_agent_name) {
+                anyhow::bail!("session agent mismatch for '{}'", session_id);
+            }
+            let mut tree = self.session_tree.write().await;
+            tree.insert(key, resolved.clone());
+            return Ok(resolved);
+        }
+
+        let mut resolved_parent_agent_id = requested_parent_agent_id;
+        let resolved_parent_key = requested_parent_key;
+        let resolved_depth = match resolved_parent_key.as_ref() {
+            Some(parent_key) => {
+                let parent_meta = self.resolve_parent_lineage(cfg, parent_key).await?;
+                if let Some(expected_parent_agent_id) = resolved_parent_agent_id.as_ref() {
+                    if parent_meta.agent_name.as_deref() != Some(expected_parent_agent_id.as_str()) {
+                        anyhow::bail!(
+                            "parentAgentId '{}' does not match parent session agent",
+                            expected_parent_agent_id
+                        );
+                    }
+                } else {
+                    resolved_parent_agent_id = parent_meta.agent_name.clone();
+                }
+                let parent_depth = parent_meta.spawn_depth;
+                let inferred = parent_depth.saturating_add(1);
+                if let Some(depth) = requested_depth {
+                    if depth != inferred {
+                        anyhow::bail!(
+                            "session depth mismatch: expected {}, got {}",
+                            inferred,
+                            depth
+                        );
+                    }
+                }
+                inferred
+            }
+            None => requested_depth.unwrap_or(0),
+        };
+
+        if let Some(max_depth) = cfg
+            .agent_defaults_extended
+            .subagents
+            .as_ref()
+            .and_then(|s| s.max_spawn_depth)
+        {
+            if resolved_depth > max_depth {
+                anyhow::bail!(
+                    "subagent spawn depth {} exceeds limit {}",
+                    resolved_depth,
+                    max_depth
+                );
+            }
+        }
+
+        let resolved = SessionLineageMeta {
+            parent_session_key: resolved_parent_key,
+            parent_agent_id: resolved_parent_agent_id,
+            agent_name: Some(route_agent_name.to_string()),
+            spawn_depth: resolved_depth,
+            updated_at: now_unix_ts(),
+        };
+        let mut tree = self.session_tree.write().await;
+        tree.insert(key, resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn resolve_parent_lineage(
+        &self,
+        cfg: &Config,
+        parent_key: &str,
+    ) -> anyhow::Result<SessionLineageMeta> {
+        {
+            let tree = self.session_tree.read().await;
+            if let Some(node) = tree.get(parent_key) {
+                return Ok(node.clone());
+            }
+        }
+        if let Some(record) = load_session_record_by_key(cfg, parent_key).await? {
+            return Ok(SessionLineageMeta {
+                parent_session_key: record.parent_session_key,
+                parent_agent_id: record.parent_agent_id,
+                agent_name: record.agent_name,
+                spawn_depth: record.spawn_depth,
+                updated_at: record.updated_at,
+            });
+        }
+        anyhow::bail!("parent session not found: {}", parent_key)
     }
 
     pub async fn estop_status(&self) -> anyhow::Result<EstopState> {
@@ -161,6 +347,130 @@ impl GatewayRuntime {
     pub async fn estop_resume(&self) -> anyhow::Result<EstopState> {
         let cfg = self.config.read().await.clone();
         EstopController::from_config(&cfg).resume().await
+    }
+
+    pub async fn session_tree_snapshot(&self) -> anyhow::Result<GatewaySessionTreeResponse> {
+        self.session_tree_snapshot_filtered(&GatewaySessionTreeQuery::default())
+            .await
+    }
+
+    pub async fn session_tree_snapshot_filtered(
+        &self,
+        query: &GatewaySessionTreeQuery,
+    ) -> anyhow::Result<GatewaySessionTreeResponse> {
+        let query = normalize_session_tree_query(query);
+        if let (Some(min_depth), Some(max_depth)) = (query.min_spawn_depth, query.max_spawn_depth)
+        {
+            if min_depth > max_depth {
+                anyhow::bail!("min_spawn_depth cannot be greater than max_spawn_depth");
+            }
+        }
+        let cfg = self.config.read().await.clone();
+        let now = now_unix_ts();
+        let path = session_store_path(&cfg);
+        let mut merged: HashMap<String, GatewaySessionTreeNode> = HashMap::new();
+
+        let persisted = load_session_store(&path).await?;
+        for (session_key, record) in persisted.sessions {
+            if now - record.updated_at > cfg.gateway.session_ttl_secs as i64 {
+                continue;
+            }
+            merged.insert(
+                session_key,
+                GatewaySessionTreeNode {
+                    session_key: None,
+                    channel: None,
+                    session_id: None,
+                    parent_session_key: record.parent_session_key,
+                    parent_agent_id: record.parent_agent_id,
+                    agent_name: record.agent_name,
+                    spawn_depth: record.spawn_depth,
+                    updated_at: record.updated_at,
+                    source: "persisted".to_string(),
+                },
+            );
+        }
+
+        {
+            let in_memory = self.session_tree.read().await;
+            for (session_key, meta) in in_memory.iter() {
+                let source = if merged.contains_key(session_key) {
+                    "memory+persisted"
+                } else {
+                    "memory"
+                };
+                merged.insert(
+                    session_key.clone(),
+                    GatewaySessionTreeNode {
+                        session_key: None,
+                        channel: None,
+                        session_id: None,
+                        parent_session_key: meta.parent_session_key.clone(),
+                        parent_agent_id: meta.parent_agent_id.clone(),
+                        agent_name: meta.agent_name.clone(),
+                        spawn_depth: meta.spawn_depth,
+                        updated_at: meta.updated_at,
+                        source: source.to_string(),
+                    },
+                );
+            }
+        }
+
+        let mut sessions = merged
+            .into_iter()
+            .map(|(session_key, mut node)| {
+                let (channel, session_id) = split_session_key(&session_key);
+                node.session_key = Some(session_key);
+                node.channel = channel;
+                node.session_id = session_id;
+                node
+            })
+            .collect::<Vec<_>>();
+        let total_before_filter = sessions.len();
+        sessions.retain(|entry| match_session_tree_filters(entry, &query));
+        let total_after_filter = sessions.len();
+        let source_counts_after_filter = count_session_sources(&sessions);
+        let stats_after_filter = compute_session_tree_stats(&sessions);
+        sort_session_tree_entries(&mut sessions, &query);
+        let offset = query.offset.unwrap_or(0);
+        if offset >= sessions.len() {
+            sessions.clear();
+        } else if offset > 0 {
+            sessions = sessions.split_off(offset);
+        }
+        if let Some(limit) = query.limit {
+            sessions.truncate(limit);
+        }
+        let returned = sessions.len();
+        let has_more = offset.saturating_add(returned) < total_after_filter;
+        let next_offset = if has_more {
+            Some(offset.saturating_add(returned))
+        } else {
+            None
+        };
+        let prev_offset = if offset > 0 {
+            Some(offset.saturating_sub(query.limit.unwrap_or(offset)))
+        } else {
+            None
+        };
+
+        let active_children_by_parent = self.active_children_by_parent.read().await.clone();
+        Ok(GatewaySessionTreeResponse {
+            sessions,
+            active_children_by_parent,
+            total_before_filter,
+            total_after_filter,
+            returned,
+            offset,
+            limit: query.limit,
+            has_more,
+            next_offset,
+            prev_offset,
+            next_cursor: next_offset,
+            prev_cursor: prev_offset,
+            source_counts_after_filter,
+            stats_after_filter,
+        })
     }
 
     async fn ensure_not_stopped(&self) -> anyhow::Result<()> {
@@ -230,6 +540,7 @@ impl GatewayRuntime {
             .route("/route", post(http_route))
             .route("/ingress", post(http_ingress))
             .route("/webhook", post(http_webhook))
+            .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
             .route("/estop/pause", post(http_estop_pause))
             .route("/estop/resume", post(http_estop_resume))
@@ -240,6 +551,164 @@ impl GatewayRuntime {
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
+
+struct InboundSlotGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for InboundSlotGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct ChildSlotGuard {
+    parent_agent_id: Option<String>,
+    active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
+}
+
+impl Drop for ChildSlotGuard {
+    fn drop(&mut self) {
+        let Some(parent_agent_id) = self.parent_agent_id.clone() else {
+            return;
+        };
+        let map = Arc::clone(&self.active_children_by_parent);
+        tokio::spawn(async move {
+            let mut lock = map.write().await;
+            if let Some(count) = lock.get_mut(&parent_agent_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    lock.remove(&parent_agent_id);
+                }
+            }
+        });
+    }
+}
+
+fn acquire_inbound_slot(
+    cfg: &Config,
+    active: &Arc<AtomicUsize>,
+) -> anyhow::Result<Option<InboundSlotGuard>> {
+    let limit = cfg
+        .agent_defaults_extended
+        .max_concurrent
+        .or_else(|| {
+            cfg.agent_defaults_extended
+                .subagents
+                .as_ref()
+                .and_then(|s| s.max_concurrent)
+        });
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if limit == 0 {
+        return Ok(None);
+    }
+    let limit = limit as usize;
+    loop {
+        let current = active.load(Ordering::Acquire);
+        if current >= limit {
+            anyhow::bail!("too many concurrent inbound requests (limit={limit})");
+        }
+        if active
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(Some(InboundSlotGuard {
+                active: Arc::clone(active),
+            }));
+        }
+    }
+}
+
+fn resolve_agent_timeout_secs(cfg: &Config, route_agent_name: &str) -> u64 {
+    let subagent_timeout = if route_agent_name != cfg.agent.name {
+        cfg.agent_defaults_extended
+            .subagents
+            .as_ref()
+            .and_then(|s| s.run_timeout_seconds)
+    } else {
+        None
+    };
+
+    subagent_timeout
+        .or(cfg.agent_defaults_extended.timeout_seconds)
+        .unwrap_or(600)
+        .max(1) as u64
+}
+
+async fn acquire_subagent_guard(
+    cfg: &Config,
+    inbound: &InboundMessage,
+    active_children_by_parent: &Arc<RwLock<HashMap<String, usize>>>,
+) -> anyhow::Result<Option<ChildSlotGuard>> {
+    let subagents = match &cfg.agent_defaults_extended.subagents {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    if let Some(max_depth) = subagents.max_spawn_depth {
+        let depth = metadata_u32(inbound, &["spawn_depth", "spawnDepth"]).unwrap_or(0);
+        if depth > max_depth {
+            anyhow::bail!(
+                "subagent spawn depth {} exceeds limit {}",
+                depth,
+                max_depth
+            );
+        }
+    }
+
+    let Some(limit) = subagents.max_children_per_agent else {
+        return Ok(None);
+    };
+    if limit == 0 {
+        return Ok(None);
+    }
+    let Some(parent_agent_id) =
+        metadata_str(inbound, &["parent_agent_id", "parentAgentId"]).map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let mut lock = active_children_by_parent.write().await;
+    let count = lock.entry(parent_agent_id.clone()).or_insert(0);
+    if *count >= limit as usize {
+        anyhow::bail!(
+            "subagent children limit exceeded for parent '{}' (limit={})",
+            parent_agent_id,
+            limit
+        );
+    }
+    *count += 1;
+    drop(lock);
+
+    Ok(Some(ChildSlotGuard {
+        parent_agent_id: Some(parent_agent_id),
+        active_children_by_parent: Arc::clone(active_children_by_parent),
+    }))
+}
+
+fn metadata_u32(inbound: &InboundMessage, keys: &[&str]) -> Option<u32> {
+    for key in keys {
+        let Some(value) = inbound.metadata.get(*key) else {
+            continue;
+        };
+        if let Some(v) = value.as_u64() {
+            return u32::try_from(v).ok();
+        }
+        if let Some(v) = value.as_str() {
+            if let Ok(parsed) = v.parse::<u32>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn metadata_str<'a>(inbound: &'a InboundMessage, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| inbound.metadata.get(*key).and_then(serde_json::Value::as_str))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -283,6 +752,79 @@ pub struct GatewayRouteRequest {
 pub struct GatewayInboundResponse {
     pub route: RouteDecision,
     pub reply: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GatewaySessionTreeResponse {
+    pub sessions: Vec<GatewaySessionTreeNode>,
+    #[serde(default)]
+    pub active_children_by_parent: HashMap<String, usize>,
+    #[serde(default)]
+    pub total_before_filter: usize,
+    #[serde(default)]
+    pub total_after_filter: usize,
+    #[serde(default)]
+    pub returned: usize,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub has_more: bool,
+    pub next_offset: Option<usize>,
+    pub prev_offset: Option<usize>,
+    pub next_cursor: Option<usize>,
+    pub prev_cursor: Option<usize>,
+    #[serde(default)]
+    pub source_counts_after_filter: HashMap<String, usize>,
+    pub stats_after_filter: GatewaySessionTreeStats,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct GatewaySessionTreeStats {
+    #[serde(default)]
+    pub unique_agents: usize,
+    #[serde(default)]
+    pub unique_parent_agents: usize,
+    #[serde(default)]
+    pub max_spawn_depth: u32,
+    #[serde(default)]
+    pub min_updated_at: i64,
+    #[serde(default)]
+    pub max_updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct GatewaySessionTreeQuery {
+    pub session_id: Option<String>,
+    pub session_key: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub parent_session_key: Option<String>,
+    pub agent_name: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub channel: Option<String>,
+    pub source: Option<String>,
+    pub min_spawn_depth: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
+    pub contains: Option<String>,
+    pub case_insensitive: Option<bool>,
+    pub cursor: Option<usize>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GatewaySessionTreeNode {
+    pub session_key: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub parent_session_key: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub spawn_depth: u32,
+    pub updated_at: i64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -344,6 +886,18 @@ async fn http_set_config(
 ) -> Result<Json<GatewayConfigUpdateResponse>, Json<GatewayError>> {
     match runtime.set_config(config).await {
         Ok(()) => Ok(Json(GatewayConfigUpdateResponse { ok: true })),
+        Err(e) => Err(Json(GatewayError {
+            message: e.to_string(),
+        })),
+    }
+}
+
+async fn http_sessions_tree(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<GatewaySessionTreeQuery>,
+) -> Result<Json<GatewaySessionTreeResponse>, Json<GatewayError>> {
+    match runtime.session_tree_snapshot_filtered(&query).await {
+        Ok(snapshot) => Ok(Json(snapshot)),
         Err(e) => Err(Json(GatewayError {
             message: e.to_string(),
         })),
@@ -485,11 +1039,203 @@ fn session_store_path(config: &Config) -> PathBuf {
 struct SessionRecord {
     #[serde(default)]
     messages: Vec<ChatMessage>,
+    #[serde(default)]
+    parent_session_key: Option<String>,
+    #[serde(default)]
+    parent_agent_id: Option<String>,
+    #[serde(default)]
+    agent_name: Option<String>,
+    #[serde(default)]
+    spawn_depth: u32,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionLineageMeta {
+    parent_session_key: Option<String>,
+    parent_agent_id: Option<String>,
+    agent_name: Option<String>,
+    spawn_depth: u32,
     updated_at: i64,
 }
 
 fn session_key(channel: &ChannelKind, session_id: &str) -> String {
     format!("{:?}:{session_id}", channel).to_lowercase()
+}
+
+fn split_session_key(key: &str) -> (Option<String>, Option<String>) {
+    let Some((channel, session_id)) = key.split_once(':') else {
+        return (None, Some(key.to_string()));
+    };
+    (Some(channel.to_string()), Some(session_id.to_string()))
+}
+
+fn match_session_tree_filters(
+    entry: &GatewaySessionTreeNode,
+    query: &GatewaySessionTreeQuery,
+) -> bool {
+    let case_insensitive = query.case_insensitive.unwrap_or(true);
+    let cmp = |left: Option<&str>, right: Option<&str>| -> bool {
+        match (left, right) {
+            (Some(l), Some(r)) if case_insensitive => l.eq_ignore_ascii_case(r),
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        }
+    };
+    if let Some(session_id) = query.session_id.as_deref() {
+        if !cmp(entry.session_id.as_deref(), Some(session_id)) {
+            return false;
+        }
+    }
+    if let Some(session_key) = query.session_key.as_deref() {
+        if !cmp(entry.session_key.as_deref(), Some(session_key)) {
+            return false;
+        }
+    }
+    if let Some(parent_session_key) = query.parent_session_key.as_deref() {
+        if !cmp(entry.parent_session_key.as_deref(), Some(parent_session_key)) {
+            return false;
+        }
+    }
+    if let Some(parent_session_id) = query.parent_session_id.as_deref() {
+        let parent_session_id_actual = entry
+            .parent_session_key
+            .as_deref()
+            .and_then(|key| split_session_key(key).1);
+        if !cmp(parent_session_id_actual.as_deref(), Some(parent_session_id)) {
+            return false;
+        }
+    }
+    if let Some(agent_name) = query.agent_name.as_deref() {
+        if !cmp(entry.agent_name.as_deref(), Some(agent_name)) {
+            return false;
+        }
+    }
+    if let Some(parent_agent_id) = query.parent_agent_id.as_deref() {
+        if !cmp(entry.parent_agent_id.as_deref(), Some(parent_agent_id)) {
+            return false;
+        }
+    }
+    if let Some(channel) = query.channel.as_deref() {
+        if !cmp(entry.channel.as_deref(), Some(channel)) {
+            return false;
+        }
+    }
+    if let Some(source) = query.source.as_deref() {
+        if !cmp(Some(entry.source.as_str()), Some(source)) {
+            return false;
+        }
+    }
+    if let Some(min_depth) = query.min_spawn_depth {
+        if entry.spawn_depth < min_depth {
+            return false;
+        }
+    }
+    if let Some(max_depth) = query.max_spawn_depth {
+        if entry.spawn_depth > max_depth {
+            return false;
+        }
+    }
+    if let Some(contains) = query.contains.as_deref() {
+        let hay = format!(
+            "{}|{}|{}|{}",
+            entry.session_key.clone().unwrap_or_default(),
+            entry.session_id.clone().unwrap_or_default(),
+            entry.agent_name.clone().unwrap_or_default(),
+            entry.parent_session_key.clone().unwrap_or_default()
+        );
+        let contains_match = if case_insensitive {
+            hay.to_lowercase().contains(&contains.to_lowercase())
+        } else {
+            hay.contains(contains)
+        };
+        if !contains_match {
+            return false;
+        }
+    }
+    true
+}
+
+fn sort_session_tree_entries(entries: &mut [GatewaySessionTreeNode], query: &GatewaySessionTreeQuery) {
+    let sort_by = query.sort_by.as_deref().unwrap_or("updated_at");
+    let asc = query
+        .sort_order
+        .as_deref()
+        .map(|v| v == "asc")
+        .unwrap_or(false);
+    entries.sort_by(|a, b| {
+        let ord = match sort_by {
+            "spawn_depth" => a.spawn_depth.cmp(&b.spawn_depth),
+            "session_id" => a.session_id.cmp(&b.session_id),
+            "agent_name" => a.agent_name.cmp(&b.agent_name),
+            _ => a.updated_at.cmp(&b.updated_at),
+        };
+        if asc { ord } else { ord.reverse() }
+    });
+}
+
+fn normalize_session_tree_query(query: &GatewaySessionTreeQuery) -> GatewaySessionTreeQuery {
+    let mut normalized = query.clone();
+    normalized.session_id = normalized.session_id.map(|v| v.trim().to_string());
+    normalized.session_key = normalized.session_key.map(|v| v.trim().to_string());
+    normalized.parent_session_id = normalized.parent_session_id.map(|v| v.trim().to_string());
+    normalized.parent_session_key = normalized.parent_session_key.map(|v| v.trim().to_string());
+    normalized.agent_name = normalized.agent_name.map(|v| v.trim().to_string());
+    normalized.parent_agent_id = normalized.parent_agent_id.map(|v| v.trim().to_string());
+    normalized.channel = normalized.channel.map(|v| v.trim().to_string());
+    normalized.source = normalized.source.map(|v| v.trim().to_string());
+    normalized.contains = normalized.contains.map(|v| v.trim().to_string());
+    normalized.sort_by = normalized
+        .sort_by
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| matches!(v.as_str(), "updated_at" | "spawn_depth" | "session_id" | "agent_name"));
+    normalized.sort_order = normalized
+        .sort_order
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| matches!(v.as_str(), "asc" | "desc"));
+    if normalized.offset.is_none() {
+        normalized.offset = normalized.cursor;
+    }
+    normalized
+}
+
+fn count_session_sources(entries: &[GatewaySessionTreeNode]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for entry in entries {
+        *counts.entry(entry.source.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn compute_session_tree_stats(entries: &[GatewaySessionTreeNode]) -> GatewaySessionTreeStats {
+    if entries.is_empty() {
+        return GatewaySessionTreeStats::default();
+    }
+    let mut unique_agents = HashSet::new();
+    let mut unique_parent_agents = HashSet::new();
+    let mut max_spawn_depth = 0u32;
+    let mut min_updated_at = i64::MAX;
+    let mut max_updated_at = i64::MIN;
+
+    for entry in entries {
+        if let Some(agent_name) = entry.agent_name.as_deref() {
+            unique_agents.insert(agent_name.to_string());
+        }
+        if let Some(parent_agent_id) = entry.parent_agent_id.as_deref() {
+            unique_parent_agents.insert(parent_agent_id.to_string());
+        }
+        max_spawn_depth = max_spawn_depth.max(entry.spawn_depth);
+        min_updated_at = min_updated_at.min(entry.updated_at);
+        max_updated_at = max_updated_at.max(entry.updated_at);
+    }
+
+    GatewaySessionTreeStats {
+        unique_agents: unique_agents.len(),
+        unique_parent_agents: unique_parent_agents.len(),
+        max_spawn_depth,
+        min_updated_at,
+        max_updated_at,
+    }
 }
 
 fn now_unix_ts() -> i64 {
@@ -520,6 +1266,10 @@ async fn save_session_history(
     session_id: &str,
     mut messages: Vec<ChatMessage>,
     max_history_messages: usize,
+    parent_session_key: Option<String>,
+    parent_agent_id: Option<String>,
+    agent_name: String,
+    spawn_depth: u32,
 ) -> anyhow::Result<()> {
     if max_history_messages > 0 && messages.len() > max_history_messages {
         let start = messages.len() - max_history_messages;
@@ -542,6 +1292,10 @@ async fn save_session_history(
         key,
         SessionRecord {
             messages,
+            parent_session_key,
+            parent_agent_id,
+            agent_name: Some(agent_name),
+            spawn_depth,
             updated_at: now,
         },
     );
@@ -558,7 +1312,28 @@ async fn save_session_history(
     Ok(())
 }
 
+async fn load_session_record(
+    config: &Config,
+    channel: &ChannelKind,
+    session_id: &str,
+) -> anyhow::Result<Option<SessionRecord>> {
+    let key = session_key(channel, session_id);
+    load_session_record_by_key(config, &key).await
+}
+
+async fn load_session_record_by_key(
+    config: &Config,
+    key: &str,
+) -> anyhow::Result<Option<SessionRecord>> {
+    let path = session_store_path(config);
+    let store = load_session_store(&path).await?;
+    Ok(store.sessions.get(key).cloned())
+}
+
 async fn load_session_store(path: &PathBuf) -> anyhow::Result<SessionStoreFile> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let _guard = acquire_lockfile_guard(path, 5_000, 60_000).await?;
     if !path.exists() {
         return Ok(SessionStoreFile::default());
@@ -705,4 +1480,508 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
         Box::new(FileEditTool::new(workspace.clone())),
         Box::new(ShellTool::new(workspace, shell_allowlist, Some(30))),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GatewayRuntime, GatewaySessionTreeQuery, SessionLineageMeta, acquire_inbound_slot,
+        acquire_subagent_guard, resolve_agent_timeout_secs, split_session_key,
+    };
+    use crate::channels::{ChannelKind, InboundMessage};
+    use crate::config::Config;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn timeout_defaults_to_600_when_unset() {
+        let config = Config::default();
+        assert_eq!(resolve_agent_timeout_secs(&config, "omninova"), 600);
+    }
+
+    #[test]
+    fn timeout_respects_agents_defaults_value() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.timeout_seconds = Some(42);
+        assert_eq!(resolve_agent_timeout_secs(&config, "omninova"), 42);
+    }
+
+    #[test]
+    fn timeout_prefers_subagent_timeout_for_delegate_route() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.timeout_seconds = Some(50);
+        config.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            run_timeout_seconds: Some(12),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        assert_eq!(resolve_agent_timeout_secs(&config, "delegate"), 12);
+        assert_eq!(resolve_agent_timeout_secs(&config, "omninova"), 50);
+    }
+
+    #[test]
+    fn acquire_inbound_slot_enforces_limit() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.max_concurrent = Some(1);
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let first = acquire_inbound_slot(&config, &active).expect("first slot should succeed");
+        assert!(first.is_some());
+
+        let second = acquire_inbound_slot(&config, &active);
+        assert!(second.is_err());
+
+        drop(first);
+        let third = acquire_inbound_slot(&config, &active).expect("slot should be released");
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn acquire_inbound_slot_uses_subagent_limit_fallback() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.max_concurrent = None;
+        config.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_concurrent: Some(1),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = acquire_inbound_slot(&config, &active).expect("first slot should succeed");
+        assert!(first.is_some());
+        let second = acquire_inbound_slot(&config, &active);
+        assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn subagent_guard_rejects_depth_over_limit() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_spawn_depth: Some(2),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let mut metadata = HashMap::new();
+        metadata.insert("spawnDepth".to_string(), json!(3));
+        let inbound = InboundMessage {
+            channel: ChannelKind::Cli,
+            text: "spawn".to_string(),
+            metadata,
+            ..InboundMessage::default()
+        };
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        let result = acquire_subagent_guard(&config, &inbound, &map).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subagent_guard_enforces_children_per_parent() {
+        let mut config = Config::default();
+        config.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_children_per_agent: Some(1),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let mut metadata = HashMap::new();
+        metadata.insert("parentAgentId".to_string(), json!("main"));
+        let inbound = InboundMessage {
+            channel: ChannelKind::Cli,
+            text: "spawn".to_string(),
+            metadata,
+            ..InboundMessage::default()
+        };
+        let map = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = acquire_subagent_guard(&config, &inbound, &map)
+            .await
+            .expect("first child should pass");
+        assert!(first.is_some());
+
+        let second = acquire_subagent_guard(&config, &inbound, &map).await;
+        assert!(second.is_err());
+    }
+
+    fn temp_workspace() -> PathBuf {
+        std::env::temp_dir().join(format!("omninova-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn session_lineage_registers_root_session() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        let inbound = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("root-1".to_string()),
+            text: "root".to_string(),
+            ..InboundMessage::default()
+        };
+        let meta = runtime
+            .validate_and_resolve_session_lineage(&config, &inbound, "omninova")
+            .await
+            .expect("root session should register");
+        assert_eq!(meta.spawn_depth, 0);
+        assert!(meta.parent_session_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_lineage_validates_parent_child_depth() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+
+        let root = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("parent".to_string()),
+            text: "root".to_string(),
+            ..InboundMessage::default()
+        };
+        runtime
+            .validate_and_resolve_session_lineage(&config, &root, "omninova")
+            .await
+            .expect("root session should register");
+
+        let mut child_meta = HashMap::new();
+        child_meta.insert("parentSessionId".to_string(), json!("parent"));
+        child_meta.insert("spawnDepth".to_string(), json!(1));
+        let child = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("child".to_string()),
+            text: "child".to_string(),
+            metadata: child_meta,
+            ..InboundMessage::default()
+        };
+        runtime
+            .validate_and_resolve_session_lineage(&config, &child, "delegate")
+            .await
+            .expect("child depth should match parent");
+
+        let mut bad_meta = HashMap::new();
+        bad_meta.insert("parentSessionId".to_string(), json!("parent"));
+        bad_meta.insert("spawnDepth".to_string(), json!(3));
+        let bad_child = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("child-bad".to_string()),
+            text: "child".to_string(),
+            metadata: bad_meta,
+            ..InboundMessage::default()
+        };
+        let result = runtime
+            .validate_and_resolve_session_lineage(&config, &bad_child, "delegate")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_lineage_validates_parent_agent_binding() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+
+        let root = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("parent-agent".to_string()),
+            text: "root".to_string(),
+            ..InboundMessage::default()
+        };
+        runtime
+            .validate_and_resolve_session_lineage(&config, &root, "omninova")
+            .await
+            .expect("root session should register");
+
+        let mut child_meta = HashMap::new();
+        child_meta.insert("parentSessionId".to_string(), json!("parent-agent"));
+        child_meta.insert("parentAgentId".to_string(), json!("wrong-agent"));
+        child_meta.insert("spawnDepth".to_string(), json!(1));
+        let child = InboundMessage {
+            channel: ChannelKind::Cli,
+            session_id: Some("child-agent-check".to_string()),
+            text: "child".to_string(),
+            metadata: child_meta,
+            ..InboundMessage::default()
+        };
+        let result = runtime
+            .validate_and_resolve_session_lineage(&config, &child, "delegate")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn split_session_key_parses_channel_and_session() {
+        let (channel, session_id) = split_session_key("cli:abc-123");
+        assert_eq!(channel.as_deref(), Some("cli"));
+        assert_eq!(session_id.as_deref(), Some("abc-123"));
+    }
+
+    #[tokio::test]
+    async fn session_tree_snapshot_exposes_in_memory_nodes() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        {
+            let mut lock = runtime.session_tree.write().await;
+            lock.insert(
+                "cli:debug-session".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: Some("cli:parent".to_string()),
+                    parent_agent_id: Some("omninova".to_string()),
+                    agent_name: Some("delegate".to_string()),
+                    spawn_depth: 1,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+        }
+        let snapshot = runtime
+            .session_tree_snapshot()
+            .await
+            .expect("snapshot should load");
+        assert_eq!(snapshot.total_before_filter, 1);
+        assert_eq!(snapshot.total_after_filter, 1);
+        assert_eq!(snapshot.returned, 1);
+        assert!(!snapshot.has_more);
+        assert_eq!(snapshot.next_offset, None);
+        assert_eq!(
+            snapshot.source_counts_after_filter.get("memory"),
+            Some(&1usize)
+        );
+        assert_eq!(snapshot.stats_after_filter.unique_agents, 1);
+        assert_eq!(snapshot.stats_after_filter.unique_parent_agents, 1);
+        assert_eq!(snapshot.stats_after_filter.max_spawn_depth, 1);
+        assert!(snapshot
+            .sessions
+            .iter()
+            .any(|entry| entry.session_key.as_deref() == Some("cli:debug-session")
+                && entry.parent_agent_id.as_deref() == Some("omninova")));
+    }
+
+    #[tokio::test]
+    async fn session_tree_snapshot_supports_query_filters() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        {
+            let mut lock = runtime.session_tree.write().await;
+            lock.insert(
+                "cli:keep-me".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: Some("omninova".to_string()),
+                    agent_name: Some("delegate-a".to_string()),
+                    spawn_depth: 0,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:drop-me".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: Some("omninova".to_string()),
+                    agent_name: Some("delegate-b".to_string()),
+                    spawn_depth: 0,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+        }
+
+        let filtered = runtime
+            .session_tree_snapshot_filtered(&GatewaySessionTreeQuery {
+                session_id: Some("keep-me".to_string()),
+                agent_name: Some("delegate-a".to_string()),
+                channel: Some("cli".to_string()),
+                source: Some("memory".to_string()),
+                limit: Some(1),
+                ..GatewaySessionTreeQuery::default()
+            })
+            .await
+            .expect("filtered snapshot should load");
+
+        assert_eq!(filtered.sessions.len(), 1);
+        assert_eq!(filtered.total_before_filter, 2);
+        assert_eq!(filtered.total_after_filter, 1);
+        assert_eq!(filtered.returned, 1);
+        assert!(!filtered.has_more);
+        assert_eq!(filtered.next_offset, None);
+        assert_eq!(
+            filtered.source_counts_after_filter.get("memory"),
+            Some(&1usize)
+        );
+        assert_eq!(
+            filtered.sessions[0].session_key.as_deref(),
+            Some("cli:keep-me")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_tree_snapshot_supports_parent_and_depth_filters() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        {
+            let mut lock = runtime.session_tree.write().await;
+            lock.insert(
+                "cli:parent-x".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("OmniNova".to_string()),
+                    spawn_depth: 0,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:child-x-1".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: Some("cli:parent-x".to_string()),
+                    parent_agent_id: Some("OmniNova".to_string()),
+                    agent_name: Some("Delegate-X".to_string()),
+                    spawn_depth: 1,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:child-x-2".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: Some("cli:parent-x".to_string()),
+                    parent_agent_id: Some("OmniNova".to_string()),
+                    agent_name: Some("Delegate-Y".to_string()),
+                    spawn_depth: 2,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+        }
+
+        let filtered = runtime
+            .session_tree_snapshot_filtered(&GatewaySessionTreeQuery {
+                parent_session_id: Some("PARENT-X".to_string()),
+                parent_agent_id: Some("omninova".to_string()),
+                min_spawn_depth: Some(1),
+                max_spawn_depth: Some(1),
+                source: Some("MEMORY".to_string()),
+                case_insensitive: Some(true),
+                ..GatewaySessionTreeQuery::default()
+            })
+            .await
+            .expect("filtered snapshot should load");
+
+        assert_eq!(filtered.sessions.len(), 1);
+        assert_eq!(
+            filtered.sessions[0].session_key.as_deref(),
+            Some("cli:child-x-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_tree_snapshot_supports_sort_and_offset() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        {
+            let mut lock = runtime.session_tree.write().await;
+            lock.insert(
+                "cli:s1".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("B-Agent".to_string()),
+                    spawn_depth: 2,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:s2".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("A-Agent".to_string()),
+                    spawn_depth: 1,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:s3".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("C-Agent".to_string()),
+                    spawn_depth: 3,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+        }
+
+        let filtered = runtime
+            .session_tree_snapshot_filtered(&GatewaySessionTreeQuery {
+                sort_by: Some("spawn_depth".to_string()),
+                sort_order: Some("asc".to_string()),
+                offset: Some(1),
+                limit: Some(1),
+                ..GatewaySessionTreeQuery::default()
+            })
+            .await
+            .expect("filtered snapshot should load");
+
+        assert_eq!(filtered.total_before_filter, 3);
+        assert_eq!(filtered.total_after_filter, 3);
+        assert_eq!(filtered.offset, 1);
+        assert_eq!(filtered.limit, Some(1));
+        assert_eq!(filtered.returned, 1);
+        assert!(filtered.has_more);
+        assert_eq!(filtered.next_offset, Some(2));
+        assert_eq!(filtered.prev_offset, Some(0));
+        assert_eq!(filtered.next_cursor, Some(2));
+        assert_eq!(filtered.prev_cursor, Some(0));
+        assert_eq!(
+            filtered.source_counts_after_filter.get("memory"),
+            Some(&3usize)
+        );
+        assert_eq!(filtered.stats_after_filter.unique_agents, 3);
+        assert_eq!(filtered.stats_after_filter.unique_parent_agents, 0);
+        assert_eq!(filtered.stats_after_filter.max_spawn_depth, 3);
+        assert_eq!(filtered.sessions[0].spawn_depth, 2);
+        assert_eq!(filtered.sessions[0].session_key.as_deref(), Some("cli:s1"));
+    }
+
+    #[tokio::test]
+    async fn session_tree_snapshot_supports_cursor_as_offset_alias() {
+        let mut config = Config::default();
+        config.workspace_dir = temp_workspace();
+        let runtime = GatewayRuntime::new(config.clone());
+        {
+            let mut lock = runtime.session_tree.write().await;
+            lock.insert(
+                "cli:c1".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("A".to_string()),
+                    spawn_depth: 1,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+            lock.insert(
+                "cli:c2".to_string(),
+                SessionLineageMeta {
+                    parent_session_key: None,
+                    parent_agent_id: None,
+                    agent_name: Some("B".to_string()),
+                    spawn_depth: 2,
+                    updated_at: super::now_unix_ts(),
+                },
+            );
+        }
+
+        let filtered = runtime
+            .session_tree_snapshot_filtered(&GatewaySessionTreeQuery {
+                sort_by: Some("spawn_depth".to_string()),
+                sort_order: Some("asc".to_string()),
+                cursor: Some(1),
+                limit: Some(1),
+                ..GatewaySessionTreeQuery::default()
+            })
+            .await
+            .expect("cursor paging should work");
+
+        assert_eq!(filtered.offset, 1);
+        assert_eq!(filtered.sessions.len(), 1);
+        assert_eq!(filtered.sessions[0].session_key.as_deref(), Some("cli:c2"));
+    }
 }

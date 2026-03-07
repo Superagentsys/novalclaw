@@ -81,6 +81,47 @@ impl Config {
             );
         }
 
+        if self.agent_defaults_extended.timeout_seconds == Some(0) {
+            report
+                .errors
+                .push("agents.defaults.timeoutSeconds must be > 0".into());
+        }
+
+        if self.agent_defaults_extended.max_concurrent == Some(0) {
+            report.warnings.push(
+                "agents.defaults.maxConcurrent is 0 – inbound concurrency limiting is disabled."
+                    .into(),
+            );
+        }
+
+        if let Some(subagents) = &self.agent_defaults_extended.subagents {
+            if subagents.run_timeout_seconds == Some(0) {
+                report
+                    .errors
+                    .push("agents.defaults.subagents.runTimeoutSeconds must be > 0".into());
+            }
+            if let Some(depth) = subagents.max_spawn_depth {
+                if !(1..=5).contains(&depth) {
+                    report.errors.push(
+                        "agents.defaults.subagents.maxSpawnDepth must be in [1, 5]".into(),
+                    );
+                }
+            }
+            if let Some(max_children_per_agent) = subagents.max_children_per_agent {
+                if !(1..=20).contains(&max_children_per_agent) {
+                    report.errors.push(
+                        "agents.defaults.subagents.maxChildrenPerAgent must be in [1, 20]".into(),
+                    );
+                }
+            }
+            if subagents.max_concurrent == Some(0) {
+                report.warnings.push(
+                    "agents.defaults.subagents.maxConcurrent is 0 – subagent concurrency limiting is disabled."
+                        .into(),
+                );
+            }
+        }
+
         for (name, delegate) in &self.agents {
             if delegate.allowed_tools.is_empty() && delegate.agentic {
                 report.warnings.push(format!(
@@ -135,5 +176,70 @@ mod tests {
         cfg.gateway.port = 0;
         let report = cfg.validate();
         assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn test_agents_defaults_timeout_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.agent_defaults_extended.timeout_seconds = Some(0);
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("agents.defaults.timeoutSeconds"))
+        );
+    }
+
+    #[test]
+    fn test_subagent_timeout_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            run_timeout_seconds: Some(0),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("runTimeoutSeconds"))
+        );
+    }
+
+    #[test]
+    fn test_subagent_depth_range() {
+        let mut cfg = Config::default();
+        cfg.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_spawn_depth: Some(9),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("maxSpawnDepth"))
+        );
+    }
+
+    #[test]
+    fn test_subagent_children_limit_range() {
+        let mut cfg = Config::default();
+        cfg.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_children_per_agent: Some(25),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("maxChildrenPerAgent"))
+        );
     }
 }
