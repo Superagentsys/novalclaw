@@ -57,7 +57,7 @@ omninovalclaw/
 ### 1) Enter the repository
 
 ```bash
-cd /Users/mac/Documents/work/CompaniesStartups/奥米智能/dev/claw/omninovalclaw
+cd omninovalclaw
 ```
 
 ### 2) Build and test core

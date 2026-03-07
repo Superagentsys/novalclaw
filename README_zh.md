@@ -57,7 +57,7 @@ omninovalclaw/
 ### 1) 进入仓库
 
 ```bash
-cd /Users/mac/Documents/work/CompaniesStartups/奥米智能/dev/claw/omninovalclaw
+cd /omninovalclaw
 ```
 
 ### 2) 构建和测试核心
