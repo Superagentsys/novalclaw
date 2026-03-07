@@ -2,7 +2,7 @@ use crate::config::schema::Config;
 use tracing::debug;
 
 /// Apply environment variable overrides to a loaded Config.
-/// Mirrors OpenClaw's `apply_env_overrides` behaviour.
+/// Mirrors omninoval's `apply_env_overrides` behaviour.
 pub fn apply_env_overrides(cfg: &mut Config) {
     // --- API key ---
     env_opt("OMNINOVA_API_KEY", |v| cfg.api_key = Some(v));

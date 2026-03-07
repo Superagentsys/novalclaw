@@ -13,8 +13,8 @@ const initialConfig: AppConfig = {
   default_provider: "",
   default_model: "",
   workspace_dir: "",
-  openclaw_gateway_url: "http://localhost:18789",
-  openclaw_config_dir: "~/.openclaw",
+  omninoval_gateway_url: "http://localhost:18789",
+  omninoval_config_dir: "~/.omninoval",
   robot: DEFAULT_ROBOT_CONFIG,
   providers: DEFAULT_PROVIDERS,
 };
@@ -33,7 +33,7 @@ export function Setup() {
         <div>
           <div className="setup-title">OmniNova 启动配置</div>
           <div className="setup-subtitle">
-            参照 zeroclaw-main 与 openclaw 的关键配置点
+            参照 novalclaw-main 与 omninoval 的关键配置点
           </div>
         </div>
       </header>
@@ -95,16 +95,16 @@ export function Setup() {
       </section>
 
       <section className="setup-section">
-        <h2>OpenClaw 连接</h2>
+        <h2>omninoval 连接</h2>
         <div className="setup-grid">
           <label>
             Gateway 地址
             <input
-              value={config.openclaw_gateway_url ?? ""}
+              value={config.omninoval_gateway_url ?? ""}
               onChange={(event) =>
                 setConfig({
                   ...config,
-                  openclaw_gateway_url: event.target.value,
+                  omninoval_gateway_url: event.target.value,
                 })
               }
               placeholder="http://localhost:18789"
@@ -113,14 +113,14 @@ export function Setup() {
           <label>
             配置目录
             <input
-              value={config.openclaw_config_dir ?? ""}
+              value={config.omninoval_config_dir ?? ""}
               onChange={(event) =>
                 setConfig({
                   ...config,
-                  openclaw_config_dir: event.target.value,
+                  omninoval_config_dir: event.target.value,
                 })
               }
-              placeholder="~/.openclaw"
+              placeholder="~/.omninoval"
             />
           </label>
         </div>

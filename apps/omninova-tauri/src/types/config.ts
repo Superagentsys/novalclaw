@@ -62,8 +62,8 @@ export interface AppConfig {
   default_provider?: string;
   default_model?: string;
   workspace_dir: string;
-  openclaw_gateway_url?: string;
-  openclaw_config_dir?: string;
+  omninoval_gateway_url?: string;
+  omninoval_config_dir?: string;
   robot?: RobotConfig;
   providers: ProviderConfig[];
 }

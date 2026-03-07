@@ -405,24 +405,24 @@ pub struct DelegateAgentConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct OpenClawAgentsCompat {
+struct omninovalAgentsCompat {
     #[serde(default)]
     pub defaults: Option<AgentDefaultsExtendedConfig>,
     #[serde(default)]
-    pub list: Vec<OpenClawAgentEntryCompat>,
+    pub list: Vec<omninovalAgentEntryCompat>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct OpenClawAgentEntryCompat {
+struct omninovalAgentEntryCompat {
     pub id: String,
     #[serde(default)]
-    pub model: Option<OpenClawModelRefCompat>,
+    pub model: Option<omninovalModelRefCompat>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum OpenClawModelRefCompat {
+enum omninovalModelRefCompat {
     Name(String),
     Detailed(AgentModelConfig),
 }
@@ -431,7 +431,7 @@ enum OpenClawModelRefCompat {
 #[serde(untagged)]
 enum AgentsCompatInput {
     DelegateMap(HashMap<String, DelegateAgentConfig>),
-    OpenClaw(OpenClawAgentsCompat),
+    omninoval(omninovalAgentsCompat),
 }
 
 fn deserialize_agents_compat<'de, D>(
@@ -446,24 +446,24 @@ where
     };
     let mapped = match input {
         AgentsCompatInput::DelegateMap(map) => map,
-        AgentsCompatInput::OpenClaw(openclaw) => {
+        AgentsCompatInput::omninoval(omninoval) => {
             let mut map = HashMap::new();
-            let fallback_provider = openclaw
+            let fallback_provider = omninoval
                 .defaults
                 .as_ref()
                 .and_then(|d| d.model.as_ref())
                 .and_then(|m| m.provider.clone());
-            let fallback_model = openclaw
+            let fallback_model = omninoval
                 .defaults
                 .as_ref()
                 .and_then(|d| d.model.as_ref())
                 .and_then(|m| m.model.clone());
-            for entry in openclaw.list {
+            for entry in omninoval.list {
                 let (provider, model) = match entry.model {
-                    Some(OpenClawModelRefCompat::Name(model_name)) => {
+                    Some(omninovalModelRefCompat::Name(model_name)) => {
                         (fallback_provider.clone(), Some(model_name))
                     }
-                    Some(OpenClawModelRefCompat::Detailed(model_cfg)) => {
+                    Some(omninovalModelRefCompat::Detailed(model_cfg)) => {
                         (model_cfg.provider, model_cfg.model)
                     }
                     None => (fallback_provider.clone(), fallback_model.clone()),
@@ -1549,7 +1549,7 @@ pub struct AgentsIpcConfig {
 }
 
 // ---------------------------------------------------------------------------
-// OpenClaw Compatibility Configs
+// omninoval Compatibility Configs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
