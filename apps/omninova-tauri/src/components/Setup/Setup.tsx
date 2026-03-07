@@ -6,6 +6,7 @@ import {
 } from "../../types/config";
 import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
+import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const initialConfig: AppConfig = {
   api_key: "",
@@ -21,19 +22,102 @@ const initialConfig: AppConfig = {
 
 export function Setup() {
   const [config, setConfig] = useState<AppConfig>(initialConfig);
+  const enabledProviders = useMemo(
+    () => config.providers.filter((provider) => provider.enabled),
+    [config.providers]
+  );
+  const defaultModelOptions = useMemo(() => {
+    if (config.default_provider) {
+      const activeProvider = enabledProviders.find(
+        (provider) => provider.id === config.default_provider
+      );
+
+      return activeProvider
+        ? [
+            {
+              providerId: activeProvider.id,
+              providerName: activeProvider.name,
+              models: activeProvider.models,
+            },
+          ]
+        : [];
+    }
+
+    return enabledProviders.map((provider) => ({
+      providerId: provider.id,
+      providerName: provider.name,
+      models: provider.models,
+    }));
+  }, [config.default_provider, enabledProviders]);
 
   const jsonPreview = useMemo(
     () => JSON.stringify(config, null, 2),
     [config]
   );
 
+  const handleProvidersChange = (providers: AppConfig["providers"]) => {
+    const enabledProviderIds = providers
+      .filter((provider) => provider.enabled)
+      .map((provider) => provider.id);
+    const currentDefaultProvider = enabledProviderIds.includes(
+      config.default_provider ?? ""
+    )
+      ? config.default_provider
+      : "";
+    const currentProvider = providers.find(
+      (provider) => provider.id === currentDefaultProvider
+    );
+    const currentDefaultModel = currentProvider?.models.includes(
+      config.default_model ?? ""
+    )
+      ? config.default_model
+      : "";
+
+    setConfig({
+      ...config,
+      providers,
+      default_provider: currentDefaultProvider,
+      default_model: currentDefaultModel,
+    });
+  };
+
+  const handleDefaultModelChange = (value: string) => {
+    if (!value) {
+      setConfig({ ...config, default_model: "" });
+      return;
+    }
+
+    const [providerId, model] = value.split("::");
+
+    setConfig({
+      ...config,
+      default_provider: providerId,
+      default_model: model ?? "",
+    });
+  };
+
+  const selectedDefaultModelValue =
+    config.default_provider && config.default_model
+      ? `${config.default_provider}::${config.default_model}`
+      : "";
+
   return (
     <div className="setup-page">
       <header className="setup-header">
-        <div>
-          <div className="setup-title">OmniNova 启动配置</div>
-          <div className="setup-subtitle">
-            参照 novalclaw-main 与 omninoval 的关键配置点
+        <div className="setup-brand">
+          <div className="setup-logo-frame">
+            <img
+              src={omninovalLogo}
+              alt="OmniNova logo"
+              className="setup-logo"
+            />
+          </div>
+          <div className="setup-brand-copy">
+            <div className="setup-chip">OmniNova Claw</div>
+            <div className="setup-title">OmniNova 启动配置</div>
+            <div className="setup-subtitle">
+              在首次启动前完成工作目录、模型服务与机器人参数初始化
+            </div>
           </div>
         </div>
       </header>
@@ -53,23 +137,53 @@ export function Setup() {
           </label>
           <label>
             默认模型服务
-            <input
+            <select
               value={config.default_provider ?? ""}
               onChange={(event) =>
-                setConfig({ ...config, default_provider: event.target.value })
+                setConfig({
+                  ...config,
+                  default_provider: event.target.value,
+                  default_model: "",
+                })
               }
-              placeholder="openai / anthropic / ollama"
-            />
+            >
+              <option value="">
+                {enabledProviders.length === 0
+                  ? "请先启用模型服务"
+                  : "选择默认模型服务"}
+              </option>
+              {enabledProviders.map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.name}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             默认模型
-            <input
-              value={config.default_model ?? ""}
-              onChange={(event) =>
-                setConfig({ ...config, default_model: event.target.value })
-              }
-              placeholder="gpt-4o"
-            />
+            <select
+              value={selectedDefaultModelValue}
+              onChange={(event) => handleDefaultModelChange(event.target.value)}
+              disabled={defaultModelOptions.length === 0}
+            >
+              <option value="">
+                {defaultModelOptions.length === 0
+                  ? "请先启用模型服务"
+                  : "选择默认模型"}
+              </option>
+              {defaultModelOptions.map((provider) => (
+                <optgroup key={provider.providerId} label={provider.providerName}>
+                  {provider.models.map((model) => (
+                    <option
+                      key={`${provider.providerId}-${model}`}
+                      value={`${provider.providerId}::${model}`}
+                    >
+                      {model}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
           </label>
           <label>
             API 地址
@@ -133,7 +247,7 @@ export function Setup() {
 
       <ProviderConfigForm
         value={config.providers}
-        onChange={(providers) => setConfig({ ...config, providers })}
+        onChange={handleProvidersChange}
       />
 
       <section className="setup-section">

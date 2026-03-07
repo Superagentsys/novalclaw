@@ -190,6 +190,47 @@ npm run lint
 npm run build
 ```
 
+## 编译命令
+
+`apps/omninova-tauri` 支持以下桌面端和移动端编译命令：
+
+```bash
+cd apps/omninova-tauri
+
+# 查看全部可用目标
+npm run build:list
+
+# 检查本机构建环境
+npm run check:build-env
+npm run check:build-env:desktop
+npm run check:build-env:mobile
+
+# 仅构建前端
+npm run build
+
+# 桌面端
+npm run build:desktop
+npm run build:all:desktop
+npm run build:linux
+npm run build:linux:arm64
+npm run build:macos
+npm run build:macos:intel
+npm run build:macos:apple
+npm run build:windows
+npm run build:windows:arm64
+
+# 移动端
+npm run mobile:init:android
+npm run build:android
+npm run mobile:init:ios
+npm run build:ios
+```
+
+常见产物路径示例：
+
+- Apple Silicon macOS 应用：`target/aarch64-apple-darwin/release/bundle/macos/OmniNova Claw.app`
+- Apple Silicon macOS 安装包：`target/aarch64-apple-darwin/release/bundle/dmg/OmniNova Claw_0.1.0_aarch64.dmg`
+
 ---
 
 ## 代码导航

@@ -105,7 +105,15 @@ Common frontend commands:
 npm run lint
 npm run build
 npm run dev
+npm run check:build-env
+npm run build:list
+npm run build:all:desktop
 ```
+
+Release notes:
+
+- Push a tag like `v0.1.0` to trigger the desktop GitHub Release workflow
+- Signing/secrets checklist: `.github/omninova-tauri-secrets.example.md`
 
 ---
 
@@ -189,6 +197,47 @@ cd apps/omninova-tauri
 npm run lint
 npm run build
 ```
+
+## Build Commands
+
+Desktop and mobile build commands for `apps/omninova-tauri`:
+
+```bash
+cd apps/omninova-tauri
+
+# Show all available targets
+npm run build:list
+
+# Check local build prerequisites
+npm run check:build-env
+npm run check:build-env:desktop
+npm run check:build-env:mobile
+
+# Web/frontend only
+npm run build
+
+# Desktop
+npm run build:desktop
+npm run build:all:desktop
+npm run build:linux
+npm run build:linux:arm64
+npm run build:macos
+npm run build:macos:intel
+npm run build:macos:apple
+npm run build:windows
+npm run build:windows:arm64
+
+# Mobile
+npm run mobile:init:android
+npm run build:android
+npm run mobile:init:ios
+npm run build:ios
+```
+
+Common output examples:
+
+- Apple Silicon macOS app: `target/aarch64-apple-darwin/release/bundle/macos/OmniNova Claw.app`
+- Apple Silicon macOS dmg: `target/aarch64-apple-darwin/release/bundle/dmg/OmniNova Claw_0.1.0_aarch64.dmg`
 
 ---
 

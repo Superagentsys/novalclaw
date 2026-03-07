@@ -405,24 +405,24 @@ pub struct DelegateAgentConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct omninovalAgentsCompat {
+struct OmninovalAgentsCompat {
     #[serde(default)]
     pub defaults: Option<AgentDefaultsExtendedConfig>,
     #[serde(default)]
-    pub list: Vec<omninovalAgentEntryCompat>,
+    pub list: Vec<OmninovalAgentEntryCompat>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct omninovalAgentEntryCompat {
+struct OmninovalAgentEntryCompat {
     pub id: String,
     #[serde(default)]
-    pub model: Option<omninovalModelRefCompat>,
+    pub model: Option<OmninovalModelRefCompat>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum omninovalModelRefCompat {
+enum OmninovalModelRefCompat {
     Name(String),
     Detailed(AgentModelConfig),
 }
@@ -431,7 +431,7 @@ enum omninovalModelRefCompat {
 #[serde(untagged)]
 enum AgentsCompatInput {
     DelegateMap(HashMap<String, DelegateAgentConfig>),
-    omninoval(omninovalAgentsCompat),
+    Omninoval(OmninovalAgentsCompat),
 }
 
 fn deserialize_agents_compat<'de, D>(
@@ -446,7 +446,7 @@ where
     };
     let mapped = match input {
         AgentsCompatInput::DelegateMap(map) => map,
-        AgentsCompatInput::omninoval(omninoval) => {
+        AgentsCompatInput::Omninoval(omninoval) => {
             let mut map = HashMap::new();
             let fallback_provider = omninoval
                 .defaults

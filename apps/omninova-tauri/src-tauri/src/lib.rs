@@ -1,7 +1,6 @@
 use omninova_core::config::Config;
 use omninova_core::gateway::GatewayRuntime;
 use std::sync::Arc;
-use tauri::Manager;
 use tokio::sync::Mutex;
 
 struct AppState {
@@ -99,10 +98,10 @@ pub fn run() {
             save_config,
             reload_config,
         ])
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(debug_assertions)]
             {
-                let window = app.get_webview_window("main").unwrap();
+                let window = _app.get_webview_window("main").unwrap();
                 window.open_devtools();
             }
             Ok(())

@@ -1,73 +1,82 @@
-# React + TypeScript + Vite
+# OmniNova Tauri
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Tauri desktop and mobile shell for OmniNova Claw.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev
+npm run tauri dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Frontend Build
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+```bash
+npm run build
+```
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Environment Checks
+
+```bash
+npm run check:build-env
+npm run check:build-env:desktop
+npm run check:build-env:mobile
+```
+
+## Cross-Platform Build Commands
+
+List all available build commands:
+
+```bash
+npm run build:list
+```
+
+Desktop targets:
+
+```bash
+npm run build:desktop
+npm run build:all:desktop
+npm run build:linux
+npm run build:linux:arm64
+npm run build:macos
+npm run build:macos:intel
+npm run build:macos:apple
+npm run build:windows
+npm run build:windows:arm64
+```
+
+Mobile targets:
+
+```bash
+npm run mobile:init:android
+npm run mobile:init:ios
+npm run build:android
+npm run build:ios
+```
+
+## GitHub Release
+
+- Push a tag such as `v0.1.0` to trigger the desktop release workflow.
+- The workflow publishes staged desktop assets to GitHub Releases automatically.
+- Release asset names follow this pattern:
+
+```text
+omninova-claw_<version>_<platform>_<original-bundle-name>.<ext>
+```
+
+## Signing Secrets Template
+
+- Reference: `../../.github/omninova-tauri-secrets.example.md`
+- Use that file as the checklist for Android/iOS/macOS signing variables and GitHub Actions secrets.
+- The GitHub workflow enables signing/notarization steps automatically when the corresponding secrets are configured.
+
+## Notes
+
+- Cross-platform desktop builds require the matching Rust target toolchain and platform-specific native dependencies.
+- Mobile builds require Android Studio or Xcode and the corresponding Tauri mobile toolchain setup.
+- `npm run build:all:desktop` will attempt all configured desktop targets sequentially and print a success/failure summary.
+- Extra Tauri CLI arguments can be passed through the helper script:
+
+```bash
+node ./scripts/build-platform.mjs windows --bundles nsis,msi
 ```

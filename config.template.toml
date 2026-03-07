@@ -19,20 +19,42 @@
 # [model_providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
-# default_model = "gpt-4o"
-# models = ["gpt-4o", "gpt-4o-mini"]
+# default_model = "gpt-5"
+# models = ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o3"]
+# enabled = true
+#
+# [model_providers.gemini]
+# api_key_env = "GEMINI_API_KEY"
+# base_url = "https://generativelanguage.googleapis.com"
+# default_model = "gemini-2.5-pro"
+# models = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
+# enabled = true
+#
+# [model_providers.deepseek]
+# api_key_env = "DEEPSEEK_API_KEY"
+# base_url = "https://api.deepseek.com"
+# default_model = "deepseek-chat"
+# models = ["deepseek-chat", "deepseek-reasoner", "deepseek-r1"]
+# enabled = true
+#
+# [model_providers.qwen]
+# api_key_env = "DASHSCOPE_API_KEY"
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# default_model = "qwen-max"
+# models = ["qwen-max", "qwen-plus", "qwen2.5-72b-instruct"]
 # enabled = true
 #
 # [model_providers.ollama]
 # base_url = "http://localhost:11434"
 # default_model = "llama3.2"
-# models = ["llama3.2", "mistral"]
+# models = ["llama3.2", "qwen2.5", "deepseek-r1", "mistral"]
 # enabled = true
 #
 # [model_providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com"
 # default_model = "claude-sonnet-4-20250514"
+# models = ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-7-sonnet-latest"]
 # enabled = true
 
 # --- Provider Behavior ---
