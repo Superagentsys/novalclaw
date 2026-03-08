@@ -20,6 +20,7 @@ impl Config {
 
         if self.api_key.is_none()
             && self.default_provider.as_deref() != Some("ollama")
+            && self.default_provider.as_deref() != Some("lmstudio")
             && self.default_provider.as_deref() != Some("mock")
         {
             report.warnings.push(

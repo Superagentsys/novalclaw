@@ -1,11 +1,13 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type AppConfig,
+  type GatewayStatus,
 } from "../../types/config";
 import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
+import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const initialConfig: AppConfig = {
@@ -22,6 +24,15 @@ const initialConfig: AppConfig = {
 
 export function Setup() {
   const [config, setConfig] = useState<AppConfig>(initialConfig);
+  const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
+    running: false,
+    url: "http://127.0.0.1:42617",
+    last_error: null,
+  });
+  const [busyAction, setBusyAction] = useState<
+    "load" | "save" | "start" | "stop" | null
+  >(null);
+  const [actionMessage, setActionMessage] = useState("");
   const enabledProviders = useMemo(
     () => config.providers.filter((provider) => provider.enabled),
     [config.providers]
@@ -100,6 +111,90 @@ export function Setup() {
     config.default_provider && config.default_model
       ? `${config.default_provider}::${config.default_model}`
       : "";
+
+  useEffect(() => {
+    void loadSetupState();
+  }, []);
+
+  const loadSetupState = async () => {
+    setBusyAction("load");
+    try {
+      const [nextConfig, nextGatewayStatus] = await Promise.all([
+        invokeTauri<AppConfig>("get_setup_config"),
+        invokeTauri<GatewayStatus>("gateway_status"),
+      ]);
+
+      setConfig({
+        ...initialConfig,
+        ...nextConfig,
+        robot: nextConfig.robot ?? DEFAULT_ROBOT_CONFIG,
+        providers: nextConfig.providers ?? DEFAULT_PROVIDERS,
+      });
+      setGatewayStatus(nextGatewayStatus);
+      setActionMessage("已加载当前配置。");
+    } catch (error) {
+      setActionMessage(
+        `加载配置失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const saveSetupConfig = async () => {
+    await invokeTauri("save_setup_config", { config });
+    const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
+    setGatewayStatus(nextGatewayStatus);
+  };
+
+  const handleSaveConfig = async () => {
+    setBusyAction("save");
+    try {
+      await saveSetupConfig();
+      setActionMessage("配置已保存。");
+    } catch (error) {
+      setActionMessage(
+        `保存配置失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSaveAndStartGateway = async () => {
+    setBusyAction("start");
+    try {
+      await saveSetupConfig();
+      const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
+      setGatewayStatus(nextGatewayStatus);
+      setActionMessage(`网关已启动：${nextGatewayStatus.url}`);
+    } catch (error) {
+      setActionMessage(
+        `启动网关失败：${error instanceof Error ? error.message : String(error)}`
+      );
+      const nextGatewayStatus = await invokeTauri<GatewayStatus>(
+        "gateway_status"
+      ).catch(() => gatewayStatus);
+      setGatewayStatus(nextGatewayStatus);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleStopGateway = async () => {
+    setBusyAction("stop");
+    try {
+      const nextGatewayStatus = await invokeTauri<GatewayStatus>("stop_gateway");
+      setGatewayStatus(nextGatewayStatus);
+      setActionMessage("网关已停止。");
+    } catch (error) {
+      setActionMessage(
+        `停止网关失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
 
   return (
     <div className="setup-page">
@@ -249,6 +344,86 @@ export function Setup() {
         value={config.providers}
         onChange={handleProvidersChange}
       />
+
+      <section className="setup-section">
+        <div className="section-heading">
+          <div>
+            <h2>网关控制</h2>
+            <div className="section-subtitle">
+              保存当前配置后启动本地网关服务，供桌面端或外部客户端接入。
+            </div>
+          </div>
+          <div
+            className={`gateway-status-chip ${
+              gatewayStatus.running ? "is-running" : "is-stopped"
+            }`}
+          >
+            {gatewayStatus.running ? "运行中" : "未启动"}
+          </div>
+        </div>
+        <div className="gateway-status-panel">
+          <div className="gateway-status-line">
+            <span>网关地址</span>
+            {gatewayStatus.url ? (
+              <a
+                href={gatewayStatus.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="gateway-url-link"
+                title="在浏览器中打开可查看接口说明（根路径）；健康检查请访问 /health"
+              >
+                <code>{gatewayStatus.url}</code>
+              </a>
+            ) : (
+              <code>未配置</code>
+            )}
+          </div>
+          {gatewayStatus.url ? (
+            <div className="gateway-status-hint">
+              此为 API 服务，仅支持接口调用。在浏览器中打开上述链接可查看可用接口；健康检查请访问 <code>/health</code>。
+            </div>
+          ) : null}
+          <div className="gateway-status-line">
+            <span>最新状态</span>
+            <span>{actionMessage || "等待操作"}</span>
+          </div>
+          {gatewayStatus.last_error ? (
+            <div className="gateway-status-error">{gatewayStatus.last_error}</div>
+          ) : null}
+        </div>
+        <div className="setup-actions">
+          <button
+            type="button"
+            onClick={() => void loadSetupState()}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "load" ? "加载中..." : "重新加载配置"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleSaveConfig()}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "save" ? "保存中..." : "保存配置"}
+          </button>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void handleSaveAndStartGateway()}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "start" ? "启动中..." : "保存并启动网关"}
+          </button>
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => void handleStopGateway()}
+            disabled={busyAction !== null || !gatewayStatus.running}
+          >
+            {busyAction === "stop" ? "停止中..." : "停止网关"}
+          </button>
+        </div>
+      </section>
 
       <section className="setup-section">
         <h2>配置预览</h2>

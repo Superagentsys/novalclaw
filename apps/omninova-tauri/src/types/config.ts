@@ -72,6 +72,12 @@ export interface AppConfig {
   providers: ProviderConfig[];
 }
 
+export interface GatewayStatus {
+  running: boolean;
+  url: string;
+  last_error?: string | null;
+}
+
 export const DEFAULT_ROBOT_CONFIG: RobotConfig = {
   drive: {
     backend: 'mock',

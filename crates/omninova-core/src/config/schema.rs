@@ -460,10 +460,10 @@ where
                 .and_then(|m| m.model.clone());
             for entry in omninoval.list {
                 let (provider, model) = match entry.model {
-                    Some(omninovalModelRefCompat::Name(model_name)) => {
+                    Some(OmninovalModelRefCompat::Name(model_name)) => {
                         (fallback_provider.clone(), Some(model_name))
                     }
-                    Some(omninovalModelRefCompat::Detailed(model_cfg)) => {
+                    Some(OmninovalModelRefCompat::Detailed(model_cfg)) => {
                         (model_cfg.provider, model_cfg.model)
                     }
                     None => (fallback_provider.clone(), fallback_model.clone()),

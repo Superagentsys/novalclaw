@@ -47,7 +47,16 @@ pub fn build_provider_with_selection(
             None,
         )),
         "mock" => Box::new(MockProvider::new("mock-provider")),
-        "openai" | "openrouter" | "ollama" => Box::new(OpenAiProvider::new(
+        "openai"
+        | "openrouter"
+        | "ollama"
+        | "deepseek"
+        | "qwen"
+        | "moonshot"
+        | "groq"
+        | "xai"
+        | "mistral"
+        | "lmstudio" => Box::new(OpenAiProvider::new(
             base_url.as_deref(),
             api_key.as_deref(),
             model,
@@ -79,6 +88,13 @@ fn resolve_base_url(
     match provider_name {
         "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
         "ollama" => Some("http://localhost:11434/v1".to_string()),
+        "deepseek" => Some("https://api.deepseek.com".to_string()),
+        "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        "moonshot" => Some("https://api.moonshot.cn/v1".to_string()),
+        "groq" => Some("https://api.groq.com/openai/v1".to_string()),
+        "xai" => Some("https://api.x.ai/v1".to_string()),
+        "mistral" => Some("https://api.mistral.ai/v1".to_string()),
+        "lmstudio" => Some("http://localhost:1234/v1".to_string()),
         "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
         "gemini" => std::env::var("GEMINI_BASE_URL").ok(),
         _ => None,
@@ -109,6 +125,13 @@ fn resolve_api_key(
         "gemini" => "GEMINI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        "moonshot" => "MOONSHOT_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "lmstudio" => "LMSTUDIO_API_KEY",
         _ => "OPENAI_API_KEY",
     };
     std::env::var(env_var_name)

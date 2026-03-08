@@ -29,14 +29,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "2.2.0",
-    "@tauri-apps/plugin-shell": "2.2.1",
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-shell": "^2.2.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.2.6",
     "@eslint/js": "^9.39.1",
+    "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",

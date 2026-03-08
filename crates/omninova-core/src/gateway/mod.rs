@@ -527,7 +527,7 @@ impl GatewayRuntime {
         Ok(())
     }
 
-    /// Start an HTTP gateway server with `/health`, `/chat`, `/config`.
+    /// Start an HTTP gateway server with `/`, `/health`, `/chat`, `/config`.
     pub async fn serve_http(self) -> anyhow::Result<()> {
         let cfg = self.get_config().await;
         let addr: SocketAddr = format!("{}:{}", cfg.gateway.host, cfg.gateway.port)
@@ -535,6 +535,7 @@ impl GatewayRuntime {
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
 
         let app = Router::new()
+            .route("/", get(http_root))
             .route("/health", get(http_health))
             .route("/chat", post(http_chat))
             .route("/route", post(http_route))
@@ -833,6 +834,15 @@ pub struct GatewayEstopPauseRequest {
     pub domain: Option<String>,
     pub tool: Option<String>,
     pub reason: Option<String>,
+}
+
+async fn http_root() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "service": "OmniNova Gateway",
+        "health": "/health",
+        "chat": "/chat",
+        "config": "/config"
+    }))
 }
 
 async fn http_health(
