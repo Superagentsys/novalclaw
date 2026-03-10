@@ -9,7 +9,7 @@ function App() {
   const [view, setView] = useState<AppView>("setup");
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${view === "chat" ? "app-shell--chat" : ""}`}>
       {view === "setup" ? (
         <Setup
           onConfigSuccess={() => setView("chat")}

@@ -24,8 +24,13 @@ a:hover {
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
+  height: 100vh;
   background-color: #090909;
+  overflow: hidden;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
 }
 
 h1 {
@@ -45,7 +50,7 @@ button {
   transition: border-color 0.25s;
 }
 button:hover {
-  border-color: #646cff;
+  border-color: #3a2e24;
 }
 button:focus,
 button:focus-visible {

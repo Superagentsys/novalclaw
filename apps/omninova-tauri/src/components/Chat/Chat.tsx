@@ -1,12 +1,13 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 import { invokeTauri } from "../../utils/tauri";
 import type { GatewayInboundResponse, GatewayStatus } from "../../types/config";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const USER_ID = "desktop-user";
+const SEND_TIMEOUT_MS = 60_000;
 
 interface ChatMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "error";
   content: string;
   agent?: string;
 }
@@ -32,6 +33,19 @@ function formatTime(date: Date) {
   });
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`请求超时（${Math.round(ms / 1000)}s），请检查模型服务是否可达`)),
+      ms
+    );
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 export function Chat({ onBack }: ChatProps) {
   const [avatars, setAvatars] = useState<AvatarSession[]>([
     { id: "main", name: "OmniNova", sessionId: "omninova-chat-session", lastAt: formatTime(new Date()) },
@@ -43,9 +57,12 @@ export function Chat({ onBack }: ChatProps) {
   });
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const listEndRef = useRef<HTMLDivElement>(null);
+  const cancelledRef = useRef(false);
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
@@ -60,6 +77,12 @@ export function Chat({ onBack }: ChatProps) {
   useEffect(() => {
     listEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+    };
+  }, []);
 
   const refreshGatewayStatus = async () => {
     try {
@@ -81,12 +104,24 @@ export function Chat({ onBack }: ChatProps) {
     setActiveAvatarId(id);
   };
 
+  const handleCancel = useCallback(() => {
+    cancelledRef.current = true;
+  }, []);
+
   const handleSend = async () => {
     const text = input.trim();
     if (!text || sending) return;
 
+    if (gatewayStatus !== "connected") {
+      setError("网关未连接，请先在配置页启动网关后再发送消息");
+      return;
+    }
+
     setInput("");
     setError(null);
+    cancelledRef.current = false;
+    setElapsedSec(0);
+
     setMessagesBySession((prev) => ({
       ...prev,
       [activeAvatarId]: [...(prev[activeAvatarId] ?? []), { role: "user", content: text }],
@@ -98,10 +133,13 @@ export function Chat({ onBack }: ChatProps) {
     );
     setSending(true);
 
+    elapsedTimerRef.current = setInterval(() => {
+      setElapsedSec((s) => s + 1);
+    }, 1000);
+
     try {
-      const result = await invokeTauri<GatewayInboundResponse>(
-        "process_inbound_message",
-        {
+      const result = await withTimeout(
+        invokeTauri<GatewayInboundResponse>("process_inbound_message", {
           payload: {
             channel: "web",
             text,
@@ -109,29 +147,58 @@ export function Chat({ onBack }: ChatProps) {
             userId: USER_ID,
             metadata: {},
           },
-        }
+        }),
+        SEND_TIMEOUT_MS
       );
+
+      if (cancelledRef.current) {
+        setMessagesBySession((prev) => ({
+          ...prev,
+          [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+        }));
+        setInput(text);
+        return;
+      }
+
+      const replyText = result?.reply || "(空回复)";
       setMessagesBySession((prev) => ({
         ...prev,
         [activeAvatarId]: [
           ...(prev[activeAvatarId] ?? []),
           {
             role: "assistant",
-            content: result.reply,
-            agent: result.route?.agent_name,
+            content: replyText,
+            agent: result?.route?.agent_name,
           },
         ],
       }));
     } catch (e) {
+      if (cancelledRef.current) {
+        setMessagesBySession((prev) => ({
+          ...prev,
+          [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+        }));
+        setInput(text);
+        return;
+      }
+
       const msg = e instanceof Error ? e.message : String(e);
-      setError(`发送失败：${msg}`);
+      const errorContent = `发送失败：${msg}`;
+      setError(errorContent);
       setMessagesBySession((prev) => ({
         ...prev,
-        [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+        [activeAvatarId]: [
+          ...(prev[activeAvatarId] ?? []),
+          { role: "error", content: errorContent },
+        ],
       }));
-      setInput(text);
     } finally {
       setSending(false);
+      setElapsedSec(0);
+      if (elapsedTimerRef.current) {
+        clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = null;
+      }
     }
   };
 
@@ -151,13 +218,14 @@ export function Chat({ onBack }: ChatProps) {
 
   return (
     <div className="chat-layout">
-      {/* 顶栏 */}
       <header className="chat-topbar">
         <div className="chat-topbar-left">
           <img src={omninovalLogo} alt="" className="chat-topbar-logo" />
           <span className="chat-topbar-title">OmniNova Claw</span>
           {sending && (
-            <span className="chat-topbar-typing">正在输入中</span>
+            <span className="chat-topbar-typing">
+              正在输入中 ({elapsedSec}s)
+            </span>
           )}
         </div>
         <div className="chat-topbar-right">
@@ -176,7 +244,6 @@ export function Chat({ onBack }: ChatProps) {
       </header>
 
       <div className="chat-body">
-        {/* 左侧边栏 */}
         <aside className="chat-sidebar">
           <section className="chat-sidebar-section">
             <h3 className="chat-sidebar-heading">分身</h3>
@@ -228,12 +295,15 @@ export function Chat({ onBack }: ChatProps) {
           </nav>
         </aside>
 
-        {/* 主对话区 */}
         <main className="chat-main">
           <div className="chat-connection-line">
             {gatewayStatus === "connecting" && "正在恢复连接…"}
             {gatewayStatus === "connected" && "已连接"}
-            {gatewayStatus === "disconnected" && "未连接，请先在配置页启动网关"}
+            {gatewayStatus === "disconnected" && (
+              <span className="chat-warn-text">
+                未连接 — 请先在配置页启动网关
+              </span>
+            )}
           </div>
 
           <div className="chat-messages">
@@ -260,6 +330,7 @@ export function Chat({ onBack }: ChatProps) {
                 <span className="typing-dot" />
                 <span className="typing-dot" />
                 <span className="typing-dot" />
+                <span className="typing-elapsed">{elapsedSec}s</span>
               </div>
             )}
             <div ref={listEndRef} />
@@ -268,15 +339,19 @@ export function Chat({ onBack }: ChatProps) {
           {error && (
             <div className="chat-error" role="alert">
               {error}
+              <button
+                type="button"
+                className="chat-error-dismiss"
+                onClick={() => setError(null)}
+              >
+                ✕
+              </button>
             </div>
           )}
 
           <div className="chat-footer">
             <span className="chat-footer-status">{statusText}</span>
             <span className="chat-footer-model">OmniNova</span>
-            <button type="button" className="chat-footer-attach" title="附件" aria-label="附件">
-              📎
-            </button>
           </div>
           <div className="chat-input-row">
             <textarea
@@ -284,21 +359,32 @@ export function Chat({ onBack }: ChatProps) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="输入消息..."
+              placeholder={
+                gatewayStatus === "connected"
+                  ? "输入消息..."
+                  : "网关未连接，请先启动网关..."
+              }
               rows={1}
-              disabled={sending}
+              disabled={sending || gatewayStatus !== "connected"}
             />
-            <button
-              type="button"
-              className="chat-send-button"
-              onClick={() => void handleSend()}
-              disabled={sending || !input.trim()}
-            >
-              {sending ? "发送中…" : "发送"}
-            </button>
-          </div>
-          <div className="chat-user-bar">
-            <span className="chat-user-id">{USER_ID}</span>
+            {sending ? (
+              <button
+                type="button"
+                className="chat-cancel-button"
+                onClick={handleCancel}
+              >
+                取消
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="chat-send-button"
+                onClick={() => void handleSend()}
+                disabled={!input.trim() || gatewayStatus !== "connected"}
+              >
+                发送
+              </button>
+            )}
           </div>
         </main>
       </div>

@@ -15,5 +15,10 @@ serde_json = "1.0"
 omninova-core = { path = "../../../crates/omninova-core" }
 tokio = { version = "1.43.0", features = ["full"] }
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+devtools = ["tauri/devtools"]
+
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
