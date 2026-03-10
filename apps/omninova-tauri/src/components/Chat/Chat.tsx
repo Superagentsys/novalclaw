@@ -1,10 +1,16 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { invokeTauri } from "../../utils/tauri";
-import type { GatewayInboundResponse, GatewayStatus } from "../../types/config";
+import type {
+  GatewayHealth,
+  GatewayInboundResponse,
+  GatewayStatus,
+  ProviderHealthSummary,
+  RouteDecision,
+} from "../../types/config";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const USER_ID = "desktop-user";
-const SEND_TIMEOUT_MS = 60_000;
+const SEND_TIMEOUT_MS = 180_000;
 
 interface ChatMessage {
   role: "user" | "assistant" | "error";
@@ -36,7 +42,12 @@ function formatTime(date: Date) {
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error(`请求超时（${Math.round(ms / 1000)}s），请检查模型服务是否可达`)),
+      () =>
+        reject(
+          new Error(
+            `请求超时（${Math.round(ms / 1000)}s），正在补充诊断信息，请稍候重试`
+          )
+        ),
       ms
     );
     promise.then(
@@ -66,7 +77,10 @@ export function Chat({ onBack }: ChatProps) {
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
-  const messages = messagesBySession[activeAvatarId] ?? [];
+  const messages = useMemo(
+    () => messagesBySession[activeAvatarId] ?? [],
+    [messagesBySession, activeAvatarId]
+  );
 
   useEffect(() => {
     void refreshGatewayStatus();
@@ -137,16 +151,21 @@ export function Chat({ onBack }: ChatProps) {
       setElapsedSec((s) => s + 1);
     }, 1000);
 
+    let route: RouteDecision | null = null;
     try {
+      const payload = {
+        channel: "web" as const,
+        text,
+        sessionId,
+        userId: USER_ID,
+        metadata: {},
+      };
+      route = await invokeTauri<RouteDecision>("route_inbound_message", {
+        payload,
+      }).catch(() => null);
       const result = await withTimeout(
         invokeTauri<GatewayInboundResponse>("process_inbound_message", {
-          payload: {
-            channel: "web",
-            text,
-            sessionId,
-            userId: USER_ID,
-            metadata: {},
-          },
+          payload,
         }),
         SEND_TIMEOUT_MS
       );
@@ -183,7 +202,8 @@ export function Chat({ onBack }: ChatProps) {
       }
 
       const msg = e instanceof Error ? e.message : String(e);
-      const errorContent = `发送失败：${msg}`;
+      const errorDetail = await buildSendErrorMessage(msg, route);
+      const errorContent = `发送失败：${errorDetail}`;
       setError(errorContent);
       setMessagesBySession((prev) => ({
         ...prev,
@@ -390,4 +410,42 @@ export function Chat({ onBack }: ChatProps) {
       </div>
     </div>
   );
+}
+
+async function buildSendErrorMessage(
+  rawMessage: string,
+  route: RouteDecision | null
+) {
+  if (!rawMessage.includes("请求超时")) {
+    return rawMessage;
+  }
+
+  try {
+    const [gatewayHealth, providers] = await Promise.all([
+      invokeTauri<GatewayHealth>("gateway_health"),
+      invokeTauri<ProviderHealthSummary[]>("provider_health_overview"),
+    ]);
+
+    const routedProviderId =
+      route?.provider ?? providers.find((item) => item.is_default)?.id ?? gatewayHealth.provider;
+    const matchedProvider = providers.find((item) => item.id === routedProviderId);
+    const agentHint = route?.agent_name ? `，Agent 为 ${route.agent_name}` : "";
+    const providerHint = routedProviderId ? `，Provider 为 ${routedProviderId}` : "";
+
+    if (!gatewayHealth.provider_healthy) {
+      return `${rawMessage}。网关已响应，但当前 Provider 健康检查失败${providerHint}${agentHint}，请检查 API Key、Base URL、网络连通性或本地模型服务是否启动。`;
+    }
+
+    if (matchedProvider?.healthy === false) {
+      return `${rawMessage}。路由命中的 Provider 健康检查失败${providerHint}${agentHint}，请优先检查该模型服务是否可达。`;
+    }
+
+    if (matchedProvider?.enabled === false) {
+      return `${rawMessage}。当前路由命中的 Provider 未启用${providerHint}${agentHint}，请先在配置页启用并保存。`;
+    }
+
+    return `${rawMessage}。网关健康检查正常${providerHint}${agentHint}，更可能是模型推理耗时过长而不是网关断连。可以稍后重试，或检查上游模型服务响应速度。`;
+  } catch {
+    return `${rawMessage}。另外，超时后未能取得健康检查结果，请确认网关仍在运行，并检查上游模型服务是否可达。`;
+  }
 }
