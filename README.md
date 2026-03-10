@@ -28,6 +28,7 @@ Novalclaw is the architecture behind OmniNova Claw. Here’s what makes it stand
 ## Highlights
 
 - **Local-first gateway** — HTTP API for chat, route, ingress, webhook, session tree, e-stop, and config; default bind `http://127.0.0.1:42617`.
+- **Channels** — WhatsApp (Baileys), Telegram (grammY), Slack (Bolt), Discord (discord.js), Google Chat, Signal (signal-cli), BlueBubbles (iMessage), iMessage (legacy), IRC, Microsoft Teams, Matrix, Feishu, LINE, Mattermost, Nextcloud Talk, Nostr, Synology Chat, Tlon, Twitch, WeChat, Zalo, Zalo Personal, Lark, 钉钉 (DingTalk), WebChat, Email, Webhook. Route by channel in `[bindings]`; platform webhooks at `/webhook/wechat`, `/webhook/feishu`, `/webhook/lark`, `/webhook/dingtalk`.
 - **Multi-provider** — OpenAI, Anthropic, Gemini, DeepSeek, Qwen, Moonshot, xAI, Mistral, Groq, OpenRouter, Ollama, LM Studio; extensible via TOML and env.
 - **Routing & agents** — Route by channel, metadata, or bindings to different agents/models; delegate agents with custom prompts and tool allowlists.
 - **Session tree** — Parent-child sessions, depth/concurrency limits, pagination, cursor, and source distribution for governance.

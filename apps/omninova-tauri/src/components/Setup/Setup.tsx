@@ -11,6 +11,11 @@ import { ControlPanel } from "../Console/ControlPanel";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
+export interface SetupProps {
+  /** 配置完成且网关启动成功后调用，用于进入对话界面 */
+  onConfigSuccess?: () => void;
+}
+
 const initialConfig: AppConfig = {
   api_key: "",
   api_url: "",
@@ -23,7 +28,7 @@ const initialConfig: AppConfig = {
   providers: DEFAULT_PROVIDERS,
 };
 
-export function Setup() {
+export function Setup({ onConfigSuccess }: SetupProps) {
   const [config, setConfig] = useState<AppConfig>(initialConfig);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
@@ -169,6 +174,9 @@ export function Setup() {
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
       setActionMessage(`网关已启动：${nextGatewayStatus.url}`);
+      if (nextGatewayStatus.running && onConfigSuccess) {
+        onConfigSuccess();
+      }
     } catch (error) {
       setActionMessage(
         `启动网关失败：${error instanceof Error ? error.message : String(error)}`

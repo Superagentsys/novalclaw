@@ -233,6 +233,11 @@
 # alert_threshold_cents = 400
 
 # --- Channels ---
+# Supported: WhatsApp (Baileys), Telegram (grammY), Slack (Bolt), Discord (discord.js),
+#   Google Chat, Signal (signal-cli), BlueBubbles (iMessage), iMessage (legacy), IRC,
+#   Microsoft Teams, Matrix, Feishu, LINE, Mattermost, Nextcloud Talk, Nostr,
+#   Synology Chat, Tlon, Twitch, WeChat, Zalo, Zalo Personal, Lark, 钉钉 (DingTalk), WebChat, Email, Webhook
+#
 # [channels_config.telegram]
 # enabled = false
 # token_env = "TELEGRAM_BOT_TOKEN"
@@ -245,9 +250,39 @@
 # enabled = false
 # token_env = "SLACK_TOKEN"
 #
+# [channels_config.whatsapp]
+# enabled = false
+# token_env = "WHATSAPP_CREDENTIALS_PATH"
+#
+# [channels_config.google_chat]
+# enabled = false
+# token_env = "GOOGLE_CHAT_CREDENTIALS"
+#
+# [channels_config.signal]
+# enabled = false
+# token_env = "SIGNAL_CLI_CONFIG"
+#
+# [channels_config.bluebubbles]
+# enabled = false
+# extra = { server_url = "...", webhook_path = "..." }
+#
+# [channels_config.imessage]
+# enabled = false
+#
+# [channels_config.irc]
+# enabled = false
+# extra = { server = "...", nick = "..." }
+#
+# [channels_config.msteams]
+# enabled = false
+# token_env = "MSTEAMS_BOT_TOKEN"
+#
+# [channels_config.matrix]
+# enabled = false
+# token_env = "MATRIX_ACCESS_TOKEN"
+#
 # [channels_config.wechat]
 # enabled = false
-# # token / token_env 可按你的 webhook bridge 或企业微信代理服务填写
 # token_env = "WECHAT_BOT_TOKEN"
 # extra = { webhook_path = "/webhook/wechat", signing_secret_env = "WECHAT_SIGNING_SECRET" }
 #
@@ -256,15 +291,60 @@
 # token_env = "FEISHU_BOT_TOKEN"
 # extra = { webhook_path = "/webhook/feishu", app_id_env = "FEISHU_APP_ID", app_secret_env = "FEISHU_APP_SECRET", signing_secret_env = "FEISHU_SIGNING_SECRET" }
 #
+# [channels_config.line]
+# enabled = false
+# token_env = "LINE_CHANNEL_ACCESS_TOKEN"
+#
+# [channels_config.mattermost]
+# enabled = false
+# extra = { url = "...", token_env = "MATTERMOST_TOKEN" }
+#
+# [channels_config.nextcloud_talk]
+# enabled = false
+# extra = { base_url = "...", token_env = "NEXTCLOUD_TALK_TOKEN" }
+#
+# [channels_config.nostr]
+# enabled = false
+# extra = { relay = "...", private_key_env = "NOSTR_PRIVATE_KEY" }
+#
+# [channels_config.synology_chat]
+# enabled = false
+# extra = { incoming_webhook_url = "..." }
+#
+# [channels_config.tlon]
+# enabled = false
+#
+# [channels_config.twitch]
+# enabled = false
+# token_env = "TWITCH_BOT_TOKEN"
+#
+# [channels_config.zalo]
+# enabled = false
+# token_env = "ZALO_ACCESS_TOKEN"
+#
+# [channels_config.zalo_personal]
+# enabled = false
+# token_env = "ZALO_PERSONAL_ACCESS_TOKEN"
+#
 # [channels_config.lark]
 # enabled = false
 # token_env = "LARK_BOT_TOKEN"
-# extra = { webhook_path = "/webhook/lark", app_id_env = "LARK_APP_ID", app_secret_env = "LARK_APP_SECRET", signing_secret_env = "LARK_SIGNING_SECRET" }
+# extra = { webhook_path = "/webhook/lark", signing_secret_env = "LARK_SIGNING_SECRET" }
 #
 # [channels_config.dingtalk]
 # enabled = false
 # token_env = "DINGTALK_BOT_TOKEN"
 # extra = { webhook_path = "/webhook/dingtalk", signing_secret_env = "DINGTALK_SIGNING_SECRET" }
+#
+# [channels_config.email]
+# enabled = false
+#
+# [channels_config.webhook]
+# enabled = false
+# extra = { signing_secret_env = "WEBHOOK_SIGNING_SECRET" }
+#
+# [channels_config.webchat]
+# enabled = false
 
 # --- Observability ---
 # [observability]

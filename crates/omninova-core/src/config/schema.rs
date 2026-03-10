@@ -1129,19 +1129,51 @@ pub struct ChannelsConfig {
     #[serde(default)]
     pub whatsapp: Option<ChannelEntry>,
     #[serde(default)]
+    pub google_chat: Option<ChannelEntry>,
+    #[serde(default)]
+    pub signal: Option<ChannelEntry>,
+    #[serde(default)]
+    pub bluebubbles: Option<ChannelEntry>,
+    #[serde(default)]
+    pub imessage: Option<ChannelEntry>,
+    #[serde(default)]
+    pub irc: Option<ChannelEntry>,
+    #[serde(default)]
+    pub msteams: Option<ChannelEntry>,
+    #[serde(default)]
     pub matrix: Option<ChannelEntry>,
+    #[serde(default)]
+    pub feishu: Option<ChannelEntry>,
+    #[serde(default)]
+    pub line: Option<ChannelEntry>,
+    #[serde(default)]
+    pub mattermost: Option<ChannelEntry>,
+    #[serde(default)]
+    pub nextcloud_talk: Option<ChannelEntry>,
+    #[serde(default)]
+    pub nostr: Option<ChannelEntry>,
+    #[serde(default)]
+    pub synology_chat: Option<ChannelEntry>,
+    #[serde(default)]
+    pub tlon: Option<ChannelEntry>,
+    #[serde(default)]
+    pub twitch: Option<ChannelEntry>,
     #[serde(default)]
     pub wechat: Option<ChannelEntry>,
     #[serde(default)]
-    pub lark: Option<ChannelEntry>,
+    pub zalo: Option<ChannelEntry>,
     #[serde(default)]
-    pub feishu: Option<ChannelEntry>,
+    pub zalo_personal: Option<ChannelEntry>,
+    #[serde(default)]
+    pub lark: Option<ChannelEntry>,
     #[serde(default)]
     pub dingtalk: Option<ChannelEntry>,
     #[serde(default)]
     pub email: Option<ChannelEntry>,
     #[serde(default)]
     pub webhook: Option<ChannelEntry>,
+    #[serde(default)]
+    pub webchat: Option<ChannelEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
