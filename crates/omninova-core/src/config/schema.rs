@@ -1131,6 +1131,8 @@ pub struct ChannelsConfig {
     #[serde(default)]
     pub matrix: Option<ChannelEntry>,
     #[serde(default)]
+    pub wechat: Option<ChannelEntry>,
+    #[serde(default)]
     pub lark: Option<ChannelEntry>,
     #[serde(default)]
     pub feishu: Option<ChannelEntry>,

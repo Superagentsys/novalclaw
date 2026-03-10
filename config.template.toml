@@ -244,6 +244,27 @@
 # [channels_config.slack]
 # enabled = false
 # token_env = "SLACK_TOKEN"
+#
+# [channels_config.wechat]
+# enabled = false
+# # token / token_env 可按你的 webhook bridge 或企业微信代理服务填写
+# token_env = "WECHAT_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/wechat", signing_secret_env = "WECHAT_SIGNING_SECRET" }
+#
+# [channels_config.feishu]
+# enabled = false
+# token_env = "FEISHU_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/feishu", app_id_env = "FEISHU_APP_ID", app_secret_env = "FEISHU_APP_SECRET", signing_secret_env = "FEISHU_SIGNING_SECRET" }
+#
+# [channels_config.lark]
+# enabled = false
+# token_env = "LARK_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/lark", app_id_env = "LARK_APP_ID", app_secret_env = "LARK_APP_SECRET", signing_secret_env = "LARK_SIGNING_SECRET" }
+#
+# [channels_config.dingtalk]
+# enabled = false
+# token_env = "DINGTALK_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/dingtalk", signing_secret_env = "DINGTALK_SIGNING_SECRET" }
 
 # --- Observability ---
 # [observability]

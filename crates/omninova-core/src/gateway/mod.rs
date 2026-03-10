@@ -2,6 +2,9 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use crate::channels::adapters::platform_webhook::{
+    inbound_from_platform_webhook, verification_response,
+};
 use crate::channels::adapters::webhook::{WebhookInboundPayload, inbound_from_webhook};
 use crate::channels::{ChannelKind, InboundMessage};
 use crate::config::Config;
@@ -93,9 +96,12 @@ impl GatewayRuntime {
     pub async fn chat(&self, message: &str) -> anyhow::Result<String> {
         self.ensure_not_stopped().await?;
         let cfg = self.config.read().await.clone();
+        let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let tools = create_default_tools(&cfg);
-        let mut agent = Agent::new(provider, tools, self.memory.clone(), cfg.agent);
+        let tools = create_tools_for_route(&cfg, &route_agent_name);
+        let mut agent_cfg = cfg.agent.clone();
+        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
+        let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg);
         agent.process_message(message).await
     }
 
@@ -114,12 +120,26 @@ impl GatewayRuntime {
         let lineage = self
             .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
             .await?;
+        if let Some(max_depth) = cfg
+            .agents
+            .get(&route.agent_name)
+            .and_then(|delegate| delegate.max_depth)
+        {
+            if lineage.spawn_depth > max_depth {
+                anyhow::bail!(
+                    "delegate agent '{}' spawn depth {} exceeds limit {}",
+                    route.agent_name,
+                    lineage.spawn_depth,
+                    max_depth
+                );
+            }
+        }
         let selection = ProviderSelection {
             provider: route.provider.clone(),
             model: route.model.clone(),
         };
         let provider = build_provider_with_selection(&cfg, &selection);
-        let tools = create_default_tools(&cfg);
+        let tools = create_tools_for_route(&cfg, &route.agent_name);
 
         let mut agent_cfg = cfg.agent.clone();
         if let Some(delegate) = cfg.agents.get(&route.agent_name) {
@@ -127,6 +147,7 @@ impl GatewayRuntime {
                 agent_cfg.system_prompt = Some(prompt.clone());
             }
         }
+        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
 
         let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg.clone());
         if let Some(session_id) = inbound.session_id.as_deref() {
@@ -541,6 +562,10 @@ impl GatewayRuntime {
             .route("/route", post(http_route))
             .route("/ingress", post(http_ingress))
             .route("/webhook", post(http_webhook))
+            .route("/webhook/wechat", post(http_wechat_webhook))
+            .route("/webhook/feishu", post(http_feishu_webhook))
+            .route("/webhook/lark", post(http_lark_webhook))
+            .route("/webhook/dingtalk", post(http_dingtalk_webhook))
             .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
             .route("/estop/pause", post(http_estop_pause))
@@ -841,7 +866,13 @@ async fn http_root() -> Json<serde_json::Value> {
         "service": "OmniNova Gateway",
         "health": "/health",
         "chat": "/chat",
-        "config": "/config"
+        "config": "/config",
+        "channel_webhooks": {
+            "wechat": "/webhook/wechat",
+            "feishu": "/webhook/feishu",
+            "lark": "/webhook/lark",
+            "dingtalk": "/webhook/dingtalk"
+        }
     }))
 }
 
@@ -995,6 +1026,118 @@ async fn http_webhook(
     }
 }
 
+async fn http_wechat_webhook(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Wechat).await
+}
+
+async fn http_feishu_webhook(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Feishu).await
+}
+
+async fn http_lark_webhook(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Lark).await
+}
+
+async fn http_dingtalk_webhook(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Dingtalk).await
+}
+
+async fn http_channel_webhook(
+    runtime: GatewayRuntime,
+    headers: HeaderMap,
+    raw_body: String,
+    channel: ChannelKind,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let cfg = runtime.get_config().await;
+    if let Some(secret) = channel_webhook_signing_secret(&cfg, &channel) {
+        let allowed_algorithms = cfg
+            .gateway
+            .webhook_signature_algorithms
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let priority_algorithms = cfg
+            .gateway
+            .webhook_signature_priority
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let signature = headers
+            .get("x-omninova-signature")
+            .or_else(|| headers.get("x-signature"))
+            .or_else(|| headers.get("x-hub-signature-256"))
+            .and_then(|v| v.to_str().ok());
+        let signed_payload = signed_webhook_payload(&cfg, &headers, &raw_body)
+            .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        let verified = verify_webhook_signature_with_policy_options(
+            &signed_payload,
+            signature,
+            &secret,
+            &allowed_algorithms,
+            &priority_algorithms,
+            cfg.gateway.webhook_signature_strict_priority,
+        )
+        .map_err(|e| Json(GatewayError {
+            message: e.to_string(),
+        }))?;
+        if !verified {
+            return Err(Json(GatewayError {
+                message: "invalid webhook signature".to_string(),
+            }));
+        }
+    }
+
+    runtime
+        .validate_webhook_replay(&headers)
+        .await
+        .map_err(|e| Json(GatewayError {
+            message: e.to_string(),
+        }))?;
+
+    let payload: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
+        Json(GatewayError {
+            message: format!("invalid channel webhook payload: {e}"),
+        })
+    })?;
+
+    if let Some(challenge) = verification_response(&payload) {
+        return Ok(Json(challenge));
+    }
+
+    let inbound = inbound_from_platform_webhook(channel, payload).map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    let response = runtime.process_inbound(&inbound).await.map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    let value = serde_json::to_value(response).map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    Ok(Json(value))
+}
+
 fn signed_webhook_payload(config: &Config, headers: &HeaderMap, raw_body: &str) -> anyhow::Result<String> {
     if !config.gateway.webhook_signing_include_timestamp {
         return Ok(raw_body.to_string());
@@ -1026,6 +1169,39 @@ fn webhook_signing_secret(config: &Config) -> Option<String> {
         return Some(secret.to_string());
     }
     if let Some(env_key) = webhook
+        .extra
+        .get("signing_secret_env")
+        .and_then(serde_json::Value::as_str)
+    {
+        return std::env::var(env_key).ok().filter(|v| !v.trim().is_empty());
+    }
+    None
+}
+
+fn channel_webhook_signing_secret(config: &Config, channel: &ChannelKind) -> Option<String> {
+    let entry = match channel {
+        ChannelKind::Wechat => config.channels_config.wechat.as_ref(),
+        ChannelKind::Feishu => config.channels_config.feishu.as_ref(),
+        ChannelKind::Lark => config.channels_config.lark.as_ref(),
+        ChannelKind::Dingtalk => config.channels_config.dingtalk.as_ref(),
+        _ => None,
+    };
+
+    channel_entry_signing_secret(entry).or_else(|| webhook_signing_secret(config))
+}
+
+fn channel_entry_signing_secret(
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    let entry = entry?;
+    if let Some(secret) = entry
+        .extra
+        .get("signing_secret")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(secret.to_string());
+    }
+    if let Some(env_key) = entry
         .extra
         .get("signing_secret_env")
         .and_then(serde_json::Value::as_str)
@@ -1492,14 +1668,38 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
     ]
 }
 
+fn create_tools_for_route(config: &Config, route_agent_name: &str) -> Vec<Box<dyn Tool>> {
+    let tools = create_default_tools(config);
+    let Some(delegate) = config.agents.get(route_agent_name) else {
+        return tools;
+    };
+    if delegate.allowed_tools.is_empty() {
+        return tools;
+    }
+    let allowed: HashSet<&str> = delegate.allowed_tools.iter().map(String::as_str).collect();
+    tools
+        .into_iter()
+        .filter(|tool| allowed.contains(tool.name()))
+        .collect()
+}
+
+fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) -> usize {
+    config
+        .agents
+        .get(route_agent_name)
+        .and_then(|delegate| delegate.max_iterations)
+        .unwrap_or(config.agent.max_tool_iterations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         GatewayRuntime, GatewaySessionTreeQuery, SessionLineageMeta, acquire_inbound_slot,
-        acquire_subagent_guard, resolve_agent_timeout_secs, split_session_key,
+        acquire_subagent_guard, create_tools_for_route, resolve_agent_max_tool_iterations,
+        resolve_agent_timeout_secs, split_session_key,
     };
     use crate::channels::{ChannelKind, InboundMessage};
-    use crate::config::Config;
+    use crate::config::{Config, DelegateAgentConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1530,6 +1730,38 @@ mod tests {
         });
         assert_eq!(resolve_agent_timeout_secs(&config, "delegate"), 12);
         assert_eq!(resolve_agent_timeout_secs(&config, "omninova"), 50);
+    }
+
+    #[test]
+    fn delegate_allowed_tools_filter_default_toolset() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                allowed_tools: vec!["file_read".to_string(), "shell".to_string()],
+                ..DelegateAgentConfig::default()
+            },
+        );
+
+        let tools = create_tools_for_route(&config, "researcher");
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["file_read", "shell"]);
+    }
+
+    #[test]
+    fn delegate_max_iterations_overrides_agent_default() {
+        let mut config = Config::default();
+        config.agent.max_tool_iterations = 20;
+        config.agents.insert(
+            "researcher".to_string(),
+            DelegateAgentConfig {
+                max_iterations: Some(4),
+                ..DelegateAgentConfig::default()
+            },
+        );
+
+        assert_eq!(resolve_agent_max_tool_iterations(&config, "researcher"), 4);
+        assert_eq!(resolve_agent_max_tool_iterations(&config, "omninova"), 20);
     }
 
     #[test]

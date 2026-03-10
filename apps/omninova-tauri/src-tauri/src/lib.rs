@@ -1,6 +1,13 @@
+use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig};
-use omninova_core::gateway::GatewayRuntime;
+use omninova_core::gateway::{
+    GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionTreeQuery,
+    GatewaySessionTreeResponse,
+};
+use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
+use omninova_core::routing::RouteDecision;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +54,29 @@ struct GatewayStatusPayload {
     running: bool,
     url: String,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiInboundPayload {
+    #[serde(default)]
+    channel: Option<ChannelKind>,
+    user_id: Option<String>,
+    session_id: Option<String>,
+    text: String,
+    #[serde(default)]
+    metadata: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderHealthPayload {
+    id: String,
+    name: String,
+    enabled: bool,
+    is_default: bool,
+    model: Option<String>,
+    base_url: Option<String>,
+    healthy: Option<bool>,
 }
 
 #[tauri::command]
@@ -161,6 +191,133 @@ async fn gateway_status(
     let state_ref = state.inner().clone();
     sync_gateway_task_state(&state_ref).await;
     Ok(gateway_status_from_state(&state_ref).await)
+}
+
+#[tauri::command]
+async fn gateway_health(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayHealth, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    Ok(runtime.health().await)
+}
+
+#[tauri::command]
+async fn provider_health_overview(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<ProviderHealthPayload>, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let cfg = runtime.get_config().await;
+
+    let provider_ids = collect_provider_ids(&cfg);
+    let mut items = Vec::with_capacity(provider_ids.len());
+    for id in provider_ids {
+        let enabled = cfg
+            .model_providers
+            .get(&id)
+            .map(|provider| provider.enabled)
+            .or_else(|| {
+                cfg.providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+                    .map(|provider| provider.enabled)
+            })
+            .unwrap_or(id == cfg.default_provider.clone().unwrap_or_default());
+        let model = cfg
+            .model_providers
+            .get(&id)
+            .and_then(|provider| provider.default_model.clone())
+            .or_else(|| {
+                cfg.providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+                    .and_then(|provider| provider.models.first().cloned())
+            })
+            .or_else(|| cfg.default_model.clone());
+        let base_url = cfg
+            .model_providers
+            .get(&id)
+            .and_then(|provider| provider.base_url.clone())
+            .or_else(|| {
+                cfg.providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+                    .and_then(|provider| provider.base_url.clone())
+            })
+            .or_else(|| default_provider_base_url(&id, &cfg));
+        let healthy = if enabled {
+            let provider = build_provider_with_selection(
+                &cfg,
+                &ProviderSelection {
+                    provider: Some(id.clone()),
+                    model: model.clone(),
+                },
+            );
+            Some(provider.health_check().await)
+        } else {
+            None
+        };
+        items.push(ProviderHealthPayload {
+            name: display_provider_name(&id),
+            id: id.clone(),
+            enabled,
+            is_default: cfg.default_provider.as_deref() == Some(id.as_str()),
+            model,
+            base_url,
+            healthy,
+        });
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+async fn route_inbound_message(
+    payload: UiInboundPayload,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<RouteDecision, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let inbound = inbound_from_payload(payload);
+    Ok(runtime.route(&inbound).await)
+}
+
+#[tauri::command]
+async fn process_inbound_message(
+    payload: UiInboundPayload,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayInboundResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let inbound = inbound_from_payload(payload);
+    runtime
+        .process_inbound(&inbound)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn session_tree_snapshot(
+    query: Option<GatewaySessionTreeQuery>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewaySessionTreeResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let query = query.unwrap_or_default();
+    runtime
+        .session_tree_snapshot_filtered(&query)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -310,6 +467,55 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             .map(|path| path.to_string_lossy().to_string()),
         robot: config.robot.clone(),
         providers,
+    }
+}
+
+fn inbound_from_payload(payload: UiInboundPayload) -> InboundMessage {
+    InboundMessage {
+        channel: payload.channel.unwrap_or(ChannelKind::Cli),
+        user_id: normalize_optional_string(payload.user_id),
+        session_id: normalize_optional_string(payload.session_id),
+        text: payload.text.trim().to_string(),
+        metadata: payload.metadata,
+    }
+}
+
+fn collect_provider_ids(config: &Config) -> Vec<String> {
+    let mut ids = config.model_providers.keys().cloned().collect::<Vec<_>>();
+    if ids.is_empty() {
+        ids.extend(config.providers.iter().map(|provider| provider.id.clone()));
+    } else {
+        for provider in &config.providers {
+            if !ids.iter().any(|id| id == &provider.id) {
+                ids.push(provider.id.clone());
+            }
+        }
+    }
+    if let Some(default_provider) = config.default_provider.clone() {
+        if !ids.iter().any(|id| id == &default_provider) {
+            ids.push(default_provider);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
+    if let Some(api_url) = config.api_url.clone() {
+        return Some(api_url);
+    }
+    match id {
+        "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
+        "ollama" => Some("http://localhost:11434/v1".to_string()),
+        "deepseek" => Some("https://api.deepseek.com".to_string()),
+        "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        "moonshot" => Some("https://api.moonshot.cn/v1".to_string()),
+        "groq" => Some("https://api.groq.com/openai/v1".to_string()),
+        "xai" => Some("https://api.x.ai/v1".to_string()),
+        "mistral" => Some("https://api.mistral.ai/v1".to_string()),
+        "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        _ => None,
     }
 }
 
@@ -494,6 +700,11 @@ pub fn run() {
             get_setup_config,
             save_setup_config,
             gateway_status,
+            gateway_health,
+            provider_health_overview,
+            route_inbound_message,
+            process_inbound_message,
+            session_tree_snapshot,
             start_gateway,
             stop_gateway,
         ])

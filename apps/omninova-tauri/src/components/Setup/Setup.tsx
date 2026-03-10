@@ -7,6 +7,7 @@ import {
 } from "../../types/config";
 import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
+import { ControlPanel } from "../Console/ControlPanel";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
@@ -429,6 +430,8 @@ export function Setup() {
         <h2>配置预览</h2>
         <textarea readOnly value={jsonPreview} className="setup-preview" />
       </section>
+
+      <ControlPanel />
     </div>
   );
 }

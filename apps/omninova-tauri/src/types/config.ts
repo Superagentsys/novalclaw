@@ -78,6 +78,86 @@ export interface GatewayStatus {
   last_error?: string | null;
 }
 
+export type ChannelKindValue =
+  | "cli"
+  | "web"
+  | "telegram"
+  | "discord"
+  | "slack"
+  | "whatsapp"
+  | "matrix"
+  | "wechat"
+  | "feishu"
+  | "lark"
+  | "dingtalk"
+  | "email"
+  | "webhook";
+
+export interface RouteDecision {
+  agent_name: string;
+  provider?: string | null;
+  model?: string | null;
+}
+
+export interface GatewayInboundResponse {
+  route: RouteDecision;
+  reply: string;
+}
+
+export interface GatewayHealth {
+  ok: boolean;
+  provider: string;
+  provider_healthy: boolean;
+  memory_healthy: boolean;
+}
+
+export interface ProviderHealthSummary {
+  id: string;
+  name: string;
+  enabled: boolean;
+  is_default: boolean;
+  model?: string | null;
+  base_url?: string | null;
+  healthy?: boolean | null;
+}
+
+export interface SessionTreeNode {
+  session_key?: string | null;
+  channel?: string | null;
+  session_id?: string | null;
+  parent_session_key?: string | null;
+  parent_agent_id?: string | null;
+  agent_name?: string | null;
+  spawn_depth: number;
+  updated_at: number;
+  source: string;
+}
+
+export interface SessionTreeStats {
+  unique_agents: number;
+  unique_parent_agents: number;
+  max_spawn_depth: number;
+  min_updated_at: number;
+  max_updated_at: number;
+}
+
+export interface SessionTreeResponse {
+  sessions: SessionTreeNode[];
+  active_children_by_parent: Record<string, number>;
+  total_before_filter: number;
+  total_after_filter: number;
+  returned: number;
+  offset: number;
+  limit?: number | null;
+  has_more: boolean;
+  next_offset?: number | null;
+  prev_offset?: number | null;
+  next_cursor?: number | null;
+  prev_cursor?: number | null;
+  source_counts_after_filter: Record<string, number>;
+  stats_after_filter: SessionTreeStats;
+}
+
 export const DEFAULT_ROBOT_CONFIG: RobotConfig = {
   drive: {
     backend: 'mock',
