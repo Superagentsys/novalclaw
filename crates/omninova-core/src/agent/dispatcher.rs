@@ -35,7 +35,11 @@ impl<'a> AgentDispatcher<'a> {
                 .provider
                 .chat(ChatRequest {
                     messages,
-                    tools: Some(self.tool_specs),
+                    tools: if self.tool_specs.is_empty() {
+                        None
+                    } else {
+                        Some(self.tool_specs)
+                    },
                 })
                 .await?;
 

@@ -27,7 +27,7 @@ pub fn build_provider_with_selection(
     let model = selection
         .model
         .clone()
-        .unwrap_or_else(|| resolve_model(config, profile));
+        .unwrap_or_else(|| resolve_model(&provider_name, config, profile));
     let base_url = resolve_base_url(&provider_name, config, profile);
     let temp = config.default_temperature;
 
@@ -67,11 +67,31 @@ pub fn build_provider_with_selection(
     }
 }
 
-fn resolve_model(config: &Config, profile: Option<&ModelProviderConfig>) -> String {
-    profile
-        .and_then(|p| p.default_model.clone())
-        .or_else(|| config.default_model.clone())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string())
+fn resolve_model(
+    provider_name: &str,
+    config: &Config,
+    profile: Option<&ModelProviderConfig>,
+) -> String {
+    if let Some(m) = profile.and_then(|p| p.default_model.clone()) {
+        return m;
+    }
+    if let Some(m) = config.default_model.clone() {
+        return m;
+    }
+    match provider_name {
+        "deepseek" => "deepseek-chat".to_string(),
+        "qwen" => "qwen-max".to_string(),
+        "moonshot" => "moonshot-v1-8k".to_string(),
+        "groq" => "llama-3.3-70b-versatile".to_string(),
+        "xai" => "grok-2-latest".to_string(),
+        "mistral" => "mistral-small-latest".to_string(),
+        "ollama" => "llama3.2".to_string(),
+        "lmstudio" => "local-model".to_string(),
+        "openrouter" => "anthropic/claude-3.5-sonnet".to_string(),
+        "anthropic" => "claude-3-5-sonnet-latest".to_string(),
+        "gemini" => "gemini-2.0-flash".to_string(),
+        _ => "gpt-4o-mini".to_string(),
+    }
 }
 
 fn resolve_base_url(
@@ -88,7 +108,7 @@ fn resolve_base_url(
     match provider_name {
         "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
         "ollama" => Some("http://localhost:11434/v1".to_string()),
-        "deepseek" => Some("https://api.deepseek.com".to_string()),
+        "deepseek" => Some("https://api.deepseek.com/v1".to_string()),
         "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
         "moonshot" => Some("https://api.moonshot.cn/v1".to_string()),
         "groq" => Some("https://api.groq.com/openai/v1".to_string()),

@@ -10,7 +10,7 @@ import type {
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const USER_ID = "desktop-user";
-const SEND_TIMEOUT_MS = 180_000;
+const SEND_TIMEOUT_MS = 90_000;
 
 interface ChatMessage {
   role: "user" | "assistant" | "error";
@@ -416,7 +416,16 @@ async function buildSendErrorMessage(
   rawMessage: string,
   route: RouteDecision | null
 ) {
-  if (!rawMessage.includes("请求超时")) {
+  const isConnectivityIssue =
+    rawMessage.includes("请求超时") ||
+    rawMessage.includes("连接失败") ||
+    rawMessage.includes("网络请求失败") ||
+    rawMessage.includes("timed out") ||
+    rawMessage.includes("timeout") ||
+    rawMessage.includes("connection refused") ||
+    rawMessage.includes("connect error");
+
+  if (!isConnectivityIssue) {
     return rawMessage;
   }
 

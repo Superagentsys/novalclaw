@@ -129,7 +129,7 @@ impl OpenAiProvider {
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("failed to build reqwest client");
 
@@ -144,19 +144,21 @@ impl OpenAiProvider {
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools.map(|items| {
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect()
-        })
+        tools
+            .filter(|items| !items.is_empty())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|tool| NativeToolSpec {
+                        kind: "function".to_string(),
+                        function: NativeToolFunctionSpec {
+                            name: tool.name.clone(),
+                            description: tool.description.clone(),
+                            parameters: tool.parameters.clone(),
+                        },
+                    })
+                    .collect()
+            })
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -313,7 +315,22 @@ impl Provider for OpenAiProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .json(&native_request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    anyhow::anyhow!(
+                        "请求超时：调用 {} 超时（60s），请检查网络连通性或 API 服务可用性",
+                        self.base_url
+                    )
+                } else if e.is_connect() {
+                    anyhow::anyhow!(
+                        "连接失败：无法连接到 {}，请检查 Base URL 配置和网络连通性",
+                        self.base_url
+                    )
+                } else {
+                    anyhow::anyhow!("网络请求失败：{}", e)
+                }
+            })?;
 
         if !response.status().is_success() {
             return Err(api_error("OpenAI", response).await);
