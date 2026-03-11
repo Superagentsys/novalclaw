@@ -43,6 +43,7 @@ home.workspace = true
 avif-serialize.workspace = true
 base64ct.workspace = true
 globset.workspace = true
+url.workspace = true
 axum = "0.8.8"
 hmac = "0.12.1"
 sha2 = "0.10.9"

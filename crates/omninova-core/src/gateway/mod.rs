@@ -13,7 +13,11 @@ use crate::providers::ChatMessage;
 use crate::providers::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
 use crate::routing::{RouteDecision, resolve_agent_route};
 use crate::security::{EstopController, EstopState, resolve_shell_allowlist};
-use crate::tools::{FileEditTool, FileReadTool, ShellTool, Tool};
+use crate::tools::{
+    ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool,
+    GlobSearchTool, HttpRequestTool, MemoryRecallTool, MemoryStoreTool, ShellTool, Tool,
+    WebFetchTool,
+};
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
 use std::collections::{HashMap, HashSet};
@@ -98,7 +102,7 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let tools = create_tools_for_route(&cfg, &route_agent_name);
+        let tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
         let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg);
@@ -139,7 +143,7 @@ impl GatewayRuntime {
             model: route.model.clone(),
         };
         let provider = build_provider_with_selection(&cfg, &selection);
-        let tools = create_tools_for_route(&cfg, &route.agent_name);
+        let tools = create_tools_for_route(&cfg, &route.agent_name, self.memory.clone());
 
         let mut agent_cfg = cfg.agent.clone();
         if let Some(delegate) = cfg.agents.get(&route.agent_name) {
@@ -571,6 +575,10 @@ impl GatewayRuntime {
             .route("/estop/pause", post(http_estop_pause))
             .route("/estop/resume", post(http_estop_resume))
             .route("/config", get(http_get_config).post(http_set_config))
+            .route("/api/status", get(http_api_status))
+            .route("/api/tools", get(http_api_tools))
+            .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
+            .route("/api/doctor", get(http_api_doctor))
             .with_state(self);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1663,13 +1671,42 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
     let shell_allowlist = resolve_shell_allowlist(config);
     vec![
         Box::new(FileReadTool::new(workspace.clone())),
+        Box::new(FileWriteTool::new(workspace.clone())),
         Box::new(FileEditTool::new(workspace.clone())),
+        Box::new(GlobSearchTool::new(workspace.clone())),
+        Box::new(ContentSearchTool::new(workspace.clone())),
+        Box::new(GitOperationsTool::new(workspace.clone())),
         Box::new(ShellTool::new(workspace, shell_allowlist, Some(30))),
     ]
 }
 
-fn create_tools_for_route(config: &Config, route_agent_name: &str) -> Vec<Box<dyn Tool>> {
-    let tools = create_default_tools(config);
+pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
+    let mut tools = create_default_tools(config);
+
+    if config.http_request.enabled {
+        tools.push(Box::new(HttpRequestTool::new(
+            config.http_request.allowed_domains.clone(),
+        )));
+    }
+
+    if config.web_fetch.enabled {
+        tools.push(Box::new(WebFetchTool::new(
+            config.web_fetch.allowed_domains.clone(),
+        )));
+    }
+
+    tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
+    tools.push(Box::new(MemoryRecallTool::new(memory)));
+
+    tools
+}
+
+fn create_tools_for_route(
+    config: &Config,
+    route_agent_name: &str,
+    memory: Arc<dyn Memory>,
+) -> Vec<Box<dyn Tool>> {
+    let tools = create_all_tools(config, memory);
     let Some(delegate) = config.agents.get(route_agent_name) else {
         return tools;
     };
@@ -1743,7 +1780,9 @@ mod tests {
             },
         );
 
-        let tools = create_tools_for_route(&config, "researcher");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::InMemoryMemory::new());
+        let tools = create_tools_for_route(&config, "researcher", memory);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
     }
