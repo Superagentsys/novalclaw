@@ -1661,6 +1661,163 @@ async fn http_estop_resume(
     }
 }
 
+async fn http_api_status(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let health = runtime.health().await;
+    let cfg = runtime.get_config().await;
+    let tools = create_default_tools(&cfg);
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    Ok(Json(serde_json::json!({
+        "gateway": {
+            "ok": health.ok,
+            "provider": health.provider,
+            "provider_healthy": health.provider_healthy,
+            "memory_healthy": health.memory_healthy,
+        },
+        "config": {
+            "default_provider": cfg.default_provider,
+            "default_model": cfg.default_model,
+            "gateway_host": cfg.gateway.host,
+            "gateway_port": cfg.gateway.port,
+            "agent_name": cfg.agent.name,
+        },
+        "tools": tool_names,
+        "agents": cfg.agents.keys().collect::<Vec<_>>(),
+    })))
+}
+
+async fn http_api_tools(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let cfg = runtime.get_config().await;
+    let tools = create_default_tools(&cfg);
+    let specs: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name(),
+                "description": t.description(),
+                "parameters": t.parameters_schema(),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "tools": specs })))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ApiMemoryStoreRequest {
+    key: String,
+    content: String,
+    category: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ApiMemoryForgetRequest {
+    key: String,
+}
+
+async fn http_api_memory_list(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let entries = runtime.memory.list(None, None).await.map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "key": e.key,
+                "content": e.content,
+                "category": format!("{:?}", e.category),
+                "timestamp": e.timestamp,
+            })
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "entries": items, "count": items.len() }),
+    ))
+}
+
+async fn http_api_memory_store(
+    State(runtime): State<GatewayRuntime>,
+    Json(req): Json<ApiMemoryStoreRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::memory::MemoryCategory;
+    let category = match req.category.as_deref() {
+        Some("daily") => MemoryCategory::Daily,
+        Some("conversation") => MemoryCategory::Conversation,
+        _ => MemoryCategory::Core,
+    };
+    runtime
+        .memory
+        .store(&req.key, &req.content, category, None)
+        .await
+        .map_err(|e| Json(GatewayError {
+            message: e.to_string(),
+        }))?;
+    Ok(Json(serde_json::json!({ "ok": true, "key": req.key })))
+}
+
+async fn http_api_memory_forget(
+    State(runtime): State<GatewayRuntime>,
+    Json(req): Json<ApiMemoryForgetRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let removed = runtime.memory.forget(&req.key).await.map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "key": req.key, "removed": removed }),
+    ))
+}
+
+async fn http_api_doctor(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let health = runtime.health().await;
+    let cfg = runtime.get_config().await;
+    let estop = runtime.estop_status().await.ok();
+    let session_tree = runtime.session_tree_snapshot().await.ok();
+    let memory_count = runtime.memory.count().await.unwrap_or(0);
+
+    let mut checks = Vec::new();
+    checks.push(serde_json::json!({
+        "check": "provider_health",
+        "ok": health.provider_healthy,
+        "detail": health.provider,
+    }));
+    checks.push(serde_json::json!({
+        "check": "memory_health",
+        "ok": health.memory_healthy,
+        "detail": format!("{memory_count} entries"),
+    }));
+    checks.push(serde_json::json!({
+        "check": "estop",
+        "ok": estop.as_ref().map(|s| !s.paused).unwrap_or(true),
+        "detail": estop.map(|s| if s.paused { "PAUSED" } else { "active" }.to_string()),
+    }));
+    checks.push(serde_json::json!({
+        "check": "sessions",
+        "ok": true,
+        "detail": format!("{} active sessions", session_tree.map(|t| t.total_before_filter).unwrap_or(0)),
+    }));
+    checks.push(serde_json::json!({
+        "check": "config",
+        "ok": cfg.validate().is_ok(),
+        "detail": format!("provider={}, model={}", cfg.default_provider.as_deref().unwrap_or("-"), cfg.default_model.as_deref().unwrap_or("-")),
+    }));
+
+    let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
+    Ok(Json(serde_json::json!({
+        "ok": all_ok,
+        "checks": checks,
+    })))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayError {
     pub message: String,
