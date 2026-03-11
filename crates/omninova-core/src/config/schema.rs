@@ -280,6 +280,8 @@ pub struct ModelProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod channels;
 pub mod cli;
 pub mod config;
+pub mod cron;
 pub mod daemon;
 pub mod gateway;
 pub mod memory;
@@ -14,6 +15,7 @@ pub mod util;
 
 pub use agent::Agent;
 pub use config::{AgentConfig, Config};
+pub use cron::{CronScheduler, CronStore};
 pub use memory::backend::{InMemoryMemory, MockMemory};
 pub use providers::{MockProvider, OpenAiProvider};
 

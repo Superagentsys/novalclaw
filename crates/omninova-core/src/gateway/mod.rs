@@ -1,3 +1,6 @@
+pub mod pairing;
+pub mod ws;
+
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
@@ -35,7 +38,8 @@ static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct GatewayRuntime {
     config: Arc<RwLock<Config>>,
-    memory: Arc<dyn Memory>,
+    pub(crate) memory: Arc<dyn Memory>,
+    cron_store: Option<crate::cron::CronStore>,
     webhook_nonces: Arc<RwLock<HashMap<String, i64>>>,
     session_store_guard: Arc<tokio::sync::Mutex<()>>,
     active_inbound: Arc<AtomicUsize>,
@@ -48,6 +52,7 @@ impl GatewayRuntime {
         Self {
             config: Arc::new(RwLock::new(config)),
             memory: Arc::new(crate::InMemoryMemory::new()),
+            cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
             active_inbound: Arc::new(AtomicUsize::new(0)),
@@ -60,12 +65,18 @@ impl GatewayRuntime {
         Self {
             config: Arc::new(RwLock::new(config)),
             memory,
+            cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
+        self.cron_store = Some(store);
+        self
     }
 
     pub async fn health(&self) -> GatewayHealth {
@@ -579,6 +590,9 @@ impl GatewayRuntime {
             .route("/api/tools", get(http_api_tools))
             .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
             .route("/api/doctor", get(http_api_doctor))
+            .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
+            .route("/metrics", get(http_metrics))
+            .route("/ws/chat", get(ws::ws_chat_handler))
             .with_state(self);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1816,6 +1830,73 @@ async fn http_api_doctor(
         "ok": all_ok,
         "checks": checks,
     })))
+}
+
+async fn http_api_cron_list(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let Some(store) = &runtime.cron_store else {
+        return Ok(Json(serde_json::json!({ "jobs": [], "note": "cron store not initialized" })));
+    };
+    let jobs = store.list();
+    let items: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "name": j.name,
+                "schedule": j.schedule,
+                "command": j.command,
+                "enabled": j.enabled,
+                "last_run": j.last_run,
+                "last_status": j.last_status,
+                "next_run": j.next_run,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "jobs": items })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApiCronAddRequest {
+    name: String,
+    schedule: String,
+    command: String,
+}
+
+async fn http_api_cron_add(
+    State(runtime): State<GatewayRuntime>,
+    Json(req): Json<ApiCronAddRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let Some(store) = &runtime.cron_store else {
+        return Err(Json(GatewayError {
+            message: "cron store not initialized".to_string(),
+        }));
+    };
+    let job = crate::cron::CronJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: req.name,
+        schedule: req.schedule,
+        command: req.command,
+        enabled: true,
+        last_run: None,
+        last_status: None,
+        next_run: None,
+        created_at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    };
+    let id = job.id.clone();
+    store.add(job).await.map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn http_metrics() -> String {
+    crate::observability::encode_metrics()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

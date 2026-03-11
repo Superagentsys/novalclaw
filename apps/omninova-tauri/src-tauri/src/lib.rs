@@ -577,6 +577,7 @@ fn setup_config_to_core(
                     default_model: provider_default_model,
                     models: provider.models.clone(),
                     enabled: provider.enabled,
+                    timeout_secs: None,
                 },
             )
         })

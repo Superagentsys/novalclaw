@@ -1,6 +1,4 @@
 pub mod log;
 pub mod prometheus;
 
-pub fn init() {
-    // Initializing observability
-}
+pub use self::prometheus::{encode_metrics, metrics};
