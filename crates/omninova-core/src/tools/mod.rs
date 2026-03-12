@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod content_search;
 pub mod file_edit;
 pub mod file_read;
@@ -7,10 +8,13 @@ pub mod glob_search;
 pub mod http_request;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod pdf_read;
 pub mod shell;
 pub mod traits;
 pub mod web_fetch;
+pub mod web_search;
 
+pub use browser::BrowserTool;
 pub use content_search::ContentSearchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
@@ -20,6 +24,8 @@ pub use glob_search::GlobSearchTool;
 pub use http_request::HttpRequestTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use pdf_read::PdfReadTool;
 pub use shell::ShellTool;
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;

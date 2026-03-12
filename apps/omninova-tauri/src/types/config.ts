@@ -60,16 +60,206 @@ export interface ProviderPreset extends ProviderConfig {
   category: "cloud" | "local";
 }
 
-export interface AppConfig {
+export interface ChannelEntryConfig {
+  enabled: boolean;
+  token?: string;
+  token_env?: string;
+  app_id?: string;
+  app_secret?: string;
+  verification_token?: string;
+  encrypt_key?: string;
+  webhook_url?: string;
+}
+
+export interface ChannelsConfig {
+  telegram?: ChannelEntryConfig;
+  discord?: ChannelEntryConfig;
+  slack?: ChannelEntryConfig;
+  whatsapp?: ChannelEntryConfig;
+  wechat?: ChannelEntryConfig;
+  feishu?: ChannelEntryConfig;
+  lark?: ChannelEntryConfig;
+  dingtalk?: ChannelEntryConfig;
+  matrix?: ChannelEntryConfig;
+  email?: ChannelEntryConfig;
+  msteams?: ChannelEntryConfig;
+  irc?: ChannelEntryConfig;
+  webhook?: ChannelEntryConfig;
+}
+
+export interface ChannelField {
+  key: keyof ChannelEntryConfig;
+  label: string;
+  placeholder: string;
+  type?: "text" | "password";
+}
+
+export interface ChannelPreset {
+  id: keyof ChannelsConfig;
+  name: string;
+  category: "im" | "webhook" | "other";
+  tokenEnvHint: string;
+  fields: ChannelField[];
+  isDefault?: boolean;
+}
+
+const COMMON_TOKEN_FIELDS: ChannelField[] = [
+  { key: "token", label: "Token / Secret", placeholder: "直接填写 token", type: "password" },
+  { key: "token_env", label: "Token 环境变量", placeholder: "", type: "text" },
+];
+
+export const CHANNEL_PRESETS: ChannelPreset[] = [
+  {
+    id: "feishu",
+    name: "飞书 Feishu",
+    category: "im",
+    tokenEnvHint: "FEISHU_APP_SECRET",
+    isDefault: true,
+    fields: [
+      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
+      { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password" },
+      { key: "verification_token", label: "Verification Token", placeholder: "事件订阅验证 Token", type: "text" },
+      { key: "encrypt_key", label: "Encrypt Key", placeholder: "事件加密密钥（可选）", type: "password" },
+      { key: "webhook_url", label: "Webhook 回调地址", placeholder: "https://your-domain/webhook/feishu", type: "text" },
+      { key: "token_env", label: "Secret 环境变量", placeholder: "FEISHU_APP_SECRET", type: "text" },
+    ],
+  },
+  {
+    id: "telegram",
+    name: "Telegram",
+    category: "im",
+    tokenEnvHint: "TELEGRAM_BOT_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "discord",
+    name: "Discord",
+    category: "im",
+    tokenEnvHint: "DISCORD_BOT_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "slack",
+    name: "Slack",
+    category: "im",
+    tokenEnvHint: "SLACK_BOT_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "whatsapp",
+    name: "WhatsApp",
+    category: "im",
+    tokenEnvHint: "WHATSAPP_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "wechat",
+    name: "WeChat / 企业微信",
+    category: "im",
+    tokenEnvHint: "WECHAT_TOKEN",
+    fields: [
+      { key: "app_id", label: "Corp ID / App ID", placeholder: "企业 ID 或应用 ID", type: "text" },
+      { key: "app_secret", label: "App Secret", placeholder: "应用密钥", type: "password" },
+      { key: "token", label: "Token", placeholder: "回调 Token", type: "password" },
+      { key: "encrypt_key", label: "EncodingAESKey", placeholder: "消息加解密密钥", type: "password" },
+      { key: "token_env", label: "Secret 环境变量", placeholder: "WECHAT_TOKEN", type: "text" },
+    ],
+  },
+  {
+    id: "lark",
+    name: "Lark (国际版飞书)",
+    category: "im",
+    tokenEnvHint: "LARK_APP_SECRET",
+    fields: [
+      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
+      { key: "app_secret", label: "App Secret", placeholder: "Lark 应用密钥", type: "password" },
+      { key: "verification_token", label: "Verification Token", placeholder: "事件验证 Token", type: "text" },
+      { key: "token_env", label: "Secret 环境变量", placeholder: "LARK_APP_SECRET", type: "text" },
+    ],
+  },
+  {
+    id: "dingtalk",
+    name: "钉钉 DingTalk",
+    category: "im",
+    tokenEnvHint: "DINGTALK_TOKEN",
+    fields: [
+      { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text" },
+      { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password" },
+      { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },
+      { key: "token_env", label: "Secret 环境变量", placeholder: "DINGTALK_TOKEN", type: "text" },
+    ],
+  },
+  {
+    id: "matrix",
+    name: "Matrix",
+    category: "im",
+    tokenEnvHint: "MATRIX_ACCESS_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "msteams",
+    name: "Microsoft Teams",
+    category: "im",
+    tokenEnvHint: "MSTEAMS_TOKEN",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "email",
+    name: "Email",
+    category: "other",
+    tokenEnvHint: "EMAIL_SMTP_PASSWORD",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "irc",
+    name: "IRC",
+    category: "other",
+    tokenEnvHint: "IRC_PASSWORD",
+    fields: [...COMMON_TOKEN_FIELDS],
+  },
+  {
+    id: "webhook",
+    name: "通用 Webhook",
+    category: "webhook",
+    tokenEnvHint: "WEBHOOK_SECRET",
+    fields: [
+      { key: "token", label: "Signing Secret", placeholder: "Webhook 签名密钥", type: "password" },
+      { key: "webhook_url", label: "回调地址", placeholder: "https://your-domain/webhook", type: "text" },
+      { key: "token_env", label: "Secret 环境变量", placeholder: "WEBHOOK_SECRET", type: "text" },
+    ],
+  },
+];
+
+export interface SkillsConfig {
+  open_skills_enabled: boolean;
+  open_skills_dir?: string;
+  prompt_injection_mode?: string;
+}
+
+export interface AgentPersonaConfig {
+  name: string;
+  system_prompt?: string;
+  compact_context?: boolean;
+  max_tool_iterations?: number;
+  max_history_messages?: number;
+}
+
+// Main configuration interface
+export interface Config {
   api_key?: string;
   api_url?: string;
   default_provider?: string;
   default_model?: string;
-  workspace_dir: string;
+  default_temperature?: number;
+  workspace_dir?: string;
   omninoval_gateway_url?: string;
   omninoval_config_dir?: string;
-  robot?: RobotConfig;
+  provider_api?: string;
+  robot: RobotConfig;
   providers: ProviderConfig[];
+  channels: ChannelsConfig;
+  skills?: SkillsConfig;
+  agent?: AgentPersonaConfig;
 }
 
 export interface GatewayStatus {

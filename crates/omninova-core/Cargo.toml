@@ -25,7 +25,7 @@ urlencoding.workspace = true
 base64.workspace = true
 image.workspace = true
 prometheus.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting", "parsing", "macros"] }
 time-core.workspace = true
 time-macros.workspace = true
 deranged.workspace = true
@@ -49,3 +49,5 @@ futures-util = "0.3"
 hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
+pdf-extract = "0.10.0"
+serde_yaml = "0.9.34"

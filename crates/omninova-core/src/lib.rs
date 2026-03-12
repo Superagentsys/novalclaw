@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod acp;
 pub mod channels;
 pub mod cli;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod observability;
 pub mod providers;
 pub mod routing;
 pub mod security;
+pub mod skills;
 pub mod tools;
 pub mod util;
 

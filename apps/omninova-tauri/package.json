@@ -24,12 +24,17 @@
     "check:build-env:mobile": "node ./scripts/check-build-env.mjs mobile",
     "mobile:init:android": "node ./scripts/build-platform.mjs android:init",
     "mobile:init:ios": "node ./scripts/build-platform.mjs ios:init",
+    "postinstall": "node ./scripts/postinstall-deps.mjs",
+    "setup": "node ./scripts/postinstall-deps.mjs --install",
+    "setup:browser": "npm install -g agent-browser && agent-browser install",
+    "check:deps": "node ./scripts/postinstall-deps.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-shell": "^2.2.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"

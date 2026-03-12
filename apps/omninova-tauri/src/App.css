@@ -1067,3 +1067,89 @@
 .chat-cancel-button:hover {
   background: rgba(232, 112, 112, 0.16);
 }
+
+.channel-selector-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.channel-selector-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  flex: 1;
+  min-width: 240px;
+}
+
+.channel-selector-select {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.25);
+  color: inherit;
+  appearance: none;
+  font-size: 14px;
+}
+
+.channel-enable-toggle {
+  padding-bottom: 4px;
+  white-space: nowrap;
+}
+
+.channel-config-card {
+  padding: 18px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 190, 132, 0.16);
+  background:
+    linear-gradient(135deg, rgba(255, 120, 51, 0.06), rgba(255, 185, 77, 0.03)),
+    rgba(255, 255, 255, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.channel-config-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.channel-guide {
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.channel-guide h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+
+.channel-guide ol {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: rgba(255, 245, 237, 0.82);
+}
+
+.channel-guide code {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+}
+
+.channel-guide a {
+  color: var(--accent, #6cb4ee);
+  text-decoration: none;
+}
+
+.channel-guide a:hover {
+  text-decoration: underline;
+}

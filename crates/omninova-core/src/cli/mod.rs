@@ -7,7 +7,9 @@ use crate::gateway::GatewayRuntime;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::ToSocketAddrs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::fs;
+use crate::skills::load_skills_from_dir;
 
 #[derive(Debug, Parser)]
 #[command(name = "omninova", version, about = "OmniNova CLI")]
@@ -55,6 +57,33 @@ pub enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Install optional dependencies (agent-browser, etc.).
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommands,
+    },
+    /// Run diagnostics on environment and dependencies.
+    Doctor,
+    /// Manage skills.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommands {
+    /// List available skills.
+    List,
+    /// Import skills from a directory.
+    Import {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "true")]
+        overwrite: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,6 +113,14 @@ pub enum DaemonCommands {
         #[arg(long)]
         strict: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SetupCommands {
+    /// Install agent-browser (headless browser automation for AI agents).
+    Browser,
+    /// Install all optional dependencies.
+    All,
 }
 
 pub async fn run_cli(cli: Cli) -> Result<String> {
@@ -162,6 +199,8 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 )?),
             }
         }
+        Commands::Setup { command } => run_setup(command).await,
+        Commands::Doctor => run_doctor(&config).await,
         Commands::Daemon { command } => {
             let svc = resolve_gateway_service();
             match command {
@@ -215,6 +254,84 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                     Ok(serde_json::to_string_pretty(&report)?)
                 }
             }
+        }
+        Commands::Skills { command } => run_skills(command, &config).await,
+    }
+}
+
+async fn run_skills(command: SkillsCommands, config: &Config) -> Result<String> {
+    let skills_dir = config.skills.open_skills_dir.as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+
+    match command {
+        SkillsCommands::List => {
+            let skills = load_skills_from_dir(&skills_dir)?;
+            if skills.is_empty() {
+                return Ok(format!("No skills found in {:?}.", skills_dir));
+            }
+            let mut output = String::new();
+            output.push_str(&format!("Found {} skills in {:?}:\n\n", skills.len(), skills_dir));
+            for skill in skills {
+                output.push_str(&format!("- {} ({})\n", skill.metadata.name, skill.metadata.description));
+            }
+            Ok(output)
+        }
+        SkillsCommands::Import { from, to, overwrite } => {
+            let target_dir = to.map(PathBuf::from).unwrap_or(skills_dir);
+            if !target_dir.exists() {
+                fs::create_dir_all(&target_dir)?;
+            }
+
+            let source_dir = PathBuf::from(from);
+            if !source_dir.exists() {
+                anyhow::bail!("Source directory does not exist: {:?}", source_dir);
+            }
+
+            let mut count = 0;
+            // Iterate over subdirectories in source_dir
+            for entry in fs::read_dir(&source_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let skill_file = path.join("SKILL.md");
+                    if skill_file.exists() {
+                        let skill_name = path.file_name().unwrap();
+                        let target_skill_dir = target_dir.join(skill_name);
+
+                        if target_skill_dir.exists() {
+                            if !overwrite {
+                                println!("Skipping existing skill: {:?}", skill_name);
+                                continue;
+                            }
+                        } else {
+                            fs::create_dir_all(&target_skill_dir)?;
+                        }
+
+                        // Copy all files
+                        for sub_entry in fs::read_dir(&path)? {
+                            let sub_entry = sub_entry?;
+                            let sub_path = sub_entry.path();
+                            if sub_path.is_file() {
+                                fs::copy(&sub_path, target_skill_dir.join(sub_entry.file_name()))?;
+                            } else if sub_path.is_dir() {
+                                // Simple recursive copy for 1 level deep (e.g. scripts/)
+                                let sub_dir_name = sub_entry.file_name();
+                                let target_sub_dir = target_skill_dir.join(sub_dir_name);
+                                fs::create_dir_all(&target_sub_dir)?;
+                                for deep_entry in fs::read_dir(&sub_path)? {
+                                    let deep_entry = deep_entry?;
+                                    if deep_entry.path().is_file() {
+                                        fs::copy(deep_entry.path(), target_sub_dir.join(deep_entry.file_name()))?;
+                                    }
+                                }
+                            }
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            Ok(format!("Imported {} skills to {:?}", count, target_dir))
         }
     }
 }
@@ -435,4 +552,171 @@ fn parse_channel_kind(raw: &str) -> crate::channels::ChannelKind {
         "webhook" => crate::channels::ChannelKind::Webhook,
         other => crate::channels::ChannelKind::Other(other.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Setup & Doctor
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DepStatus {
+    name: String,
+    installed: bool,
+    version: Option<String>,
+    detail: String,
+}
+
+async fn check_dep_installed(bin: &str, version_flag: &str) -> DepStatus {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    match Command::new(bin)
+        .arg(version_flag)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let version = raw
+                .split_whitespace()
+                .find(|s| s.chars().next().map_or(false, |c| c.is_ascii_digit()))
+                .map(ToString::to_string);
+            DepStatus {
+                name: bin.to_string(),
+                installed: true,
+                version,
+                detail: raw,
+            }
+        }
+        Ok(output) => DepStatus {
+            name: bin.to_string(),
+            installed: false,
+            version: None,
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        },
+        Err(e) => DepStatus {
+            name: bin.to_string(),
+            installed: false,
+            version: None,
+            detail: format!("not found: {e}"),
+        },
+    }
+}
+
+async fn install_agent_browser() -> Result<String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    println!("Installing agent-browser via npm...");
+    let install_out = Command::new("npm")
+        .args(["install", "-g", "agent-browser"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !install_out.status.success() {
+        let stderr = String::from_utf8_lossy(&install_out.stderr);
+        anyhow::bail!("npm install -g agent-browser failed: {stderr}");
+    }
+
+    println!("Downloading Chromium browser engine...");
+    let chromium_out = Command::new("agent-browser")
+        .arg("install")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !chromium_out.status.success() {
+        let stderr = String::from_utf8_lossy(&chromium_out.stderr);
+        anyhow::bail!("agent-browser install failed: {stderr}");
+    }
+
+    let status = check_dep_installed("agent-browser", "--version").await;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "installed": status.installed,
+        "version": status.version,
+    }))?)
+}
+
+async fn run_setup(command: SetupCommands) -> Result<String> {
+    match command {
+        SetupCommands::Browser => install_agent_browser().await,
+        SetupCommands::All => {
+            let browser_result = install_agent_browser().await;
+            let mut results = Vec::new();
+            results.push(serde_json::json!({
+                "dep": "agent-browser",
+                "ok": browser_result.is_ok(),
+                "detail": browser_result.as_deref().unwrap_or("failed"),
+            }));
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "ok": results.iter().all(|r| r["ok"].as_bool().unwrap_or(false)),
+                "results": results,
+            }))?)
+        }
+    }
+}
+
+async fn run_doctor(config: &Config) -> Result<String> {
+    let runtime = GatewayRuntime::new(config.clone());
+    let health = runtime.health().await;
+
+    let agent_browser = check_dep_installed("agent-browser", "--version").await;
+    let node = check_dep_installed("node", "--version").await;
+    let npm = check_dep_installed("npm", "--version").await;
+    let rg = check_dep_installed("rg", "--version").await;
+    let git = check_dep_installed("git", "--version").await;
+
+    let validation = config.validate();
+
+    let mut checks = Vec::new();
+
+    checks.push(serde_json::json!({
+        "check": "gateway_provider",
+        "ok": health.provider_healthy,
+        "detail": format!("provider={}", health.provider),
+    }));
+    checks.push(serde_json::json!({
+        "check": "memory",
+        "ok": health.memory_healthy,
+    }));
+    checks.push(serde_json::json!({
+        "check": "config",
+        "ok": validation.is_ok(),
+        "errors": validation.errors,
+        "warnings": validation.warnings,
+    }));
+
+    for dep in &[&agent_browser, &node, &npm, &rg, &git] {
+        let required = dep.name == "agent-browser" && config.browser.enabled;
+        checks.push(serde_json::json!({
+            "check": format!("dep:{}", dep.name),
+            "ok": dep.installed || !required,
+            "installed": dep.installed,
+            "version": dep.version,
+            "detail": dep.detail,
+            "required": required,
+        }));
+    }
+
+    if config.browser.enabled && !agent_browser.installed {
+        checks.push(serde_json::json!({
+            "check": "browser_tool_ready",
+            "ok": false,
+            "detail": "browser.enabled=true but agent-browser is not installed. Run: omninova setup browser",
+        }));
+    } else if config.browser.enabled {
+        checks.push(serde_json::json!({
+            "check": "browser_tool_ready",
+            "ok": true,
+            "detail": format!("agent-browser {} ready", agent_browser.version.as_deref().unwrap_or("?")),
+        }));
+    }
+
+    let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": all_ok,
+        "checks": checks,
+    }))?)
 }

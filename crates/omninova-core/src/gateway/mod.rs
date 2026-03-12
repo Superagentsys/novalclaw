@@ -16,10 +16,11 @@ use crate::providers::ChatMessage;
 use crate::providers::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
 use crate::routing::{RouteDecision, resolve_agent_route};
 use crate::security::{EstopController, EstopState, resolve_shell_allowlist};
+use crate::skills::{format_skills_prompt, load_skills_from_dir};
 use crate::tools::{
-    ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool,
-    GlobSearchTool, HttpRequestTool, MemoryRecallTool, MemoryStoreTool, ShellTool, Tool,
-    WebFetchTool,
+    BrowserTool, ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool,
+    GlobSearchTool, HttpRequestTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool,
+    WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
@@ -116,6 +117,20 @@ impl GatewayRuntime {
         let tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
+
+        if cfg.skills.open_skills_enabled {
+            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
+                let prompt = format_skills_prompt(&skills);
+                if !prompt.is_empty() {
+                    let current = agent_cfg.system_prompt.unwrap_or_default();
+                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
+                }
+            }
+        }
+
         let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg);
         agent.process_message(message).await
     }
@@ -163,6 +178,19 @@ impl GatewayRuntime {
             }
         }
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
+
+        if cfg.skills.open_skills_enabled {
+            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
+                let prompt = format_skills_prompt(&skills);
+                if !prompt.is_empty() {
+                    let current = agent_cfg.system_prompt.unwrap_or_default();
+                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
+                }
+            }
+        }
 
         let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg.clone());
         if let Some(session_id) = inbound.session_id.as_deref() {
@@ -1914,7 +1942,8 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
         Box::new(GlobSearchTool::new(workspace.clone())),
         Box::new(ContentSearchTool::new(workspace.clone())),
         Box::new(GitOperationsTool::new(workspace.clone())),
-        Box::new(ShellTool::new(workspace, shell_allowlist, Some(30))),
+        Box::new(ShellTool::new(workspace.clone(), shell_allowlist, Some(30))),
+        Box::new(PdfReadTool::new(workspace)),
     ]
 }
 
@@ -1930,6 +1959,19 @@ pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn
     if config.web_fetch.enabled {
         tools.push(Box::new(WebFetchTool::new(
             config.web_fetch.allowed_domains.clone(),
+        )));
+    }
+
+    if config.web_search.enabled {
+        if let Some(key) = &config.web_search.brave_api_key {
+            tools.push(Box::new(WebSearchTool::new(key.clone())));
+        }
+    }
+
+    if config.browser.enabled {
+        tools.push(Box::new(BrowserTool::new(
+            config.browser.allowed_domains.clone(),
+            config.browser.native_headless,
         )));
     }
 

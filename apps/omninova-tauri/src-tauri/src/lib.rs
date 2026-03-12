@@ -1,11 +1,12 @@
 use omninova_core::channels::{ChannelKind, InboundMessage};
-use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig};
+use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig, ChannelsConfig, ChannelEntry};
 use omninova_core::gateway::{
     GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionTreeQuery,
     GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
+use omninova_core::skills::import_skills_from_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -48,6 +49,46 @@ struct SetupAppConfig {
     robot: Option<RobotConfig>,
     #[serde(default)]
     providers: Vec<SetupProviderConfig>,
+    #[serde(default)]
+    channels: Option<SetupChannelsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SetupChannelsConfig {
+    #[serde(default)]
+    telegram: Option<SetupChannelEntry>,
+    #[serde(default)]
+    discord: Option<SetupChannelEntry>,
+    #[serde(default)]
+    slack: Option<SetupChannelEntry>,
+    #[serde(default)]
+    whatsapp: Option<SetupChannelEntry>,
+    #[serde(default)]
+    wechat: Option<SetupChannelEntry>,
+    #[serde(default)]
+    feishu: Option<SetupChannelEntry>,
+    #[serde(default)]
+    lark: Option<SetupChannelEntry>,
+    #[serde(default)]
+    dingtalk: Option<SetupChannelEntry>,
+    #[serde(default)]
+    matrix: Option<SetupChannelEntry>,
+    #[serde(default)]
+    email: Option<SetupChannelEntry>,
+    #[serde(default)]
+    msteams: Option<SetupChannelEntry>,
+    #[serde(default)]
+    irc: Option<SetupChannelEntry>,
+    #[serde(default)]
+    webhook: Option<SetupChannelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SetupChannelEntry {
+    #[serde(default)]
+    enabled: bool,
+    token: Option<String>,
+    token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +362,80 @@ async fn session_tree_snapshot(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DepStatusPayload {
+    name: String,
+    installed: bool,
+    version: Option<String>,
+    detail: String,
+}
+
+#[tauri::command]
+async fn check_browser_dep() -> Result<DepStatusPayload, String> {
+    let status = check_command_installed("agent-browser", "--version").await;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn install_browser_dep() -> Result<DepStatusPayload, String> {
+    let npm_out = tokio::process::Command::new("npm")
+        .args(["install", "-g", "agent-browser"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("npm install failed: {e}"))?;
+    if !npm_out.status.success() {
+        let stderr = String::from_utf8_lossy(&npm_out.stderr);
+        return Err(format!("npm install -g agent-browser failed: {stderr}"));
+    }
+
+    let chromium_out = tokio::process::Command::new("agent-browser")
+        .arg("install")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("agent-browser install failed: {e}"))?;
+    if !chromium_out.status.success() {
+        let stderr = String::from_utf8_lossy(&chromium_out.stderr);
+        return Err(format!("agent-browser install (Chromium) failed: {stderr}"));
+    }
+
+    let status = check_command_installed("agent-browser", "--version").await;
+    Ok(status)
+}
+
+async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayload {
+    match tokio::process::Command::new(bin)
+        .arg(version_flag)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let version = raw
+                .split_whitespace()
+                .find(|s| s.chars().next().map_or(false, |c| c.is_ascii_digit()))
+                .map(ToString::to_string);
+            DepStatusPayload {
+                name: bin.to_string(),
+                installed: true,
+                version,
+                detail: raw,
+            }
+        }
+        _ => DepStatusPayload {
+            name: bin.to_string(),
+            installed: false,
+            version: None,
+            detail: "not installed".to_string(),
+        },
+    }
+}
+
 #[tauri::command]
 async fn start_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
@@ -362,6 +477,26 @@ async fn stop_gateway(
     let state_ref = state.inner().clone();
     stop_gateway_inner(&state_ref).await;
     Ok(gateway_status_from_state(&state_ref).await)
+}
+
+#[tauri::command]
+async fn import_skills(
+    source_dir: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+    let config = app_state.runtime.get_config().await;
+    
+    let target = config.skills.open_skills_dir.as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+
+    let source = PathBuf::from(source_dir);
+    
+    match import_skills_from_dir(&source, &target, true) {
+        Ok(count) => Ok(format!("Successfully imported {} skills.", count)),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
@@ -468,6 +603,34 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             .map(|path| path.to_string_lossy().to_string()),
         robot: config.robot.clone(),
         providers,
+        channels: Some(channels_from_core(&config.channels_config)),
+    }
+}
+
+fn channel_entry_from_core(entry: &Option<ChannelEntry>) -> Option<SetupChannelEntry> {
+    let entry = entry.as_ref()?;
+    Some(SetupChannelEntry {
+        enabled: entry.enabled,
+        token: entry.token.clone(),
+        token_env: entry.token_env.clone(),
+    })
+}
+
+fn channels_from_core(cfg: &ChannelsConfig) -> SetupChannelsConfig {
+    SetupChannelsConfig {
+        telegram: channel_entry_from_core(&cfg.telegram),
+        discord: channel_entry_from_core(&cfg.discord),
+        slack: channel_entry_from_core(&cfg.slack),
+        whatsapp: channel_entry_from_core(&cfg.whatsapp),
+        wechat: channel_entry_from_core(&cfg.wechat),
+        feishu: channel_entry_from_core(&cfg.feishu),
+        lark: channel_entry_from_core(&cfg.lark),
+        dingtalk: channel_entry_from_core(&cfg.dingtalk),
+        matrix: channel_entry_from_core(&cfg.matrix),
+        email: channel_entry_from_core(&cfg.email),
+        msteams: channel_entry_from_core(&cfg.msteams),
+        irc: channel_entry_from_core(&cfg.irc),
+        webhook: channel_entry_from_core(&cfg.webhook),
     }
 }
 
@@ -583,8 +746,44 @@ fn setup_config_to_core(
         })
         .collect::<HashMap<_, _>>();
 
+    if let Some(channels) = setup.channels {
+        current.channels_config = channels_to_core(channels);
+    }
+
     current.validate_or_bail().map_err(|e| e.to_string())?;
     Ok(current)
+}
+
+fn channel_entry_to_core(entry: Option<SetupChannelEntry>) -> Option<ChannelEntry> {
+    let entry = entry?;
+    if !entry.enabled && entry.token.is_none() && entry.token_env.is_none() {
+        return None;
+    }
+    Some(ChannelEntry {
+        enabled: entry.enabled,
+        token: normalize_optional_string(entry.token),
+        token_env: normalize_optional_string(entry.token_env),
+        extra: HashMap::new(),
+    })
+}
+
+fn channels_to_core(setup: SetupChannelsConfig) -> ChannelsConfig {
+    ChannelsConfig {
+        telegram: channel_entry_to_core(setup.telegram),
+        discord: channel_entry_to_core(setup.discord),
+        slack: channel_entry_to_core(setup.slack),
+        whatsapp: channel_entry_to_core(setup.whatsapp),
+        wechat: channel_entry_to_core(setup.wechat),
+        feishu: channel_entry_to_core(setup.feishu),
+        lark: channel_entry_to_core(setup.lark),
+        dingtalk: channel_entry_to_core(setup.dingtalk),
+        matrix: channel_entry_to_core(setup.matrix),
+        email: channel_entry_to_core(setup.email),
+        msteams: channel_entry_to_core(setup.msteams),
+        irc: channel_entry_to_core(setup.irc),
+        webhook: channel_entry_to_core(setup.webhook),
+        ..ChannelsConfig::default()
+    }
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -707,8 +906,11 @@ pub fn run() {
             route_inbound_message,
             process_inbound_message,
             session_tree_snapshot,
+            check_browser_dep,
+            install_browser_dep,
             start_gateway,
             stop_gateway,
+            import_skills,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

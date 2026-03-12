@@ -80,6 +80,12 @@
 # allowed_tools = ["web_search", "http_request", "file_read"]
 # max_iterations = 8
 
+# --- Skills ---
+# [skills]
+# open_skills_enabled = true
+# open_skills_dir = "~/.omninova/skills"
+# prompt_injection_mode = "full"
+
 # --- Autonomy ---
 # [autonomy]
 # level = "supervised"          # supervised, semi, autonomous

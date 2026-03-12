@@ -2,11 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
-  type AppConfig,
+  type Config,
   type GatewayStatus,
 } from "../../types/config";
+import { ChannelConfigForm } from "./ChannelConfigForm";
 import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
+import { SkillsConfigForm } from "./SkillsConfigForm";
+import { PersonaConfigForm } from "./PersonaConfigForm";
 import { ControlPanel } from "../Console/ControlPanel";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -16,20 +19,32 @@ export interface SetupProps {
   onConfigSuccess?: () => void;
 }
 
-const initialConfig: AppConfig = {
+const initialConfig: Config = {
   api_key: "",
   api_url: "",
   default_provider: "",
   default_model: "",
-  workspace_dir: "",
-  omninoval_gateway_url: "http://localhost:18789",
-  omninoval_config_dir: "~/.omninoval",
   robot: DEFAULT_ROBOT_CONFIG,
   providers: DEFAULT_PROVIDERS,
+  channels: {
+    slack: { enabled: false },
+    discord: { enabled: false },
+    telegram: { enabled: false },
+  },
+  skills: {
+    open_skills_enabled: true,
+    prompt_injection_mode: "full",
+  },
+  agent: {
+    name: "omninova",
+    max_tool_iterations: 20,
+    compact_context: true,
+  },
 };
 
 export function Setup({ onConfigSuccess }: SetupProps) {
-  const [config, setConfig] = useState<AppConfig>(initialConfig);
+  const [activeTab, setActiveTab] = useState<"general" | "providers" | "channels" | "skills" | "persona">("general");
+  const [config, setConfig] = useState<Config>(initialConfig);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
     url: "http://127.0.0.1:42617",
@@ -72,7 +87,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
     [config]
   );
 
-  const handleProvidersChange = (providers: AppConfig["providers"]) => {
+  const handleProvidersChange = (providers: Config["providers"]) => {
     const enabledProviderIds = providers
       .filter((provider) => provider.enabled)
       .map((provider) => provider.id);
@@ -126,7 +141,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
     setBusyAction("load");
     try {
       const [nextConfig, nextGatewayStatus] = await Promise.all([
-        invokeTauri<AppConfig>("get_setup_config"),
+        invokeTauri<Config>("get_setup_config"),
         invokeTauri<GatewayStatus>("gateway_status"),
       ]);
 
@@ -135,6 +150,8 @@ export function Setup({ onConfigSuccess }: SetupProps) {
         ...nextConfig,
         robot: nextConfig.robot ?? DEFAULT_ROBOT_CONFIG,
         providers: nextConfig.providers ?? DEFAULT_PROVIDERS,
+        skills: nextConfig.skills ?? initialConfig.skills,
+        agent: nextConfig.agent ?? initialConfig.agent,
       });
       setGatewayStatus(nextGatewayStatus);
       setActionMessage("已加载当前配置。");
@@ -205,239 +222,273 @@ export function Setup({ onConfigSuccess }: SetupProps) {
     }
   };
 
-  return (
-    <div className="setup-page">
-      <header className="setup-header">
-        <div className="setup-brand">
-          <div className="setup-logo-frame">
-            <img
-              src={omninovalLogo}
-              alt="OmniNova logo"
-              className="setup-logo"
-            />
-          </div>
-          <div className="setup-brand-copy">
-            <div className="setup-chip">OmniNova Claw</div>
-            <div className="setup-title">OmniNova 启动配置</div>
-            <div className="setup-subtitle">
-              在首次启动前完成工作目录、模型服务与机器人参数初始化
-            </div>
-          </div>
-        </div>
-      </header>
-
-      <section className="setup-section">
-        <h2>基础信息</h2>
-        <div className="setup-grid">
-          <label>
-            Workspace 目录
-            <input
-              value={config.workspace_dir}
-              onChange={(event) =>
-                setConfig({ ...config, workspace_dir: event.target.value })
-              }
-              placeholder="/path/to/workspace"
-            />
-          </label>
-          <label>
-            默认模型服务
-            <select
-              value={config.default_provider ?? ""}
-              onChange={(event) =>
-                setConfig({
-                  ...config,
-                  default_provider: event.target.value,
-                  default_model: "",
-                })
-              }
-            >
-              <option value="">
-                {enabledProviders.length === 0
-                  ? "请先启用模型服务"
-                  : "选择默认模型服务"}
-              </option>
-              {enabledProviders.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            默认模型
-            <select
-              value={selectedDefaultModelValue}
-              onChange={(event) => handleDefaultModelChange(event.target.value)}
-              disabled={defaultModelOptions.length === 0}
-            >
-              <option value="">
-                {defaultModelOptions.length === 0
-                  ? "请先启用模型服务"
-                  : "选择默认模型"}
-              </option>
-              {defaultModelOptions.map((provider) => (
-                <optgroup key={provider.providerId} label={provider.providerName}>
-                  {provider.models.map((model) => (
-                    <option
-                      key={`${provider.providerId}-${model}`}
-                      value={`${provider.providerId}::${model}`}
-                    >
-                      {model}
+  const renderTabContent = () => {
+    switch (activeTab) {
+      case "general":
+        return (
+          <div className="space-y-8">
+            <section className="setup-section">
+              <h2>基础信息</h2>
+              <div className="setup-grid">
+                <label>
+                  Workspace 目录
+                  <input
+                    value={config.workspace_dir ?? ""}
+                    onChange={(event) =>
+                      setConfig({ ...config, workspace_dir: event.target.value })
+                    }
+                    placeholder="/path/to/workspace"
+                  />
+                </label>
+                <label>
+                  默认模型服务
+                  <select
+                    value={config.default_provider ?? ""}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        default_provider: event.target.value,
+                        default_model: "",
+                      })
+                    }
+                  >
+                    <option value="">
+                      {enabledProviders.length === 0
+                        ? "请先启用模型服务"
+                        : "选择默认模型服务"}
                     </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-          </label>
-          <label>
-            API 地址
-            <input
-              value={config.api_url ?? ""}
-              onChange={(event) =>
-                setConfig({ ...config, api_url: event.target.value })
-              }
-              placeholder="https://api.openai.com/v1"
-            />
-          </label>
-          <label>
-            API Key
-            <input
-              value={config.api_key ?? ""}
-              onChange={(event) =>
-                setConfig({ ...config, api_key: event.target.value })
-              }
-              placeholder="sk-..."
-            />
-          </label>
-        </div>
-      </section>
+                    {enabledProviders.map((provider) => (
+                      <option key={provider.id} value={provider.id}>
+                        {provider.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  默认模型
+                  <select
+                    value={selectedDefaultModelValue}
+                    onChange={(event) => handleDefaultModelChange(event.target.value)}
+                    disabled={defaultModelOptions.length === 0}
+                  >
+                    <option value="">
+                      {defaultModelOptions.length === 0
+                        ? "请先启用模型服务"
+                        : "选择默认模型"}
+                    </option>
+                    {defaultModelOptions.map((provider) => (
+                      <optgroup key={provider.providerId} label={provider.providerName}>
+                        {provider.models.map((model) => (
+                          <option
+                            key={`${provider.providerId}-${model}`}
+                            value={`${provider.providerId}::${model}`}
+                          >
+                            {model}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  API 地址
+                  <input
+                    value={config.api_url ?? ""}
+                    onChange={(event) =>
+                      setConfig({ ...config, api_url: event.target.value })
+                    }
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </label>
+                <label>
+                  API Key
+                  <input
+                    type="password"
+                    value={config.api_key ?? ""}
+                    onChange={(event) =>
+                      setConfig({ ...config, api_key: event.target.value })
+                    }
+                    placeholder="sk-..."
+                  />
+                </label>
+              </div>
+            </section>
 
-      <section className="setup-section">
-        <h2>omninoval 连接</h2>
-        <div className="setup-grid">
-          <label>
-            Gateway 地址
-            <input
-              value={config.omninoval_gateway_url ?? ""}
-              onChange={(event) =>
-                setConfig({
-                  ...config,
-                  omninoval_gateway_url: event.target.value,
-                })
-              }
-              placeholder="http://localhost:18789"
+            <section className="setup-section">
+              <h2>OmniNova 连接</h2>
+              <div className="setup-grid">
+                <label>
+                  Gateway 地址
+                  <input
+                    value={config.omninoval_gateway_url ?? ""}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        omninoval_gateway_url: event.target.value,
+                      })
+                    }
+                    placeholder="http://localhost:18789"
+                  />
+                </label>
+                <label>
+                  配置目录
+                  <input
+                    value={config.omninoval_config_dir ?? ""}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        omninoval_config_dir: event.target.value,
+                      })
+                    }
+                    placeholder="~/.omninoval"
+                  />
+                </label>
+              </div>
+            </section>
+            
+             <RobotConfigForm
+                value={config.robot ?? DEFAULT_ROBOT_CONFIG}
+                onChange={(robot) => setConfig({ ...config, robot })}
+              />
+          </div>
+        );
+      case "providers":
+        return <ProviderConfigForm value={config.providers} onChange={handleProvidersChange} />;
+      case "channels":
+        return <ChannelConfigForm value={config.channels} onChange={(channels) => setConfig({ ...config, channels })} />;
+      case "skills":
+        return (
+          <div className="setup-section">
+            <h2>技能扩展</h2>
+            <SkillsConfigForm 
+              config={config.skills || { open_skills_enabled: true }}
+              onChange={(skills) => setConfig({ ...config, skills })}
             />
-          </label>
-          <label>
-            配置目录
-            <input
-              value={config.omninoval_config_dir ?? ""}
-              onChange={(event) =>
-                setConfig({
-                  ...config,
-                  omninoval_config_dir: event.target.value,
-                })
-              }
-              placeholder="~/.omninoval"
+          </div>
+        );
+      case "persona":
+        return (
+          <div className="setup-section">
+            <h2>Agent 人设 (灵魂系统)</h2>
+            <PersonaConfigForm 
+              config={config.agent || { name: "omninova", max_tool_iterations: 20, compact_context: true }}
+              onChange={(agent) => setConfig({ ...config, agent })}
             />
-          </label>
-        </div>
-      </section>
+          </div>
+        );
+    }
+  };
 
-      <RobotConfigForm
-        value={config.robot ?? DEFAULT_ROBOT_CONFIG}
-        onChange={(robot) => setConfig({ ...config, robot })}
-      />
-
-      <ProviderConfigForm
-        value={config.providers}
-        onChange={handleProvidersChange}
-      />
-
-      <section className="setup-section">
-        <div className="section-heading">
+  return (
+    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#090909' }}>
+      {/* Sidebar */}
+      <aside style={{ width: '280px', backgroundColor: 'rgba(255, 255, 255, 0.03)', borderRight: '1px solid rgba(255, 255, 255, 0.1)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
+        <div className="flex items-center gap-4 mb-8">
+          <img src={omninovalLogo} alt="Logo" style={{ width: '48px', height: '48px', borderRadius: '12px' }} />
           <div>
-            <h2>网关控制</h2>
-            <div className="section-subtitle">
-              保存当前配置后启动本地网关服务，供桌面端或外部客户端接入。
-            </div>
-          </div>
-          <div
-            className={`gateway-status-chip ${
-              gatewayStatus.running ? "is-running" : "is-stopped"
-            }`}
-          >
-            {gatewayStatus.running ? "运行中" : "未启动"}
+            <div className="text-sm font-bold opacity-50 uppercase tracking-wider">OmniNova</div>
+            <div className="text-lg font-bold">Claw 控制面</div>
           </div>
         </div>
-        <div className="gateway-status-panel">
-          <div className="gateway-status-line">
-            <span>网关地址</span>
-            {gatewayStatus.url ? (
-              <a
-                href={gatewayStatus.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="gateway-url-link"
-                title="在浏览器中打开可查看接口说明（根路径）；健康检查请访问 /health"
-              >
-                <code>{gatewayStatus.url}</code>
-              </a>
-            ) : (
-              <code>未配置</code>
-            )}
+
+        <nav className="flex-1 space-y-2">
+          {[
+            { id: 'general', label: '通用设置', icon: '⚙️' },
+            { id: 'providers', label: '模型服务', icon: '🤖' },
+            { id: 'channels', label: '渠道接入', icon: '🔌' },
+            { id: 'skills', label: '技能扩展', icon: '🛠️' },
+            { id: 'persona', label: 'Agent 人设', icon: '🧠' },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              style={{
+                width: '100%',
+                textAlign: 'left',
+                padding: '12px 16px',
+                borderRadius: '12px',
+                backgroundColor: activeTab === tab.id ? 'rgba(255, 255, 255, 0.1)' : 'transparent',
+                border: 'none',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                color: activeTab === tab.id ? '#fff' : 'rgba(255, 255, 255, 0.5)',
+                cursor: 'pointer',
+                transition: 'all 0.2s'
+              }}
+            >
+              <span>{tab.icon}</span>
+              <span className="font-medium">{tab.label}</span>
+            </button>
+          ))}
+        </nav>
+
+        <div className="mt-auto pt-6 space-y-3 border-t border-white/10">
+          <div className="flex items-center gap-3 px-2 py-2 mb-2">
+            <div className={`w-3 h-3 rounded-full ${gatewayStatus.running ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500'}`} />
+            <span className="text-sm font-medium opacity-80">
+              网关{gatewayStatus.running ? '运行中' : '已停止'}
+            </span>
           </div>
-          {gatewayStatus.url ? (
-            <div className="gateway-status-hint">
-              此为 API 服务，仅支持接口调用。在浏览器中打开上述链接可查看可用接口；健康检查请访问 <code>/health</code>。
-            </div>
-          ) : null}
-          <div className="gateway-status-line">
-            <span>最新状态</span>
-            <span>{actionMessage || "等待操作"}</span>
-          </div>
-          {gatewayStatus.last_error ? (
-            <div className="gateway-status-error">{gatewayStatus.last_error}</div>
-          ) : null}
-        </div>
-        <div className="setup-actions">
+
           <button
-            type="button"
-            onClick={() => void loadSetupState()}
-            disabled={busyAction !== null}
-          >
-            {busyAction === "load" ? "加载中..." : "重新加载配置"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleSaveConfig()}
+            className="w-full py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl font-medium border border-white/10 transition-all cursor-pointer"
+            onClick={handleSaveConfig}
             disabled={busyAction !== null}
           >
             {busyAction === "save" ? "保存中..." : "保存配置"}
           </button>
-          <button
-            type="button"
-            className="primary-button"
-            onClick={() => void handleSaveAndStartGateway()}
-            disabled={busyAction !== null}
-          >
-            {busyAction === "start" ? "启动中..." : "保存并启动网关"}
-          </button>
-          <button
-            type="button"
-            className="ghost-button"
-            onClick={() => void handleStopGateway()}
-            disabled={busyAction !== null || !gatewayStatus.running}
-          >
-            {busyAction === "stop" ? "停止中..." : "停止网关"}
-          </button>
-        </div>
-      </section>
 
-      <section className="setup-section">
-        <h2>配置预览</h2>
-        <textarea readOnly value={jsonPreview} className="setup-preview" />
-      </section>
+          {!gatewayStatus.running ? (
+            <button
+              className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-xl font-bold shadow-lg shadow-orange-900/20 transition-all cursor-pointer"
+              onClick={handleSaveAndStartGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "start" ? "启动中..." : "保存并启动网关"}
+            </button>
+          ) : (
+            <button
+              className="w-full py-3 bg-red-600/20 hover:bg-red-600/30 text-red-500 rounded-xl font-medium border border-red-600/20 transition-all cursor-pointer"
+              onClick={handleStopGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "stop" ? "停止中..." : "停止网关"}
+            </button>
+          )}
+
+          {actionMessage && (
+            <div className="mt-4 p-3 bg-white/5 rounded-lg text-xs opacity-60 text-center italic">
+              {actionMessage}
+            </div>
+          )}
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main style={{ flex: 1, overflowY: 'auto', padding: '40px', backgroundColor: 'transparent' }}>
+        <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+          {renderTabContent()}
+          
+          <div className="mt-12 pt-8 border-t border-white/5">
+            <div className="setup-preview">
+              <div className="setup-preview-header">
+                <span>配置预览 (JSON)</span>
+                <button
+                  className="setup-preview-copy"
+                  onClick={() => {
+                    navigator.clipboard.writeText(jsonPreview);
+                    setActionMessage("配置已复制到剪贴板。");
+                  }}
+                >
+                  复制
+                </button>
+              </div>
+              <pre className="setup-preview-content">{jsonPreview}</pre>
+            </div>
+          </div>
+        </div>
+      </main>
 
       <ControlPanel />
     </div>
