@@ -13,7 +13,6 @@ if (!sourceDir || !outputDir || !platformLabel || !version) {
 
 const allowedExtensions = [
   ".appimage",
-  ".app",
   ".deb",
   ".dmg",
   ".exe",
@@ -61,22 +60,7 @@ const walkFiles = (dir) => {
 };
 
 const walkAppBundles = (dir) => {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  const bundles = [];
-
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory() && entry.name.toLowerCase().endsWith(".app")) {
-      bundles.push(fullPath);
-      continue;
-    }
-
-    if (entry.isDirectory()) {
-      bundles.push(...walkAppBundles(fullPath));
-    }
-  }
-
-  return bundles;
+  return [];
 };
 
 if (!fs.existsSync(sourceDir)) {
