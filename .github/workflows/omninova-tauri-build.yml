@@ -246,7 +246,7 @@ jobs:
 
   android:
     name: Android
-    if: github.event_name == 'workflow_dispatch' && inputs.build_android
+    if: (github.event_name == 'workflow_dispatch' && inputs.build_android) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
 
     defaults:
@@ -309,7 +309,7 @@ jobs:
 
   ios:
     name: iOS
-    if: github.event_name == 'workflow_dispatch' && inputs.build_ios
+    if: (github.event_name == 'workflow_dispatch' && inputs.build_ios) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: macos-latest
 
     defaults:
@@ -401,22 +401,41 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - desktop
+      - android
+      - ios
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Download staged desktop assets
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
 
+      - name: Download mobile artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mobile-*
+          path: release-assets
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Generate Checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-          files: release-assets/**
+          files: |
+            release-assets/**
+            release-assets/SHA256SUMS.txt
