@@ -74,10 +74,6 @@ jobs:
       # Rename to avoid auto-detection by Tauri
       _APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       _APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
     steps:
       - name: Checkout repository
@@ -157,15 +153,29 @@ jobs:
         run: node ./scripts/check-build-env.mjs ${{ matrix.check }}
 
       - name: Build Tauri app
-        run: npm run ${{ matrix.script }}
+        shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          _SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          _APPLE_ID: ${{ secrets.APPLE_ID }}
+          _APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          _APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
           APPLE_API_ISSUER: ${{ env.APPLE_API_ISSUER }}
+        run: |
+          if [ -n "$_SIGNING_IDENTITY" ]; then export APPLE_SIGNING_IDENTITY="$_SIGNING_IDENTITY"; fi
+          if [ -n "$_APPLE_ID" ]; then export APPLE_ID="$_APPLE_ID"; fi
+          if [ -n "$_APPLE_PASSWORD" ]; then export APPLE_PASSWORD="$_APPLE_PASSWORD"; fi
+          if [ -n "$_APPLE_TEAM_ID" ]; then export APPLE_TEAM_ID="$_APPLE_TEAM_ID"; fi
+          npm run ${{ matrix.script }}
+
+      - name: Debug build output
+        if: always()
+        run: |
+          echo "Listing target directory:"
+          find src-tauri/target -maxdepth 4 -name "bundle" || echo "No bundle dir found"
+          ls -R src-tauri/target/release/bundle || echo "No release bundle"
+          ls -R src-tauri/target/${{ matrix.target }}/release/bundle || echo "No target bundle"
 
       - name: Stage desktop release assets
         run: >
