@@ -169,18 +169,29 @@ jobs:
           if [ -n "$_APPLE_TEAM_ID" ]; then export APPLE_TEAM_ID="$_APPLE_TEAM_ID"; fi
           npm run ${{ matrix.script }}
 
-      - name: Debug build output
-        if: always()
+      - name: Resolve bundle path
+        id: resolve_path
+        shell: bash
         run: |
-          echo "Listing target directory:"
-          find src-tauri/target -maxdepth 4 -name "bundle" || echo "No bundle dir found"
-          ls -R src-tauri/target/release/bundle || echo "No release bundle"
-          ls -R src-tauri/target/${{ matrix.target }}/release/bundle || echo "No target bundle"
+          TARGET_PATH="./src-tauri/target/${{ matrix.target }}/release/bundle"
+          FLAT_PATH="./src-tauri/target/release/bundle"
+          if [ -d "$TARGET_PATH" ]; then
+            echo "Found bundle at target path"
+            echo "bundle_path=$TARGET_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$FLAT_PATH" ]; then
+            echo "Found bundle at flat path"
+            echo "bundle_path=$FLAT_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: Bundle directory not found at $TARGET_PATH or $FLAT_PATH"
+            echo "Listing target directory:"
+            ls -R src-tauri/target || echo "target dir not found"
+            exit 1
+          fi
 
       - name: Stage desktop release assets
         run: >
           node ./scripts/stage-release-assets.mjs
-          ./src-tauri/target/${{ matrix.target }}/release/bundle
+          ${{ steps.resolve_path.outputs.bundle_path }}
           ./release-assets
           ${{ matrix.asset_platform }}
           ${{ steps.meta.outputs.version }}
