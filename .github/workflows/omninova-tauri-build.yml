@@ -83,6 +83,29 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Fix Windows link.exe conflict
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $paths = @(
+            "C:\Program Files\Git\usr\bin\link.exe",
+            "C:\Program Files\Git\mingw64\bin\link.exe"
+          )
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "Renaming conflict: $path"
+              Move-Item -Path $path -Destination "$path.bak" -Force
+            }
+          }
+          
+          # Verify link.exe resolution
+          try {
+            $linkPath = (Get-Command link).Source
+            Write-Host "link.exe resolves to: $linkPath"
+          } catch {
+            Write-Host "link.exe not found in PATH (this is okay if MSVC sets it up later, but usually it should be there)"
+          }
+
       - name: Install create-dmg
         if: runner.os == 'macOS'
         run: brew install create-dmg
