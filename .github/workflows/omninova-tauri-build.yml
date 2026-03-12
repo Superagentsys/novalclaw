@@ -196,18 +196,36 @@ jobs:
         id: resolve_path
         shell: bash
         run: |
-          TARGET_PATH="./src-tauri/target/${{ matrix.target }}/release/bundle"
-          FLAT_PATH="./src-tauri/target/release/bundle"
-          if [ -d "$TARGET_PATH" ]; then
-            echo "Found bundle at target path"
-            echo "bundle_path=$TARGET_PATH" >> "$GITHUB_OUTPUT"
-          elif [ -d "$FLAT_PATH" ]; then
-            echo "Found bundle at flat path"
-            echo "bundle_path=$FLAT_PATH" >> "$GITHUB_OUTPUT"
+          # Check workspace root target (standard for workspace members)
+          WS_TARGET_PATH="../../target/${{ matrix.target }}/release/bundle"
+          WS_FLAT_PATH="../../target/release/bundle"
+          
+          # Check package local target (if configured or standalone)
+          PKG_TARGET_PATH="./src-tauri/target/${{ matrix.target }}/release/bundle"
+          PKG_FLAT_PATH="./src-tauri/target/release/bundle"
+
+          if [ -d "$WS_TARGET_PATH" ]; then
+            echo "Found bundle at workspace target path: $WS_TARGET_PATH"
+            echo "bundle_path=$WS_TARGET_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$WS_FLAT_PATH" ]; then
+            echo "Found bundle at workspace flat path: $WS_FLAT_PATH"
+            echo "bundle_path=$WS_FLAT_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$PKG_TARGET_PATH" ]; then
+            echo "Found bundle at package target path: $PKG_TARGET_PATH"
+            echo "bundle_path=$PKG_TARGET_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$PKG_FLAT_PATH" ]; then
+            echo "Found bundle at package flat path: $PKG_FLAT_PATH"
+            echo "bundle_path=$PKG_FLAT_PATH" >> "$GITHUB_OUTPUT"
           else
-            echo "Error: Bundle directory not found at $TARGET_PATH or $FLAT_PATH"
-            echo "Listing target directory:"
-            ls -R src-tauri/target || echo "target dir not found"
+            echo "Error: Bundle directory not found."
+            echo "Searched locations:"
+            echo "- $WS_TARGET_PATH"
+            echo "- $WS_FLAT_PATH"
+            echo "- $PKG_TARGET_PATH"
+            echo "- $PKG_FLAT_PATH"
+            echo "Listing workspace target directory:"
+            ls -F ../../target/release || echo "workspace target/release not found"
+            ls -F ../../target/${{ matrix.target }}/release || echo "workspace target/${{ matrix.target }}/release not found"
             exit 1
           fi
 
