@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const [, , sourceDir, outputDir, platformLabel, version] = process.argv;
+let [, , sourceDir, outputDir, platformLabel, version] = process.argv;
 
 if (!sourceDir || !outputDir || !platformLabel || !version) {
   console.error(
@@ -80,8 +80,16 @@ const walkAppBundles = (dir) => {
 };
 
 if (!fs.existsSync(sourceDir)) {
-  console.error(`Source directory does not exist: ${sourceDir}`);
-  process.exit(1);
+  // Check if it's a Rust target path that might have been flattened
+  // e.g. target/x86_64-unknown-linux-gnu/release/bundle -> target/release/bundle
+  const flattened = sourceDir.replace(/target\/[^/]+\/release/, "target/release");
+  if (flattened !== sourceDir && fs.existsSync(flattened)) {
+    console.log(`Source directory not found at ${sourceDir}, using flattened path: ${flattened}`);
+    sourceDir = flattened;
+  } else {
+    console.error(`Source directory does not exist: ${sourceDir}`);
+    process.exit(1);
+  }
 }
 
 fs.mkdirSync(outputDir, { recursive: true });
