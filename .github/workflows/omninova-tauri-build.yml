@@ -253,7 +253,7 @@ jobs:
       - name: Generate Checksums
         working-directory: release-assets
         run: |
-          sha256sum * > SHA256SUMS.txt
+          find . -type f -not -name 'SHA256SUMS.txt' -print0 | xargs -0 sha256sum > SHA256SUMS.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
