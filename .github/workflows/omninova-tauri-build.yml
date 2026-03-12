@@ -33,6 +33,9 @@ permissions:
   pull-requests: write
   packages: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   desktop:
     name: Desktop ${{ matrix.name }}
@@ -65,7 +68,6 @@ jobs:
         working-directory: apps/omninova-tauri
 
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
       APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
