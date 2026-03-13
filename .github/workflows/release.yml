@@ -46,7 +46,7 @@ jobs:
             target: x86_64-apple-darwin
             asset_platform: macos-intel
           - name: macOS (Apple Silicon)
-            os: macos-latest
+            os: macos-14
             script: build:macos:apple
             check: macos
             target: aarch64-apple-darwin
