@@ -115,7 +115,7 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
             <div className="space-y-2">
               <div className="text-white/50 text-xs uppercase tracking-wider">认知栈</div>
               <div className="flex gap-2">
-                {selectedMBTI.cognitive_stack.map((func) => (
+                {selectedMBTI.cognitive_stack.map((func: string) => (
                   <span key={func} className="px-2 py-0.5 bg-blue-500/20 text-blue-300 rounded text-xs font-mono">
                     {func}
                   </span>
@@ -133,7 +133,7 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
             <div className="space-y-1">
               <div className="text-white/50 text-xs uppercase tracking-wider">优势</div>
               <div className="flex flex-wrap gap-1">
-                {selectedMBTI.strengths.map((s) => (
+                {selectedMBTI.strengths.map((s: string) => (
                   <span key={s} className="px-1.5 py-0.5 bg-green-500/10 text-green-300 rounded text-xs">
                     {s}
                   </span>
