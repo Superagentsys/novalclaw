@@ -242,6 +242,7 @@ export interface AgentPersonaConfig {
   compact_context?: boolean;
   max_tool_iterations?: number;
   max_history_messages?: number;
+  mbti_type?: string;
 }
 
 // Main configuration interface
