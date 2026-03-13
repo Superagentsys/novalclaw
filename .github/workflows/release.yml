@@ -1,4 +1,4 @@
-name: OmniNova Tauri Build
+name: Release Build
 
 on:
   push:
@@ -9,12 +9,12 @@ on:
     paths:
       - "apps/omninova-tauri/**"
       - "crates/omninova-core/**"
-      - ".github/workflows/omninova-tauri-build.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     paths:
       - "apps/omninova-tauri/**"
       - "crates/omninova-core/**"
-      - ".github/workflows/omninova-tauri-build.yml"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:
