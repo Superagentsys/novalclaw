@@ -79,10 +79,23 @@ OmniNova Claw implements a sophisticated cognitive architecture with three disti
     ```
 
 4.  **Build for Production**
+    
+    You can build optimized binaries for specific platforms using the following commands:
+
     ```bash
-    # Build the application for your OS
-    npm run tauri build
+    # Windows (x64)
+    npm run build:windows
+
+    # macOS (Apple Silicon / M1/M2/M3)
+    npm run build:macos:apple
+
+    # macOS (Intel)
+    npm run build:macos:intel
+
+    # Linux (x64)
+    npm run build:linux
     ```
+    
     Artifacts will be generated in `apps/omninova-tauri/src-tauri/target/release/bundle/`.
 
 ## 🏗️ Architecture
