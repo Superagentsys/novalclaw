@@ -39,9 +39,15 @@ jobs:
             check: linux
             target: x86_64-unknown-linux-gnu
             asset_platform: linux-x64
-          - name: macOS
+          - name: macOS (Intel)
+            os: macos-13
+            script: build:macos:intel
+            check: macos
+            target: x86_64-apple-darwin
+            asset_platform: macos-intel
+          - name: macOS (Apple Silicon)
             os: macos-latest
-            script: build:macos
+            script: build:macos:apple
             check: macos
             target: aarch64-apple-darwin
             asset_platform: macos-arm64
