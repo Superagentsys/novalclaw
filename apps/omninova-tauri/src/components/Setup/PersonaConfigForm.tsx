@@ -1,6 +1,5 @@
 import React, { useMemo } from "react";
-import type { AgentPersonaConfig } from "../../types/config";
-import { MBTI_TYPES } from "../../types/mbti";
+import { type AgentPersonaConfig, MBTI_TYPES } from "../../types/config";
 
 interface Props {
   config: AgentPersonaConfig;
