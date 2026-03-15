@@ -217,7 +217,7 @@ mod tests {
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.default_temperature, 0.7);
-        assert_eq!(parsed.gateway.port, 42617);
+        assert_eq!(parsed.gateway.port, 10809);
     }
 
     #[test]

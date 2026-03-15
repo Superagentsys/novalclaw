@@ -442,6 +442,16 @@ async fn start_gateway(
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
     sync_gateway_task_state(&state_ref).await;
+    let runtime = {
+        let app_state = state_ref.lock().await;
+        app_state.runtime.clone()
+    };
+    let mut config = runtime.get_config().await;
+    if ensure_desktop_automation_capabilities(&mut config) {
+        config.save().map_err(|e| e.to_string())?;
+        config.save_active_workspace().map_err(|e| e.to_string())?;
+        runtime.set_config(config).await.map_err(|e| e.to_string())?;
+    }
 
     {
         let mut app_state = state_ref.lock().await;
@@ -750,8 +760,43 @@ fn setup_config_to_core(
         current.channels_config = channels_to_core(channels);
     }
 
+    ensure_desktop_automation_capabilities(&mut current);
     current.validate_or_bail().map_err(|e| e.to_string())?;
     Ok(current)
+}
+
+fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
+    let mut changed = false;
+
+    if !config.browser.enabled {
+        config.browser.enabled = true;
+        changed = true;
+    }
+
+    let desktop_open_commands = [
+        "open",
+        "xdg-open",
+        "explorer",
+        "start",
+        "cmd",
+        "powershell",
+        "pwsh",
+        "osascript",
+    ];
+
+    for command in desktop_open_commands {
+        if !config
+            .autonomy
+            .allowed_commands
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(command))
+        {
+            config.autonomy.allowed_commands.push(command.to_string());
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn channel_entry_to_core(entry: Option<SetupChannelEntry>) -> Option<ChannelEntry> {
