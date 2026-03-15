@@ -861,7 +861,7 @@ fn default_gateway_host() -> String {
     "127.0.0.1".into()
 }
 fn default_gateway_port() -> u16 {
-    42617
+    10809
 }
 fn default_gateway_session_ttl_secs() -> u64 {
     24 * 60 * 60
@@ -949,6 +949,9 @@ pub struct BrowserConfig {
     pub backend: String,
     #[serde(default)]
     pub native_headless: bool,
+    #[serde(default)]
+    pub attach_only: bool,
+    pub cdp_url: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -962,6 +965,8 @@ impl Default for BrowserConfig {
             allowed_domains: Vec::new(),
             backend: default_browser_backend(),
             native_headless: false,
+            attach_only: false,
+            cdp_url: None,
         }
     }
 }

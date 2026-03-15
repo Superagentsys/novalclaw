@@ -157,7 +157,7 @@
 # --- Gateway ---
 # [gateway]
 # host = "127.0.0.1"
-# port = 42617
+# port = 10809
 # require_pairing = true
 # allow_public_bind = false
 # session_ttl_secs = 86400
@@ -191,6 +191,8 @@
 # enabled = false
 # backend = "playwright"
 # native_headless = false
+# attach_only = false
+# cdp_url = "http://127.0.0.1:9222"
 # allowed_domains = []
 
 # --- HTTP Request Tool ---

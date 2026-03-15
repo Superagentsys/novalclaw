@@ -12,14 +12,23 @@ const AGENT_BROWSER_BIN: &str = "agent-browser";
 pub struct BrowserTool {
     allowed_domains: Vec<String>,
     headless: bool,
+    attach_only: bool,
+    cdp_url: Option<String>,
     session: Option<String>,
 }
 
 impl BrowserTool {
-    pub fn new(allowed_domains: Vec<String>, headless: bool) -> Self {
+    pub fn new(
+        allowed_domains: Vec<String>,
+        headless: bool,
+        attach_only: bool,
+        cdp_url: Option<String>,
+    ) -> Self {
         Self {
             allowed_domains,
             headless,
+            attach_only,
+            cdp_url,
             session: None,
         }
     }
@@ -65,6 +74,14 @@ impl BrowserTool {
 
         if let Some(session) = &self.session {
             cmd.arg("--session").arg(session);
+        }
+
+        if self.attach_only {
+            cmd.arg("--attach-only");
+        }
+
+        if let Some(cdp_url) = &self.cdp_url {
+            cmd.arg("--cdp-url").arg(cdp_url);
         }
 
         cmd.arg("--json");
