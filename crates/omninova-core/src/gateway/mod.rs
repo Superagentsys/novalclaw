@@ -1972,6 +1972,8 @@ pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn
         tools.push(Box::new(BrowserTool::new(
             config.browser.allowed_domains.clone(),
             config.browser.native_headless,
+            config.browser.attach_only,
+            config.browser.cdp_url.clone(),
         )));
     }
 

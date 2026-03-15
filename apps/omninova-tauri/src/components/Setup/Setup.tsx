@@ -10,7 +10,6 @@ import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
 import { SkillsConfigForm } from "./SkillsConfigForm";
 import { PersonaConfigForm } from "./PersonaConfigForm";
-import { ControlPanel } from "../Console/ControlPanel";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
@@ -42,12 +41,28 @@ const initialConfig: Config = {
   },
 };
 
+type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
+type SetupTabItem = {
+  id: SetupTab;
+  label: string;
+  icon: string;
+};
+
+const setupTabs: SetupTabItem[] = [
+  { id: "general", label: "通用设置", icon: "⚙️" },
+  { id: "providers", label: "模型服务", icon: "🤖" },
+  { id: "channels", label: "渠道接入", icon: "🔌" },
+  { id: "skills", label: "技能扩展", icon: "🛠️" },
+  { id: "persona", label: "Agent 人设", icon: "🧠" },
+];
+
 export function Setup({ onConfigSuccess }: SetupProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "providers" | "channels" | "skills" | "persona">("general");
+  const [activeTab, setActiveTab] = useState<SetupTab>("general");
   const [config, setConfig] = useState<Config>(initialConfig);
+  const [previewCollapsed, setPreviewCollapsed] = useState(true);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
-    url: "http://127.0.0.1:42617",
+    url: "http://127.0.0.1:10809",
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
@@ -327,7 +342,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
                         omninoval_gateway_url: event.target.value,
                       })
                     }
-                    placeholder="http://localhost:18789"
+                    placeholder="http://localhost:10809"
                   />
                 </label>
                 <label>
@@ -392,16 +407,10 @@ export function Setup({ onConfigSuccess }: SetupProps) {
         </div>
 
         <nav className="flex-1 space-y-2">
-          {[
-            { id: 'general', label: '通用设置', icon: '⚙️' },
-            { id: 'providers', label: '模型服务', icon: '🤖' },
-            { id: 'channels', label: '渠道接入', icon: '🔌' },
-            { id: 'skills', label: '技能扩展', icon: '🛠️' },
-            { id: 'persona', label: 'Agent 人设', icon: '🧠' },
-          ].map((tab) => (
+          {setupTabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
+              onClick={() => setActiveTab(tab.id)}
               style={{
                 width: '100%',
                 textAlign: 'left',
@@ -474,23 +483,33 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             <div className="setup-preview">
               <div className="setup-preview-header">
                 <span>配置预览 (JSON)</span>
-                <button
-                  className="setup-preview-copy"
-                  onClick={() => {
-                    navigator.clipboard.writeText(jsonPreview);
-                    setActionMessage("配置已复制到剪贴板。");
-                  }}
-                >
-                  复制
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="setup-preview-copy"
+                    onClick={() => {
+                      setPreviewCollapsed((prev) => !prev);
+                    }}
+                  >
+                    {previewCollapsed ? "展开" : "折叠"}
+                  </button>
+                  <button
+                    className="setup-preview-copy"
+                    onClick={() => {
+                      navigator.clipboard.writeText(jsonPreview);
+                      setActionMessage("配置已复制到剪贴板。");
+                    }}
+                  >
+                    复制
+                  </button>
+                </div>
               </div>
-              <pre className="setup-preview-content">{jsonPreview}</pre>
+              {!previewCollapsed ? (
+                <pre className="setup-preview-content">{jsonPreview}</pre>
+              ) : null}
             </div>
           </div>
         </div>
       </main>
-
-      <ControlPanel />
     </div>
   );
 }
