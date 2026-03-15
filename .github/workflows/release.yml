@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
     tags:
       - "v*"
     paths:
@@ -17,6 +18,10 @@ on:
       - ".github/workflows/release.yml"
   workflow_dispatch:
 
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
   contents: write
   pull-requests: write
@@ -29,6 +34,7 @@ jobs:
   desktop:
     name: Desktop ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +123,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/omninova-tauri/src-tauri -> target
+
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -163,7 +176,9 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="sha-${GITHUB_SHA::7}"
+            BRANCH_NAME="${GITHUB_REF_NAME:-branch}"
+            SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
+            VERSION="${SANITIZED_BRANCH}-sha-${GITHUB_SHA::7}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -245,6 +260,7 @@ jobs:
     needs:
       - desktop
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 
@@ -266,6 +282,7 @@ jobs:
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          overwrite_files: true
           files: |
             release-assets/**
             release-assets/SHA256SUMS.txt
