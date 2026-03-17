@@ -22,7 +22,7 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "=0.12.0", default-features = false, features = ["json", "rustls-tls", "http2"] }
+reqwest = { version = "=0.12.0", default-features = false, features = ["json", "rustls-tls", "http2", "stream"] }
 uuid = { version = "=1.11.0", features = ["v4", "std"] }
 async-trait = "0.1"
 parking_lot = "0.12"
@@ -52,3 +52,8 @@ proc-macro-crate = "=3.1.0"
 home = "=0.5.9"
 avif-serialize = "=0.8.2"
 base64ct = "=1.6.0"
+
+# Database dependencies
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"

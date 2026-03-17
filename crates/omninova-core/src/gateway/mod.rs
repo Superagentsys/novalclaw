@@ -95,6 +95,12 @@ impl GatewayRuntime {
         self.config.read().await.clone()
     }
 
+    /// Get a reference to the internal config Arc for shared access.
+    /// This allows external components (like ConfigWatcher) to update the config.
+    pub fn config_ref(&self) -> Arc<RwLock<Config>> {
+        self.config.clone()
+    }
+
     pub async fn set_config(&self, mut config: Config) -> anyhow::Result<()> {
         config.validate_or_bail()?;
         let mut lock = self.config.write().await;

@@ -1,0 +1,4 @@
+# ESLint ignore configuration
+
+# Test coverage output
+coverage/

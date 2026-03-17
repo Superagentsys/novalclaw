@@ -1,13 +1,17 @@
+pub mod account;
 pub mod agent;
 pub mod acp;
+pub mod backup;
 pub mod channels;
 pub mod cli;
 pub mod config;
 pub mod cron;
 pub mod daemon;
+pub mod db;
 pub mod gateway;
 pub mod memory;
 pub mod observability;
+pub mod privacy;
 pub mod providers;
 pub mod routing;
 pub mod security;
@@ -15,6 +19,7 @@ pub mod skills;
 pub mod tools;
 pub mod util;
 
+pub use account::AccountStore;
 pub use agent::Agent;
 pub use config::{AgentConfig, Config};
 pub use cron::{CronScheduler, CronStore};

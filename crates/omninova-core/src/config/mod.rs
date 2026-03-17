@@ -3,6 +3,7 @@ pub mod loader;
 pub mod schema;
 pub mod traits;
 pub mod validation;
+pub mod watcher;
 
 pub use schema::{
     AgentConfig, AgentsIpcConfig, ArduinoConfig, AuditConfig, AudioConfig, AutonomyConfig,
@@ -22,3 +23,4 @@ pub use schema::{
 
 pub use loader::resolve_config_path;
 pub use validation::ValidationReport;
+pub use watcher::{ConfigManager, ConfigReloadStatus, ConfigWatcher, ConfigWatcherError};

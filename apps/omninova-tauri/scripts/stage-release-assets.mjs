@@ -26,6 +26,12 @@ const allowedExtensions = [
   ".aab",
 ];
 
+const ignoredBaseNames = new Set([
+  "control.tar.gz",
+  "data.tar.gz",
+  "debian-binary",
+]);
+
 const sanitize = (value) =>
   value
     .toLowerCase()
@@ -80,6 +86,10 @@ fs.mkdirSync(outputDir, { recursive: true });
 
 const sourceFiles = walkFiles(sourceDir).filter((file) => {
   const relativePath = path.relative(sourceDir, file).toLowerCase();
+  const baseName = path.basename(file).toLowerCase();
+  if (ignoredBaseNames.has(baseName)) {
+    return false;
+  }
   return allowedExtensions
     .filter((extension) => extension !== ".app")
     .some((extension) => relativePath.endsWith(extension));

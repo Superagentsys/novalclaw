@@ -285,4 +285,3 @@ jobs:
           overwrite_files: true
           files: |
             release-assets/**
-            release-assets/SHA256SUMS.txt

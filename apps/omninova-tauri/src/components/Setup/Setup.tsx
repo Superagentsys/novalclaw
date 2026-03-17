@@ -11,6 +11,9 @@ import { RobotConfigForm } from "./RobotConfigForm";
 import { SkillsConfigForm } from "./SkillsConfigForm";
 import { PersonaConfigForm } from "./PersonaConfigForm";
 import { ControlPanel } from "../Console/ControlPanel";
+import { AccountSettingsForm } from "../account/AccountSettingsForm";
+import { BackupSettings } from "../backup/BackupSettings";
+import { PrivacySettings } from "../settings/PrivacySettings";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
@@ -43,7 +46,7 @@ const initialConfig: Config = {
 };
 
 export function Setup({ onConfigSuccess }: SetupProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "providers" | "channels" | "skills" | "persona">("general");
+  const [activeTab, setActiveTab] = useState<"general" | "providers" | "channels" | "skills" | "persona" | "account" | "backup" | "privacy">("general");
   const [config, setConfig] = useState<Config>(initialConfig);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
@@ -370,10 +373,31 @@ export function Setup({ onConfigSuccess }: SetupProps) {
         return (
           <div className="setup-section">
             <h2>Agent 人设 (灵魂系统)</h2>
-            <PersonaConfigForm 
+            <PersonaConfigForm
               config={config.agent || { name: "omninova", max_tool_iterations: 20, compact_context: true }}
               onChange={(agent) => setConfig({ ...config, agent })}
             />
+          </div>
+        );
+      case "account":
+        return (
+          <div className="setup-section">
+            <h2>账户管理</h2>
+            <AccountSettingsForm />
+          </div>
+        );
+      case "backup":
+        return (
+          <div className="setup-section">
+            <h2>备份与恢复</h2>
+            <BackupSettings onImportComplete={loadSetupState} />
+          </div>
+        );
+      case "privacy":
+        return (
+          <div className="setup-section">
+            <h2>隐私与安全</h2>
+            <PrivacySettings />
           </div>
         );
     }
@@ -398,6 +422,9 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             { id: 'channels', label: '渠道接入', icon: '🔌' },
             { id: 'skills', label: '技能扩展', icon: '🛠️' },
             { id: 'persona', label: 'Agent 人设', icon: '🧠' },
+            { id: 'account', label: '账户管理', icon: '👤' },
+            { id: 'privacy', label: '隐私与安全', icon: '🔒' },
+            { id: 'backup', label: '备份恢复', icon: '💾' },
           ].map((tab) => (
             <button
               key={tab.id}
