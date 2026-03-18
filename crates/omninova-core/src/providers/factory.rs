@@ -118,7 +118,7 @@ fn resolve_model(
         "fireworks" => "accounts/fireworks/models/llama-v3p1-70b-instruct".to_string(),
         "perplexity" => "llama-3.1-sonar-large-128k-online".to_string(),
         "cohere" => "command-r-plus".to_string(),
-        "doubao" => "doubao-pro-32k".to_string(),
+        "doubao" => "doubao-seed-2-0-pro-260215".to_string(),
         "qianfan" => "ernie-4.0-8k".to_string(),
         "glm" => "glm-4".to_string(),
         "minimax" => "abab6.5s-chat".to_string(),

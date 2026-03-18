@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invokeTauri } from "../../utils/tauri";
 import type {
   ChannelKindValue,
@@ -52,6 +52,15 @@ interface SessionQueryForm {
   sort_order: "asc" | "desc";
 }
 
+const INITIAL_SESSION_QUERY: SessionQueryForm = {
+  agent_name: "",
+  channel: "",
+  contains: "",
+  limit: "20",
+  sort_by: "updated_at",
+  sort_order: "desc",
+};
+
 export function ControlPanel() {
   const [channel, setChannel] = useState<ChannelKindValue>("cli");
   const [text, setText] = useState("请帮我总结当前工作区的主要模块。");
@@ -63,14 +72,7 @@ export function ControlPanel() {
   const [gatewayHealth, setGatewayHealth] = useState<GatewayHealth | null>(null);
   const [providerHealths, setProviderHealths] = useState<ProviderHealthSummary[]>([]);
   const [sessionTree, setSessionTree] = useState<SessionTreeResponse | null>(null);
-  const [sessionQuery, setSessionQuery] = useState<SessionQueryForm>({
-    agent_name: "",
-    channel: "",
-    contains: "",
-    limit: "20",
-    sort_by: "updated_at",
-    sort_order: "desc",
-  });
+  const [sessionQuery, setSessionQuery] = useState<SessionQueryForm>(INITIAL_SESSION_QUERY);
   const [busyAction, setBusyAction] = useState<
     "route" | "chat" | "health" | "sessions" | null
   >(null);
@@ -100,10 +102,56 @@ export function ControlPanel() {
     }
   }, [metadataText]);
 
+  const refreshHealth = useCallback(async () => {
+    setBusyAction("health");
+    try {
+      const [health, providers] = await Promise.all([
+        invokeTauri<GatewayHealth>("gateway_health"),
+        invokeTauri<ProviderHealthSummary[]>("provider_health_overview"),
+      ]);
+      setGatewayHealth(health);
+      setProviderHealths(providers);
+      setStatusMessage("已刷新网关与 Provider 健康状态。");
+    } catch (error) {
+      setStatusMessage(
+        `健康检查失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  }, []);
+
+  const refreshSessions = useCallback(async (queryForm: SessionQueryForm) => {
+    setBusyAction("sessions");
+    try {
+      const limit = Number.parseInt(queryForm.limit, 10);
+      const query = {
+        agent_name: queryForm.agent_name.trim() || undefined,
+        channel: queryForm.channel.trim() || undefined,
+        contains: queryForm.contains.trim() || undefined,
+        limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+        sort_by: queryForm.sort_by,
+        sort_order: queryForm.sort_order,
+      };
+      const snapshot = await invokeTauri<SessionTreeResponse>(
+        "session_tree_snapshot",
+        { query }
+      );
+      setSessionTree(snapshot);
+      setStatusMessage(`已加载 ${snapshot.returned} 条会话树记录。`);
+    } catch (error) {
+      setStatusMessage(
+        `会话树加载失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshHealth();
-    void refreshSessions();
-  }, []);
+    void refreshSessions(INITIAL_SESSION_QUERY);
+  }, [refreshHealth, refreshSessions]);
 
   const buildInboundPayload = () => {
     if (!parsedMetadata.ok) {
@@ -151,7 +199,7 @@ export function ControlPanel() {
       setChatResult(result);
       setRouteDecision(result.route);
       setStatusMessage(`消息已处理完成，回复来自 Agent：${result.route.agent_name}`);
-      await refreshSessions();
+      await refreshSessions(sessionQuery);
     } catch (error) {
       setStatusMessage(
         `发送消息失败：${error instanceof Error ? error.message : String(error)}`
@@ -161,51 +209,6 @@ export function ControlPanel() {
     }
   };
 
-  const refreshHealth = async () => {
-    setBusyAction("health");
-    try {
-      const [health, providers] = await Promise.all([
-        invokeTauri<GatewayHealth>("gateway_health"),
-        invokeTauri<ProviderHealthSummary[]>("provider_health_overview"),
-      ]);
-      setGatewayHealth(health);
-      setProviderHealths(providers);
-      setStatusMessage("已刷新网关与 Provider 健康状态。");
-    } catch (error) {
-      setStatusMessage(
-        `健康检查失败：${error instanceof Error ? error.message : String(error)}`
-      );
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const refreshSessions = async () => {
-    setBusyAction("sessions");
-    try {
-      const limit = Number.parseInt(sessionQuery.limit, 10);
-      const query = {
-        agent_name: sessionQuery.agent_name.trim() || undefined,
-        channel: sessionQuery.channel.trim() || undefined,
-        contains: sessionQuery.contains.trim() || undefined,
-        limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
-        sort_by: sessionQuery.sort_by,
-        sort_order: sessionQuery.sort_order,
-      };
-      const snapshot = await invokeTauri<SessionTreeResponse>(
-        "session_tree_snapshot",
-        { query }
-      );
-      setSessionTree(snapshot);
-      setStatusMessage(`已加载 ${snapshot.returned} 条会话树记录。`);
-    } catch (error) {
-      setStatusMessage(
-        `会话树加载失败：${error instanceof Error ? error.message : String(error)}`
-      );
-    } finally {
-      setBusyAction(null);
-    }
-  };
 
   return (
     <div className="setup-stack">
@@ -413,7 +416,7 @@ export function ControlPanel() {
           </div>
           <button
             type="button"
-            onClick={() => void refreshSessions()}
+            onClick={() => void refreshSessions(sessionQuery)}
             disabled={busyAction !== null}
           >
             {busyAction === "sessions" ? "加载中..." : "刷新会话树"}

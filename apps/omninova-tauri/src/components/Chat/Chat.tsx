@@ -27,6 +27,30 @@ interface AvatarSession {
 
 type SidebarTab = "avatars" | "channels" | "scheduled";
 
+interface ImChannelEntry {
+  id: string;
+  name: string;
+  platform: string;
+  createdAt: string;
+}
+
+interface ScheduledTaskEntry {
+  id: string;
+  name: string;
+  cron: string;
+  createdAt: string;
+}
+
+const IM_PLATFORM_OPTIONS = [
+  "feishu",
+  "lark",
+  "dingtalk",
+  "wechat",
+  "telegram",
+  "discord",
+  "slack",
+];
+
 interface ChatProps {
   onBack: () => void;
 }
@@ -63,6 +87,12 @@ export function Chat({ onBack }: ChatProps) {
   ]);
   const [activeAvatarId, setActiveAvatarId] = useState("main");
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("avatars");
+  const [channels, setChannels] = useState<ImChannelEntry[]>([]);
+  const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskEntry[]>([]);
+  const [newChannelName, setNewChannelName] = useState("");
+  const [newChannelPlatform, setNewChannelPlatform] = useState(IM_PLATFORM_OPTIONS[0]);
+  const [newTaskName, setNewTaskName] = useState("");
+  const [newTaskCron, setNewTaskCron] = useState("0 9 * * *");
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>({
     main: [],
   });
@@ -116,6 +146,45 @@ export function Chat({ onBack }: ChatProps) {
     ]);
     setMessagesBySession((prev) => ({ ...prev, [id]: [] }));
     setActiveAvatarId(id);
+  };
+
+  const handleCreateChannel = () => {
+    const name = newChannelName.trim();
+    if (!name) {
+      setError("请先输入 IM 频道名称");
+      return;
+    }
+    const entry: ImChannelEntry = {
+      id: `im-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      name,
+      platform: newChannelPlatform,
+      createdAt: formatTime(new Date()),
+    };
+    setChannels((prev) => [entry, ...prev]);
+    setNewChannelName("");
+    setError(null);
+  };
+
+  const handleCreateScheduledTask = () => {
+    const name = newTaskName.trim();
+    const cron = newTaskCron.trim();
+    if (!name) {
+      setError("请先输入定时任务名称");
+      return;
+    }
+    if (!cron) {
+      setError("请先输入 Cron 表达式");
+      return;
+    }
+    const entry: ScheduledTaskEntry = {
+      id: `cron-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      name,
+      cron,
+      createdAt: formatTime(new Date()),
+    };
+    setScheduledTasks((prev) => [entry, ...prev]);
+    setNewTaskName("");
+    setError(null);
   };
 
   const handleCancel = useCallback(() => {
@@ -313,6 +382,81 @@ export function Chat({ onBack }: ChatProps) {
               定时任务
             </button>
           </nav>
+          {sidebarTab === "channels" ? (
+            <section className="chat-sidebar-section">
+              <h3 className="chat-sidebar-heading">创建 IM 频道</h3>
+              <select
+                value={newChannelPlatform}
+                onChange={(event) => setNewChannelPlatform(event.target.value)}
+              >
+                {IM_PLATFORM_OPTIONS.map((platform) => (
+                  <option key={platform} value={platform}>
+                    {platform}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={newChannelName}
+                onChange={(event) => setNewChannelName(event.target.value)}
+                placeholder="频道名称，例如：研发群"
+              />
+              <button type="button" className="chat-new-avatar" onClick={handleCreateChannel}>
+                + 创建 IM 频道
+              </button>
+              <ul className="chat-avatar-list">
+                {channels.length === 0 ? (
+                  <li className="chat-avatar-time">暂无 IM 频道</li>
+                ) : (
+                  channels.map((item) => (
+                    <li key={item.id}>
+                      <div className="chat-avatar-item">
+                        <span className="chat-avatar-icon">#</span>
+                        <span className="chat-avatar-name">{item.name}</span>
+                        <span className="chat-avatar-time">{item.platform}</span>
+                      </div>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </section>
+          ) : null}
+          {sidebarTab === "scheduled" ? (
+            <section className="chat-sidebar-section">
+              <h3 className="chat-sidebar-heading">创建定时任务</h3>
+              <input
+                value={newTaskName}
+                onChange={(event) => setNewTaskName(event.target.value)}
+                placeholder="任务名称，例如：早报推送"
+              />
+              <input
+                value={newTaskCron}
+                onChange={(event) => setNewTaskCron(event.target.value)}
+                placeholder="Cron，例如：0 9 * * *"
+              />
+              <button
+                type="button"
+                className="chat-new-avatar"
+                onClick={handleCreateScheduledTask}
+              >
+                + 创建定时任务
+              </button>
+              <ul className="chat-avatar-list">
+                {scheduledTasks.length === 0 ? (
+                  <li className="chat-avatar-time">暂无定时任务</li>
+                ) : (
+                  scheduledTasks.map((task) => (
+                    <li key={task.id}>
+                      <div className="chat-avatar-item">
+                        <span className="chat-avatar-icon">⏰</span>
+                        <span className="chat-avatar-name">{task.name}</span>
+                        <span className="chat-avatar-time">{task.cron}</span>
+                      </div>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </section>
+          ) : null}
         </aside>
 
         <main className="chat-main">

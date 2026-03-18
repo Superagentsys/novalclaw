@@ -178,8 +178,8 @@ impl Default for Config {
             config_path: omninova_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".into()),
-            default_model: Some("anthropic/claude-sonnet-4-20250514".into()),
+            default_provider: Some("doubao".into()),
+            default_model: Some("doubao-seed-2-0-pro-260215".into()),
             default_temperature: 0.7,
             provider_api: None,
             model_providers: HashMap::new(),
@@ -754,12 +754,26 @@ pub struct MemoryConfig {
     pub qdrant_url: Option<String>,
     pub qdrant_collection: Option<String>,
     pub qdrant_api_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub search_expand_query: bool,
+    #[serde(default = "default_memory_search_recency_weight")]
+    pub search_recency_weight: f64,
+    #[serde(default = "default_memory_search_half_life_days")]
+    pub search_recency_half_life_days: f64,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
 }
 
 fn default_memory_backend() -> String {
     "sqlite".into()
+}
+
+fn default_memory_search_recency_weight() -> f64 {
+    2.0
+}
+
+fn default_memory_search_half_life_days() -> f64 {
+    7.0
 }
 
 impl Default for MemoryConfig {
@@ -770,6 +784,9 @@ impl Default for MemoryConfig {
             qdrant_url: None,
             qdrant_collection: None,
             qdrant_api_key: None,
+            search_expand_query: default_true(),
+            search_recency_weight: default_memory_search_recency_weight(),
+            search_recency_half_life_days: default_memory_search_half_life_days(),
             embedding: EmbeddingConfig::default(),
         }
     }

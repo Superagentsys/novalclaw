@@ -684,6 +684,7 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
         "ollama" => Some("http://localhost:11434/v1".to_string()),
         "deepseek" => Some("https://api.deepseek.com".to_string()),
         "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        "doubao" => Some("https://ark.cn-beijing.volces.com/api/v3".to_string()),
         "moonshot" => Some("https://api.moonshot.cn/v1".to_string()),
         "groq" => Some("https://api.groq.com/openai/v1".to_string()),
         "xai" => Some("https://api.x.ai/v1".to_string()),

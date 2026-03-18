@@ -1,4 +1,5 @@
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::memory::search::rank_entries;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -111,10 +112,7 @@ impl Memory for FileMemory {
             })
             .cloned()
             .collect();
-
-        // Simple scoring based on length match or something trivial for now
-        // In a real vector store, this would be semantic similarity
-        matches.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)); // Newest first
+        matches = rank_entries(query, matches);
         matches.truncate(limit);
         
         Ok(matches)

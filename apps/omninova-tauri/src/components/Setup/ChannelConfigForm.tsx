@@ -39,13 +39,9 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
     onChange({ ...value, [id]: entry });
   };
 
-  const enabledList = useMemo(
-    () =>
-      CHANNEL_PRESETS.filter((preset) => getEntry(preset.id).enabled).map(
-        (preset) => preset.name
-      ),
-    [value]
-  );
+  const enabledList = CHANNEL_PRESETS.filter((preset) =>
+    getEntry(preset.id).enabled
+  ).map((preset) => preset.name);
 
   const entry = selectedPreset
     ? getEntry(selectedPreset.id)

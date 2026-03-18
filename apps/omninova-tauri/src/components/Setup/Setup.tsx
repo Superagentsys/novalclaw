@@ -20,9 +20,9 @@ export interface SetupProps {
 
 const initialConfig: Config = {
   api_key: "",
-  api_url: "",
-  default_provider: "",
-  default_model: "",
+  api_url: "https://ark.cn-beijing.volces.com/api/v3",
+  default_provider: "doubao",
+  default_model: "doubao-seed-2-0-pro-260215",
   robot: DEFAULT_ROBOT_CONFIG,
   providers: DEFAULT_PROVIDERS,
   channels: {
