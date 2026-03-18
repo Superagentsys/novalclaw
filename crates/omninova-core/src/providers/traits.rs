@@ -50,7 +50,7 @@ pub struct ToolCall {
 }
 
 /// Raw token counts from a single LLM API response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -124,7 +124,7 @@ pub enum ConversationMessage {
 ///
 /// Each chunk represents a partial update to the response,
 /// which may contain text delta, tool calls, or completion signal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatStreamChunk {
     /// Incremental text content (may be None for tool-only chunks).
     pub delta: Option<String>,
