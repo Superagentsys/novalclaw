@@ -472,6 +472,56 @@ DROP INDEX IF EXISTS idx_provider_configs_type;
 DROP TABLE IF EXISTS provider_configs;
 "#;
 
+/// Agent default provider migration SQL
+const AGENT_DEFAULT_PROVIDER_SQL: &str = r#"
+-- Migration: 006_agent_default_provider
+-- Description: Add default_provider_id column to agents table for per-agent provider assignment
+
+-- Add default_provider_id column to agents table
+ALTER TABLE agents ADD COLUMN default_provider_id TEXT;
+
+-- Create index for provider lookups
+CREATE INDEX IF NOT EXISTS idx_agents_default_provider ON agents(default_provider_id);
+"#;
+
+/// Agent default provider rollback SQL
+const AGENT_DEFAULT_PROVIDER_DOWN_SQL: &str = r#"
+-- Rollback: 006_agent_default_provider
+-- Note: SQLite doesn't support DROP COLUMN, so we recreate the table
+
+-- Drop index
+DROP INDEX IF EXISTS idx_agents_default_provider;
+
+-- Create a backup of the schema without default_provider_id
+CREATE TABLE agents_backup (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    mbti_type TEXT,
+    system_prompt TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    agent_uuid TEXT,
+    domain TEXT,
+    status TEXT CHECK(status IN ('active', 'inactive', 'archived'))
+);
+
+-- Copy data back (excluding default_provider_id)
+INSERT INTO agents_backup (id, name, description, mbti_type, system_prompt, is_active, created_at, updated_at, agent_uuid, domain, status)
+SELECT id, name, description, mbti_type, system_prompt, is_active, created_at, updated_at, agent_uuid, domain, status
+FROM agents;
+
+-- Drop old table and rename backup
+DROP TABLE agents;
+ALTER TABLE agents_backup RENAME TO agents;
+
+-- Recreate indexes
+CREATE INDEX IF NOT EXISTS idx_agents_uuid ON agents(agent_uuid);
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+CREATE INDEX IF NOT EXISTS idx_agents_mbti_type ON agents(mbti_type);
+"#;
+
 /// Get the built-in migrations
 ///
 /// Returns a list of migrations that are embedded in the binary.
@@ -490,6 +540,9 @@ pub fn get_builtin_migrations() -> Vec<Migration> {
         Migration::new("005_provider_configs", "Add provider_configs table for LLM provider configuration storage")
             .up(PROVIDER_CONFIGS_SQL)
             .down(PROVIDER_CONFIGS_DOWN_SQL),
+        Migration::new("006_agent_default_provider", "Add default_provider_id column to agents table for per-agent provider assignment")
+            .up(AGENT_DEFAULT_PROVIDER_SQL)
+            .down(AGENT_DEFAULT_PROVIDER_DOWN_SQL),
     ]
 }
 
@@ -707,7 +760,7 @@ mod tests {
     #[test]
     fn test_builtin_migrations_include_agent_enhancements() {
         let migrations = get_builtin_migrations();
-        assert_eq!(migrations.len(), 5);
+        assert_eq!(migrations.len(), 6);
         assert_eq!(migrations[0].id, "001_initial");
         assert_eq!(migrations[1].id, "002_agent_enhancements");
         assert!(migrations[1].down_sql.is_some());
@@ -717,6 +770,8 @@ mod tests {
         assert!(migrations[3].down_sql.is_some());
         assert_eq!(migrations[4].id, "005_provider_configs");
         assert!(migrations[4].down_sql.is_some());
+        assert_eq!(migrations[5].id, "006_agent_default_provider");
+        assert!(migrations[5].down_sql.is_some());
     }
 
     #[test]
@@ -727,7 +782,7 @@ mod tests {
         let runner = create_builtin_runner();
         let report = runner.run(&conn).expect("Failed to run migrations");
 
-        assert_eq!(report.applied.len(), 5);
+        assert_eq!(report.applied.len(), 6);
 
         // Verify agent_uuid column exists
         let uuid_count: i32 = conn
@@ -824,12 +879,12 @@ mod tests {
         // Run migrations twice
         let runner = create_builtin_runner();
         let report1 = runner.run(&conn).expect("First run failed");
-        assert_eq!(report1.applied.len(), 5);
+        assert_eq!(report1.applied.len(), 6);
 
         // Second run should skip all
         let report2 = runner.run(&conn).expect("Second run failed");
         assert_eq!(report2.applied.len(), 0);
-        assert_eq!(report2.skipped.len(), 5);
+        assert_eq!(report2.skipped.len(), 6);
     }
 
     #[test]
@@ -907,5 +962,53 @@ mod tests {
         assert!(columns.contains(&"is_default".to_string()));
         assert!(columns.contains(&"created_at".to_string()));
         assert!(columns.contains(&"updated_at".to_string()));
+    }
+
+    #[test]
+    fn test_agent_default_provider_migration_adds_column() {
+        let conn = create_test_connection();
+
+        // Run migrations
+        let runner = create_builtin_runner();
+        runner.run(&conn).expect("Failed to run migrations");
+
+        // Verify default_provider_id column exists
+        let column_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name='default_provider_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 1, "default_provider_id column should exist");
+
+        // Verify index exists
+        let idx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_agents_default_provider'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "idx_agents_default_provider should exist");
+
+        // Test inserting an agent with default_provider_id
+        conn.execute(
+            "INSERT INTO agents (name, agent_uuid, status, default_provider_id) VALUES ('Test Agent', 'test-uuid-456', 'active', 'provider-123')",
+            [],
+        )
+        .unwrap();
+
+        // Query to verify the column works
+        let (name, provider_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, default_provider_id FROM agents WHERE agent_uuid = 'test-uuid-456'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(name, "Test Agent");
+        assert_eq!(provider_id, Some("provider-123".to_string()));
     }
 }

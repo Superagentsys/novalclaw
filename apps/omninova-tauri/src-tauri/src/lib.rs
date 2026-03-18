@@ -1,5 +1,5 @@
 use omninova_core::account::{AccountStore, AccountInfo, NewAccount, AccountUpdate};
-use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig};
+use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig, AgentService, ChatResult, StreamManager, StreamEvent};
 use omninova_core::backup::{
     BackupService, BackupMeta, BackupFormat,
     ImportMode, ImportOptions,
@@ -12,6 +12,7 @@ use omninova_core::gateway::{
     GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionTreeQuery,
     GatewaySessionTreeResponse,
 };
+use omninova_core::memory::factory::build_memory_from_config;
 use omninova_core::privacy::{
     PrivacySettings, StorageInfo, ClearOptions, ClearResult,
 };
@@ -19,6 +20,7 @@ use omninova_core::providers::{ProviderSelection, build_provider_with_selection,
 use omninova_core::routing::RouteDecision;
 use omninova_core::security::EncryptionKeyManager;
 use omninova_core::security::KeyringService;
+use omninova_core::session::{Message, MessageStore, NewMessage, NewSession, Session, SessionStore, SessionUpdate};
 use omninova_core::skills::import_skills_from_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,12 +40,16 @@ struct AppState {
     agent_store: Option<AgentStore>,
     account_store: Option<AccountStore>,
     provider_store: Option<ProviderStore>,
+    session_store: Option<SessionStore>,
+    message_store: Option<MessageStore>,
     /// Config manager with file watcher for hot reload.
     /// This field keeps the watcher alive for the lifetime of the app.
     #[allow(dead_code)]
     config_manager: Option<Arc<ConfigManager>>,
     /// Keyring service for secure API key storage
     keyring_service: Option<Arc<KeyringService>>,
+    /// Stream manager for tracking active streaming sessions
+    stream_manager: StreamManager,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1386,6 +1392,213 @@ async fn test_provider_connection(
 }
 
 // ============================================================================
+// Agent Provider Assignment Commands (Story 3.7)
+// ============================================================================
+
+/// Agent provider validation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProviderValidation {
+    /// Whether the provider is valid for agent assignment
+    is_valid: bool,
+    /// Error messages if validation fails
+    errors: Vec<String>,
+    /// Warning messages (non-blocking issues)
+    warnings: Vec<String>,
+    /// Suggested alternative provider IDs
+    suggestions: Vec<String>,
+}
+
+/// Set the default provider for an agent
+///
+/// Updates the agent's default_provider_id field.
+/// Validates that the provider exists before setting.
+#[tauri::command]
+async fn set_agent_default_provider(
+    agent_uuid: String,
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    // Get stores
+    let agent_store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+    let provider_store = app_state.provider_store.as_ref()
+        .ok_or_else(|| "Provider store not initialized. Call init_provider_store first.".to_string())?;
+
+    // Validate provider exists
+    let provider = provider_store.find_by_id(&provider_id)
+        .map_err(|e| format!("Failed to find provider: {e}"))?
+        .ok_or_else(|| format!("未找到提供商配置: {}", provider_id))?;
+
+    // Update agent with new default provider
+    let updates = omninova_core::agent::AgentUpdate {
+        default_provider_id: Some(provider_id),
+        ..Default::default()
+    };
+
+    let updated_agent = agent_store.update(&agent_uuid, &updates)
+        .map_err(|e| format!("更新代理默认提供商失败: {e}"))?;
+
+    // Return updated agent as JSON
+    serde_json::to_string(&updated_agent).map_err(|e| e.to_string())
+}
+
+/// Get the provider configuration for an agent
+///
+/// Returns the agent's default provider if set, otherwise returns the global default provider.
+/// Returns null if no provider is configured.
+#[tauri::command]
+async fn get_agent_provider(
+    agent_uuid: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<String>, String> {
+    let app_state = state.lock().await;
+
+    // Get stores
+    let agent_store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+    let provider_store = app_state.provider_store.as_ref()
+        .ok_or_else(|| "Provider store not initialized. Call init_provider_store first.".to_string())?;
+
+    // Find the agent
+    let agent = agent_store.find_by_uuid(&agent_uuid)
+        .map_err(|e| format!("查找代理失败: {e}"))?
+        .ok_or_else(|| format!("未找到代理: {}", agent_uuid))?;
+
+    // Get the agent's default provider or fall back to global default
+    let provider = if let Some(ref provider_id) = agent.default_provider_id {
+        // Agent has a specific default provider
+        provider_store.find_by_id(provider_id)
+            .map_err(|e| format!("查找提供商失败: {e}"))?
+    } else {
+        // Fall back to global default provider
+        provider_store.find_default()
+            .map_err(|e| format!("查找默认提供商失败: {e}"))?
+    };
+
+    // Return provider as JSON string or null
+    match provider {
+        Some(p) => Ok(Some(serde_json::to_string(&p).map_err(|e| e.to_string())?)),
+        None => Ok(None),
+    }
+}
+
+/// Validate a provider for agent assignment
+///
+/// Checks if a provider is suitable for use with an agent:
+/// - Provider exists
+/// - Provider has API key configured (if required)
+/// - Provider is not deleted
+///
+/// Returns validation result with suggestions for alternatives.
+#[tauri::command]
+async fn validate_provider_for_agent(
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    // Get stores
+    let provider_store = app_state.provider_store.as_ref()
+        .ok_or_else(|| "Provider store not initialized. Call init_provider_store first.".to_string())?;
+    let keyring_service = app_state.keyring_service.as_ref();
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut suggestions = Vec::new();
+
+    // Check if provider exists
+    let provider = match provider_store.find_by_id(&provider_id)
+        .map_err(|e| format!("查找提供商失败: {e}"))?
+    {
+        Some(p) => p,
+        None => {
+            errors.push(format!("未找到提供商配置: {}", provider_id));
+
+            // Get all available providers as suggestions
+            let all_providers = provider_store.find_all()
+                .map_err(|e| format!("获取提供商列表失败: {e}"))?;
+
+            for p in all_providers.iter().take(3) {
+                suggestions.push(p.id.clone());
+            }
+
+            let result = AgentProviderValidation {
+                is_valid: false,
+                errors,
+                warnings,
+                suggestions,
+            };
+
+            return serde_json::to_string(&result).map_err(|e| e.to_string());
+        }
+    };
+
+    // Check if API key is configured (for providers that require it)
+    let provider_type = provider.provider_type;
+    let requires_api_key = !matches!(
+        provider_type,
+        omninova_core::providers::ProviderType::Ollama
+            | omninova_core::providers::ProviderType::LlamaCpp
+            | omninova_core::providers::ProviderType::Vllm
+            | omninova_core::providers::ProviderType::Sglang
+            | omninova_core::providers::ProviderType::LmStudio
+            | omninova_core::providers::ProviderType::Mock
+    );
+
+    if requires_api_key {
+        // Check if API key reference is set
+        let has_key_ref = provider.api_key_ref.is_some();
+
+        // Check if key exists in keyring
+        let key_exists = if let (Some(ref api_key_ref), Some(keyring)) = (&provider.api_key_ref, keyring_service) {
+            if api_key_ref.starts_with("keyring://") {
+                let provider_name = &api_key_ref[10..];
+                keyring.provider_key_exists(provider_name).await.unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Check environment variable as fallback
+        let env_var = provider_type.api_key_env_var();
+        let has_env_key = std::env::var(&env_var).is_ok();
+
+        if !has_key_ref && !has_env_key {
+            errors.push("提供商缺少 API 密钥配置".to_string());
+        } else if has_key_ref && !key_exists && !has_env_key {
+            warnings.push("API 密钥引用已设置但密钥可能不存在".to_string());
+        }
+    }
+
+    // Get alternative providers for suggestions if there are errors
+    if !errors.is_empty() {
+        let all_providers = provider_store.find_all()
+            .map_err(|e| format!("获取提供商列表失败: {e}"))?;
+
+        for p in all_providers.iter()
+            .filter(|p| p.id != provider_id)
+            .take(3)
+        {
+            suggestions.push(p.id.clone());
+        }
+    }
+
+    let result = AgentProviderValidation {
+        is_valid: errors.is_empty(),
+        errors,
+        warnings,
+        suggestions,
+    };
+
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+// ============================================================================
 // Backup Commands
 // ============================================================================
 
@@ -1834,6 +2047,481 @@ async fn get_keyring_store_type(
     Ok(service.store_type().to_string())
 }
 
+// ============================================================================
+// Session Management Commands (Story 4.1)
+// ============================================================================
+
+/// Initialize the session store
+#[tauri::command]
+async fn init_session_store(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock().await;
+
+    // Check if already initialized
+    if app_state.session_store.is_some() && app_state.message_store.is_some() {
+        return Ok(());
+    }
+
+    // Ensure database pool is initialized
+    let pool = if let Some(pool) = &app_state.db_pool {
+        pool.clone()
+    } else {
+        let db_path = omninova_core::db::pool::default_db_path()
+            .map_err(|e| format!("Failed to get database path: {e}"))?;
+
+        let pool = create_pool(&db_path, DbPoolConfig::default())
+            .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+        // Run migrations
+        let conn = pool.get()
+            .map_err(|e| format!("Failed to get database connection: {e}"))?;
+
+        let runner = create_builtin_runner();
+        runner.run(&conn)
+            .map_err(|e| format!("Failed to run migrations: {e}"))?;
+
+        app_state.db_pool = Some(pool.clone());
+        pool
+    };
+
+    // Create stores
+    app_state.session_store = Some(SessionStore::new(pool.clone()));
+    app_state.message_store = Some(MessageStore::new(pool));
+    Ok(())
+}
+
+/// Create a new session
+#[tauri::command]
+async fn create_session(
+    new_session: NewSession,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Session, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+
+    store.create(&new_session).map_err(|e| e.to_string())
+}
+
+/// Get a session by ID
+#[tauri::command]
+async fn get_session(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<Session>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_id(id).map_err(|e| e.to_string())
+}
+
+/// List all sessions for an agent
+#[tauri::command]
+async fn list_sessions_by_agent(
+    agent_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<Session>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_agent(agent_id).map_err(|e| e.to_string())
+}
+
+/// Update a session
+#[tauri::command]
+async fn update_session(
+    id: i64,
+    update: SessionUpdate,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Session, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+
+    store.update(id, &update).map_err(|e| e.to_string())
+}
+
+/// Delete a session
+#[tauri::command]
+async fn delete_session(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+
+    store.delete(id).map_err(|e| e.to_string())
+}
+
+/// Create a new message
+#[tauri::command]
+async fn create_message(
+    new_message: NewMessage,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Message, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.message_store.as_ref()
+        .ok_or_else(|| "Message store not initialized. Call init_session_store first.".to_string())?;
+
+    store.create(&new_message).map_err(|e| e.to_string())
+}
+
+/// List all messages for a session
+#[tauri::command]
+async fn list_messages_by_session(
+    session_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<Message>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.message_store.as_ref()
+        .ok_or_else(|| "Message store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_session(session_id).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Chat Commands (Story 4.2)
+// ============================================================================
+
+/// Request to send a message to an agent
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMessageRequest {
+    /// Agent ID (numeric database ID)
+    agent_id: i64,
+    /// Message content
+    message: String,
+    /// Optional provider selection
+    provider_id: Option<String>,
+    /// Optional model override
+    model: Option<String>,
+}
+
+/// Request to send a message to an existing session
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMessageToSessionRequest {
+    /// Session ID
+    session_id: i64,
+    /// Message content
+    message: String,
+    /// Optional provider selection
+    provider_id: Option<String>,
+    /// Optional model override
+    model: Option<String>,
+}
+
+/// Request to create a new session and send the first message
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionAndSendRequest {
+    /// Agent ID (numeric database ID)
+    agent_id: i64,
+    /// Optional session title
+    title: Option<String>,
+    /// Message content
+    message: String,
+    /// Optional provider selection
+    provider_id: Option<String>,
+    /// Optional model override
+    model: Option<String>,
+}
+
+/// Response from chat commands
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatResponse {
+    /// The assistant's response text
+    response: String,
+    /// The session ID (existing or newly created)
+    session_id: i64,
+    /// The message ID of the assistant's response
+    message_id: i64,
+}
+
+impl From<ChatResult> for ChatResponse {
+    fn from(result: ChatResult) -> Self {
+        ChatResponse {
+            response: result.response,
+            session_id: result.session_id,
+            message_id: result.message_id,
+        }
+    }
+}
+
+/// Send a message to an agent, creating a new session if needed
+#[tauri::command]
+async fn send_message(
+    request: SendMessageRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ChatResponse, String> {
+    let app_state = state.lock().await;
+
+    // Get required stores
+    let agent_store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+    let db_pool = app_state.db_pool.as_ref()
+        .ok_or_else(|| "Database not initialized. Call init_database first.".to_string())?;
+
+    // Get the agent to find its default provider
+    let agent = agent_store.find_by_id(request.agent_id)
+        .map_err(|e| format!("Failed to find agent: {e}"))?
+        .ok_or_else(|| format!("Agent not found: {}", request.agent_id))?;
+
+    // Build provider from config
+    let cfg = app_state.runtime.get_config().await;
+    let provider_selection = ProviderSelection {
+        provider: request.provider_id.or(agent.default_provider_id),
+        model: request.model,
+    };
+    let provider = build_provider_with_selection(&cfg, &provider_selection);
+
+    // Build memory from config
+    let memory = build_memory_from_config(&cfg).await
+        .map_err(|e| format!("Failed to initialize memory: {e}"))?;
+
+    // Create agent service
+    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Send message (creates new session)
+    let result = service.chat(request.agent_id, None, &request.message, provider.as_ref())
+        .await
+        .map_err(|e| format!("Chat failed: {e}"))?;
+
+    Ok(ChatResponse::from(result))
+}
+
+/// Send a message to an existing session
+#[tauri::command]
+async fn send_message_to_session(
+    request: SendMessageToSessionRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ChatResponse, String> {
+    let app_state = state.lock().await;
+
+    // Get required stores
+    let session_store = app_state.session_store.as_ref()
+        .ok_or_else(|| "Session store not initialized. Call init_session_store first.".to_string())?;
+    let db_pool = app_state.db_pool.as_ref()
+        .ok_or_else(|| "Database not initialized. Call init_database first.".to_string())?;
+
+    // Get the session to find its agent
+    let session = session_store.find_by_id(request.session_id)
+        .map_err(|e| format!("Failed to find session: {e}"))?
+        .ok_or_else(|| format!("Session not found: {}", request.session_id))?;
+
+    // Get agent to find provider
+    let agent_store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+    let agent = agent_store.find_by_id(session.agent_id)
+        .map_err(|e| format!("Failed to find agent: {e}"))?
+        .ok_or_else(|| format!("Agent not found: {}", session.agent_id))?;
+
+    // Build provider from config
+    let cfg = app_state.runtime.get_config().await;
+    let provider_selection = ProviderSelection {
+        provider: request.provider_id.or(agent.default_provider_id),
+        model: request.model,
+    };
+    let provider = build_provider_with_selection(&cfg, &provider_selection);
+
+    // Build memory from config
+    let memory = build_memory_from_config(&cfg).await
+        .map_err(|e| format!("Failed to initialize memory: {e}"))?;
+
+    // Create agent service
+    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Send message to existing session
+    let result = service.chat(session.agent_id, Some(request.session_id), &request.message, provider.as_ref())
+        .await
+        .map_err(|e| format!("Chat failed: {e}"))?;
+
+    Ok(ChatResponse::from(result))
+}
+
+/// Create a new session and send the first message
+#[tauri::command]
+async fn create_session_and_send(
+    request: CreateSessionAndSendRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ChatResponse, String> {
+    let app_state = state.lock().await;
+
+    // Get required stores
+    let agent_store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+    let db_pool = app_state.db_pool.as_ref()
+        .ok_or_else(|| "Database not initialized. Call init_database first.".to_string())?;
+
+    // Get the agent to find its default provider
+    let agent = agent_store.find_by_id(request.agent_id)
+        .map_err(|e| format!("Failed to find agent: {e}"))?
+        .ok_or_else(|| format!("Agent not found: {}", request.agent_id))?;
+
+    // Build provider from config
+    let cfg = app_state.runtime.get_config().await;
+    let provider_selection = ProviderSelection {
+        provider: request.provider_id.or(agent.default_provider_id),
+        model: request.model,
+    };
+    let provider = build_provider_with_selection(&cfg, &provider_selection);
+
+    // Build memory from config
+    let memory = build_memory_from_config(&cfg).await
+        .map_err(|e| format!("Failed to initialize memory: {e}"))?;
+
+    // Create agent service
+    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Create session and send first message
+    let result = service.create_session_and_chat(request.agent_id, request.title, &request.message, provider.as_ref())
+        .await
+        .map_err(|e| format!("Chat failed: {e}"))?;
+
+    Ok(ChatResponse::from(result))
+}
+
+// ============================================================================
+// Streaming Chat Commands (Story 4.3)
+// ============================================================================
+
+/// Request to start a streaming chat session
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamChatRequest {
+    /// Agent ID (numeric database ID)
+    agent_id: i64,
+    /// Optional session ID (if continuing a conversation)
+    session_id: Option<i64>,
+    /// Message content
+    message: String,
+    /// Optional provider selection
+    provider_id: Option<String>,
+    /// Optional model override
+    model: Option<String>,
+}
+
+/// Start a streaming chat session.
+///
+/// Events are emitted to the frontend:
+/// - `stream:start`: Stream has started
+/// - `stream:delta`: Incremental content received
+/// - `stream:toolCall`: Tool call during streaming
+/// - `stream:done`: Stream completed successfully
+/// - `stream:error`: Stream encountered an error
+#[tauri::command]
+async fn stream_chat(
+    app: tauri::AppHandle,
+    request: StreamChatRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let (db_pool, agent_store, stream_manager, runtime) = {
+        let app_state = state.lock().await;
+
+        // Get required stores
+        let db_pool = app_state.db_pool.as_ref()
+            .ok_or_else(|| "Database not initialized. Call init_database first.".to_string())?
+            .clone();
+        let agent_store = app_state.agent_store.as_ref()
+            .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?
+            .clone();
+        let runtime = app_state.runtime.clone();
+        let stream_manager = app_state.stream_manager.clone();
+
+        Ok::<_, String>((db_pool, agent_store, stream_manager, runtime))
+    }?;
+
+    // Get the agent to find its default provider
+    let agent = agent_store.find_by_id(request.agent_id)
+        .map_err(|e| format!("Failed to find agent: {e}"))?
+        .ok_or_else(|| format!("Agent not found: {}", request.agent_id))?;
+
+    // Build provider from config
+    let cfg = runtime.get_config().await;
+    let provider_selection = ProviderSelection {
+        provider: request.provider_id.or(agent.default_provider_id),
+        model: request.model,
+    };
+    let provider = build_provider_with_selection(&cfg, &provider_selection);
+
+    // Build memory from config
+    let memory = build_memory_from_config(&cfg).await
+        .map_err(|e| format!("Failed to initialize memory: {e}"))?;
+
+    // Create agent service
+    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Create event emitter closure
+    let app_clone = app.clone();
+    let emit_event = move |event: StreamEvent| {
+        let event_name = event.event_name();
+        if let Err(e) = app_clone.emit(event_name, &event) {
+            tracing::error!("Failed to emit stream event {}: {}", event_name, e);
+        }
+    };
+
+    // Wrap stream_manager in Arc for sharing
+    let stream_manager_arc = Arc::new(stream_manager);
+
+    // Run the streaming chat
+    let result = service.chat_stream(
+        request.agent_id,
+        request.session_id,
+        &request.message,
+        provider.as_ref(),
+        emit_event,
+        Some(stream_manager_arc.clone()),
+    ).await.map_err(|e| format!("Streaming chat failed: {e}"))?;
+
+    // Clean up the stream after completion
+    stream_manager_arc.remove(result.session_id).await;
+
+    Ok(())
+}
+
+/// Cancel an active streaming session.
+///
+/// This will stop the stream and emit a `stream:error` event with code `CANCELLED`.
+#[tauri::command]
+async fn cancel_stream(
+    session_id: i64,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let stream_manager = {
+        let app_state = state.lock().await;
+        app_state.stream_manager.clone()
+    };
+
+    // Check if stream exists and cancel it
+    let was_active = stream_manager.cancel(session_id).await;
+
+    if was_active {
+        // Emit cancellation event
+        let event = StreamEvent::error("CANCELLED", "用户取消了流式响应");
+        if let Err(e) = app.emit(event.event_name(), &event) {
+            tracing::error!("Failed to emit cancel event: {}", e);
+        }
+
+        // Clean up the stream
+        stream_manager.remove(session_id).await;
+    }
+
+    Ok(was_active)
+}
+
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
     let (runtime, running, last_error): (GatewayRuntime, bool, Option<String>) = {
         let app_state = state.lock().await;
@@ -2251,8 +2939,11 @@ pub fn run() {
         agent_store: None,
         account_store: None,
         provider_store: None,
+        session_store: None,
+        message_store: None,
         config_manager: Some(config_manager),
         keyring_service: None,
+        stream_manager: StreamManager::new(),
     }));
 
     tauri::Builder::default()
@@ -2312,6 +3003,10 @@ pub fn run() {
             delete_provider_config,
             set_default_provider_config,
             test_provider_connection,
+            // Agent Provider Assignment commands (Story 3.7)
+            set_agent_default_provider,
+            get_agent_provider,
+            validate_provider_for_agent,
             // Backup commands
             export_config_backup,
             validate_backup_file,
@@ -2330,6 +3025,22 @@ pub fn run() {
             delete_api_key,
             api_key_exists,
             get_keyring_store_type,
+            // Session commands (Story 4.1)
+            init_session_store,
+            create_session,
+            get_session,
+            list_sessions_by_agent,
+            update_session,
+            delete_session,
+            create_message,
+            list_messages_by_session,
+            // Chat commands (Story 4.2)
+            send_message,
+            send_message_to_session,
+            create_session_and_send,
+            // Streaming commands (Story 4.3)
+            stream_chat,
+            cancel_stream,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

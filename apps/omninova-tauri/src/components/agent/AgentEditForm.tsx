@@ -20,9 +20,10 @@ import { cn } from '@/lib/utils';
 import { personalityColors } from '@/lib/personality-colors';
 import { MBTISelector } from './MBTISelector';
 import { PersonalityPreview } from './PersonalityPreview';
+import { ProviderSelector } from './ProviderSelector';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Loader2, Sparkles, UserCircle } from 'lucide-react';
+import { Loader2, Sparkles, UserCircle, Zap } from 'lucide-react';
 import {
   type AgentModel,
   type AgentUpdate,
@@ -41,6 +42,7 @@ interface FormState {
   description: string;
   domain: string;
   mbtiType?: MBTIType;
+  defaultProviderId?: string;
 }
 
 /**
@@ -50,6 +52,8 @@ interface FormErrors {
   name?: string;
   description?: string;
   domain?: string;
+  mbtiType?: string;
+  defaultProviderId?: string;
 }
 
 /**
@@ -117,6 +121,7 @@ function initializeFormState(agent: AgentModel): FormState {
     description: agent.description || '',
     domain: agent.domain || '',
     mbtiType: agent.mbti_type,
+    defaultProviderId: agent.default_provider_id,
   };
 }
 
@@ -184,7 +189,8 @@ export function AgentEditForm({
       formState.name !== original.name ||
       formState.description !== original.description ||
       formState.domain !== original.domain ||
-      formState.mbtiType !== original.mbtiType
+      formState.mbtiType !== original.mbtiType ||
+      formState.defaultProviderId !== original.defaultProviderId
     );
   }, [formState, agent]);
 
@@ -268,6 +274,14 @@ export function AgentEditForm({
     [updateField]
   );
 
+  /** 处理默认提供商选择 */
+  const handleProviderChange = useCallback(
+    (providerId: string | undefined) => {
+      updateField('defaultProviderId', providerId);
+    },
+    [updateField]
+  );
+
   /** 处理表单提交 */
   const handleSubmit = useCallback(async () => {
     // 验证表单
@@ -294,6 +308,9 @@ export function AgentEditForm({
       }
       if (formState.mbtiType !== agent.mbti_type) {
         updates.mbti_type = formState.mbtiType;
+      }
+      if (formState.defaultProviderId !== agent.default_provider_id) {
+        updates.default_provider_id = formState.defaultProviderId;
       }
 
       // 如果没有更改，直接返回
@@ -468,6 +485,23 @@ export function AgentEditForm({
               value={formState.mbtiType}
               onChange={handleMBTIChange}
               disabled={isSubmitting}
+            />
+          </div>
+
+          {/* 默认提供商选择 */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-foreground/70 flex items-center gap-2">
+              <Zap className="w-4 h-4" />
+              默认提供商
+            </label>
+            <p className="text-xs text-muted-foreground">
+              为此代理指定默认的 LLM 提供商。如不指定，将使用全局默认提供商。
+            </p>
+            <ProviderSelector
+              value={formState.defaultProviderId}
+              onChange={handleProviderChange}
+              disabled={isSubmitting}
+              placeholder="选择默认提供商（可选）"
             />
           </div>
         </div>

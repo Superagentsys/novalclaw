@@ -81,6 +81,8 @@ pub struct AgentModel {
     pub system_prompt: Option<String>,
     /// Current status of the agent
     pub status: AgentStatus,
+    /// Default LLM provider ID for this agent
+    pub default_provider_id: Option<String>,
     /// Unix timestamp of creation
     pub created_at: i64,
     /// Unix timestamp of last update
@@ -101,6 +103,8 @@ pub struct NewAgent {
     pub mbti_type: Option<String>,
     /// Optional system prompt
     pub system_prompt: Option<String>,
+    /// Optional default LLM provider ID
+    pub default_provider_id: Option<String>,
 }
 
 /// Error type for agent validation
@@ -147,6 +151,8 @@ pub struct AgentUpdate {
     pub system_prompt: Option<String>,
     /// New status
     pub status: Option<AgentStatus>,
+    /// New default provider ID
+    pub default_provider_id: Option<String>,
 }
 
 impl NewAgent {
@@ -209,6 +215,7 @@ mod tests {
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             status: AgentStatus::Active,
+            default_provider_id: Some("openai-provider".to_string()),
             created_at: 1700000000,
             updated_at: 1700000000,
         };
@@ -216,10 +223,12 @@ mod tests {
         let json = serde_json::to_string(&agent).unwrap();
         assert!(json.contains("\"agentUuid\":\"test-uuid-123\""));
         assert!(json.contains("\"mbtiType\":\"INTJ\""));
+        assert!(json.contains("\"defaultProviderId\":\"openai-provider\""));
 
         let parsed: AgentModel = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, agent.id);
         assert_eq!(parsed.agent_uuid, agent.agent_uuid);
+        assert_eq!(parsed.default_provider_id, Some("openai-provider".to_string()));
     }
 
     #[test]
@@ -230,13 +239,16 @@ mod tests {
             domain: None,
             mbti_type: Some("ENFP".to_string()),
             system_prompt: None,
+            default_provider_id: Some("anthropic-provider".to_string()),
         };
 
         let json = serde_json::to_string(&new_agent).unwrap();
         assert!(json.contains("\"name\":\"New Agent\""));
+        assert!(json.contains("\"defaultProviderId\":\"anthropic-provider\""));
 
         let parsed: NewAgent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "New Agent");
+        assert_eq!(parsed.default_provider_id, Some("anthropic-provider".to_string()));
     }
 
     #[test]
@@ -244,6 +256,7 @@ mod tests {
         let update = AgentUpdate {
             name: Some("Updated Name".to_string()),
             status: Some(AgentStatus::Inactive),
+            default_provider_id: Some("new-provider".to_string()),
             ..Default::default()
         };
 
@@ -251,6 +264,7 @@ mod tests {
         let parsed: AgentUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, Some("Updated Name".to_string()));
         assert_eq!(parsed.status, Some(AgentStatus::Inactive));
+        assert_eq!(parsed.default_provider_id, Some("new-provider".to_string()));
         assert!(parsed.description.is_none());
     }
 
@@ -275,6 +289,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
         assert!(agent.validate().is_ok());
     }
@@ -287,6 +302,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
         assert!(matches!(agent.validate(), Err(AgentValidationError::EmptyName)));
     }
@@ -299,6 +315,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
         assert!(matches!(agent.validate(), Err(AgentValidationError::NameTooLong(100))));
     }
@@ -311,6 +328,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
         assert!(agent.validate().is_ok());
     }

@@ -678,6 +678,7 @@ impl BackupService {
             domain: backup.domain.clone(),
             mbti_type: backup.mbti_type.clone(),
             system_prompt: backup.system_prompt.clone(),
+            default_provider_id: None,
         };
 
         self.agent_store.create(&new_agent)
@@ -1186,6 +1187,7 @@ account: null
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are helpful.".to_string()),
             status: AgentStatus::Active,
+            default_provider_id: None,
             created_at: 1700000000,
             updated_at: 1700000000,
         };
@@ -1368,6 +1370,7 @@ account: null
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
         agent_store.create(&existing).expect("Failed to create existing agent");
 

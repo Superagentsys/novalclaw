@@ -60,8 +60,8 @@ impl AgentStore {
         let timestamp = NewAgent::current_timestamp();
 
         conn.execute(
-            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &uuid,
                 &agent.name,
@@ -70,6 +70,7 @@ impl AgentStore {
                 &agent.mbti_type,
                 &agent.system_prompt,
                 "active", // default status
+                &agent.default_provider_id,
                 timestamp,
                 timestamp,
             ],
@@ -85,6 +86,7 @@ impl AgentStore {
             mbti_type: agent.mbti_type.clone(),
             system_prompt: agent.system_prompt.clone(),
             status: AgentStatus::Active,
+            default_provider_id: agent.default_provider_id.clone(),
             created_at: timestamp,
             updated_at: timestamp,
         })
@@ -94,7 +96,7 @@ impl AgentStore {
     pub fn find_by_uuid(&self, uuid: &str) -> Result<Option<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
              FROM agents WHERE agent_uuid = ?1"
         )?;
 
@@ -110,8 +112,9 @@ impl AgentStore {
                 mbti_type: row.get(5)?,
                 system_prompt: row.get(6)?,
                 status,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                default_provider_id: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         });
 
@@ -126,7 +129,7 @@ impl AgentStore {
     pub fn find_by_id(&self, id: i64) -> Result<Option<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
              FROM agents WHERE id = ?1"
         )?;
 
@@ -142,8 +145,9 @@ impl AgentStore {
                 mbti_type: row.get(5)?,
                 system_prompt: row.get(6)?,
                 status,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                default_provider_id: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         });
 
@@ -158,7 +162,7 @@ impl AgentStore {
     pub fn find_all(&self) -> Result<Vec<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
              FROM agents ORDER BY created_at DESC"
         )?;
 
@@ -174,8 +178,9 @@ impl AgentStore {
                 mbti_type: row.get(5)?,
                 system_prompt: row.get(6)?,
                 status,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                default_provider_id: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })?;
 
@@ -201,10 +206,11 @@ impl AgentStore {
         let new_mbti = updates.mbti_type.as_ref().or(existing.mbti_type.as_ref());
         let new_prompt = updates.system_prompt.as_ref().or(existing.system_prompt.as_ref());
         let new_status = updates.status.unwrap_or(existing.status);
+        let new_provider_id = updates.default_provider_id.as_ref().or(existing.default_provider_id.as_ref());
 
         conn.execute(
-            "UPDATE agents SET name = ?1, description = ?2, domain = ?3, mbti_type = ?4, system_prompt = ?5, status = ?6, updated_at = ?7
-             WHERE agent_uuid = ?8",
+            "UPDATE agents SET name = ?1, description = ?2, domain = ?3, mbti_type = ?4, system_prompt = ?5, status = ?6, default_provider_id = ?7, updated_at = ?8
+             WHERE agent_uuid = ?9",
             params![
                 new_name,
                 new_description,
@@ -212,6 +218,7 @@ impl AgentStore {
                 new_mbti,
                 new_prompt,
                 new_status.to_string(),
+                new_provider_id,
                 timestamp,
                 uuid,
             ],
@@ -226,6 +233,7 @@ impl AgentStore {
             mbti_type: new_mbti.cloned(),
             system_prompt: new_prompt.cloned(),
             status: new_status,
+            default_provider_id: new_provider_id.cloned(),
             created_at: existing.created_at,
             updated_at: timestamp,
         })
@@ -262,7 +270,7 @@ impl AgentStore {
     /// # Behavior
     /// - Generates a new UUID for the duplicate
     /// - Appends " (副本)" to the original name
-    /// - Copies all configuration fields (description, domain, mbti_type, system_prompt)
+    /// - Copies all configuration fields (description, domain, mbti_type, system_prompt, default_provider_id)
     /// - Sets status to 'active' regardless of original status
     /// - Sets new created_at and updated_at timestamps
     pub fn duplicate(&self, uuid: &str) -> Result<AgentModel, AgentStoreError> {
@@ -277,8 +285,8 @@ impl AgentStore {
 
         let conn = self.get_conn()?;
         conn.execute(
-            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &new_uuid,
                 &duplicated_name,
@@ -287,6 +295,7 @@ impl AgentStore {
                 &original.mbti_type,
                 &original.system_prompt,
                 "active", // Always set status to active
+                &original.default_provider_id,
                 timestamp,
                 timestamp,
             ],
@@ -302,6 +311,7 @@ impl AgentStore {
             mbti_type: original.mbti_type,
             system_prompt: original.system_prompt,
             status: AgentStatus::Active,
+            default_provider_id: original.default_provider_id,
             created_at: timestamp,
             updated_at: timestamp,
         })
@@ -333,6 +343,7 @@ mod tests {
             domain: Some("coding".to_string()),
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are a helpful assistant.".to_string()),
+            default_provider_id: Some("openai-provider".to_string()),
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -341,6 +352,7 @@ mod tests {
         assert!(!created.agent_uuid.is_empty());
         assert_eq!(created.name, "Test Agent");
         assert_eq!(created.status, AgentStatus::Active);
+        assert_eq!(created.default_provider_id, Some("openai-provider".to_string()));
     }
 
     #[test]
@@ -353,6 +365,7 @@ mod tests {
             domain: None,
             mbti_type: Some("ENFP".to_string()),
             system_prompt: None,
+            default_provider_id: Some("anthropic-provider".to_string()),
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -363,6 +376,7 @@ mod tests {
         let found = found.unwrap();
         assert_eq!(found.name, "Findable Agent");
         assert_eq!(found.mbti_type, Some("ENFP".to_string()));
+        assert_eq!(found.default_provider_id, Some("anthropic-provider".to_string()));
 
         // Try to find non-existent agent
         let not_found = store.find_by_uuid("non-existent-uuid").expect("Query failed");
@@ -381,6 +395,7 @@ mod tests {
                 domain: None,
                 mbti_type: None,
                 system_prompt: None,
+                default_provider_id: None,
             }).expect("Failed to create agent");
         }
 
@@ -398,11 +413,13 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: Some("original-provider".to_string()),
         }).expect("Failed to create agent");
 
         let updates = AgentUpdate {
             name: Some("Updated Name".to_string()),
             status: Some(AgentStatus::Inactive),
+            default_provider_id: Some("new-provider".to_string()),
             ..Default::default()
         };
 
@@ -410,10 +427,12 @@ mod tests {
         assert_eq!(updated.name, "Updated Name");
         assert_eq!(updated.status, AgentStatus::Inactive);
         assert_eq!(updated.description, Some("Original description".to_string())); // unchanged
+        assert_eq!(updated.default_provider_id, Some("new-provider".to_string()));
 
         // Verify persisted
         let found = store.find_by_uuid(&created.agent_uuid).expect("Failed to find").unwrap();
         assert_eq!(found.name, "Updated Name");
+        assert_eq!(found.default_provider_id, Some("new-provider".to_string()));
     }
 
     #[test]
@@ -435,6 +454,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         // Delete the agent
@@ -464,6 +484,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         let updated = store.update_status(&created.agent_uuid, AgentStatus::Archived).expect("Failed to update status");
@@ -480,6 +501,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         let found = store.find_by_id(created.id).expect("Failed to find by id");
@@ -500,6 +522,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
 
         let result = store.create(&invalid_agent);
@@ -517,6 +540,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         };
 
         let result = store.create(&invalid_agent);
@@ -534,6 +558,7 @@ mod tests {
             domain: Some("coding".to_string()),
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are helpful.".to_string()),
+            default_provider_id: None,
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -578,6 +603,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         // Set original agent to inactive
@@ -598,6 +624,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         // Archive the original
@@ -627,6 +654,7 @@ mod tests {
             domain: None,
             mbti_type: None,
             system_prompt: None,
+            default_provider_id: None,
         }).expect("Failed to create agent");
 
         let all = store.find_all().expect("Failed to find all");

@@ -105,6 +105,17 @@ export interface ProviderWithStatus extends ProviderConfig {
 }
 
 /**
+ * Agent provider validation result
+ * Returned by validate_provider_for_agent command
+ */
+export interface AgentProviderValidation {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+  suggestions: string[];
+}
+
+/**
  * Provider category for UI grouping
  */
 export type ProviderCategory = 'cloud' | 'local' | 'custom';
@@ -184,6 +195,50 @@ export async function testProviderConnection(
 ): Promise<ProviderTestResult> {
   const json = await invokeTauri<string>('test_provider_connection', {
     configJson: JSON.stringify(config),
+  });
+  return JSON.parse(json);
+}
+
+// ============================================================================
+// Agent Provider Assignment Commands (Story 3.7)
+// ============================================================================
+
+/**
+ * Set the default provider for an agent
+ */
+export async function setAgentDefaultProvider(
+  agentUuid: string,
+  providerId: string
+): Promise<void> {
+  await invokeTauri<string>('set_agent_default_provider', {
+    agentUuid,
+    providerId,
+  });
+}
+
+/**
+ * Get the provider configuration for an agent
+ * Returns the agent's default provider if set, otherwise the global default.
+ * Returns null if no provider is configured.
+ */
+export async function getAgentProvider(
+  agentUuid: string
+): Promise<ProviderConfig | null> {
+  const json = await invokeTauri<string | null>('get_agent_provider', {
+    agentUuid,
+  });
+  return json ? JSON.parse(json) : null;
+}
+
+/**
+ * Validate a provider for agent assignment
+ * Checks if a provider is suitable for use with an agent.
+ */
+export async function validateProviderForAgent(
+  providerId: string
+): Promise<AgentProviderValidation> {
+  const json = await invokeTauri<string>('validate_provider_for_agent', {
+    providerId,
   });
   return JSON.parse(json);
 }
