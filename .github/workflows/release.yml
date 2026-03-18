@@ -275,11 +275,22 @@ jobs:
       - name: Collect and deduplicate artifacts
         working-directory: release-assets
         run: |
-          # Find all SHA256SUMS files and merge them
-          find . -name "SHA256SUMS.txt" -exec cat {} \; > SHA256SUMS-merged.txt
-          # Remove duplicates from upload list
-          rm -f */SHA256SUMS.txt
-          mv SHA256SUMS-merged.txt SHA256SUMS.txt
+          rm -f SHA256SUMS.txt
+          find . -mindepth 2 -name "SHA256SUMS.txt" -type f -delete
+          mapfile -t release_files < <(
+            find . -type f \
+              \( -name "*.dmg" -o -name "*.deb" -o -name "*.appimage" -o -name "*.rpm" -o -name "*.exe" -o -name "*.msi" -o -name "*.tar.gz" \) \
+              -print | sort
+          )
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No release artifacts found after download."
+            exit 1
+          fi
+          sha256sum "${release_files[@]}" > SHA256SUMS.txt
+          if [ ! -s SHA256SUMS.txt ]; then
+            echo "Generated SHA256SUMS.txt is empty."
+            exit 1
+          fi
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
