@@ -110,7 +110,8 @@ describe('ProviderSettings', () => {
       render(<ProviderSettings />);
 
       await waitFor(() => {
-        expect(screen.getByText('加载失败')).toBeInTheDocument();
+        // 使用 heading role 来更精确地查找错误标题
+        expect(screen.getByRole('heading', { name: '加载失败' })).toBeInTheDocument();
       });
     });
 
@@ -132,7 +133,7 @@ describe('ProviderSettings', () => {
       render(<ProviderSettings />);
 
       await waitFor(() => {
-        expect(screen.getByText('加载失败')).toBeInTheDocument();
+        expect(screen.getByRole('heading', { name: '加载失败' })).toBeInTheDocument();
       });
 
       const retryButton = screen.getByRole('button', { name: '重试' });
@@ -202,7 +203,8 @@ describe('ProviderSettings', () => {
       fireEvent.click(addButton);
 
       await waitFor(() => {
-        expect(screen.getByText('添加提供商')).toBeInTheDocument();
+        // 使用 heading role 来更精确地查找对话框标题
+        expect(screen.getByRole('heading', { name: '添加提供商' })).toBeInTheDocument();
       });
     });
   });
@@ -269,7 +271,122 @@ describe('ProviderSettings', () => {
       fireEvent.click(addButton);
 
       await waitFor(() => {
-        expect(screen.getByText('添加提供商')).toBeInTheDocument();
+        // 使用 heading role 来更精确地查找对话框标题
+        expect(screen.getByRole('heading', { name: '添加提供商' })).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('页面头部', () => {
+    it('应该显示页面标题', async () => {
+      mockInvokeTauri.mockResolvedValue('[]');
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: '提供商设置' })).toBeInTheDocument();
+      });
+    });
+
+    it('应该显示页面描述', async () => {
+      mockInvokeTauri.mockResolvedValue('[]');
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('管理 LLM 提供商配置和 API 密钥')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('连接状态统计', () => {
+    it('应该显示已连接数量', async () => {
+      const providers = [
+        createMockProvider({ id: '1', name: 'OpenAI', providerType: 'openai' }),
+        createMockProvider({ id: '2', name: 'Anthropic', providerType: 'anthropic' }),
+      ];
+      mockInvokeTauri.mockResolvedValue(JSON.stringify(providers));
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('OpenAI')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('关闭对话框', () => {
+    it('点击取消按钮应该关闭添加对话框', async () => {
+      mockInvokeTauri.mockResolvedValue('[]');
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('暂无提供商')).toBeInTheDocument();
+      });
+
+      // 打开对话框
+      const addButton = screen.getByRole('button', { name: /添加提供商/i });
+      fireEvent.click(addButton);
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: '添加提供商' })).toBeInTheDocument();
+      });
+
+      // 点击取消
+      const cancelButton = screen.getByRole('button', { name: '取消' });
+      fireEvent.click(cancelButton);
+
+      await waitFor(() => {
+        expect(screen.queryByRole('heading', { name: '添加提供商' })).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('编辑对话框关闭', () => {
+    it('编辑后关闭对话框应该清空编辑状态', async () => {
+      const provider = createMockProvider();
+      mockInvokeTauri.mockResolvedValue(JSON.stringify([provider]));
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Test Provider')).toBeInTheDocument();
+      });
+
+      // 打开编辑对话框
+      const editButtons = screen.getAllByRole('button');
+      const editButton = editButtons.find(btn => btn.querySelector('svg.lucide-pencil'));
+      fireEvent.click(editButton!);
+
+      await waitFor(() => {
+        expect(screen.getByText('编辑提供商')).toBeInTheDocument();
+      });
+
+      // 点击取消关闭
+      const cancelButton = screen.getByRole('button', { name: '取消' });
+      fireEvent.click(cancelButton);
+
+      await waitFor(() => {
+        expect(screen.queryByText('编辑提供商')).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('统计信息计算', () => {
+    it('应该正确计算云端和本地提供商数量', async () => {
+      const providers = [
+        createMockProvider({ id: '1', name: 'OpenAI', providerType: 'openai' }),
+        createMockProvider({ id: '2', name: 'Ollama', providerType: 'ollama' }),
+        createMockProvider({ id: '3', name: 'LMStudio', providerType: 'lmstudio' }),
+      ];
+      mockInvokeTauri.mockResolvedValue(JSON.stringify(providers));
+
+      render(<ProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('1 个云端')).toBeInTheDocument();
+        expect(screen.getByText('2 个本地')).toBeInTheDocument();
       });
     });
   });

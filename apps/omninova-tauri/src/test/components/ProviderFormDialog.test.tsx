@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '../utils';
+import userEvent from '@testing-library/user-event';
 import { ProviderFormDialog } from '@/components/settings/ProviderFormDialog';
 import type { ProviderWithStatus, NewProviderConfig, ProviderConfigUpdate } from '@/types/provider';
 
@@ -64,6 +65,7 @@ describe('ProviderFormDialog', () => {
     });
 
     it('应该显示云端和本地提供商选项', async () => {
+      const user = userEvent.setup();
       render(
         <ProviderFormDialog
           open={true}
@@ -75,7 +77,7 @@ describe('ProviderFormDialog', () => {
       // 打开提供商类型选择器 (第一个 combobox)
       const triggers = screen.getAllByRole('combobox');
       const providerTypeTrigger = triggers[0];
-      fireEvent.click(providerTypeTrigger);
+      await user.click(providerTypeTrigger);
 
       await waitFor(() => {
         expect(screen.getByText('云端服务')).toBeInTheDocument();
@@ -98,6 +100,7 @@ describe('ProviderFormDialog', () => {
     });
 
     it('选择提供商类型后应该填充默认值', async () => {
+      const user = userEvent.setup();
       render(
         <ProviderFormDialog
           open={true}
@@ -109,13 +112,14 @@ describe('ProviderFormDialog', () => {
       // 打开提供商类型选择器 (第一个 combobox)
       const triggers = screen.getAllByRole('combobox');
       const providerTypeTrigger = triggers[0];
-      fireEvent.click(providerTypeTrigger);
+      await user.click(providerTypeTrigger);
 
+      // 等待选项出现并点击 Ollama
       await waitFor(() => {
-        expect(screen.getByText('Ollama')).toBeInTheDocument();
+        expect(screen.getByRole('option', { name: 'Ollama' })).toBeInTheDocument();
       });
 
-      fireEvent.click(screen.getByText('Ollama'));
+      await user.click(screen.getByRole('option', { name: 'Ollama' }));
 
       // 应该填充默认 Base URL
       await waitFor(() => {
@@ -331,7 +335,7 @@ describe('ProviderFormDialog', () => {
       );
 
       // 填写并提交
-      const nameInput = screen.getByLabelText(/显示名称/i);
+      const nameInput = screen.getByPlaceholderText('输入提供商名称');
       fireEvent.change(nameInput, { target: { value: 'My OpenAI' } });
 
       const apiKeyInput = screen.getByPlaceholderText(/输入 API 密钥/);
@@ -357,7 +361,7 @@ describe('ProviderFormDialog', () => {
       );
 
       // 填写并提交
-      const nameInput = screen.getByLabelText(/显示名称/i);
+      const nameInput = screen.getByPlaceholderText('输入提供商名称');
       fireEvent.change(nameInput, { target: { value: 'My OpenAI' } });
 
       const apiKeyInput = screen.getByPlaceholderText(/输入 API 密钥/);

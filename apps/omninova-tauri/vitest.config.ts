@@ -17,10 +17,18 @@ export default defineConfig({
         'src/test/',
       ],
     },
+    deps: {
+      // Inline zustand so it uses react from app's node_modules
+      inline: ['zustand'],
+    },
   },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // Fix for monorepo: zustand imports react from root node_modules
+      // but react is installed in app's node_modules
+      react: path.resolve(__dirname, './node_modules/react'),
+      'react-dom': path.resolve(__dirname, './node_modules/react-dom'),
     },
   },
 })
