@@ -56,7 +56,7 @@ impl Agent {
             &self.tool_specs,
             self.config.max_tool_iterations,
         );
-        dispatcher.run(&mut self.messages).await
+        dispatcher.run(&mut self.messages).await.map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     pub fn import_messages(&mut self, messages: Vec<ChatMessage>) {
