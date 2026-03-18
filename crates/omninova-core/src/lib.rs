@@ -15,6 +15,7 @@ pub mod privacy;
 pub mod providers;
 pub mod routing;
 pub mod security;
+pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod util;
@@ -25,6 +26,10 @@ pub use config::{AgentConfig, Config};
 pub use cron::{CronScheduler, CronStore};
 pub use memory::backend::{InMemoryMemory, MockMemory};
 pub use providers::{MockProvider, OpenAiProvider};
+pub use session::{
+    Message, MessageRole, MessageStore, NewMessage, NewSession, Session, SessionStore,
+    SessionUpdate,
+};
 
 pub fn init() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
