@@ -5,11 +5,14 @@
  * markdown rendering, and cancellation support.
  *
  * [Source: Story 4.3 - 流式响应处理]
+ * [Source: Story 4.5 - 打字指示器与加载状态]
  */
 
 import { useEffect, useRef, useState, memo } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { type MBTIType } from '@/lib/personality-colors';
+import TypingIndicator from './TypingIndicator';
 
 /**
  * Props for StreamingMessage component
@@ -29,6 +32,8 @@ export interface StreamingMessageProps {
   showReasoning?: boolean;
   /** Agent name for attribution */
   agentName?: string;
+  /** Agent MBTI personality type for typing indicator theming */
+  personalityType?: MBTIType;
 }
 
 /**
@@ -40,19 +45,6 @@ function TypingCursor() {
       className="inline-block w-2 h-4 ml-0.5 bg-current animate-pulse"
       aria-hidden="true"
     />
-  );
-}
-
-/**
- * Typing indicator shown before first content arrives
- */
-function TypingIndicator() {
-  return (
-    <div className="flex items-center gap-1 py-2" aria-label="正在输入">
-      <span className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce [animation-delay:0ms]" />
-      <span className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce [animation-delay:150ms]" />
-      <span className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce [animation-delay:300ms]" />
-    </div>
   );
 }
 
@@ -218,6 +210,7 @@ export const StreamingMessage = memo(function StreamingMessage({
   className,
   showReasoning = true,
   agentName,
+  personalityType,
 }: StreamingMessageProps) {
   const [showReasoningExpanded, setShowReasoningExpanded] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -276,7 +269,7 @@ export const StreamingMessage = memo(function StreamingMessage({
       {/* Main content area */}
       <div ref={contentRef} className="flex-1 overflow-auto">
         {!hasContent && isStreaming ? (
-          <TypingIndicator />
+          <TypingIndicator personalityType={personalityType} />
         ) : (
           <div className="prose prose-sm dark:prose-invert max-w-none">
             {renderFormattedText(content)}
