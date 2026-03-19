@@ -830,7 +830,7 @@ mod tests {
         let runner = create_builtin_runner();
         let report = runner.run(&conn).expect("Failed to run migrations");
 
-        assert_eq!(report.applied.len(), 6);
+        assert_eq!(report.applied.len(), 7);
 
         // Verify agent_uuid column exists
         let uuid_count: i32 = conn
@@ -927,12 +927,12 @@ mod tests {
         // Run migrations twice
         let runner = create_builtin_runner();
         let report1 = runner.run(&conn).expect("First run failed");
-        assert_eq!(report1.applied.len(), 6);
+        assert_eq!(report1.applied.len(), 7);
 
         // Second run should skip all
         let report2 = runner.run(&conn).expect("Second run failed");
         assert_eq!(report2.applied.len(), 0);
-        assert_eq!(report2.skipped.len(), 6);
+        assert_eq!(report2.skipped.len(), 7);
     }
 
     #[test]

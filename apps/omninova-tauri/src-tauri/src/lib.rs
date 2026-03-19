@@ -2206,6 +2206,8 @@ struct SendMessageRequest {
     provider_id: Option<String>,
     /// Optional model override
     model: Option<String>,
+    /// Optional ID of a message to quote/reply to
+    quote_message_id: Option<i64>,
 }
 
 /// Request to send a message to an existing session
@@ -2220,6 +2222,8 @@ struct SendMessageToSessionRequest {
     provider_id: Option<String>,
     /// Optional model override
     model: Option<String>,
+    /// Optional ID of a message to quote/reply to
+    quote_message_id: Option<i64>,
 }
 
 /// Request to create a new session and send the first message
@@ -2236,6 +2240,8 @@ struct CreateSessionAndSendRequest {
     provider_id: Option<String>,
     /// Optional model override
     model: Option<String>,
+    /// Optional ID of a message to quote/reply to
+    quote_message_id: Option<i64>,
 }
 
 /// Response from chat commands
@@ -2295,7 +2301,7 @@ async fn send_message(
     let service = AgentService::new(db_pool.clone(), memory, Vec::new());
 
     // Send message (creates new session)
-    let result = service.chat(request.agent_id, None, &request.message, provider.as_ref())
+    let result = service.chat(request.agent_id, None, &request.message, provider.as_ref(), request.quote_message_id)
         .await
         .map_err(|e| format!("Chat failed: {e}"))?;
 
@@ -2344,7 +2350,7 @@ async fn send_message_to_session(
     let service = AgentService::new(db_pool.clone(), memory, Vec::new());
 
     // Send message to existing session
-    let result = service.chat(session.agent_id, Some(request.session_id), &request.message, provider.as_ref())
+    let result = service.chat(session.agent_id, Some(request.session_id), &request.message, provider.as_ref(), request.quote_message_id)
         .await
         .map_err(|e| format!("Chat failed: {e}"))?;
 
@@ -2386,7 +2392,7 @@ async fn create_session_and_send(
     let service = AgentService::new(db_pool.clone(), memory, Vec::new());
 
     // Create session and send first message
-    let result = service.create_session_and_chat(request.agent_id, request.title, &request.message, provider.as_ref())
+    let result = service.create_session_and_chat(request.agent_id, request.title, &request.message, provider.as_ref(), request.quote_message_id)
         .await
         .map_err(|e| format!("Chat failed: {e}"))?;
 
@@ -2411,6 +2417,8 @@ struct StreamChatRequest {
     provider_id: Option<String>,
     /// Optional model override
     model: Option<String>,
+    /// Optional ID of a message to quote/reply to
+    quote_message_id: Option<i64>,
 }
 
 /// Start a streaming chat session.
@@ -2483,6 +2491,7 @@ async fn stream_chat(
         provider.as_ref(),
         emit_event,
         Some(stream_manager_arc.clone()),
+        request.quote_message_id,
     ).await.map_err(|e| format!("Streaming chat failed: {e}"))?;
 
     // Clean up the stream after completion

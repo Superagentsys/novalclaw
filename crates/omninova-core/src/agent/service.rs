@@ -104,13 +104,15 @@ impl AgentService {
     /// Send a message to an agent, optionally within an existing session
     ///
     /// If `session_id` is `None`, a new session will be created.
-    #[instrument(skip(self, provider), fields(agent_id = agent_id, session_id = ?session_id))]
+    /// If `quote_message_id` is provided, the message will be marked as a reply to that message.
+    #[instrument(skip(self, provider), fields(agent_id = agent_id, session_id = ?session_id, quote_message_id = ?quote_message_id))]
     pub async fn chat(
         &self,
         agent_id: i64,
         session_id: Option<i64>,
         message: &str,
         provider: &dyn Provider,
+        quote_message_id: Option<i64>,
     ) -> Result<ChatResult, AgentServiceError> {
         // 1. Load agent configuration
         let agent = self
@@ -152,7 +154,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::User,
             content: message.to_string(),
-            quote_message_id: None,
+            quote_message_id,
         };
         let saved_user_msg = self.message_store.create(&user_msg)?;
         messages.push(ChatMessage::user(message));
@@ -217,6 +219,7 @@ impl AgentService {
     /// * `title` - Optional title for the session
     /// * `message` - The user message
     /// * `provider` - The LLM provider to use
+    /// * `quote_message_id` - Optional ID of a message to quote/reply to
     ///
     /// # Returns
     /// Returns `ChatResult` containing the session ID and assistant response.
@@ -226,6 +229,7 @@ impl AgentService {
         title: Option<String>,
         message: &str,
         provider: &dyn Provider,
+        quote_message_id: Option<i64>,
     ) -> Result<ChatResult, AgentServiceError> {
         // Create new session with optional title
         let new_session = NewSession {
@@ -235,7 +239,7 @@ impl AgentService {
         let session = self.session_store.create(&new_session)?;
 
         // Use the chat method with the new session
-        self.chat(agent_id, Some(session.id), message, provider).await
+        self.chat(agent_id, Some(session.id), message, provider, quote_message_id).await
     }
 
     /// Stream a chat response with real-time events
@@ -250,11 +254,12 @@ impl AgentService {
     /// * `provider` - The LLM provider to use
     /// * `on_event` - Callback for streaming events
     /// * `stream_manager` - Manager for tracking/cancelling active streams
+    /// * `quote_message_id` - Optional ID of a message to quote/reply to
     ///
     /// # Returns
     /// Returns `ChatResult` on success, or `AgentServiceError` on failure.
     /// If the stream is cancelled, returns `AgentServiceError::StreamCancelled`.
-    #[instrument(skip(self, provider, on_event, stream_manager), fields(agent_id = agent_id, session_id = ?session_id))]
+    #[instrument(skip(self, provider, on_event, stream_manager), fields(agent_id = agent_id, session_id = ?session_id, quote_message_id = ?quote_message_id))]
     pub async fn chat_stream<F>(
         &self,
         agent_id: i64,
@@ -263,6 +268,7 @@ impl AgentService {
         provider: &dyn Provider,
         mut on_event: F,
         stream_manager: Option<Arc<StreamManager>>,
+        quote_message_id: Option<i64>,
     ) -> Result<ChatResult, AgentServiceError>
     where
         F: FnMut(StreamEvent) + Send,
@@ -307,7 +313,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::User,
             content: message.to_string(),
-            quote_message_id: None,
+            quote_message_id,
         };
         let saved_user_msg = self.message_store.create(&user_msg)?;
 
@@ -538,6 +544,7 @@ impl AgentService {
         provider: &dyn Provider,
         on_event: F,
         stream_manager: Option<Arc<StreamManager>>,
+        quote_message_id: Option<i64>,
     ) -> Result<ChatResult, AgentServiceError>
     where
         F: FnMut(StreamEvent) + Send,
@@ -550,7 +557,7 @@ impl AgentService {
         let session = self.session_store.create(&new_session)?;
 
         // Then stream the message
-        self.chat_stream(agent_id, Some(session.id), message, provider, on_event, stream_manager)
+        self.chat_stream(agent_id, Some(session.id), message, provider, on_event, stream_manager, quote_message_id)
             .await
     }
 
@@ -787,6 +794,7 @@ mod tests {
                     events_clone.lock().unwrap().push(event);
                 },
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -834,6 +842,7 @@ mod tests {
                 &provider,
                 |_event| {},
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -912,6 +921,7 @@ mod tests {
                     events_clone.lock().unwrap().push(event);
                 },
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -959,6 +969,7 @@ mod tests {
                     &provider1,
                     move |e| events1_clone.lock().unwrap().push(e),
                     None,
+                    None, // quote_message_id
                 )
                 .await
         });
@@ -972,6 +983,7 @@ mod tests {
                     &provider2,
                     move |e| events2_clone.lock().unwrap().push(e),
                     None,
+                    None, // quote_message_id
                 )
                 .await
         });
@@ -1021,6 +1033,7 @@ mod tests {
                 &provider,
                 move |e| events_clone.lock().unwrap().push(e),
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -1053,6 +1066,7 @@ mod tests {
                 &provider,
                 |_| {},
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -1077,6 +1091,7 @@ mod tests {
                 &provider,
                 |_| {},
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -1101,6 +1116,7 @@ mod tests {
                 &provider,
                 |_| {},
                 None,
+                None, // quote_message_id
             )
             .await;
 
@@ -1116,5 +1132,64 @@ mod tests {
         assert!(session.is_some());
         let session = session.unwrap();
         assert_eq!(session.title, Some("Test Session".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_quote_message_id() {
+        // Test that quote_message_id is persisted when sending a message
+        let (service, _dir) = create_test_service();
+        let agent_id = create_test_agent(&service.agent_store);
+
+        // Create a provider
+        let provider = MockStreamingProvider::with_text_chunks(vec!["Response"]);
+
+        // First, create a session and send an initial message
+        let result1 = service
+            .chat(agent_id, None, "Original message", &provider, None)
+            .await
+            .expect("First chat should succeed");
+
+        // Get the user message ID from the session
+        let messages = service
+            .message_store
+            .find_by_session(result1.session_id)
+            .expect("Should find messages");
+
+        // Find the user message (should be the first one)
+        let original_user_msg = messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .expect("Should have user message");
+
+        // Now send a reply with quote_message_id
+        let result2 = service
+            .chat(
+                agent_id,
+                Some(result1.session_id),
+                "Reply to original message",
+                &provider,
+                Some(original_user_msg.id),
+            )
+            .await
+            .expect("Reply chat should succeed");
+
+        // Verify the reply message has quote_message_id set
+        let messages_after = service
+            .message_store
+            .find_by_session(result2.session_id)
+            .expect("Should find messages");
+
+        // Find the reply user message
+        let reply_user_msg = messages_after
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .find(|m| m.content == "Reply to original message")
+            .expect("Should have reply user message");
+
+        assert_eq!(
+            reply_user_msg.quote_message_id,
+            Some(original_user_msg.id),
+            "Reply message should have quote_message_id set"
+        );
     }
 }
