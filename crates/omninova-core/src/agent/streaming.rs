@@ -273,7 +273,7 @@ impl ActiveStream {
 ///
 /// This is used to support stream cancellation and to track
 /// streaming state per window/session.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StreamManager {
     /// Active streams keyed by session ID.
     streams: Arc<RwLock<HashMap<i64, ActiveStream>>>,
