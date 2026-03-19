@@ -152,6 +152,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::User,
             content: message.to_string(),
+            quote_message_id: None,
         };
         let saved_user_msg = self.message_store.create(&user_msg)?;
         messages.push(ChatMessage::user(message));
@@ -189,6 +190,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::Assistant,
             content: response.clone(),
+            quote_message_id: None,
         };
         let saved_assistant_msg = self.message_store.create(&assistant_msg)?;
 
@@ -305,6 +307,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::User,
             content: message.to_string(),
+            quote_message_id: None,
         };
         let saved_user_msg = self.message_store.create(&user_msg)?;
 
@@ -369,6 +372,7 @@ impl AgentService {
                             session_id: session.id,
                             role: MessageRole::Assistant,
                             content: accumulator.final_content(),
+                            quote_message_id: None,
                         };
                         let _ = self.message_store.create(&partial_msg);
                     }
@@ -451,6 +455,7 @@ impl AgentService {
                                 session_id: session.id,
                                 role: MessageRole::Assistant,
                                 content: accumulator.final_content(),
+                                quote_message_id: None,
                             };
                             let _ = self.message_store.create(&partial_msg);
                         }
@@ -479,6 +484,7 @@ impl AgentService {
                             session_id: session.id,
                             role: MessageRole::Assistant,
                             content: accumulator.final_content(),
+                            quote_message_id: None,
                         };
                         let _ = self.message_store.create(&partial_msg);
                     }
@@ -496,6 +502,7 @@ impl AgentService {
             session_id: session.id,
             role: MessageRole::Assistant,
             content: response.clone(),
+            quote_message_id: None,
         };
         let saved_assistant_msg = self.message_store.create(&assistant_msg)?;
 

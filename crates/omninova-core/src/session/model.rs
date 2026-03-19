@@ -266,6 +266,7 @@ mod tests {
             role: MessageRole::User,
             content: "Hello, world!".to_string(),
             created_at: 1700000000,
+            quote_message_id: None,
         };
 
         let json = serde_json::to_string(&message).unwrap();
@@ -284,6 +285,7 @@ mod tests {
             session_id: 1,
             role: MessageRole::Assistant,
             content: "I am here to help.".to_string(),
+            quote_message_id: None,
         };
 
         let json = serde_json::to_string(&new_message).unwrap();
@@ -301,6 +303,7 @@ mod tests {
             session_id: 1,
             role: MessageRole::User,
             content: "Valid message".to_string(),
+            quote_message_id: None,
         };
         assert!(message.validate().is_ok());
     }
@@ -311,6 +314,7 @@ mod tests {
             session_id: 1,
             role: MessageRole::User,
             content: "   ".to_string(), // Whitespace only
+            quote_message_id: None,
         };
         assert!(matches!(message.validate(), Err(MessageValidationError::EmptyContent)));
     }
@@ -321,6 +325,7 @@ mod tests {
             session_id: 1,
             role: MessageRole::User,
             content: "x".repeat(100_001), // Exceeds 100K limit
+            quote_message_id: None,
         };
         assert!(matches!(message.validate(), Err(MessageValidationError::ContentTooLong(100_000))));
     }
