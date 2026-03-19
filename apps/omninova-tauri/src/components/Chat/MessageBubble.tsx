@@ -2,9 +2,10 @@
  * Message Bubble Component
  *
  * Displays individual chat messages with role-based styling,
- * personality color theming, and timestamp formatting.
+ * personality color theming, timestamp formatting, and quote preview.
  *
  * [Source: Story 4.4 - ChatInterface 组件基础]
+ * [Source: Story 4.8 - 消息引用功能]
  */
 
 import { memo } from 'react';
@@ -30,6 +31,26 @@ export interface MessageBubbleProps {
   className?: string;
   /** Whether to show timestamp */
   showTimestamp?: boolean;
+  /**
+   * ID of quoted message (if this message is a reply)
+   * When set, displays a preview of the quoted message
+   */
+  quoteMessageId?: number;
+  /**
+   * Callback when quote preview is clicked
+   * Passes the quoted message ID for scroll/navigation
+   */
+  onQuoteClick?: (messageId: number) => void;
+  /**
+   * Content preview of quoted message
+   * Required when quoteMessageId is set
+   */
+  quoteContent?: string;
+  /**
+   * Role of the quoted message sender
+   * Required when quoteMessageId is set
+   */
+  quoteRole?: MessageRole;
 }
 
 /**
@@ -121,6 +142,26 @@ function renderFormattedText(text: string): React.ReactNode {
 }
 
 /**
+ * Maximum characters for quote preview
+ */
+const QUOTE_PREVIEW_LENGTH = 80;
+
+/**
+ * Truncate text for quote preview
+ */
+function truncateForQuote(text: string): string {
+  if (text.length <= QUOTE_PREVIEW_LENGTH) return text;
+  return text.slice(0, QUOTE_PREVIEW_LENGTH).trim() + '...';
+}
+
+/**
+ * Get sender label for quote based on role
+ */
+function getQuoteSenderLabel(role: MessageRole): string {
+  return role === 'user' ? '用户' : 'AI';
+}
+
+/**
  * MessageBubble component
  *
  * Displays a single chat message with appropriate styling based on role.
@@ -146,10 +187,17 @@ export const MessageBubble = memo(function MessageBubble({
   agentName,
   className,
   showTimestamp = true,
+  quoteMessageId,
+  onQuoteClick,
+  quoteContent,
+  quoteRole,
 }: MessageBubbleProps) {
   const isUser = role === 'user';
   const isAssistant = role === 'assistant';
   const isSystem = role === 'system';
+
+  // Determine if we should show quote preview
+  const showQuote = quoteMessageId !== undefined && quoteContent !== undefined;
 
   // Get personality colors for assistant messages
   const personalityColors = isAssistant && personalityType
@@ -161,6 +209,13 @@ export const MessageBubble = memo(function MessageBubble({
   const bubbleStyle = isAssistant && personalityColors
     ? { borderLeftColor: personalityColors.primary }
     : undefined;
+
+  // Handle quote click
+  const handleQuoteClick = () => {
+    if (quoteMessageId !== undefined && onQuoteClick) {
+      onQuoteClick(quoteMessageId);
+    }
+  };
 
   return (
     <div
@@ -175,6 +230,27 @@ export const MessageBubble = memo(function MessageBubble({
         <span className="text-xs text-muted-foreground font-medium px-1">
           {agentName}
         </span>
+      )}
+
+      {/* Quote preview (if this message quotes another) */}
+      {showQuote && quoteContent && quoteRole && (
+        <button
+          type="button"
+          onClick={handleQuoteClick}
+          className={cn(
+            'w-full text-left px-3 py-1.5 rounded-md mb-1',
+            'border-l-2 text-xs text-muted-foreground',
+            'hover:bg-muted/50 transition-colors cursor-pointer',
+            'focus:outline-none focus:ring-1 focus:ring-ring',
+            quoteRole === 'user' ? 'border-l-primary/60' : 'border-l-primary'
+          )}
+          aria-label="跳转到被引用的消息"
+        >
+          <span className="font-medium">
+            {getQuoteSenderLabel(quoteRole)}:
+          </span>
+          <span className="ml-1">{truncateForQuote(quoteContent)}</span>
+        </button>
       )}
 
       {/* Message bubble */}

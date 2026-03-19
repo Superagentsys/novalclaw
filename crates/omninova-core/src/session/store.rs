@@ -220,13 +220,14 @@ impl MessageStore {
         let role_str = new_message.role.to_string();
 
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO messages (session_id, role, content, created_at, quote_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 new_message.session_id,
                 role_str,
                 new_message.content,
                 timestamp,
+                new_message.quote_message_id,
             ],
         )?;
 
@@ -243,6 +244,7 @@ impl MessageStore {
             role: new_message.role,
             content: new_message.content.clone(),
             created_at: timestamp,
+            quote_message_id: new_message.quote_message_id,
         })
     }
 
@@ -250,7 +252,7 @@ impl MessageStore {
     pub fn find_by_id(&self, id: i64) -> Result<Option<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at
+            "SELECT id, session_id, role, content, created_at, quote_message_id
              FROM messages WHERE id = ?1"
         )?;
 
@@ -263,6 +265,7 @@ impl MessageStore {
                 role,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                quote_message_id: row.get(5)?,
             })
         });
 
@@ -277,7 +280,7 @@ impl MessageStore {
     pub fn find_by_session(&self, session_id: i64) -> Result<Vec<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at
+            "SELECT id, session_id, role, content, created_at, quote_message_id
              FROM messages WHERE session_id = ?1
              ORDER BY created_at ASC"
         )?;
@@ -291,6 +294,7 @@ impl MessageStore {
                 role,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                quote_message_id: row.get(5)?,
             })
         })?;
 
@@ -305,7 +309,7 @@ impl MessageStore {
     pub fn find_latest_by_session(&self, session_id: i64, limit: usize) -> Result<Vec<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at
+            "SELECT id, session_id, role, content, created_at, quote_message_id
              FROM messages WHERE session_id = ?1
              ORDER BY created_at DESC LIMIT ?2"
         )?;
@@ -319,6 +323,7 @@ impl MessageStore {
                 role,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                quote_message_id: row.get(5)?,
             })
         })?;
 
@@ -562,6 +567,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::User,
             content: "Hello, world!".to_string(),
+            quote_message_id: None,
         };
 
         let created = message_store.create(&new_message).expect("Failed to create message");
@@ -592,6 +598,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::User,
             content: "Hello".to_string(),
+            quote_message_id: None,
         }).expect("Failed to create message");
 
         // Check that session's updated_at was updated
@@ -617,6 +624,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::Assistant,
             content: "Response".to_string(),
+            quote_message_id: None,
         }).expect("Failed to create message");
 
         let found = message_store.find_by_id(created.id).expect("Failed to find message");
@@ -643,6 +651,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::User,
             content: "First".to_string(),
+            quote_message_id: None,
         }).expect("Failed to create message");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -651,6 +660,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::Assistant,
             content: "Second".to_string(),
+            quote_message_id: None,
         }).expect("Failed to create message");
 
         let messages = message_store.find_by_session(session.id).expect("Failed to find messages");
@@ -680,6 +690,7 @@ mod tests {
                 session_id: session.id,
                 role: MessageRole::User,
                 content: format!("Message {}", i),
+                quote_message_id: None,
             }).expect("Failed to create message");
         }
 
@@ -711,6 +722,7 @@ mod tests {
                 session_id: session.id,
                 role: MessageRole::User,
                 content: format!("Message {}", i),
+                quote_message_id: None,
             }).expect("Failed to create message");
         }
 
@@ -737,6 +749,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::User,
             content: "To Delete".to_string(),
+            quote_message_id: None,
         }).expect("Failed to create message");
 
         // Delete the message
@@ -774,6 +787,7 @@ mod tests {
                 session_id: session.id,
                 role: MessageRole::User,
                 content: format!("Message {}", i),
+                quote_message_id: None,
             }).expect("Failed to create message");
         }
 
@@ -796,6 +810,7 @@ mod tests {
             session_id: session.id,
             role: MessageRole::User,
             content: "   ".to_string(), // Whitespace only
+            quote_message_id: None,
         });
 
         assert!(result.is_err());
@@ -819,6 +834,7 @@ mod tests {
                 session_id: session.id,
                 role: MessageRole::User,
                 content: format!("Message {}", i),
+                quote_message_id: None,
             }).expect("Failed to create message");
         }
 
@@ -828,5 +844,74 @@ mod tests {
         // Verify messages are also deleted (foreign key cascade)
         let messages = message_store.find_by_session(session.id).expect("Failed to find messages");
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_create_message_with_quote() {
+        let (pool, agent_id, _dir) = setup_test_db();
+        let session_store = SessionStore::new(pool.clone());
+        let message_store = MessageStore::new(pool);
+
+        let session = session_store.create(&NewSession {
+            agent_id,
+            title: Some("Quote Test Session".to_string()),
+        }).expect("Failed to create session");
+
+        // Create the original message
+        let original = message_store.create(&NewMessage {
+            session_id: session.id,
+            role: MessageRole::User,
+            content: "Original message to be quoted".to_string(),
+            quote_message_id: None,
+        }).expect("Failed to create original message");
+
+        // Create a reply message that quotes the original
+        let reply = message_store.create(&NewMessage {
+            session_id: session.id,
+            role: MessageRole::Assistant,
+            content: "This is a reply to the quoted message".to_string(),
+            quote_message_id: Some(original.id),
+        }).expect("Failed to create reply message");
+
+        assert!(reply.id > 0);
+        assert_eq!(reply.quote_message_id, Some(original.id));
+
+        // Verify we can retrieve it with the quote reference
+        let found = message_store.find_by_id(reply.id)
+            .expect("Failed to find message")
+            .expect("Message not found");
+        assert_eq!(found.quote_message_id, Some(original.id));
+    }
+
+    #[test]
+    fn test_find_messages_by_session_includes_quote_id() {
+        let (pool, agent_id, _dir) = setup_test_db();
+        let session_store = SessionStore::new(pool.clone());
+        let message_store = MessageStore::new(pool);
+
+        let session = session_store.create(&NewSession {
+            agent_id,
+            title: None,
+        }).expect("Failed to create session");
+
+        // Create messages
+        let msg1 = message_store.create(&NewMessage {
+            session_id: session.id,
+            role: MessageRole::User,
+            content: "First".to_string(),
+            quote_message_id: None,
+        }).expect("Failed to create message");
+
+        let msg2 = message_store.create(&NewMessage {
+            session_id: session.id,
+            role: MessageRole::Assistant,
+            content: "Second (replying to first)".to_string(),
+            quote_message_id: Some(msg1.id),
+        }).expect("Failed to create message");
+
+        let messages = message_store.find_by_session(session.id).expect("Failed to find messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].quote_message_id, None);
+        assert_eq!(messages[1].quote_message_id, Some(msg1.id));
     }
 }

@@ -2,16 +2,19 @@
  * Chat Input Component
  *
  * Message input with auto-expanding textarea, send/cancel buttons,
- * and personality-based theming.
+ * personality-based theming, and message quote support.
  *
  * [Source: Story 4.6 - 消息输入与发送功能]
+ * [Source: Story 4.8 - 消息引用功能]
  */
 
 import { memo, useRef, useCallback, useEffect, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { type MBTIType, getPersonalityColors } from '@/lib/personality-colors';
+import { type Message } from '@/types/session';
 import { LoadingButton } from '@/components/ui/loading-button';
 import { Button } from '@/components/ui/button';
+import QuoteCard from './QuoteCard';
 
 // ============================================================================
 // Types
@@ -33,6 +36,8 @@ export interface ChatInputProps {
   placeholder?: string;
   /** Agent MBTI personality type for button theming */
   personalityType?: MBTIType;
+  /** Agent name for quote attribution */
+  agentName?: string;
   /** Additional CSS classes */
   className?: string;
   /** Initial value for the input */
@@ -45,6 +50,10 @@ export interface ChatInputProps {
   maxRows?: number;
   /** Minimum number of visible rows */
   minRows?: number;
+  /** Currently quoted message for reply */
+  quoteMessage?: Message | null;
+  /** Callback to clear quoted message */
+  onCancelQuote?: () => void;
 }
 
 // ============================================================================
@@ -105,12 +114,15 @@ export const ChatInput = memo(function ChatInput({
   disabled = false,
   placeholder = '输入消息...',
   personalityType,
+  agentName,
   className,
   defaultValue = '',
   value: controlledValue,
   onChange,
   maxRows = DEFAULT_MAX_ROWS,
   minRows = DEFAULT_MIN_ROWS,
+  quoteMessage,
+  onCancelQuote,
 }: ChatInputProps) {
   // Internal state for uncontrolled mode
   const [internalValue, setInternalValue] = useState(defaultValue);
@@ -193,6 +205,9 @@ export const ChatInput = memo(function ChatInput({
           }
           onChange?.('');
 
+          // Clear quote after send
+          onCancelQuote?.();
+
           // Refocus after a brief delay to ensure state updates
           setTimeout(() => {
             textareaRef.current?.focus();
@@ -200,7 +215,7 @@ export const ChatInput = memo(function ChatInput({
         }
       }
     },
-    [value, isStreaming, disabled, onSend, isControlled, onChange]
+    [value, isStreaming, disabled, onSend, isControlled, onChange, onCancelQuote]
   );
 
   /**
@@ -217,12 +232,15 @@ export const ChatInput = memo(function ChatInput({
       }
       onChange?.('');
 
+      // Clear quote after send
+      onCancelQuote?.();
+
       // Refocus after send
       setTimeout(() => {
         textareaRef.current?.focus();
       }, 0);
     }
-  }, [value, isStreaming, disabled, onSend, isControlled, onChange]);
+  }, [value, isStreaming, disabled, onSend, isControlled, onChange, onCancelQuote]);
 
   /**
    * Handle cancel button click
@@ -247,94 +265,109 @@ export const ChatInput = memo(function ChatInput({
   const isInputDisabled = isStreaming || disabled;
 
   return (
-    <div className={cn('flex items-end gap-2 p-3 border-t border-border bg-background', className)}>
-      {/* Textarea */}
-      <div className="relative flex-1">
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          placeholder={placeholder}
-          disabled={isInputDisabled}
-          rows={minRows}
-          className={cn(
-            'w-full resize-none rounded-lg border border-input bg-background px-3 py-2',
-            'text-sm text-foreground placeholder:text-muted-foreground',
-            'focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-0',
-            'disabled:cursor-not-allowed disabled:opacity-50',
-            'transition-colors duration-200'
-          )}
-          style={{
-            lineHeight: `${LINE_HEIGHT}px`,
-            maxHeight: `${maxRows * LINE_HEIGHT}px`,
-          }}
-          aria-label="消息输入框"
-        />
-      </div>
+    <div className={cn('border-t border-border bg-background', className)}>
+      {/* Quote card (shown when quoting a message) */}
+      {quoteMessage && onCancelQuote && (
+        <div className="px-3 pt-3">
+          <QuoteCard
+            quote={quoteMessage}
+            onCancel={onCancelQuote}
+            agentName={agentName}
+            personalityType={personalityType}
+          />
+        </div>
+      )}
 
-      {/* Action buttons */}
-      <div className="flex items-center gap-2">
-        {/* Cancel button (shown during streaming) */}
-        {isStreaming ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="default"
-            onClick={handleCancelClick}
-            disabled={!onCancel}
-            className="min-w-[72px]"
-            aria-label="停止生成"
-          >
-            <svg
-              className="w-4 h-4 mr-1.5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              aria-hidden="true"
+      {/* Input area */}
+      <div className="flex items-end gap-2 p-3">
+        {/* Textarea */}
+        <div className="relative flex-1">
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            placeholder={placeholder}
+            disabled={isInputDisabled}
+            rows={minRows}
+            className={cn(
+              'w-full resize-none rounded-lg border border-input bg-background px-3 py-2',
+              'text-sm text-foreground placeholder:text-muted-foreground',
+              'focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-0',
+              'disabled:cursor-not-allowed disabled:opacity-50',
+              'transition-colors duration-200'
+            )}
+            style={{
+              lineHeight: `${LINE_HEIGHT}px`,
+              maxHeight: `${maxRows * LINE_HEIGHT}px`,
+            }}
+            aria-label="消息输入框"
+          />
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-2">
+          {/* Cancel button (shown during streaming) */}
+          {isStreaming ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="default"
+              onClick={handleCancelClick}
+              disabled={!onCancel}
+              className="min-w-[72px]"
+              aria-label="停止生成"
             >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
-            </svg>
-            停止
-          </Button>
-        ) : (
-          /* Send button */
-          <LoadingButton
-            type="button"
-            size="default"
-            onClick={handleSendClick}
-            disabled={isSendDisabled}
-            className="min-w-[72px]"
-            style={
-              colors && !isSendDisabled
-                ? { backgroundColor: colors.primary, borderColor: colors.primary }
-                : undefined
-            }
-            aria-label="发送消息"
-          >
-            <svg
-              className="w-4 h-4 mr-1.5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              aria-hidden="true"
+              <svg
+                className="w-4 h-4 mr-1.5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                aria-hidden="true"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+              停止
+            </Button>
+          ) : (
+            /* Send button */
+            <LoadingButton
+              type="button"
+              size="default"
+              onClick={handleSendClick}
+              disabled={isSendDisabled}
+              className="min-w-[72px]"
+              style={
+                colors && !isSendDisabled
+                  ? { backgroundColor: colors.primary, borderColor: colors.primary }
+                  : undefined
+              }
+              aria-label="发送消息"
             >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-              />
-            </svg>
-            发送
-          </LoadingButton>
-        )}
+              <svg
+                className="w-4 h-4 mr-1.5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                aria-hidden="true"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+                />
+              </svg>
+              发送
+            </LoadingButton>
+          )}
+        </div>
       </div>
     </div>
   );

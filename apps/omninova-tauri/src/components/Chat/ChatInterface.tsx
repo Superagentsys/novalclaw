@@ -3,15 +3,16 @@
  *
  * Main chat interface that integrates message list, streaming display,
  * message input, and provides a complete chat experience with agent
- * personality theming.
+ * personality theming and message quote support.
  *
  * [Source: Story 4.4 - ChatInterface 组件基础]
  * [Source: Story 4.5 - 打字指示器与加载状态]
  * [Source: Story 4.6 - 消息输入与发送功能]
  * [Source: Story 4.7 - 对话历史持久化与导航]
+ * [Source: Story 4.8 - 消息引用功能]
  */
 
-import { memo, useCallback, useEffect } from 'react';
+import { memo, useCallback, useEffect, useRef } from 'react';
 import { cn } from '@/lib/utils';
 import { type AgentModel, type MBTIType } from '@/types/agent';
 import { type Message, type Session } from '@/types/session';
@@ -207,6 +208,9 @@ export const ChatInterface = memo(function ChatInterface({
   headerContent,
   emptyState,
 }: ChatInterfaceProps) {
+  // Ref for scrolling to quoted messages
+  const messageListRef = useRef<HTMLDivElement>(null);
+
   // Get state from store
   const isStreaming = useChatStore((state) => state.isStreaming);
   const streamedContent = useChatStore((state) => state.streamedContent);
@@ -215,6 +219,9 @@ export const ChatInterface = memo(function ChatInterface({
   const error = useChatStore((state) => state.error);
   const setMessages = useChatStore((state) => state.setMessages);
   const addMessage = useChatStore((state) => state.addMessage);
+  const quoteMessage = useChatStore((state) => state.quoteMessage);
+  const setQuoteMessage = useChatStore((state) => state.setQuoteMessage);
+  const clearQuoteMessage = useChatStore((state) => state.clearQuoteMessage);
 
   // Paginated messages hook - loads messages when session changes
   const {
@@ -249,12 +256,68 @@ export const ChatInterface = memo(function ChatInterface({
     }
   }, [onCancelStream]);
 
-  // Handle send message
+  /**
+   * Build message content with quote context
+   * When a message is quoted, include the quote context for the LLM
+   */
+  const buildMessageWithContext = useCallback(
+    (content: string, quote?: Message | null): string => {
+      if (!quote) return content;
+
+      const quoteRole = quote.role === 'user' ? '用户' : agent.name || 'AI';
+      const quotePreview = quote.content.length > 200
+        ? quote.content.slice(0, 200) + '...'
+        : quote.content;
+
+      return `> 引用 ${quoteRole} 的消息:\n> ${quotePreview}\n\n${content}`;
+    },
+    [agent.name]
+  );
+
+  // Handle send message (with optional quote context)
   const handleSendMessage = useCallback(
     (content: string) => {
-      onSendMessage(content);
+      // Include quote context if quoting a message
+      const contentWithContext = buildMessageWithContext(content, quoteMessage);
+
+      // Send message with quote info
+      onSendMessage(contentWithContext);
+
+      // Note: clearQuoteMessage is handled in ChatInput after send
     },
-    [onSendMessage]
+    [onSendMessage, quoteMessage, buildMessageWithContext]
+  );
+
+  // Handle quote message selection
+  const handleQuoteMessage = useCallback(
+    (message: Message) => {
+      setQuoteMessage(message);
+    },
+    [setQuoteMessage]
+  );
+
+  // Handle quote link click (scroll to quoted message)
+  const handleQuoteClick = useCallback(
+    (messageId: number) => {
+      // Find the message element by data attribute or id
+      const messageElement = messageListRef.current?.querySelector(
+        `[data-message-id="${messageId}"]`
+      );
+
+      if (messageElement) {
+        messageElement.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        });
+
+        // Add highlight effect
+        messageElement.classList.add('ring-2', 'ring-primary', 'ring-offset-2');
+        setTimeout(() => {
+          messageElement.classList.remove('ring-2', 'ring-primary', 'ring-offset-2');
+        }, 2000);
+      }
+    },
+    []
   );
 
   // Handle load more messages
@@ -296,18 +359,23 @@ export const ChatInterface = memo(function ChatInterface({
         hasMore={hasMore}
         onLoadMore={handleLoadMore}
         isLoadingMore={isLoadingMessages && displayMessages.length > 0}
+        onQuoteMessage={handleQuoteMessage}
+        onQuoteClick={handleQuoteClick}
       />
 
       {/* Loading overlay */}
       {(isLoading || isLoadingMessages) && displayMessages.length === 0 && <LoadingOverlay />}
 
-      {/* Message input */}
+      {/* Message input with quote support */}
       <ChatInput
         onSend={handleSendMessage}
         onCancel={onCancelStream}
         isStreaming={isStreaming}
         personalityType={personalityType}
+        agentName={agent.name}
         placeholder={`发送消息给 ${agent.name}...`}
+        quoteMessage={quoteMessage}
+        onCancelQuote={clearQuoteMessage}
       />
     </div>
   );

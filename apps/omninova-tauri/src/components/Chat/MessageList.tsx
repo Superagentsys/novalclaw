@@ -2,15 +2,16 @@
  * Message List Component
  *
  * Displays a scrollable list of messages with auto-scroll behavior,
- * empty state handling, and accessibility support.
+ * empty state handling, quote functionality, and accessibility support.
  *
  * [Source: Story 4.4 - ChatInterface 组件基础]
  * [Source: Story 4.7 - 对话历史持久化与导航]
+ * [Source: Story 4.8 - 消息引用功能]
  */
 
-import { useRef, useEffect, memo, type ReactNode } from 'react';
+import { useRef, useEffect, memo, useState, useCallback, type ReactNode } from 'react';
 import { cn } from '@/lib/utils';
-import { type Message } from '@/types/session';
+import { type Message, type MessageRole } from '@/types/session';
 import { type MBTIType } from '@/lib/personality-colors';
 import MessageBubble from './MessageBubble';
 import StreamingMessage from './StreamingMessage';
@@ -46,6 +47,16 @@ export interface MessageListProps {
   onLoadMore?: () => void;
   /** Whether more messages are loading */
   isLoadingMore?: boolean;
+  /**
+   * Callback when user wants to quote a message
+   * Passes the selected message for quote preview
+   */
+  onQuoteMessage?: (message: Message) => void;
+  /**
+   * Callback when quote link is clicked
+   * Passes the quoted message ID for scroll/navigation
+   */
+  onQuoteClick?: (messageId: number) => void;
 }
 
 /**
@@ -66,6 +77,13 @@ function EmptyState({ agentName }: { agentName?: string }) {
 }
 
 /**
+ * Helper to find a message by ID in the messages array
+ */
+function findMessageById(messages: Message[], id: number): Message | undefined {
+  return messages.find((m) => m.id === id);
+}
+
+/**
  * MessageList component
  *
  * Renders a list of chat messages with:
@@ -75,6 +93,7 @@ function EmptyState({ agentName }: { agentName?: string }) {
  * - Streaming message support
  * - Accessibility with aria-live regions
  * - "Load more" trigger for pagination
+ * - Quote message selection
  *
  * @example
  * ```tsx
@@ -107,11 +126,14 @@ export const MessageList = memo(function MessageList({
   hasMore = false,
   onLoadMore,
   isLoadingMore = false,
+  onQuoteMessage,
+  onQuoteClick,
 }: MessageListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
   const prevScrollHeightRef = useRef(0);
+  const [hoveredMessageId, setHoveredMessageId] = useState<number | null>(null);
 
   // Detect if user has scrolled up or to top
   useEffect(() => {
@@ -234,17 +256,66 @@ export const MessageList = memo(function MessageList({
           )}
 
           {/* Render existing messages */}
-          {messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              content={message.content}
-              role={message.role}
-              timestamp={message.createdAt}
-              personalityType={message.role === 'assistant' ? personalityType : undefined}
-              agentName={message.role === 'assistant' ? agentName : undefined}
-              showTimestamp={showTimestamps}
-            />
-          ))}
+          {messages.map((message) => {
+            // Find quoted message if this message has quoteMessageId
+            const quotedMessage = message.quoteMessageId
+              ? findMessageById(messages, message.quoteMessageId)
+              : undefined;
+
+            return (
+              <div
+                key={message.id}
+                className="group relative"
+                onMouseEnter={() => setHoveredMessageId(message.id)}
+                onMouseLeave={() => setHoveredMessageId(null)}
+              >
+                {/* Quote button - shown on hover */}
+                {onQuoteMessage && hoveredMessageId === message.id && (
+                  <button
+                    type="button"
+                    onClick={() => onQuoteMessage(message)}
+                    className={cn(
+                      'absolute -right-2 top-0 z-10',
+                      'p-1.5 rounded-md',
+                      'bg-background border border-border shadow-sm',
+                      'text-muted-foreground hover:text-foreground',
+                      'hover:bg-muted transition-colors',
+                      'focus:outline-none focus:ring-2 focus:ring-ring',
+                      message.role === 'user' ? '-translate-x-full' : 'right-0'
+                    )}
+                    aria-label="引用此消息"
+                  >
+                    <svg
+                      className="h-3.5 w-3.5"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"
+                      />
+                    </svg>
+                  </button>
+                )}
+
+                <MessageBubble
+                  content={message.content}
+                  role={message.role}
+                  timestamp={message.createdAt}
+                  personalityType={message.role === 'assistant' ? personalityType : undefined}
+                  agentName={message.role === 'assistant' ? agentName : undefined}
+                  showTimestamp={showTimestamps}
+                  quoteMessageId={message.quoteMessageId}
+                  quoteContent={quotedMessage?.content}
+                  quoteRole={quotedMessage?.role}
+                  onQuoteClick={onQuoteClick}
+                />
+              </div>
+            );
+          })}
 
           {/* Render streaming message */}
           {showStreaming && (

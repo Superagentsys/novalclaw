@@ -130,6 +130,8 @@ pub struct Message {
     pub content: String,
     /// Unix timestamp of creation
     pub created_at: i64,
+    /// Optional ID of the quoted message (for reply functionality)
+    pub quote_message_id: Option<i64>,
 }
 
 /// Data required to create a new message
@@ -142,6 +144,8 @@ pub struct NewMessage {
     pub role: MessageRole,
     /// Content of the message (required)
     pub content: String,
+    /// Optional ID of the quoted message (for reply functionality)
+    pub quote_message_id: Option<i64>,
 }
 
 /// Error type for message validation

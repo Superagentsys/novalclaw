@@ -35,6 +35,13 @@ export interface ChatState {
   streamedContent: string;
   /** Reasoning content during streaming (for thinking models) */
   reasoningContent: string;
+  /**
+   * Currently quoted message for reply
+   *
+   * When set, the message will be displayed in QuoteCard above the input
+   * and included in the context when sending a reply.
+   */
+  quoteMessage: Message | null;
 }
 
 /**
@@ -63,6 +70,19 @@ export interface ChatActions {
   setStreamedContent: (content: string, reasoning?: string) => void;
   /** Stop streaming and optionally save as message */
   stopStreaming: (saveAsMessage?: boolean) => void;
+  /**
+   * Set the message to be quoted in reply
+   *
+   * When a message is quoted, it will appear in QuoteCard above the input
+   * and be included as context when sending the reply.
+   */
+  setQuoteMessage: (message: Message | null) => void;
+  /**
+   * Clear the quoted message
+   *
+   * Resets quoteMessage to null, removing the QuoteCard display.
+   */
+  clearQuoteMessage: () => void;
   /** Reset store state */
   reset: () => void;
 }
@@ -85,6 +105,7 @@ const initialState: ChatState = {
   isStreaming: false,
   streamedContent: '',
   reasoningContent: '',
+  quoteMessage: null,
 };
 
 // ============================================================================
@@ -190,6 +211,10 @@ export const useChatStore = create<ChatStore>()(
           });
         }
       },
+
+      setQuoteMessage: (message) => set({ quoteMessage: message }),
+
+      clearQuoteMessage: () => set({ quoteMessage: null }),
 
       reset: () => set(initialState),
     }),

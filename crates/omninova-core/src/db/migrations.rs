@@ -522,6 +522,49 @@ CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_mbti_type ON agents(mbti_type);
 "#;
 
+/// Message quote migration SQL
+const MESSAGE_QUOTE_SQL: &str = r#"
+-- Migration: 007_message_quote
+-- Description: Add quote_message_id column to messages table for message reply/quote functionality
+
+-- Add quote_message_id column to messages table
+ALTER TABLE messages ADD COLUMN quote_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL;
+
+-- Create index for quote lookups
+CREATE INDEX IF NOT EXISTS idx_messages_quote_id ON messages(quote_message_id);
+"#;
+
+/// Message quote rollback SQL
+const MESSAGE_QUOTE_DOWN_SQL: &str = r#"
+-- Rollback: 007_message_quote
+-- Note: SQLite doesn't support DROP COLUMN, so we recreate the table
+
+-- Drop index
+DROP INDEX IF EXISTS idx_messages_quote_id;
+
+-- Create a backup of the schema without quote_message_id
+CREATE TABLE messages_backup (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+-- Copy data back (excluding quote_message_id)
+INSERT INTO messages_backup (id, session_id, role, content, created_at)
+SELECT id, session_id, role, content, created_at
+FROM messages;
+
+-- Drop old table and rename backup
+DROP TABLE messages;
+ALTER TABLE messages_backup RENAME TO messages;
+
+-- Recreate index
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+"#;
+
 /// Get the built-in migrations
 ///
 /// Returns a list of migrations that are embedded in the binary.
@@ -543,6 +586,9 @@ pub fn get_builtin_migrations() -> Vec<Migration> {
         Migration::new("006_agent_default_provider", "Add default_provider_id column to agents table for per-agent provider assignment")
             .up(AGENT_DEFAULT_PROVIDER_SQL)
             .down(AGENT_DEFAULT_PROVIDER_DOWN_SQL),
+        Migration::new("007_message_quote", "Add quote_message_id column to messages table for message reply/quote functionality")
+            .up(MESSAGE_QUOTE_SQL)
+            .down(MESSAGE_QUOTE_DOWN_SQL),
     ]
 }
 
@@ -760,7 +806,7 @@ mod tests {
     #[test]
     fn test_builtin_migrations_include_agent_enhancements() {
         let migrations = get_builtin_migrations();
-        assert_eq!(migrations.len(), 6);
+        assert_eq!(migrations.len(), 7);
         assert_eq!(migrations[0].id, "001_initial");
         assert_eq!(migrations[1].id, "002_agent_enhancements");
         assert!(migrations[1].down_sql.is_some());
@@ -772,6 +818,8 @@ mod tests {
         assert!(migrations[4].down_sql.is_some());
         assert_eq!(migrations[5].id, "006_agent_default_provider");
         assert!(migrations[5].down_sql.is_some());
+        assert_eq!(migrations[6].id, "007_message_quote");
+        assert!(migrations[6].down_sql.is_some());
     }
 
     #[test]
