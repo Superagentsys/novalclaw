@@ -2,17 +2,24 @@
  * Chat Interface Container Component
  *
  * Main chat interface that integrates message list, streaming display,
- * and provides a complete chat experience with agent personality theming.
+ * message input, and provides a complete chat experience with agent
+ * personality theming.
  *
  * [Source: Story 4.4 - ChatInterface 组件基础]
+ * [Source: Story 4.5 - 打字指示器与加载状态]
+ * [Source: Story 4.6 - 消息输入与发送功能]
+ * [Source: Story 4.7 - 对话历史持久化与导航]
  */
 
-import { memo, useCallback } from 'react';
+import { memo, useCallback, useEffect } from 'react';
 import { cn } from '@/lib/utils';
 import { type AgentModel, type MBTIType } from '@/types/agent';
 import { type Message, type Session } from '@/types/session';
 import { useChatStore } from '@/stores/chatStore';
+import { usePaginatedMessages } from '@/hooks/usePaginatedMessages';
 import MessageList from './MessageList';
+import { MessageSkeletonList } from './MessageSkeleton';
+import ChatInput from './ChatInput';
 
 // ============================================================================
 // Types
@@ -51,15 +58,20 @@ export interface ChatInterfaceProps {
  */
 interface ChatHeaderProps {
   agent: AgentModel;
+  session?: Session | null;
   isStreaming?: boolean;
   children?: React.ReactNode;
 }
 
 const ChatHeader = memo(function ChatHeader({
   agent,
+  session,
   isStreaming,
   children,
 }: ChatHeaderProps) {
+  // Display session title if available, otherwise agent domain
+  const subtitle = session?.title || agent.domain || 'AI 助手';
+
   return (
     <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
       <div className="flex items-center gap-3">
@@ -82,7 +94,7 @@ const ChatHeader = memo(function ChatHeader({
         <div className="flex flex-col">
           <span className="font-medium text-foreground">{agent.name}</span>
           <span className="text-xs text-muted-foreground">
-            {isStreaming ? '正在输入...' : agent.domain || 'AI 助手'}
+            {isStreaming ? '正在输入...' : subtitle}
           </span>
         </div>
       </div>
@@ -139,15 +151,12 @@ const ErrorDisplay = memo(function ErrorDisplay({
 });
 
 /**
- * Loading overlay for initial load
+ * Loading overlay for initial load with skeleton messages
  */
 const LoadingOverlay = memo(function LoadingOverlay() {
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-background/80 backdrop-blur-sm z-10">
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span className="text-sm text-muted-foreground">加载中...</span>
-      </div>
+    <div className="absolute inset-0 flex flex-col bg-background/80 backdrop-blur-sm z-10 p-4">
+      <MessageSkeletonList count={4} />
     </div>
   );
 });
@@ -165,6 +174,7 @@ const LoadingOverlay = memo(function LoadingOverlay() {
  * - Agent personality theming
  * - Loading and error states
  * - Responsive layout
+ * - Session-aware message loading with pagination
  *
  * @example
  * ```tsx
@@ -188,9 +198,9 @@ const LoadingOverlay = memo(function LoadingOverlay() {
  */
 export const ChatInterface = memo(function ChatInterface({
   agent,
-  session, // eslint-disable-line @typescript-eslint/no-unused-vars -- reserved for future use
+  session,
   initialMessages,
-  onSendMessage, // eslint-disable-line @typescript-eslint/no-unused-vars -- handled by parent integration
+  onSendMessage,
   onCancelStream,
   className,
   showTimestamps = true,
@@ -198,15 +208,39 @@ export const ChatInterface = memo(function ChatInterface({
   emptyState,
 }: ChatInterfaceProps) {
   // Get state from store
-  const messages = useChatStore((state) => state.messages);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const streamedContent = useChatStore((state) => state.streamedContent);
   const reasoningContent = useChatStore((state) => state.reasoningContent);
   const isLoading = useChatStore((state) => state.isLoading);
   const error = useChatStore((state) => state.error);
+  const setMessages = useChatStore((state) => state.setMessages);
+  const addMessage = useChatStore((state) => state.addMessage);
+
+  // Paginated messages hook - loads messages when session changes
+  const {
+    messages: paginatedMessages,
+    isLoading: isLoadingMessages,
+    hasMore,
+    loadMore,
+    appendMessage,
+    error: loadError,
+  } = usePaginatedMessages({
+    sessionId: session?.id ?? null,
+    pageSize: 50,
+    autoLoad: true,
+  });
+
+  // Sync paginated messages to chat store
+  useEffect(() => {
+    if (paginatedMessages.length > 0 || session?.id) {
+      setMessages(paginatedMessages);
+    }
+  }, [paginatedMessages, setMessages, session?.id]);
 
   // Use initial messages if provided and store is empty
-  const displayMessages = messages.length > 0 ? messages : (initialMessages || []);
+  const displayMessages = paginatedMessages.length > 0
+    ? paginatedMessages
+    : (initialMessages || []);
 
   // Handle cancel stream
   const handleCancelStream = useCallback(() => {
@@ -214,6 +248,19 @@ export const ChatInterface = memo(function ChatInterface({
       onCancelStream();
     }
   }, [onCancelStream]);
+
+  // Handle send message
+  const handleSendMessage = useCallback(
+    (content: string) => {
+      onSendMessage(content);
+    },
+    [onSendMessage]
+  );
+
+  // Handle load more messages
+  const handleLoadMore = useCallback(async () => {
+    await loadMore();
+  }, [loadMore]);
 
   // Get agent personality type for theming
   const personalityType = agent.mbti_type as MBTIType | undefined;
@@ -228,12 +275,12 @@ export const ChatInterface = memo(function ChatInterface({
       aria-label={`与 ${agent.name} 的对话`}
     >
       {/* Header */}
-      <ChatHeader agent={agent} isStreaming={isStreaming}>
+      <ChatHeader agent={agent} session={session} isStreaming={isStreaming}>
         {headerContent}
       </ChatHeader>
 
       {/* Error display */}
-      {error && <ErrorDisplay error={error} />}
+      {(error || loadError) && <ErrorDisplay error={error || loadError || ''} />}
 
       {/* Message list */}
       <MessageList
@@ -246,10 +293,22 @@ export const ChatInterface = memo(function ChatInterface({
         onCancelStream={handleCancelStream}
         showTimestamps={showTimestamps}
         emptyState={emptyState}
+        hasMore={hasMore}
+        onLoadMore={handleLoadMore}
+        isLoadingMore={isLoadingMessages && displayMessages.length > 0}
       />
 
       {/* Loading overlay */}
-      {isLoading && displayMessages.length === 0 && <LoadingOverlay />}
+      {(isLoading || isLoadingMessages) && displayMessages.length === 0 && <LoadingOverlay />}
+
+      {/* Message input */}
+      <ChatInput
+        onSend={handleSendMessage}
+        onCancel={onCancelStream}
+        isStreaming={isStreaming}
+        personalityType={personalityType}
+        placeholder={`发送消息给 ${agent.name}...`}
+      />
     </div>
   );
 });

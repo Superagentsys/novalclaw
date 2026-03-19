@@ -150,6 +150,16 @@ const config: Config = {
           'sans-serif',
         ],
       },
+      // 动画 [Source: Story 4.5 - 打字指示器与加载状态]
+      animation: {
+        'wave': 'wave 1.2s ease-in-out infinite',
+      },
+      keyframes: {
+        wave: {
+          '0%, 60%, 100%': { transform: 'translateY(0)' },
+          '30%': { transform: 'translateY(-4px)' },
+        },
+      },
     },
   },
   plugins: [],
