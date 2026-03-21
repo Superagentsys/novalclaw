@@ -7,6 +7,7 @@
  */
 
 import { type MBTIType } from '@/lib/personality-colors';
+import { type MemoryContextInfo } from './memory';
 
 // Re-export MBTIType for convenience
 export type { MBTIType } from '@/lib/personality-colors';
@@ -144,6 +145,8 @@ export interface ChatResponse {
   sessionId: number;
   /** 助手回复的消息 ID */
   messageId: number;
+  /** 记忆上下文信息（如果使用了记忆增强） */
+  memoryContext?: MemoryContextInfo;
 }
 
 // ============================================================================

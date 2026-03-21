@@ -1,5 +1,8 @@
 pub mod agent;
+pub mod command;
+pub mod commands;
 pub mod dispatcher;
+pub mod memory_context;
 pub mod model;
 pub mod prompt;
 pub mod prompts;
@@ -9,7 +12,15 @@ pub mod store;
 pub mod streaming;
 
 pub use agent::Agent;
+pub use command::{
+    Command, CommandContext, CommandError, CommandInfo, CommandRegistry, CommandResult,
+    ParsedCommand, parse_command,
+};
 pub use dispatcher::{AgentDispatcher, DispatchError, DispatcherConfig};
+pub use memory_context::{
+    MemoryContextResult, ScoredMemory,
+    build_context_string, calculate_relevance_score, retrieve_relevant_memories,
+};
 pub use model::{AgentModel, AgentStatus, AgentUpdate, AgentValidationError, NewAgent};
 pub use prompts::{get_enhanced_system_prompt, get_system_prompt_for_mbti};
 pub use service::{AgentService, AgentServiceError, ChatResult};

@@ -756,10 +756,128 @@ pub struct MemoryConfig {
     pub qdrant_api_key: Option<String>,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+    /// Working memory (L1) capacity - number of entries to keep in short-term memory
+    /// Default: 100 entries (approximately 4096 tokens of context)
+    #[serde(default = "default_working_memory_capacity")]
+    pub working_memory_capacity: usize,
+    /// Enable L2 episodic memory for long-term storage
+    /// Default: true
+    #[serde(default = "default_episodic_memory_enabled")]
+    pub episodic_memory_enabled: bool,
+    /// Enable L3 semantic memory for vector-based similarity search
+    /// Default: true
+    #[serde(default = "default_semantic_memory_enabled")]
+    pub semantic_memory_enabled: bool,
+    /// Vector embedding dimension (e.g., 1536 for text-embedding-3-small)
+    /// Default: 1536
+    #[serde(default = "default_embedding_dim")]
+    pub embedding_dim: usize,
+    /// Minimum similarity threshold for semantic search results (0.0-1.0)
+    /// Default: 0.7
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f32,
+    /// Maximum number of results to return from semantic search
+    /// Default: 10
+    #[serde(default = "default_max_semantic_results")]
+    pub max_semantic_results: usize,
+    /// Memory context configuration for context-enhanced responses
+    /// [Source: Story 5.9 - 上下文增强响应]
+    #[serde(default)]
+    pub context: MemoryContextConfig,
+}
+
+/// Configuration for memory context enhancement
+///
+/// Controls how memories are retrieved and injected into LLM prompts
+/// to provide context-enhanced responses.
+///
+/// [Source: Story 5.9 - 上下文增强响应]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryContextConfig {
+    /// Enable memory context enhancement
+    /// When enabled, relevant memories are automatically retrieved and injected into prompts
+    /// Default: true
+    #[serde(default = "default_memory_context_enabled")]
+    pub enabled: bool,
+    /// Maximum number of memories to inject into context
+    /// Default: 5
+    #[serde(default = "default_max_memories")]
+    pub max_memories: usize,
+    /// Maximum total characters for memory context
+    /// Prevents context window overflow
+    /// Default: 1000
+    #[serde(default = "default_max_context_chars")]
+    pub max_chars: usize,
+    /// Minimum similarity threshold for memory retrieval (0.0-1.0)
+    /// Memories below this threshold are excluded
+    /// Default: 0.7
+    #[serde(default = "default_context_similarity_threshold")]
+    pub min_similarity_threshold: f32,
+    /// Time decay factor for memory relevance (0.0-1.0)
+    /// Higher values mean recent memories are weighted more heavily
+    /// Default: 0.1
+    #[serde(default = "default_time_decay_factor")]
+    pub time_decay_factor: f32,
+}
+
+fn default_memory_context_enabled() -> bool {
+    true
+}
+
+fn default_max_memories() -> usize {
+    5
+}
+
+fn default_max_context_chars() -> usize {
+    1000
+}
+
+fn default_context_similarity_threshold() -> f32 {
+    0.7
+}
+
+fn default_time_decay_factor() -> f32 {
+    0.1
+}
+
+impl Default for MemoryContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_context_enabled(),
+            max_memories: default_max_memories(),
+            max_chars: default_max_context_chars(),
+            min_similarity_threshold: default_context_similarity_threshold(),
+            time_decay_factor: default_time_decay_factor(),
+        }
+    }
 }
 
 fn default_memory_backend() -> String {
     "sqlite".into()
+}
+
+fn default_working_memory_capacity() -> usize {
+    100
+}
+
+fn default_episodic_memory_enabled() -> bool {
+    true
+}
+
+fn default_semantic_memory_enabled() -> bool {
+    true
+}
+
+fn default_embedding_dim() -> usize {
+    1536
+}
+
+fn default_similarity_threshold() -> f32 {
+    0.7
+}
+
+fn default_max_semantic_results() -> usize {
+    10
 }
 
 impl Default for MemoryConfig {
@@ -771,6 +889,13 @@ impl Default for MemoryConfig {
             qdrant_collection: None,
             qdrant_api_key: None,
             embedding: EmbeddingConfig::default(),
+            working_memory_capacity: default_working_memory_capacity(),
+            episodic_memory_enabled: default_episodic_memory_enabled(),
+            semantic_memory_enabled: default_semantic_memory_enabled(),
+            embedding_dim: default_embedding_dim(),
+            similarity_threshold: default_similarity_threshold(),
+            max_semantic_results: default_max_semantic_results(),
+            context: MemoryContextConfig::default(),
         }
     }
 }

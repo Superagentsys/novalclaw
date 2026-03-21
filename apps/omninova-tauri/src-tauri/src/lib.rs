@@ -1,5 +1,6 @@
 use omninova_core::account::{AccountStore, AccountInfo, NewAccount, AccountUpdate};
-use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig, AgentService, ChatResult, StreamManager, StreamEvent};
+use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig, AgentService, ChatResult, StreamManager, StreamEvent, CommandRegistry, CommandContext, CommandResult, CommandInfo, parse_command};
+use omninova_core::memory::{WorkingMemory, WorkingMemoryEntry, MemoryStats, EpisodicMemoryStore, EpisodicMemory, NewEpisodicMemory, EpisodicMemoryStats, SemanticMemoryStore, SemanticMemory, SemanticMemoryStats, SemanticSearchResult, NewSemanticMemory, EmbeddingService, DEFAULT_EMBEDDING_DIM, DEFAULT_OPENAI_EMBEDDING_MODEL, MemoryManager, MemoryLayer, MemoryQuery, MemoryQueryResult, MemoryManagerStats, UnifiedMemoryEntry, PerformanceStats, BenchmarkResults};
 use omninova_core::backup::{
     BackupService, BackupMeta, BackupFormat,
     ImportMode, ImportOptions,
@@ -50,6 +51,16 @@ struct AppState {
     keyring_service: Option<Arc<KeyringService>>,
     /// Stream manager for tracking active streaming sessions
     stream_manager: StreamManager,
+    /// Command registry for chat command execution (e.g., /help, /clear, /export)
+    command_registry: Arc<CommandRegistry>,
+    /// Working memory (L1) for short-term session context
+    working_memory: Arc<Mutex<WorkingMemory>>,
+    /// Episodic memory store (L2) for long-term memory
+    episodic_memory_store: Option<Arc<EpisodicMemoryStore>>,
+    /// Semantic memory store (L3) for vector-based similarity search
+    semantic_memory_store: Option<Arc<SemanticMemoryStore>>,
+    /// Unified Memory Manager coordinating L1, L2, and L3
+    memory_manager: Option<Arc<Mutex<MemoryManager>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2087,7 +2098,17 @@ async fn init_session_store(
 
     // Create stores
     app_state.session_store = Some(SessionStore::new(pool.clone()));
-    app_state.message_store = Some(MessageStore::new(pool));
+    app_state.message_store = Some(MessageStore::new(pool.clone()));
+    app_state.episodic_memory_store = Some(Arc::new(EpisodicMemoryStore::new(Arc::new(pool.clone()))));
+
+    // Create unified MemoryManager
+    app_state.memory_manager = Some(Arc::new(Mutex::new(MemoryManager::new(
+        Arc::new(pool),
+        None, // No embedding service by default - L3 disabled until configured
+        DEFAULT_EMBEDDING_DIM,
+        1, // Default agent ID
+    ))));
+
     Ok(())
 }
 
@@ -2244,6 +2265,44 @@ struct CreateSessionAndSendRequest {
     quote_message_id: Option<i64>,
 }
 
+/// Memory context entry for frontend display
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryContextEntry {
+    id: String,
+    content: String,
+    similarity_score: Option<f32>,
+    importance: u8,
+    source_layer: String,
+    created_at: i64,
+}
+
+/// Memory context result for frontend display
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryContextInfo {
+    entries: Vec<MemoryContextEntry>,
+    total_chars: usize,
+    retrieval_time_ms: u64,
+}
+
+impl From<omninova_core::agent::MemoryContextResult> for MemoryContextInfo {
+    fn from(result: omninova_core::agent::MemoryContextResult) -> Self {
+        MemoryContextInfo {
+            entries: result.memories.into_iter().map(|m| MemoryContextEntry {
+                id: m.entry.id,
+                content: m.entry.content,
+                similarity_score: m.entry.similarity_score,
+                importance: m.entry.importance,
+                source_layer: m.entry.source_layer.to_string(),
+                created_at: m.entry.created_at,
+            }).collect(),
+            total_chars: result.total_chars,
+            retrieval_time_ms: result.retrieval_time_ms,
+        }
+    }
+}
+
 /// Response from chat commands
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2254,6 +2313,8 @@ struct ChatResponse {
     session_id: i64,
     /// The message ID of the assistant's response
     message_id: i64,
+    /// Memory context used for this response (if any)
+    memory_context: Option<MemoryContextInfo>,
 }
 
 impl From<ChatResult> for ChatResponse {
@@ -2262,6 +2323,7 @@ impl From<ChatResult> for ChatResponse {
             response: result.response,
             session_id: result.session_id,
             message_id: result.message_id,
+            memory_context: result.memory_context.map(MemoryContextInfo::from),
         }
     }
 }
@@ -2297,8 +2359,16 @@ async fn send_message(
     let memory = build_memory_from_config(&cfg).await
         .map_err(|e| format!("Failed to initialize memory: {e}"))?;
 
-    // Create agent service
-    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+    // Create agent service with memory manager support
+    let mut service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Set memory manager if available for context enhancement
+    if let Some(ref memory_manager) = app_state.memory_manager {
+        service.set_memory_manager(Arc::clone(memory_manager));
+    }
+
+    // Set memory context config from app config
+    service.set_memory_context_config(cfg.memory.context.clone());
 
     // Send message (creates new session)
     let result = service.chat(request.agent_id, None, &request.message, provider.as_ref(), request.quote_message_id)
@@ -2346,8 +2416,16 @@ async fn send_message_to_session(
     let memory = build_memory_from_config(&cfg).await
         .map_err(|e| format!("Failed to initialize memory: {e}"))?;
 
-    // Create agent service
-    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+    // Create agent service with memory manager support
+    let mut service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Set memory manager if available for context enhancement
+    if let Some(ref memory_manager) = app_state.memory_manager {
+        service.set_memory_manager(Arc::clone(memory_manager));
+    }
+
+    // Set memory context config from app config
+    service.set_memory_context_config(cfg.memory.context.clone());
 
     // Send message to existing session
     let result = service.chat(session.agent_id, Some(request.session_id), &request.message, provider.as_ref(), request.quote_message_id)
@@ -2388,8 +2466,16 @@ async fn create_session_and_send(
     let memory = build_memory_from_config(&cfg).await
         .map_err(|e| format!("Failed to initialize memory: {e}"))?;
 
-    // Create agent service
-    let service = AgentService::new(db_pool.clone(), memory, Vec::new());
+    // Create agent service with memory manager support
+    let mut service = AgentService::new(db_pool.clone(), memory, Vec::new());
+
+    // Set memory manager if available for context enhancement
+    if let Some(ref memory_manager) = app_state.memory_manager {
+        service.set_memory_manager(Arc::clone(memory_manager));
+    }
+
+    // Set memory context config from app config
+    service.set_memory_context_config(cfg.memory.context.clone());
 
     // Create session and send first message
     let result = service.create_session_and_chat(request.agent_id, request.title, &request.message, provider.as_ref(), request.quote_message_id)
@@ -2529,6 +2615,710 @@ async fn cancel_stream(
     }
 
     Ok(was_active)
+}
+
+// ============================================================================
+// Command Execution Commands (Story 4.10)
+// ============================================================================
+
+/// Execute a chat command (e.g., /help, /clear, /export)
+///
+/// This command parses the input and executes it if it's a valid command.
+/// Returns the command result to be displayed to the user.
+#[tauri::command]
+async fn execute_command(
+    input: String,
+    session_id: i64,
+    agent_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<CommandResult, String> {
+    // Parse the command
+    let parsed = parse_command(&input)
+        .ok_or_else(|| "输入不是有效的命令。命令应以 / 开头。".to_string())?;
+
+    // Get the command registry
+    let registry = {
+        let app_state = state.lock().await;
+        app_state.command_registry.clone()
+    };
+
+    // Create context
+    let context = CommandContext {
+        session_id,
+        agent_id,
+    };
+
+    // Execute the command
+    registry
+        .execute(&parsed.name, parsed.args, context)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// List all available commands
+///
+/// Returns a list of CommandInfo objects for all registered commands.
+#[tauri::command]
+async fn list_commands(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<CommandInfo>, String> {
+    let registry = {
+        let app_state = state.lock().await;
+        app_state.command_registry.clone()
+    };
+
+    Ok(registry.list_info())
+}
+
+// ============================================================================
+// Working Memory Commands (Story 5.1)
+// ============================================================================
+
+/// Get all working memory entries for the current session
+///
+/// Returns entries in chronological order (oldest first)
+#[tauri::command]
+async fn get_working_memory(
+    limit: usize,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<WorkingMemoryEntry>, String> {
+    let working_memory = {
+        let app_state = state.lock().await;
+        app_state.working_memory.clone()
+    };
+
+    let memory = working_memory.lock().await;
+    memory.get_context(limit).await.map_err(|e| e.to_string())
+}
+
+/// Clear all working memory entries
+#[tauri::command]
+async fn clear_working_memory(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let working_memory = {
+        let app_state = state.lock().await;
+        app_state.working_memory.clone()
+    };
+
+    let memory = working_memory.lock().await;
+    memory.clear().await.map_err(|e| e.to_string())
+}
+
+/// Get working memory statistics
+#[tauri::command]
+async fn get_memory_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<MemoryStats, String> {
+    let working_memory = {
+        let app_state = state.lock().await;
+        app_state.working_memory.clone()
+    };
+
+    let memory = working_memory.lock().await;
+    Ok(memory.stats())
+}
+
+/// Set the session context for working memory
+#[tauri::command]
+async fn set_working_memory_session(
+    session_id: i64,
+    agent_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let working_memory = {
+        let app_state = state.lock().await;
+        app_state.working_memory.clone()
+    };
+
+    let mut memory = working_memory.lock().await;
+    memory.set_session(session_id, agent_id);
+    Ok(())
+}
+
+/// Push a context entry to working memory
+#[tauri::command]
+async fn push_working_memory_context(
+    role: String,
+    content: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let working_memory = {
+        let app_state = state.lock().await;
+        app_state.working_memory.clone()
+    };
+
+    let memory = working_memory.lock().await;
+    memory.push_context(&role, &content).await.map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Episodic Memory Commands (Story 5.2)
+// ============================================================================
+
+/// Store a new episodic memory
+#[tauri::command]
+async fn store_episodic_memory(
+    agent_id: i64,
+    session_id: Option<i64>,
+    content: String,
+    importance: u8,
+    metadata: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<i64, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    let new_memory = NewEpisodicMemory {
+        agent_id,
+        session_id,
+        content,
+        importance,
+        is_marked: false,
+        metadata,
+    };
+
+    store.create(&new_memory).map_err(|e| e.to_string())
+}
+
+/// Get episodic memories by agent ID
+#[tauri::command]
+async fn get_episodic_memories(
+    agent_id: i64,
+    limit: usize,
+    offset: usize,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EpisodicMemory>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_agent(agent_id, limit, offset).map_err(|e| e.to_string())
+}
+
+/// Get episodic memories by session ID
+#[tauri::command]
+async fn get_episodic_memories_by_session(
+    session_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EpisodicMemory>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_session(session_id).map_err(|e| e.to_string())
+}
+
+/// Get episodic memories by importance
+#[tauri::command]
+async fn get_episodic_memories_by_importance(
+    min_importance: u8,
+    limit: usize,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EpisodicMemory>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_by_importance(min_importance, limit).map_err(|e| e.to_string())
+}
+
+/// Delete an episodic memory
+#[tauri::command]
+async fn delete_episodic_memory(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.delete(id).map_err(|e| e.to_string())
+}
+
+/// Get episodic memory statistics
+#[tauri::command]
+async fn get_episodic_memory_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<EpisodicMemoryStats, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.stats().map_err(|e| e.to_string())
+}
+
+/// Export episodic memories for an agent
+#[tauri::command]
+async fn export_episodic_memories(
+    agent_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.export_to_json(agent_id).map_err(|e| e.to_string())
+}
+
+/// Import episodic memories from JSON
+#[tauri::command]
+async fn import_episodic_memories(
+    json: String,
+    skip_duplicates: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<usize, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.import_from_json(&json, skip_duplicates).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Memory Mark Commands (Story 5.8 - 重要片段标记功能)
+// ============================================================================
+
+/// Mark an episodic memory as important
+#[tauri::command]
+async fn mark_episodic_memory_important(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.set_marked(id, true).map_err(|e| e.to_string())
+}
+
+/// Unmark an episodic memory (remove important flag)
+#[tauri::command]
+async fn unmark_episodic_memory_important(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.set_marked(id, false).map_err(|e| e.to_string())
+}
+
+/// Get marked episodic memories for an agent
+#[tauri::command]
+async fn get_marked_episodic_memories(
+    agent_id: i64,
+    limit: usize,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EpisodicMemory>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized. Call init_session_store first.".to_string())?;
+
+    store.find_marked(agent_id, limit).map_err(|e| e.to_string())
+}
+
+/// Mark or unmark a message as important
+///
+/// Marked messages receive higher importance scores
+/// when stored to episodic memory (L2).
+///
+/// [Source: Story 5.8 - 重要片段标记功能]
+#[tauri::command]
+async fn mark_message_important(
+    message_id: i64,
+    is_marked: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.message_store.as_ref()
+        .ok_or_else(|| "Message store not initialized. Call init_session_store first.".to_string())?;
+
+    store.set_marked(message_id, is_marked).map_err(|e| e.to_string())
+}
+
+/// End a session and persist working memory to L2 episodic memory
+///
+/// This should be called when a user closes a session to ensure
+/// important context is saved to long-term storage.
+#[tauri::command]
+async fn end_session(
+    agent_id: i64,
+    session_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<usize, String> {
+    let app_state = state.lock().await;
+
+    // Check if episodic memory is enabled
+    let episodic_store = match app_state.episodic_memory_store.as_ref() {
+        Some(store) => store,
+        None => {
+            tracing::info!("Episodic memory not configured, skipping L1->L2 persistence");
+            return Ok(0);
+        }
+    };
+
+    // Get all entries from working memory
+    let entries = app_state.working_memory.lock().await.get_context(0).await
+        .map_err(|e| e.to_string())?;
+
+    let mut count = 0;
+    for entry in entries {
+        // Determine importance based on role (user messages are more important)
+        let importance = match entry.role.as_str() {
+            "user" => 7,
+            "assistant" => 5,
+            "system" => 8,
+            _ => 5,
+        };
+
+        let new_memory = NewEpisodicMemory {
+            agent_id,
+            session_id: Some(session_id),
+            content: entry.content.clone(),
+            importance,
+            is_marked: false,
+            metadata: Some(serde_json::json!({
+                "role": entry.role,
+                "timestamp": entry.timestamp,
+            }).to_string()),
+        };
+
+        episodic_store.create(&new_memory).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+
+    tracing::info!("Persisted {} entries from L1 to L2 for session {}", count, session_id);
+    Ok(count)
+}
+
+// ============================================================================
+// Semantic Memory Commands (Story 5.3 - L3 Semantic Memory Layer)
+// ============================================================================
+
+/// Index an episodic memory to the semantic layer
+/// This generates an embedding and stores it in the semantic memory store
+#[tauri::command]
+async fn index_episodic_memory(
+    episodic_memory_id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<i64, String> {
+    let app_state = state.lock().await;
+
+    let semantic_store = app_state.semantic_memory_store.as_ref()
+        .ok_or_else(|| "Semantic memory store not initialized".to_string())?;
+
+    let episodic_store = app_state.episodic_memory_store.as_ref()
+        .ok_or_else(|| "Episodic memory store not initialized".to_string())?;
+
+    // Get the episodic memory content
+    let episodic = episodic_store.get(episodic_memory_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Episodic memory {} not found", episodic_memory_id))?;
+
+    // Store with auto-generated embedding
+    semantic_store.store_with_embedding(
+        episodic_memory_id,
+        &episodic.content,
+        DEFAULT_OPENAI_EMBEDDING_MODEL,
+    ).await.map_err(|e| e.to_string())
+}
+
+/// Search semantic memories by similarity
+#[tauri::command]
+async fn search_semantic_memories(
+    query: String,
+    k: usize,
+    agent_id: Option<i64>,
+    threshold: Option<f32>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<SemanticSearchResult>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.semantic_memory_store.as_ref()
+        .ok_or_else(|| "Semantic memory store not initialized".to_string())?;
+
+    let threshold = threshold.unwrap_or(0.7);
+    store.search_similar(&query, k, agent_id, threshold)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Get semantic memory statistics
+#[tauri::command]
+async fn get_semantic_memory_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<SemanticMemoryStats, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.semantic_memory_store.as_ref()
+        .ok_or_else(|| "Semantic memory store not initialized".to_string())?;
+
+    store.stats().map_err(|e| e.to_string())
+}
+
+/// Delete a semantic memory embedding
+#[tauri::command]
+async fn delete_semantic_memory(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.semantic_memory_store.as_ref()
+        .ok_or_else(|| "Semantic memory store not initialized".to_string())?;
+
+    store.delete(id).map_err(|e| e.to_string())
+}
+
+/// Rebuild semantic index for an agent
+/// This regenerates all embeddings from episodic memories
+#[tauri::command]
+async fn rebuild_semantic_index(
+    agent_id: i64,
+    model: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<usize, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.semantic_memory_store.as_ref()
+        .ok_or_else(|| "Semantic memory store not initialized".to_string())?;
+
+    let model = model.unwrap_or_else(|| DEFAULT_OPENAI_EMBEDDING_MODEL.to_string());
+    store.rebuild_index(agent_id, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Unified Memory Manager Commands (Story 5.4)
+// ============================================================================
+
+/// Store a memory using the unified MemoryManager
+///
+/// - Always stores to L1 (working memory)
+/// - Optionally persists to L2 if persist_to_l2 is true
+/// - Optionally indexes to L3 if index_to_l3 is true
+#[tauri::command]
+async fn memory_store(
+    content: String,
+    role: String,
+    importance: u8,
+    persist_to_l2: bool,
+    index_to_l3: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.store(&content, &role, importance, persist_to_l2, index_to_l3)
+        .await
+        .map_err(|e| format!("Failed to store memory: {}", e))
+}
+
+/// Retrieve memories using the unified MemoryManager
+///
+/// Queries layers based on the specified layer parameter:
+/// - "L1": Only working memory
+/// - "L2": Only episodic memory
+/// - "L3": Only semantic memory
+/// - "All" or other: Try L1 first, then L2, then L3
+#[tauri::command]
+async fn memory_retrieve(
+    agent_id: i64,
+    session_id: Option<i64>,
+    layer: String,
+    limit: usize,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<MemoryQueryResult, String> {
+    let layer = match layer.as_str() {
+        "L1" => MemoryLayer::L1,
+        "L2" => MemoryLayer::L2,
+        "L3" => MemoryLayer::L3,
+        _ => MemoryLayer::All,
+    };
+
+    let query = MemoryQuery {
+        agent_id,
+        session_id,
+        layer,
+        limit,
+        offset: 0,
+        min_importance: None,
+        time_range: None,
+    };
+
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.retrieve(query).await.map_err(|e| format!("Failed to retrieve memories: {}", e))
+}
+
+/// Search memories using semantic similarity (L3)
+///
+/// Returns memories sorted by similarity score (descending).
+#[tauri::command]
+async fn memory_search(
+    query: String,
+    k: usize,
+    threshold: f32,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<UnifiedMemoryEntry>, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.search(&query, k, threshold).await.map_err(|e| format!("Failed to search memories: {}", e))
+}
+
+/// Delete a memory from the specified layer(s)
+///
+/// - "L1": Not supported (L1 doesn't support direct deletion)
+/// - "L2": Delete from episodic memory
+/// - "L3": Delete from semantic memory only
+/// - "All" or other: Delete from L2 and L3
+#[tauri::command]
+async fn memory_delete(
+    id: String,
+    layer: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let layer = match layer.as_str() {
+        "L1" => MemoryLayer::L1,
+        "L2" => MemoryLayer::L2,
+        "L3" => MemoryLayer::L3,
+        _ => MemoryLayer::All,
+    };
+
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.delete(&id, layer).await.map_err(|e| format!("Failed to delete memory: {}", e))
+}
+
+/// Get statistics for all memory layers
+#[tauri::command]
+async fn memory_get_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<MemoryManagerStats, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.get_stats().await.map_err(|e| format!("Failed to get memory stats: {}", e))
+}
+
+/// Set the current session context for the MemoryManager
+#[tauri::command]
+async fn memory_set_session(
+    session_id: i64,
+    agent_id: Option<i64>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.set_session(session_id, agent_id).await;
+    Ok(())
+}
+
+/// Persist session memories from L1 to L2
+#[tauri::command]
+async fn memory_persist_session(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<usize, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.persist_session().await.map_err(|e| format!("Failed to persist session: {}", e))
+}
+
+/// Get memory performance statistics
+#[tauri::command]
+async fn memory_get_performance_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<PerformanceStats, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    Ok(manager.get_performance_stats().await)
+}
+
+/// Run memory performance benchmark
+#[tauri::command]
+async fn memory_benchmark(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<BenchmarkResults, String> {
+    // Get MemoryManager reference quickly, release AppState lock
+    let manager = {
+        let app_state = state.lock().await;
+        app_state.memory_manager.clone()
+            .ok_or_else(|| "Memory manager not initialized".to_string())?
+    };
+
+    // Perform operation with only MemoryManager lock held
+    let manager = manager.lock().await;
+    manager.benchmark().await.map_err(|e| format!("Benchmark failed: {}", e))
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
@@ -2953,6 +3743,11 @@ pub fn run() {
         config_manager: Some(config_manager),
         keyring_service: None,
         stream_manager: StreamManager::new(),
+        command_registry: Arc::new(CommandRegistry::with_defaults()),
+        working_memory: Arc::new(Mutex::new(WorkingMemory::new())),
+        episodic_memory_store: None,
+        semantic_memory_store: None,
+        memory_manager: None,
     }));
 
     tauri::Builder::default()
@@ -3050,6 +3845,49 @@ pub fn run() {
             // Streaming commands (Story 4.3)
             stream_chat,
             cancel_stream,
+            // Command execution commands (Story 4.10)
+            execute_command,
+            list_commands,
+            // Working memory commands (Story 5.1)
+            get_working_memory,
+            clear_working_memory,
+            get_memory_stats,
+            set_working_memory_session,
+            push_working_memory_context,
+            // Episodic memory commands (Story 5.2)
+            store_episodic_memory,
+            get_episodic_memories,
+            get_episodic_memories_by_session,
+            get_episodic_memories_by_importance,
+            delete_episodic_memory,
+            get_episodic_memory_stats,
+            export_episodic_memories,
+            import_episodic_memories,
+            // Memory mark commands (Story 5.8 - 重要片段标记功能)
+            mark_episodic_memory_important,
+            unmark_episodic_memory_important,
+            get_marked_episodic_memories,
+            // Message mark commands (Story 5.8 - Important fragment marking)
+            mark_message_important,
+            // Session lifecycle commands (Story 5.2 - L1→L2 persistence)
+            end_session,
+            // Semantic memory commands (Story 5.3 - L3 Semantic Memory)
+            index_episodic_memory,
+            search_semantic_memories,
+            get_semantic_memory_stats,
+            delete_semantic_memory,
+            rebuild_semantic_index,
+            // Unified Memory Manager commands (Story 5.4)
+            memory_store,
+            memory_retrieve,
+            memory_search,
+            memory_delete,
+            memory_get_stats,
+            memory_set_session,
+            memory_persist_session,
+            // Performance metrics commands (Story 5.5)
+            memory_get_performance_stats,
+            memory_benchmark,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

@@ -565,6 +565,111 @@ ALTER TABLE messages_backup RENAME TO messages;
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
 "#;
 
+/// Episodic memories migration SQL
+const EPISODIC_MEMORIES_SQL: &str = r#"
+-- Migration: 008_episodic_memories
+-- Description: Add episodic_memories table for L2 long-term memory storage
+
+-- Episodic memories table: Long-term memory for important conversations and events
+CREATE TABLE IF NOT EXISTS episodic_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL,
+    session_id INTEGER,
+    content TEXT NOT NULL,
+    importance INTEGER NOT NULL DEFAULT 5 CHECK(importance BETWEEN 1 AND 10),
+    metadata TEXT,  -- JSON for additional data
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+);
+
+-- Indexes for query patterns
+CREATE INDEX IF NOT EXISTS idx_episodic_agent_id ON episodic_memories(agent_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_session_id ON episodic_memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_importance ON episodic_memories(importance DESC);
+CREATE INDEX IF NOT EXISTS idx_episodic_created_at ON episodic_memories(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_episodic_agent_created ON episodic_memories(agent_id, created_at DESC);
+"#;
+
+/// Episodic memories rollback SQL
+const EPISODIC_MEMORIES_DOWN_SQL: &str = r#"
+-- Rollback: 008_episodic_memories
+DROP INDEX IF EXISTS idx_episodic_agent_created;
+DROP INDEX IF EXISTS idx_episodic_created_at;
+DROP INDEX IF EXISTS idx_episodic_importance;
+DROP INDEX IF EXISTS idx_episodic_session_id;
+DROP INDEX IF EXISTS idx_episodic_agent_id;
+DROP TABLE IF EXISTS episodic_memories;
+"#;
+
+/// Memory embeddings migration SQL
+const MEMORY_EMBEDDINGS_SQL: &str = r#"
+-- Migration: 009_memory_embeddings
+-- Description: Add memory_embeddings table for L3 semantic memory storage
+
+-- Memory embeddings table: Vector embeddings for semantic search
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    episodic_memory_id INTEGER NOT NULL UNIQUE,
+    embedding BLOB NOT NULL,            -- Serialized Vec<f32> (little-endian)
+    embedding_dim INTEGER NOT NULL,     -- Vector dimension (e.g., 1536 for text-embedding-3-small)
+    embedding_model TEXT NOT NULL,      -- Model used for embedding (e.g., "text-embedding-3-small")
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (episodic_memory_id) REFERENCES episodic_memories(id) ON DELETE CASCADE
+);
+
+-- Index for episodic memory lookup
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_episodic ON memory_embeddings(episodic_memory_id);
+
+-- Index for model-based filtering
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(embedding_model);
+"#;
+
+/// Memory embeddings rollback SQL
+const MEMORY_EMBEDDINGS_DOWN_SQL: &str = r#"
+-- Rollback: 009_memory_embeddings
+DROP INDEX IF EXISTS idx_memory_embeddings_model;
+DROP INDEX IF EXISTS idx_memory_embeddings_episodic;
+DROP TABLE IF EXISTS memory_embeddings;
+"#;
+
+/// Message and memory mark migration SQL
+/// [Source: Story 5.8 - 重要片段标记功能]
+const MESSAGE_MEMORY_MARK_SQL: &str = r#"
+-- Migration: 010_message_memory_mark
+-- Description: Add is_marked column to messages and episodic_memories for important fragment marking
+
+-- Add is_marked column to messages table
+ALTER TABLE messages ADD COLUMN is_marked INTEGER NOT NULL DEFAULT 0;
+
+-- Add is_marked column to episodic_memories table
+ALTER TABLE episodic_memories ADD COLUMN is_marked INTEGER NOT NULL DEFAULT 0;
+
+-- Create index for marked messages
+CREATE INDEX IF NOT EXISTS idx_messages_is_marked ON messages(is_marked) WHERE is_marked = 1;
+
+-- Create index for marked episodic memories
+CREATE INDEX IF NOT EXISTS idx_episodic_is_marked ON episodic_memories(is_marked) WHERE is_marked = 1;
+"#;
+
+/// Message and memory mark rollback SQL
+const MESSAGE_MEMORY_MARK_DOWN_SQL: &str = r#"
+-- Rollback: 010_message_memory_mark
+-- Note: SQLite doesn't support DROP COLUMN directly, so we recreate tables
+
+-- For messages, we need to recreate without is_marked
+-- This is handled by not including is_marked in the backup schema
+
+-- Drop indexes first
+DROP INDEX IF EXISTS idx_episodic_is_marked;
+DROP INDEX IF EXISTS idx_messages_is_marked;
+
+-- Note: In production, the columns will remain but unused
+-- SQLite doesn't support DROP COLUMN in older versions
+-- The application code will handle this gracefully
+"#;
+
 /// Get the built-in migrations
 ///
 /// Returns a list of migrations that are embedded in the binary.
@@ -589,6 +694,15 @@ pub fn get_builtin_migrations() -> Vec<Migration> {
         Migration::new("007_message_quote", "Add quote_message_id column to messages table for message reply/quote functionality")
             .up(MESSAGE_QUOTE_SQL)
             .down(MESSAGE_QUOTE_DOWN_SQL),
+        Migration::new("008_episodic_memories", "Add episodic_memories table for L2 long-term memory storage")
+            .up(EPISODIC_MEMORIES_SQL)
+            .down(EPISODIC_MEMORIES_DOWN_SQL),
+        Migration::new("009_memory_embeddings", "Add memory_embeddings table for L3 semantic memory storage")
+            .up(MEMORY_EMBEDDINGS_SQL)
+            .down(MEMORY_EMBEDDINGS_DOWN_SQL),
+        Migration::new("010_message_memory_mark", "Add is_marked column to messages and episodic_memories for important fragment marking")
+            .up(MESSAGE_MEMORY_MARK_SQL)
+            .down(MESSAGE_MEMORY_MARK_DOWN_SQL),
     ]
 }
 
@@ -806,7 +920,7 @@ mod tests {
     #[test]
     fn test_builtin_migrations_include_agent_enhancements() {
         let migrations = get_builtin_migrations();
-        assert_eq!(migrations.len(), 7);
+        assert_eq!(migrations.len(), 10);
         assert_eq!(migrations[0].id, "001_initial");
         assert_eq!(migrations[1].id, "002_agent_enhancements");
         assert!(migrations[1].down_sql.is_some());
@@ -820,6 +934,12 @@ mod tests {
         assert!(migrations[5].down_sql.is_some());
         assert_eq!(migrations[6].id, "007_message_quote");
         assert!(migrations[6].down_sql.is_some());
+        assert_eq!(migrations[7].id, "008_episodic_memories");
+        assert!(migrations[7].down_sql.is_some());
+        assert_eq!(migrations[8].id, "009_memory_embeddings");
+        assert!(migrations[8].down_sql.is_some());
+        assert_eq!(migrations[9].id, "010_message_memory_mark");
+        assert!(migrations[9].down_sql.is_some());
     }
 
     #[test]
@@ -830,7 +950,7 @@ mod tests {
         let runner = create_builtin_runner();
         let report = runner.run(&conn).expect("Failed to run migrations");
 
-        assert_eq!(report.applied.len(), 7);
+        assert_eq!(report.applied.len(), 10);
 
         // Verify agent_uuid column exists
         let uuid_count: i32 = conn
@@ -927,12 +1047,12 @@ mod tests {
         // Run migrations twice
         let runner = create_builtin_runner();
         let report1 = runner.run(&conn).expect("First run failed");
-        assert_eq!(report1.applied.len(), 7);
+        assert_eq!(report1.applied.len(), 10);
 
         // Second run should skip all
         let report2 = runner.run(&conn).expect("Second run failed");
         assert_eq!(report2.applied.len(), 0);
-        assert_eq!(report2.skipped.len(), 7);
+        assert_eq!(report2.skipped.len(), 10);
     }
 
     #[test]
@@ -1058,5 +1178,95 @@ mod tests {
 
         assert_eq!(name, "Test Agent");
         assert_eq!(provider_id, Some("provider-123".to_string()));
+    }
+
+    #[test]
+    fn test_episodic_memories_migration_creates_table() {
+        let conn = create_test_connection();
+
+        // Run migrations
+        let runner = create_builtin_runner();
+        runner.run(&conn).expect("Failed to run migrations");
+
+        // Verify episodic_memories table exists
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='episodic_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "episodic_memories table should exist");
+
+        // Verify indexes exist
+        let idx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_episodic%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 6, "All 6 indexes should exist");
+
+        // Verify columns exist
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('episodic_memories')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(columns.contains(&"id".to_string()));
+        assert!(columns.contains(&"agent_id".to_string()));
+        assert!(columns.contains(&"session_id".to_string()));
+        assert!(columns.contains(&"content".to_string()));
+        assert!(columns.contains(&"importance".to_string()));
+        assert!(columns.contains(&"metadata".to_string()));
+        assert!(columns.contains(&"created_at".to_string()));
+    }
+
+    #[test]
+    fn test_memory_embeddings_migration_creates_table() {
+        let conn = create_test_connection();
+
+        // Run migrations
+        let runner = create_builtin_runner();
+        runner.run(&conn).expect("Failed to run migrations");
+
+        // Verify memory_embeddings table exists
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_embeddings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "memory_embeddings table should exist");
+
+        // Verify indexes exist
+        let idx_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_memory_embeddings%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 2, "Both indexes should exist");
+
+        // Verify columns exist
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('memory_embeddings')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(columns.contains(&"id".to_string()));
+        assert!(columns.contains(&"episodic_memory_id".to_string()));
+        assert!(columns.contains(&"embedding".to_string()));
+        assert!(columns.contains(&"embedding_dim".to_string()));
+        assert!(columns.contains(&"embedding_model".to_string()));
+        assert!(columns.contains(&"created_at".to_string()));
+        assert!(columns.contains(&"updated_at".to_string()));
     }
 }

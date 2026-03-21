@@ -44,6 +44,7 @@ avif-serialize.workspace = true
 base64ct.workspace = true
 globset.workspace = true
 url.workspace = true
+lru.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
 futures-util = "0.3"
 tokio-stream = "0.1"

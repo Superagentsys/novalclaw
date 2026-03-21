@@ -4,16 +4,20 @@
 //! including session management, message persistence, and LLM provider integration.
 
 use crate::agent::dispatcher::{AgentDispatcher, DispatcherConfig, DispatchError};
+use crate::agent::memory_context::{
+    build_context_string, retrieve_relevant_memories, MemoryContextResult,
+};
 use crate::agent::model::AgentModel;
 use crate::agent::prompts::get_enhanced_system_prompt;
 use crate::agent::soul::MbtiType;
 use crate::agent::store::AgentStore;
 use crate::agent::streaming::{
-    error_codes, stream_error_to_code_and_message, ActiveStream, StreamAccumulator, StreamEvent,
+    error_codes, stream_error_to_code_and_message, StreamAccumulator, StreamEvent,
     StreamManager, FIRST_TOKEN_TIMEOUT_SECS,
 };
+use crate::config::schema::MemoryContextConfig;
 use crate::db::DbPool;
-use crate::memory::{Memory, MemoryCategory};
+use crate::memory::{Memory, MemoryCategory, MemoryManager, WorkingMemory, EpisodicMemoryStore, NewEpisodicMemory};
 use crate::providers::{ChatMessage, ChatRequest, ChatStreamChunk, Provider, StreamError};
 use crate::session::{
     Message as SessionMessage, MessageRole, NewMessage, NewSession, Session,
@@ -24,7 +28,8 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info, instrument, warn};
 
 /// Result of a chat operation
 #[derive(Debug, Clone)]
@@ -35,6 +40,8 @@ pub struct ChatResult {
     pub session_id: i64,
     /// The message ID of the assistant's response
     pub message_id: i64,
+    /// Memory context used for this response (if any)
+    pub memory_context: Option<MemoryContextResult>,
 }
 
 /// Error type for agent service operations
@@ -73,11 +80,17 @@ pub enum AgentServiceError {
 
 /// High-level service for agent operations
 pub struct AgentService {
-    db: DbPool,
     agent_store: AgentStore,
     session_store: SessionStore,
     message_store: MessageStore,
     memory: Arc<dyn Memory>,
+    working_memory: Arc<Mutex<WorkingMemory>>,
+    /// L2 episodic memory store for long-term memory
+    episodic_memory_store: Option<Arc<EpisodicMemoryStore>>,
+    /// Unified memory manager for context retrieval
+    memory_manager: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
+    /// Memory context configuration
+    memory_context_config: MemoryContextConfig,
     tools: Vec<Box<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
 }
@@ -94,11 +107,51 @@ impl AgentService {
             agent_store: AgentStore::new(db.clone()),
             session_store: SessionStore::new(db.clone()),
             message_store: MessageStore::new(db.clone()),
-            db,
             memory,
+            working_memory: Arc::new(Mutex::new(WorkingMemory::new())),
+            episodic_memory_store: None,
+            memory_manager: None,
+            memory_context_config: MemoryContextConfig::default(),
             tools,
             tool_specs,
         }
+    }
+
+    /// Create a new AgentService with episodic memory store enabled
+    pub fn with_episodic_memory(
+        db: DbPool,
+        memory: Arc<dyn Memory>,
+        tools: Vec<Box<dyn Tool>>,
+        episodic_memory_store: Arc<EpisodicMemoryStore>,
+    ) -> Self {
+        let tool_specs = tools.iter().map(|t| t.spec()).collect();
+        Self {
+            agent_store: AgentStore::new(db.clone()),
+            session_store: SessionStore::new(db.clone()),
+            message_store: MessageStore::new(db.clone()),
+            memory,
+            working_memory: Arc::new(Mutex::new(WorkingMemory::new())),
+            episodic_memory_store: Some(episodic_memory_store),
+            memory_manager: None,
+            memory_context_config: MemoryContextConfig::default(),
+            tools,
+            tool_specs,
+        }
+    }
+
+    /// Set the episodic memory store
+    pub fn set_episodic_memory_store(&mut self, store: Arc<EpisodicMemoryStore>) {
+        self.episodic_memory_store = Some(store);
+    }
+
+    /// Set the memory manager for context retrieval
+    pub fn set_memory_manager(&mut self, manager: Arc<tokio::sync::Mutex<MemoryManager>>) {
+        self.memory_manager = Some(manager);
+    }
+
+    /// Set the memory context configuration
+    pub fn set_memory_context_config(&mut self, config: MemoryContextConfig) {
+        self.memory_context_config = config;
     }
 
     /// Send a message to an agent, optionally within an existing session
@@ -142,14 +195,41 @@ impl AgentService {
 
         debug!(session_id = session.id, "Using session");
 
-        // 3. Build system prompt
-        let system_prompt = self.build_system_prompt(&agent)?;
+        // 3. Retrieve relevant memories for context enhancement
+        let memory_context = if let Some(ref memory_manager) = self.memory_manager {
+            match retrieve_relevant_memories(
+                memory_manager,
+                message,
+                &self.memory_context_config,
+                Some(agent_id),
+            ).await {
+                Ok(result) if !result.memories.is_empty() => {
+                    debug!(
+                        memories_count = result.memories.len(),
+                        total_chars = result.total_chars,
+                        retrieval_time_ms = result.retrieval_time_ms,
+                        "Retrieved relevant memories for context"
+                    );
+                    Some(result)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(error = %e, "Failed to retrieve memories for context");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        // 4. Load session history
+        // 4. Build system prompt (with memory context if available)
+        let system_prompt = self.build_system_prompt_with_memory(&agent, memory_context.as_ref())?;
+
+        // 5. Load session history
         let history = self.message_store.find_by_session(session.id)?;
         let mut messages = self.convert_history_to_chat_messages(history, &system_prompt);
 
-        // 5. Store user message
+        // 6. Store user message
         let user_msg = NewMessage {
             session_id: session.id,
             role: MessageRole::User,
@@ -170,7 +250,14 @@ impl AgentService {
             )
             .await;
 
-        // 6. Run through dispatcher
+        // Store in working memory (L1) for quick context access
+        {
+            let mut wm = self.working_memory.lock().await;
+            wm.set_session(session.id, agent_id);
+            let _ = wm.push_context("user", message).await;
+        }
+
+        // 7. Run through dispatcher
         let dispatcher_config = DispatcherConfig {
             max_tool_iterations: 10, // Default, could be from config
             ..Default::default()
@@ -187,7 +274,7 @@ impl AgentService {
             AgentServiceError::Dispatch(e)
         })?;
 
-        // 7. Save assistant response
+        // 8. Save assistant response
         let assistant_msg = NewMessage {
             session_id: session.id,
             role: MessageRole::Assistant,
@@ -195,6 +282,12 @@ impl AgentService {
             quote_message_id: None,
         };
         let saved_assistant_msg = self.message_store.create(&assistant_msg)?;
+
+        // Store assistant response in working memory (L1)
+        {
+            let wm = self.working_memory.lock().await;
+            let _ = wm.push_context("assistant", &response).await;
+        }
 
         info!(
             session_id = session.id,
@@ -207,6 +300,7 @@ impl AgentService {
             response,
             session_id: session.id,
             message_id: saved_assistant_msg.id,
+            memory_context,
         })
     }
 
@@ -327,6 +421,13 @@ impl AgentService {
                 None,
             )
             .await;
+
+        // Store in working memory (L1) for quick context access
+        {
+            let mut wm = self.working_memory.lock().await;
+            wm.set_session(session.id, agent_id);
+            let _ = wm.push_context("user", message).await;
+        }
 
         // 6. Register stream with manager if provided
         if let Some(ref manager) = stream_manager {
@@ -512,6 +613,12 @@ impl AgentService {
         };
         let saved_assistant_msg = self.message_store.create(&assistant_msg)?;
 
+        // Store assistant response in working memory (L1)
+        {
+            let wm = self.working_memory.lock().await;
+            let _ = wm.push_context("assistant", &response).await;
+        }
+
         // 12. Emit done event
         on_event(StreamEvent::done(session.id, saved_assistant_msg.id));
 
@@ -531,6 +638,7 @@ impl AgentService {
             response,
             session_id: session.id,
             message_id: saved_assistant_msg.id,
+            memory_context: None, // Memory context for streaming is returned via events
         })
     }
 
@@ -609,6 +717,25 @@ impl AgentService {
         }
     }
 
+    /// Build the system prompt with memory context for an agent
+    fn build_system_prompt_with_memory(
+        &self,
+        agent: &AgentModel,
+        memory_context: Option<&MemoryContextResult>,
+    ) -> Result<String, AgentServiceError> {
+        let base_prompt = self.build_system_prompt(agent)?;
+
+        // If there's memory context, prepend it to the system prompt
+        if let Some(ctx) = memory_context {
+            if !ctx.memories.is_empty() {
+                let memory_context_str = build_context_string(ctx, self.memory_context_config.max_chars);
+                return Ok(format!("{}{}", memory_context_str, base_prompt));
+            }
+        }
+
+        Ok(base_prompt)
+    }
+
     /// Convert session history to chat messages for the provider
     fn convert_history_to_chat_messages(
         &self,
@@ -631,6 +758,73 @@ impl AgentService {
         }
 
         messages
+    }
+
+    /// Persist working memory (L1) to episodic memory (L2)
+    ///
+    /// This should be called when a session ends to save important context
+    /// to long-term storage.
+    pub async fn persist_session_to_l2(&self, agent_id: i64, session_id: i64) -> Result<usize, AgentServiceError> {
+        let episodic_store = self.episodic_memory_store.as_ref()
+            .ok_or_else(|| AgentServiceError::Memory("Episodic memory store not configured".to_string()))?;
+
+        // Get all entries from working memory
+        let entries = self.working_memory.lock().await.get_context(0).await
+            .map_err(|e| AgentServiceError::Memory(e.to_string()))?;
+
+        let mut count = 0;
+        for entry in entries {
+            // Determine importance based on role (user messages are more important)
+            let importance = match entry.role.as_str() {
+                "user" => 7,
+                "assistant" => 5,
+                "system" => 8,
+                _ => 5,
+            };
+
+            let new_memory = NewEpisodicMemory {
+                agent_id,
+                session_id: Some(session_id),
+                content: entry.content.clone(),
+                importance,
+                is_marked: false,
+                metadata: Some(serde_json::json!({
+                    "role": entry.role,
+                    "timestamp": entry.timestamp,
+                }).to_string()),
+            };
+
+            episodic_store.create(&new_memory)
+                .map_err(|e| AgentServiceError::Memory(e.to_string()))?;
+            count += 1;
+        }
+
+        info!("Persisted {} entries from L1 to L2 for session {}", count, session_id);
+        Ok(count)
+    }
+
+    /// Store an important memory directly to L2 episodic memory
+    pub async fn store_important_memory(
+        &self,
+        agent_id: i64,
+        content: &str,
+        importance: u8,
+        session_id: Option<i64>,
+    ) -> Result<i64, AgentServiceError> {
+        let episodic_store = self.episodic_memory_store.as_ref()
+            .ok_or_else(|| AgentServiceError::Memory("Episodic memory store not configured".to_string()))?;
+
+        let new_memory = NewEpisodicMemory {
+            agent_id,
+            session_id,
+            content: content.to_string(),
+            importance,
+            is_marked: false,
+            metadata: None,
+        };
+
+        episodic_store.create(&new_memory)
+            .map_err(|e| AgentServiceError::Memory(e.to_string()))
     }
 }
 
@@ -745,6 +939,7 @@ mod tests {
             response: "Hello".to_string(),
             session_id: 1,
             message_id: 42,
+            memory_context: None,
         };
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("Hello"));

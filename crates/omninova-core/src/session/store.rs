@@ -245,6 +245,7 @@ impl MessageStore {
             content: new_message.content.clone(),
             created_at: timestamp,
             quote_message_id: new_message.quote_message_id,
+            is_marked: false,
         })
     }
 
@@ -252,7 +253,7 @@ impl MessageStore {
     pub fn find_by_id(&self, id: i64) -> Result<Option<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at, quote_message_id
+            "SELECT id, session_id, role, content, created_at, quote_message_id, is_marked
              FROM messages WHERE id = ?1"
         )?;
 
@@ -266,6 +267,7 @@ impl MessageStore {
                 content: row.get(3)?,
                 created_at: row.get(4)?,
                 quote_message_id: row.get(5)?,
+                is_marked: row.get::<_, i64>(6)? != 0,
             })
         });
 
@@ -280,7 +282,7 @@ impl MessageStore {
     pub fn find_by_session(&self, session_id: i64) -> Result<Vec<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at, quote_message_id
+            "SELECT id, session_id, role, content, created_at, quote_message_id, is_marked
              FROM messages WHERE session_id = ?1
              ORDER BY created_at ASC"
         )?;
@@ -295,6 +297,7 @@ impl MessageStore {
                 content: row.get(3)?,
                 created_at: row.get(4)?,
                 quote_message_id: row.get(5)?,
+                is_marked: row.get::<_, i64>(6)? != 0,
             })
         })?;
 
@@ -309,7 +312,7 @@ impl MessageStore {
     pub fn find_latest_by_session(&self, session_id: i64, limit: usize) -> Result<Vec<Message>, SessionStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, created_at, quote_message_id
+            "SELECT id, session_id, role, content, created_at, quote_message_id, is_marked
              FROM messages WHERE session_id = ?1
              ORDER BY created_at DESC LIMIT ?2"
         )?;
@@ -324,6 +327,7 @@ impl MessageStore {
                 content: row.get(3)?,
                 created_at: row.get(4)?,
                 quote_message_id: row.get(5)?,
+                is_marked: row.get::<_, i64>(6)? != 0,
             })
         })?;
 
@@ -364,6 +368,22 @@ impl MessageStore {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Set the marked status of a message
+    ///
+    /// Marked messages receive higher importance scores
+    /// when stored to episodic memory (L2).
+    ///
+    /// [Source: Story 5.8 - 重要片段标记功能]
+    pub fn set_marked(&self, id: i64, is_marked: bool) -> Result<bool, SessionStoreError> {
+        let conn = self.get_conn()?;
+        let rows_affected = conn.execute(
+            "UPDATE messages SET is_marked = ?1 WHERE id = ?2",
+            params![is_marked as i64, id],
+        )?;
+
+        Ok(rows_affected > 0)
     }
 }
 

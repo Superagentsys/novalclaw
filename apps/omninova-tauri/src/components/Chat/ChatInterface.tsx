@@ -10,17 +10,30 @@
  * [Source: Story 4.6 - 消息输入与发送功能]
  * [Source: Story 4.7 - 对话历史持久化与导航]
  * [Source: Story 4.8 - 消息引用功能]
+ * [Source: Story 4.9 - 响应中断功能]
+ * [Source: Story 4.10 - 指令执行框架]
+ * [Source: Story 5.6 - MemoryLayerIndicator 组件]
+ * [Source: Story 5.7 - MemoryVisualization 组件]
+ * [Source: Story 5.8 - 重要片段标记功能]
  */
 
-import { memo, useCallback, useEffect, useRef } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { type AgentModel, type MBTIType } from '@/types/agent';
 import { type Message, type Session } from '@/types/session';
+import type { CommandResult } from '@/types/command';
 import { useChatStore } from '@/stores/chatStore';
 import { usePaginatedMessages } from '@/hooks/usePaginatedMessages';
+import { useMemoryStats } from '@/hooks/useMemoryStats';
 import MessageList from './MessageList';
 import { MessageSkeletonList } from './MessageSkeleton';
 import ChatInput from './ChatInput';
+import { MemoryLayerIndicator } from './MemoryLayerIndicator';
+import { MemoryVisualization } from './MemoryVisualization';
+import {
+  Dialog,
+  DialogContent,
+} from '@/components/ui/dialog';
 
 // ============================================================================
 // Types
@@ -222,6 +235,21 @@ export const ChatInterface = memo(function ChatInterface({
   const quoteMessage = useChatStore((state) => state.quoteMessage);
   const setQuoteMessage = useChatStore((state) => state.setQuoteMessage);
   const clearQuoteMessage = useChatStore((state) => state.clearQuoteMessage);
+  const cancelActiveStream = useChatStore((state) => state.cancelActiveStream);
+  const activeSessionId = useChatStore((state) => state.activeSessionId);
+  const executeCommand = useChatStore((state) => state.executeCommand);
+  const toggleMessageMark = useChatStore((state) => state.toggleMessageMark);
+
+  // Memory stats hook - polls every 5 seconds
+  // [Source: Story 5.6 - MemoryLayerIndicator 组件]
+  const { stats: memoryStats } = useMemoryStats({ interval: 5000 });
+
+  // Command result message for displaying command responses
+  const [commandResultMessage, setCommandResultMessage] = useState<Message | null>(null);
+
+  // Memory panel state
+  // [Source: Story 5.7 - MemoryVisualization 组件]
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
 
   // Paginated messages hook - loads messages when session changes
   const {
@@ -245,16 +273,22 @@ export const ChatInterface = memo(function ChatInterface({
   }, [paginatedMessages, setMessages, session?.id]);
 
   // Use initial messages if provided and store is empty
-  const displayMessages = paginatedMessages.length > 0
+  // Include command result message if present
+  const baseMessages = paginatedMessages.length > 0
     ? paginatedMessages
     : (initialMessages || []);
+  const displayMessages = commandResultMessage
+    ? [...baseMessages, commandResultMessage]
+    : baseMessages;
 
-  // Handle cancel stream
-  const handleCancelStream = useCallback(() => {
-    if (onCancelStream) {
-      onCancelStream();
+  // Handle cancel stream - calls store's cancelActiveStream
+  const handleCancelStream = useCallback(async () => {
+    if (activeSessionId) {
+      await cancelActiveStream(activeSessionId);
     }
-  }, [onCancelStream]);
+    // Call optional external handler
+    onCancelStream?.();
+  }, [activeSessionId, cancelActiveStream, onCancelStream]);
 
   /**
    * Build message content with quote context
@@ -274,18 +308,48 @@ export const ChatInterface = memo(function ChatInterface({
     [agent.name]
   );
 
-  // Handle send message (with optional quote context)
+  /**
+   * Handle send message (with command detection)
+   *
+   * If the content starts with "/", it's treated as a command.
+   * Otherwise, it's sent as a regular message.
+   *
+   * [Source: Story 4.10 - 指令执行框架]
+   */
   const handleSendMessage = useCallback(
-    (content: string) => {
-      // Include quote context if quoting a message
+    async (content: string) => {
+      // Check if this is a command (starts with /)
+      if (content.startsWith('/')) {
+        try {
+          const result = await executeCommand(content);
+
+          // Display command result as a system message
+          if (result.message) {
+            const systemMessage: Message = {
+              id: Date.now(),
+              sessionId: activeSessionId ?? 0,
+              role: 'assistant',
+              content: result.message,
+              createdAt: Math.floor(Date.now() / 1000),
+            };
+            setCommandResultMessage(systemMessage);
+
+            // Clear the command result after a delay for non-persistent commands
+            setTimeout(() => {
+              setCommandResultMessage(null);
+            }, 5000);
+          }
+        } catch (err) {
+          console.error('Command execution failed:', err);
+        }
+        return;
+      }
+
+      // Regular message handling
       const contentWithContext = buildMessageWithContext(content, quoteMessage);
-
-      // Send message with quote info
       onSendMessage(contentWithContext);
-
-      // Note: clearQuoteMessage is handled in ChatInput after send
     },
-    [onSendMessage, quoteMessage, buildMessageWithContext]
+    [executeCommand, activeSessionId, onSendMessage, quoteMessage, buildMessageWithContext]
   );
 
   // Handle quote message selection
@@ -339,6 +403,43 @@ export const ChatInterface = memo(function ChatInterface({
     >
       {/* Header */}
       <ChatHeader agent={agent} session={session} isStreaming={isStreaming}>
+        {/* Memory Layer Indicator */}
+        <MemoryLayerIndicator
+          stats={memoryStats}
+          isRetrieving={isStreaming}
+          activeLayer={isStreaming ? 'L1' : null}
+        />
+        {/* Memory Panel Button */}
+        {/* [Source: Story 5.7 - MemoryVisualization 组件] */}
+        <button
+          type="button"
+          onClick={() => setShowMemoryPanel(true)}
+          className="p-2 rounded-md hover:bg-muted transition-colors"
+          title="查看记忆"
+          aria-label="打开记忆面板"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+            <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+            <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+            <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+            <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+            <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+            <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+            <path d="M6 18a4 4 0 0 1-1.967-.516" />
+            <path d="M19.967 17.484A4 4 0 0 1 18 18" />
+          </svg>
+        </button>
         {headerContent}
       </ChatHeader>
 
@@ -361,6 +462,7 @@ export const ChatInterface = memo(function ChatInterface({
         isLoadingMore={isLoadingMessages && displayMessages.length > 0}
         onQuoteMessage={handleQuoteMessage}
         onQuoteClick={handleQuoteClick}
+        onToggleMark={toggleMessageMark}
       />
 
       {/* Loading overlay */}
@@ -369,7 +471,7 @@ export const ChatInterface = memo(function ChatInterface({
       {/* Message input with quote support */}
       <ChatInput
         onSend={handleSendMessage}
-        onCancel={onCancelStream}
+        onCancel={handleCancelStream}
         isStreaming={isStreaming}
         personalityType={personalityType}
         agentName={agent.name}
@@ -377,6 +479,18 @@ export const ChatInterface = memo(function ChatInterface({
         quoteMessage={quoteMessage}
         onCancelQuote={clearQuoteMessage}
       />
+
+      {/* Memory Visualization Dialog */}
+      {/* [Source: Story 5.7 - MemoryVisualization 组件] */}
+      <Dialog open={showMemoryPanel} onOpenChange={setShowMemoryPanel}>
+        <DialogContent className="max-w-2xl h-[80vh] p-0" showCloseButton={false}>
+          <MemoryVisualization
+            agentId={agent.id}
+            sessionId={session?.id}
+            onClose={() => setShowMemoryPanel(false)}
+          />
+        </DialogContent>
+      </Dialog>
     </div>
   );
 });

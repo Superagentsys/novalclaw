@@ -132,6 +132,14 @@ pub struct Message {
     pub created_at: i64,
     /// Optional ID of the quoted message (for reply functionality)
     pub quote_message_id: Option<i64>,
+    /// Whether the message is marked as important
+    ///
+    /// Marked messages receive higher importance scores
+    /// when stored to episodic memory (L2).
+    ///
+    /// [Source: Story 5.8 - 重要片段标记功能]
+    #[serde(default)]
+    pub is_marked: bool,
 }
 
 /// Data required to create a new message
@@ -267,6 +275,7 @@ mod tests {
             content: "Hello, world!".to_string(),
             created_at: 1700000000,
             quote_message_id: None,
+            is_marked: false,
         };
 
         let json = serde_json::to_string(&message).unwrap();

@@ -58,6 +58,8 @@ export interface SessionUpdate {
  * - 通过 quoteMessageId 字段引用之前的消息
  * - 引用消息会在回复中显示上下文预览
  * - 引用关系用于构建对话线程结构
+ *
+ * [Source: Story 5.8 - 重要片段标记功能]
  */
 export interface Message {
   /** 自增主键 */
@@ -77,6 +79,12 @@ export interface Message {
    * 引用的消息应属于同一会话。
    */
   quoteMessageId?: number;
+  /**
+   * 是否被用户标记为重要
+   *
+   * [Source: Story 5.8 - 重要片段标记功能]
+   */
+  isMarked?: boolean;
 }
 
 /**

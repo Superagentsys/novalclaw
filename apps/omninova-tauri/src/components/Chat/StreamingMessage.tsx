@@ -6,13 +6,16 @@
  *
  * [Source: Story 4.3 - 流式响应处理]
  * [Source: Story 4.5 - 打字指示器与加载状态]
+ * [Source: Story 4.9 - 响应中断功能]
  */
 
 import { useEffect, useRef, useState, memo } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { type MBTIType } from '@/lib/personality-colors';
+import { type MemoryContextInfo } from '@/types/memory';
 import TypingIndicator from './TypingIndicator';
+import MemoryContextIndicator from './MemoryContextIndicator';
 
 /**
  * Props for StreamingMessage component
@@ -24,6 +27,15 @@ export interface StreamingMessageProps {
   reasoning?: string;
   /** Whether stream is active */
   isStreaming: boolean;
+  /**
+   * Whether the stream was cancelled/interrupted
+   *
+   * When true, displays a "[已中断]" marker at the end of content
+   * to indicate the response was stopped before completion.
+   *
+   * [Source: Story 4.9 - 响应中断功能]
+   */
+  isCancelled?: boolean;
   /** Callback to cancel the stream */
   onCancel?: () => void;
   /** Additional CSS classes */
@@ -34,6 +46,8 @@ export interface StreamingMessageProps {
   agentName?: string;
   /** Agent MBTI personality type for typing indicator theming */
   personalityType?: MBTIType;
+  /** Memory context used for this response (Story 5.9) */
+  memoryContext?: MemoryContextInfo;
 }
 
 /**
@@ -206,11 +220,13 @@ export const StreamingMessage = memo(function StreamingMessage({
   content,
   reasoning,
   isStreaming,
+  isCancelled = false,
   onCancel,
   className,
   showReasoning = true,
   agentName,
   personalityType,
+  memoryContext,
 }: StreamingMessageProps) {
   const [showReasoningExpanded, setShowReasoningExpanded] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -274,18 +290,40 @@ export const StreamingMessage = memo(function StreamingMessage({
           <div className="prose prose-sm dark:prose-invert max-w-none">
             {renderFormattedText(content)}
             {isStreaming && <TypingCursor />}
+            {isCancelled && (
+              <span
+                className="inline-flex items-center gap-1 ml-2 px-2 py-0.5 bg-yellow-500/20 text-yellow-600 dark:text-yellow-400 text-xs rounded"
+                aria-label="响应已被中断"
+              >
+                <svg
+                  className="w-3 h-3"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                  />
+                </svg>
+                已中断
+              </span>
+            )}
           </div>
         )}
       </div>
 
-      {/* Cancel button */}
-      {isStreaming && onCancel && (
+      {/* Cancel button - only show when streaming and not already cancelled */}
+      {isStreaming && !isCancelled && onCancel && (
         <div className="flex justify-end pt-2">
           <Button
             variant="outline"
             size="sm"
             onClick={onCancel}
             className="text-xs"
+            aria-label="停止生成"
           >
             <svg
               className="w-3.5 h-3.5 mr-1.5"
@@ -303,6 +341,11 @@ export const StreamingMessage = memo(function StreamingMessage({
             停止生成
           </Button>
         </div>
+      )}
+
+      {/* Memory context indicator - only show when not streaming and context exists */}
+      {!isStreaming && memoryContext && memoryContext.entries.length > 0 && (
+        <MemoryContextIndicator memoryContext={memoryContext} />
       )}
     </div>
   );

@@ -7,6 +7,7 @@
  * [Source: Story 4.4 - ChatInterface 组件基础]
  * [Source: Story 4.7 - 对话历史持久化与导航]
  * [Source: Story 4.8 - 消息引用功能]
+ * [Source: Story 5.8 - 重要片段标记功能]
  */
 
 import { useRef, useEffect, memo, useState, useCallback, type ReactNode } from 'react';
@@ -57,6 +58,13 @@ export interface MessageListProps {
    * Passes the quoted message ID for scroll/navigation
    */
   onQuoteClick?: (messageId: number) => void;
+  /**
+   * Callback when user wants to toggle mark status of a message
+   * Passes the message ID to mark/unmark
+   *
+   * [Source: Story 5.8 - 重要片段标记功能]
+   */
+  onToggleMark?: (messageId: number) => void;
 }
 
 /**
@@ -128,6 +136,7 @@ export const MessageList = memo(function MessageList({
   isLoadingMore = false,
   onQuoteMessage,
   onQuoteClick,
+  onToggleMark,
 }: MessageListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -265,40 +274,92 @@ export const MessageList = memo(function MessageList({
             return (
               <div
                 key={message.id}
-                className="group relative"
+                className={cn(
+                  'group relative',
+                  message.isMarked && 'bg-amber-50 dark:bg-amber-950/10 -mx-2 px-2 rounded-lg'
+                )}
                 onMouseEnter={() => setHoveredMessageId(message.id)}
                 onMouseLeave={() => setHoveredMessageId(null)}
               >
-                {/* Quote button - shown on hover */}
-                {onQuoteMessage && hoveredMessageId === message.id && (
-                  <button
-                    type="button"
-                    onClick={() => onQuoteMessage(message)}
+                {/* Action buttons - shown on hover */}
+                {(onQuoteMessage || onToggleMark) && hoveredMessageId === message.id && (
+                  <div
                     className={cn(
-                      'absolute -right-2 top-0 z-10',
-                      'p-1.5 rounded-md',
-                      'bg-background border border-border shadow-sm',
-                      'text-muted-foreground hover:text-foreground',
-                      'hover:bg-muted transition-colors',
-                      'focus:outline-none focus:ring-2 focus:ring-ring',
+                      'absolute -right-2 top-0 z-10 flex gap-1',
                       message.role === 'user' ? '-translate-x-full' : 'right-0'
                     )}
-                    aria-label="引用此消息"
                   >
-                    <svg
-                      className="h-3.5 w-3.5"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"
-                      />
-                    </svg>
-                  </button>
+                    {/* Mark important button */}
+                    {onToggleMark && (
+                      <button
+                        type="button"
+                        onClick={() => onToggleMark(message.id)}
+                        className={cn(
+                          'p-1.5 rounded-md',
+                          'bg-background border border-border shadow-sm',
+                          message.isMarked
+                            ? 'text-amber-500 hover:text-amber-600'
+                            : 'text-muted-foreground hover:text-amber-500',
+                          'hover:bg-muted transition-colors',
+                          'focus:outline-none focus:ring-2 focus:ring-ring'
+                        )}
+                        aria-label={message.isMarked ? '取消标记' : '标记重要'}
+                        title={message.isMarked ? '取消标记' : '标记重要'}
+                      >
+                        <svg
+                          className="h-3.5 w-3.5"
+                          fill={message.isMarked ? 'currentColor' : 'none'}
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2}
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"
+                          />
+                        </svg>
+                      </button>
+                    )}
+
+                    {/* Quote button */}
+                    {onQuoteMessage && (
+                      <button
+                        type="button"
+                        onClick={() => onQuoteMessage(message)}
+                        className={cn(
+                          'p-1.5 rounded-md',
+                          'bg-background border border-border shadow-sm',
+                          'text-muted-foreground hover:text-foreground',
+                          'hover:bg-muted transition-colors',
+                          'focus:outline-none focus:ring-2 focus:ring-ring'
+                        )}
+                        aria-label="引用此消息"
+                        title="引用回复"
+                      >
+                        <svg
+                          className="h-3.5 w-3.5"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2}
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"
+                          />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Mark indicator for marked messages */}
+                {message.isMarked && (
+                  <span className="absolute -left-1 top-0 text-amber-500 text-xs" title="已标记为重要">
+                    ⭐
+                  </span>
                 )}
 
                 <MessageBubble

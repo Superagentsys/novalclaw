@@ -53,6 +53,9 @@ home = "=0.5.9"
 avif-serialize = "=0.8.2"
 base64ct = "=1.6.0"
 
+# LRU cache for working memory
+lru = "0.12"
+
 # Database dependencies
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
