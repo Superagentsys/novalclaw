@@ -395,9 +395,9 @@ export function Setup({ onConfigSuccess }: SetupProps) {
   };
 
   return (
-    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#090909' }}>
+    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#070b16' }}>
       {/* Sidebar */}
-      <aside style={{ width: '280px', backgroundColor: 'rgba(255, 255, 255, 0.03)', borderRight: '1px solid rgba(255, 255, 255, 0.1)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
+      <aside style={{ width: '280px', backgroundColor: 'rgba(133, 152, 255, 0.08)', borderRight: '1px solid rgba(156, 176, 255, 0.24)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
         <div className="flex items-center gap-4 mb-8">
           <img src={omninovalLogo} alt="Logo" style={{ width: '48px', height: '48px', borderRadius: '12px' }} />
           <div>
@@ -416,12 +416,12 @@ export function Setup({ onConfigSuccess }: SetupProps) {
                 textAlign: 'left',
                 padding: '12px 16px',
                 borderRadius: '12px',
-                backgroundColor: activeTab === tab.id ? 'rgba(255, 255, 255, 0.1)' : 'transparent',
+                backgroundColor: activeTab === tab.id ? 'rgba(124, 151, 255, 0.26)' : 'transparent',
                 border: 'none',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '12px',
-                color: activeTab === tab.id ? '#fff' : 'rgba(255, 255, 255, 0.5)',
+                color: activeTab === tab.id ? '#eef3ff' : 'rgba(227, 235, 255, 0.62)',
                 cursor: 'pointer',
                 transition: 'all 0.2s'
               }}
@@ -441,7 +441,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
           </div>
 
           <button
-            className="w-full py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl font-medium border border-white/10 transition-all cursor-pointer"
+            className="w-full py-3 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-100 rounded-xl font-medium border border-indigo-300/30 transition-all cursor-pointer"
             onClick={handleSaveConfig}
             disabled={busyAction !== null}
           >
@@ -450,7 +450,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
 
           {!gatewayStatus.running ? (
             <button
-              className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-xl font-bold shadow-lg shadow-orange-900/20 transition-all cursor-pointer"
+              className="w-full py-3 bg-indigo-500 hover:bg-indigo-400 text-white rounded-xl font-bold shadow-lg shadow-indigo-900/30 transition-all cursor-pointer"
               onClick={handleSaveAndStartGateway}
               disabled={busyAction !== null}
             >
@@ -458,7 +458,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             </button>
           ) : (
             <button
-              className="w-full py-3 bg-red-600/20 hover:bg-red-600/30 text-red-500 rounded-xl font-medium border border-red-600/20 transition-all cursor-pointer"
+              className="w-full py-3 bg-red-500/20 hover:bg-red-500/30 text-red-200 rounded-xl font-medium border border-red-400/30 transition-all cursor-pointer"
               onClick={handleStopGateway}
               disabled={busyAction !== null}
             >

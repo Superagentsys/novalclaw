@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::fs;
 use anyhow::{Context, Result};
-use tracing::{warn, info};
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -69,18 +69,10 @@ pub fn load_skills_from_dir(dir: &Path) -> Result<Vec<Skill>> {
         return Ok(skills);
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        
-        if path.is_dir() {
-            let skill_file = path.join("SKILL.md");
-            if skill_file.exists() {
-                match Skill::load_from_file(&skill_file) {
-                    Ok(skill) => skills.push(skill),
-                    Err(e) => warn!("Failed to load skill from {:?}: {}", skill_file, e),
-                }
-            }
+    for skill_file in discover_skill_files(dir)? {
+        match Skill::load_from_file(&skill_file) {
+            Ok(skill) => skills.push(skill),
+            Err(e) => warn!("Failed to load skill from {:?}: {}", skill_file, e),
         }
     }
     
@@ -111,44 +103,76 @@ pub fn import_skills_from_dir(source_dir: &Path, target_dir: &Path, overwrite: b
         fs::create_dir_all(target_dir)?;
     }
 
+    let skill_files = discover_skill_files(source_dir)?;
     let mut count = 0;
-    for entry in fs::read_dir(source_dir)? {
+    for skill_file in skill_files {
+        let Some(skill_root) = skill_file.parent() else {
+            continue;
+        };
+        let relative_skill_root = skill_root
+            .strip_prefix(source_dir)
+            .unwrap_or(skill_root);
+        let target_skill_dir = target_dir.join(relative_skill_root);
+
+        if target_skill_dir.exists() && !overwrite {
+            continue;
+        }
+        if target_skill_dir.exists() {
+            fs::remove_dir_all(&target_skill_dir)?;
+        }
+        copy_dir_recursive(skill_root, &target_skill_dir)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn discover_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    discover_skill_files_inner(root, &mut files)?;
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn discover_skill_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            let skill_file = path.join("SKILL.md");
-            if skill_file.exists() {
-                let skill_name = path.file_name().unwrap();
-                let target_skill_dir = target_dir.join(skill_name);
-
-                if target_skill_dir.exists() {
-                    if !overwrite {
-                        continue;
-                    }
-                } else {
-                    fs::create_dir_all(&target_skill_dir)?;
-                }
-
-                for sub_entry in fs::read_dir(&path)? {
-                    let sub_entry = sub_entry?;
-                    let sub_path = sub_entry.path();
-                    if sub_path.is_file() {
-                        fs::copy(&sub_path, target_skill_dir.join(sub_entry.file_name()))?;
-                    } else if sub_path.is_dir() {
-                        let sub_dir_name = sub_entry.file_name();
-                        let target_sub_dir = target_skill_dir.join(sub_dir_name);
-                        fs::create_dir_all(&target_sub_dir)?;
-                        for deep_entry in fs::read_dir(&sub_path)? {
-                            let deep_entry = deep_entry?;
-                            if deep_entry.path().is_file() {
-                                fs::copy(deep_entry.path(), target_sub_dir.join(deep_entry.file_name()))?;
-                            }
-                        }
-                    }
-                }
-                count += 1;
-            }
+            discover_skill_files_inner(&path, out)?;
+            continue;
+        }
+        if path.is_file() && is_skill_file_path(&path) {
+            out.push(path);
         }
     }
-    Ok(count)
+    Ok(())
+}
+
+fn is_skill_file_path(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("SKILL.md"))
+        .unwrap_or(false)
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if source_path.is_file() {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
 }
