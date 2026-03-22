@@ -8,6 +8,7 @@ use tokio::time::{Duration, timeout};
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const AGENT_BROWSER_BIN: &str = "agent-browser";
+const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
 
 pub struct BrowserTool {
     allowed_domains: Vec<String>,
@@ -18,6 +19,10 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
+    fn resolve_agent_browser_bin() -> String {
+        std::env::var(EMBEDDED_AGENT_BROWSER_BIN_ENV).unwrap_or_else(|_| AGENT_BROWSER_BIN.into())
+    }
+
     pub fn new(
         allowed_domains: Vec<String>,
         headless: bool,
@@ -64,7 +69,7 @@ impl BrowserTool {
     }
 
     async fn run_agent_browser(&self, args: &[&str]) -> anyhow::Result<(bool, String)> {
-        let mut cmd = Command::new(AGENT_BROWSER_BIN);
+        let mut cmd = Command::new(Self::resolve_agent_browser_bin());
 
         if self.headless {
             // headless is the default for agent-browser, no flag needed

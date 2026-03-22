@@ -6,11 +6,12 @@ use omninova_core::gateway::{
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
-use omninova_core::skills::import_skills_from_dir;
+use omninova_core::skills::{import_skills_from_dir, load_skills_from_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
@@ -21,6 +22,121 @@ struct AppState {
     runtime: GatewayRuntime,
     gateway_task: Option<JoinHandle<Result<(), String>>>,
     last_gateway_error: Option<String>,
+}
+
+const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
+
+fn resolve_embedded_agent_browser_relative_path() -> Option<&'static str> {
+    match std::env::consts::OS {
+        "macos" => Some("agent-browser/macos/agent-browser"),
+        "linux" => Some("agent-browser/linux/agent-browser"),
+        "windows" => Some("agent-browser/windows/agent-browser.exe"),
+        _ => None,
+    }
+}
+
+fn configure_embedded_agent_browser_env(app_handle: &tauri::AppHandle) {
+    let Some(relative_path) = resolve_embedded_agent_browser_relative_path() else {
+        return;
+    };
+
+    let Ok(resource_dir) = app_handle.path().resource_dir() else {
+        eprintln!("[browser] failed to resolve resource_dir");
+        return;
+    };
+
+    let candidates = [
+        resource_dir.join(relative_path),
+        resource_dir.join("resources").join(relative_path),
+    ];
+
+    if let Some(found) = candidates.iter().find(|path| is_working_agent_browser_binary(path)) {
+        std::env::set_var(
+            EMBEDDED_AGENT_BROWSER_BIN_ENV,
+            found.to_string_lossy().into_owned(),
+        );
+        eprintln!(
+            "[browser] using embedded binary from {}",
+            found.to_string_lossy()
+        );
+        return;
+    }
+
+    if let Some(found) = detect_agent_browser_binary() {
+        std::env::set_var(
+            EMBEDDED_AGENT_BROWSER_BIN_ENV,
+            found.to_string_lossy().into_owned(),
+        );
+        eprintln!(
+            "[browser] using system binary from {}",
+            found.to_string_lossy()
+        );
+    } else {
+        eprintln!(
+            "[browser] embedded binary not found. looked for: {}",
+            candidates
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn is_working_agent_browser_binary(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(output) = StdCommand::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+}
+
+fn detect_agent_browser_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(EMBEDDED_AGENT_BROWSER_BIN_ENV) {
+        let candidate = PathBuf::from(path);
+        if is_working_agent_browser_binary(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    let static_candidates = [
+        "/opt/homebrew/bin/agent-browser",
+        "/usr/local/bin/agent-browser",
+        "/usr/bin/agent-browser",
+    ];
+    for candidate in static_candidates {
+        let path = PathBuf::from(candidate);
+        if is_working_agent_browser_binary(&path) {
+            return Some(path);
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let mut dynamic_candidates = vec![
+            home.join(".npm-global/bin/agent-browser"),
+            home.join(".local/bin/agent-browser"),
+        ];
+        let nvm_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(nvm_versions) {
+            for entry in entries.flatten() {
+                dynamic_candidates.push(entry.path().join("bin/agent-browser"));
+            }
+        }
+        for candidate in dynamic_candidates {
+            if is_working_agent_browser_binary(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,11 +328,12 @@ async fn save_setup_config(
 
     let current = runtime.get_config().await;
     let current_gateway_url = format!("http://{}:{}", current.gateway.host, current.gateway.port);
-    let next = setup_config_to_core(current, config)?;
+    let mut next = setup_config_to_core(current, config)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
 
-    next.save().map_err(|e| e.to_string())?;
-    next.save_active_workspace().map_err(|e| e.to_string())?;
+    if let Err(error) = save_config_with_fallback(&mut next) {
+        eprintln!("[config warning] {error}");
+    }
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
     if current_gateway_url != next_gateway_url {
@@ -370,8 +487,27 @@ struct DepStatusPayload {
     detail: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsPackageSummaryPayload {
+    dir: String,
+    total: usize,
+    names: Vec<String>,
+}
+
 #[tauri::command]
 async fn check_browser_dep() -> Result<DepStatusPayload, String> {
+    if let Some(path) = detect_agent_browser_binary() {
+        let version = check_command_installed(path.to_string_lossy().as_ref(), "--version").await;
+        if version.installed {
+            return Ok(DepStatusPayload {
+                name: "agent-browser".to_string(),
+                installed: true,
+                version: version.version,
+                detail: format!("{} ({})", version.detail, path.to_string_lossy()),
+            });
+        }
+    }
     let status = check_command_installed("agent-browser", "--version").await;
     Ok(status)
 }
@@ -390,7 +526,9 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
         return Err(format!("npm install -g agent-browser failed: {stderr}"));
     }
 
-    let chromium_out = tokio::process::Command::new("agent-browser")
+    let agent_browser_cmd = detect_agent_browser_binary()
+        .unwrap_or_else(|| PathBuf::from("agent-browser"));
+    let chromium_out = tokio::process::Command::new(&agent_browser_cmd)
         .arg("install")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -402,7 +540,7 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
         return Err(format!("agent-browser install (Chromium) failed: {stderr}"));
     }
 
-    let status = check_command_installed("agent-browser", "--version").await;
+    let status = check_browser_dep().await?;
     Ok(status)
 }
 
@@ -448,8 +586,9 @@ async fn start_gateway(
     };
     let mut config = runtime.get_config().await;
     if ensure_desktop_automation_capabilities(&mut config) {
-        config.save().map_err(|e| e.to_string())?;
-        config.save_active_workspace().map_err(|e| e.to_string())?;
+        if let Err(error) = save_config_with_fallback(&mut config) {
+            eprintln!("[config warning] {error}");
+        }
         runtime.set_config(config).await.map_err(|e| e.to_string())?;
     }
 
@@ -507,6 +646,33 @@ async fn import_skills(
         Ok(count) => Ok(format!("Successfully imported {} skills.", count)),
         Err(e) => Err(e.to_string()),
     }
+}
+
+#[tauri::command]
+async fn skills_package_summary(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<SkillsPackageSummaryPayload, String> {
+    let app_state = state.lock().await;
+    let config = app_state.runtime.get_config().await;
+
+    let target = config
+        .skills
+        .open_skills_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+
+    let skills = load_skills_from_dir(&target).map_err(|e| e.to_string())?;
+    let names = skills
+        .iter()
+        .map(|skill| skill.metadata.name.clone())
+        .collect::<Vec<_>>();
+
+    Ok(SkillsPackageSummaryPayload {
+        dir: target.to_string_lossy().into_owned(),
+        total: names.len(),
+        names,
+    })
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
@@ -766,6 +932,53 @@ fn setup_config_to_core(
     Ok(current)
 }
 
+fn config_fallback_candidates(config: &Config) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = config.workspace_dir.parent() {
+        candidates.push(parent.join(".omninova").join("config.toml"));
+    }
+    candidates.push(config.workspace_dir.join(".omninova").join("config.toml"));
+    candidates
+        .into_iter()
+        .filter(|path| path != &config.config_path)
+        .fold(Vec::new(), |mut acc, path| {
+            if !acc.contains(&path) {
+                acc.push(path);
+            }
+            acc
+        })
+}
+
+fn save_config_with_fallback(config: &mut Config) -> Result<(), String> {
+    match config.save() {
+        Ok(()) => {
+            config
+                .save_active_workspace()
+                .map_err(|e| format!("{:#}", e))?;
+            Ok(())
+        }
+        Err(primary_error) => {
+            let original_path = config.config_path.clone();
+            let primary_message = format!("{:#}", primary_error);
+            for candidate in config_fallback_candidates(config) {
+                config.config_path = candidate.clone();
+                if config.save().is_ok() {
+                    config
+                        .save_active_workspace()
+                        .map_err(|e| format!("{:#}", e))?;
+                    return Ok(());
+                }
+            }
+            config.config_path = original_path;
+            Err(format!(
+                "保存配置失败。原始路径: {}。错误: {}",
+                config.config_path.display(),
+                primary_message
+            ))
+        }
+    }
+}
+
 fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
     let mut changed = false;
 
@@ -793,6 +1006,24 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
             .any(|existing| existing.eq_ignore_ascii_case(command))
         {
             config.autonomy.allowed_commands.push(command.to_string());
+            changed = true;
+        }
+    }
+
+    if config.autonomy.require_approval_for_medium_risk {
+        config.autonomy.require_approval_for_medium_risk = false;
+        changed = true;
+    }
+
+    let auto_approved_tools = ["browser", "shell", "file_read", "file_write", "file_edit"];
+    for tool in auto_approved_tools {
+        if !config
+            .autonomy
+            .auto_approve
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tool))
+        {
+            config.autonomy.auto_approve.push(tool.to_string());
             changed = true;
         }
     }
@@ -957,8 +1188,10 @@ pub fn run() {
             start_gateway,
             stop_gateway,
             import_skills,
+            skills_package_summary,
         ])
         .setup(|_app| {
+            configure_embedded_agent_browser_env(_app.handle());
             #[cfg(debug_assertions)]
             {
                 let window = _app.get_webview_window("main").unwrap();
