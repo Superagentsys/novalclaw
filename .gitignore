@@ -2,7 +2,6 @@
 **/node_modules/
 **/dist/
 **/coverage/
-_bmad-output/
 # AI相关
 .claude/
 CLAUDE.md
