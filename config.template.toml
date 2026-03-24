@@ -7,9 +7,9 @@
 
 # --- Core API ---
 # api_key = "sk-..."
-# api_url = "https://openrouter.ai/api/v1"
-# default_provider = "openrouter"
-# default_model = "anthropic/claude-sonnet-4-20250514"
+# api_url = "https://ark.cn-beijing.volces.com/api/v3"
+# default_provider = "doubao"
+# default_model = "doubao-seed-2-0-pro-260215"
 # default_temperature = 0.7
 
 # Provider API mode: "chat", "completion", or "responses"
@@ -144,6 +144,9 @@
 # [memory]
 # backend = "sqlite"            # sqlite, markdown, none
 # db_path = "~/.omninova/memory.db"
+# search_expand_query = true
+# search_recency_weight = 2.0
+# search_recency_half_life_days = 7.0
 #
 # [memory.embedding]
 # provider = "openai"
@@ -157,7 +160,7 @@
 # --- Gateway ---
 # [gateway]
 # host = "127.0.0.1"
-# port = 42617
+# port = 10809
 # require_pairing = true
 # allow_public_bind = false
 # session_ttl_secs = 86400
@@ -191,6 +194,8 @@
 # enabled = false
 # backend = "playwright"
 # native_headless = false
+# attach_only = false
+# cdp_url = "http://127.0.0.1:9222"
 # allowed_domains = []
 
 # --- HTTP Request Tool ---

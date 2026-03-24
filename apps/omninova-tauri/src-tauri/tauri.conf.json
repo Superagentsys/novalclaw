@@ -31,6 +31,11 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/agent-browser/macos",
+      "resources/agent-browser/linux",
+      "resources/agent-browser/windows"
     ]
   }
 }

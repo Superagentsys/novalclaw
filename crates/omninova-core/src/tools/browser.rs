@@ -8,18 +8,32 @@ use tokio::time::{Duration, timeout};
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const AGENT_BROWSER_BIN: &str = "agent-browser";
+const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
 
 pub struct BrowserTool {
     allowed_domains: Vec<String>,
     headless: bool,
+    attach_only: bool,
+    cdp_url: Option<String>,
     session: Option<String>,
 }
 
 impl BrowserTool {
-    pub fn new(allowed_domains: Vec<String>, headless: bool) -> Self {
+    fn resolve_agent_browser_bin() -> String {
+        std::env::var(EMBEDDED_AGENT_BROWSER_BIN_ENV).unwrap_or_else(|_| AGENT_BROWSER_BIN.into())
+    }
+
+    pub fn new(
+        allowed_domains: Vec<String>,
+        headless: bool,
+        attach_only: bool,
+        cdp_url: Option<String>,
+    ) -> Self {
         Self {
             allowed_domains,
             headless,
+            attach_only,
+            cdp_url,
             session: None,
         }
     }
@@ -55,7 +69,7 @@ impl BrowserTool {
     }
 
     async fn run_agent_browser(&self, args: &[&str]) -> anyhow::Result<(bool, String)> {
-        let mut cmd = Command::new(AGENT_BROWSER_BIN);
+        let mut cmd = Command::new(Self::resolve_agent_browser_bin());
 
         if self.headless {
             // headless is the default for agent-browser, no flag needed
@@ -65,6 +79,14 @@ impl BrowserTool {
 
         if let Some(session) = &self.session {
             cmd.arg("--session").arg(session);
+        }
+
+        if self.attach_only {
+            cmd.arg("--attach-only");
+        }
+
+        if let Some(cdp_url) = &self.cdp_url {
+            cmd.arg("--cdp-url").arg(cdp_url);
         }
 
         cmd.arg("--json");

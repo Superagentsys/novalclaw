@@ -10,8 +10,8 @@
   overflow-y: auto;
   overflow-x: hidden;
   background:
-    radial-gradient(circle at top, rgba(255, 154, 63, 0.22), transparent 30%),
-    linear-gradient(180deg, #1d0c09 0%, #12090a 45%, #090909 100%);
+    radial-gradient(circle at top, rgba(110, 134, 255, 0.24), transparent 34%),
+    linear-gradient(180deg, #0d1224 0%, #0a0f1d 45%, #070b16 100%);
 }
 
 .app-shell--chat {
@@ -32,9 +32,9 @@
   align-items: center;
   padding: 22px 24px;
   border-radius: 24px;
-  border: 1px solid rgba(255, 190, 132, 0.16);
+  border: 1px solid rgba(154, 171, 255, 0.22);
   background:
-    linear-gradient(135deg, rgba(255, 120, 51, 0.18), rgba(255, 185, 77, 0.08)),
+    linear-gradient(135deg, rgba(98, 126, 255, 0.2), rgba(101, 226, 255, 0.1)),
     rgba(255, 255, 255, 0.05);
   box-shadow:
     0 20px 60px rgba(0, 0, 0, 0.32),
@@ -54,9 +54,9 @@
   padding: 10px;
   border-radius: 28px;
   background:
-    linear-gradient(180deg, rgba(255, 178, 84, 0.16), rgba(255, 120, 48, 0.12)),
+    linear-gradient(180deg, rgba(130, 150, 255, 0.2), rgba(74, 185, 255, 0.16)),
     rgba(10, 10, 10, 0.78);
-  border: 1px solid rgba(255, 193, 120, 0.2);
+  border: 1px solid rgba(157, 184, 255, 0.24);
   box-shadow:
     0 14px 40px rgba(0, 0, 0, 0.3),
     inset 0 1px 0 rgba(255, 255, 255, 0.05);
@@ -79,9 +79,9 @@
   width: fit-content;
   padding: 6px 10px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 201, 149, 0.22);
-  background: rgba(255, 246, 231, 0.08);
-  color: #ffd9b4;
+  border: 1px solid rgba(166, 186, 255, 0.28);
+  background: rgba(157, 171, 255, 0.12);
+  color: #d7e1ff;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -221,15 +221,15 @@
 
 .ghost-button {
   border-radius: 10px;
-  border: 1px solid rgba(255, 173, 125, 0.2);
+  border: 1px solid rgba(150, 173, 255, 0.28);
   padding: 9px 12px;
-  background: rgba(255, 128, 64, 0.08);
-  color: #ffd7be;
+  background: rgba(125, 150, 255, 0.12);
+  color: #dce5ff;
 }
 
 .ghost-button:hover {
-  border-color: rgba(255, 187, 143, 0.36);
-  background: rgba(255, 128, 64, 0.12);
+  border-color: rgba(181, 200, 255, 0.46);
+  background: rgba(125, 150, 255, 0.2);
 }
 
 .provider-picker {
@@ -243,13 +243,13 @@
 }
 
 .primary-button {
-  border-color: rgba(255, 184, 130, 0.3);
-  background: linear-gradient(135deg, #ff8b3d, #ffb347);
-  color: #2a1400;
+  border-color: rgba(165, 183, 255, 0.45);
+  background: linear-gradient(135deg, #7a8dff, #6fd3ff);
+  color: #09112a;
 }
 
 .primary-button:hover {
-  border-color: rgba(255, 210, 170, 0.6);
+  border-color: rgba(195, 208, 255, 0.7);
 }
 
 .gateway-status-panel {
@@ -312,9 +312,9 @@
 }
 
 .gateway-status-chip.is-stopped {
-  background: rgba(255, 160, 122, 0.1);
-  border: 1px solid rgba(255, 160, 122, 0.18);
-  color: #ffd2bf;
+  background: rgba(140, 153, 255, 0.14);
+  border: 1px solid rgba(140, 153, 255, 0.3);
+  color: #d6deff;
 }
 
 .empty-state {
@@ -551,7 +551,7 @@
   height: 100%;
   width: 100%;
   overflow: hidden;
-  background: #0d0b09;
+  background: #0b1120;
 }
 
 /* --- Top bar --- */
@@ -561,8 +561,8 @@
   justify-content: space-between;
   height: 48px;
   padding: 0 16px;
-  border-bottom: 1px solid #1e1b18;
-  background: #141210;
+  border-bottom: 1px solid #1a233e;
+  background: #121a31;
   flex-shrink: 0;
   z-index: 10;
 }

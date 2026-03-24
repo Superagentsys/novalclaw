@@ -10,10 +10,6 @@ import { ProviderConfigForm } from "./ProviderConfigForm";
 import { RobotConfigForm } from "./RobotConfigForm";
 import { SkillsConfigForm } from "./SkillsConfigForm";
 import { PersonaConfigForm } from "./PersonaConfigForm";
-import { ControlPanel } from "../Console/ControlPanel";
-import { AccountSettingsForm } from "../account/AccountSettingsForm";
-import { BackupSettings } from "../backup/BackupSettings";
-import { PrivacySettings } from "../settings/PrivacySettings";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
@@ -24,9 +20,9 @@ export interface SetupProps {
 
 const initialConfig: Config = {
   api_key: "",
-  api_url: "",
-  default_provider: "",
-  default_model: "",
+  api_url: "https://ark.cn-beijing.volces.com/api/v3",
+  default_provider: "doubao",
+  default_model: "doubao-seed-2-0-pro-260215",
   robot: DEFAULT_ROBOT_CONFIG,
   providers: DEFAULT_PROVIDERS,
   channels: {
@@ -45,12 +41,28 @@ const initialConfig: Config = {
   },
 };
 
+type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
+type SetupTabItem = {
+  id: SetupTab;
+  label: string;
+  icon: string;
+};
+
+const setupTabs: SetupTabItem[] = [
+  { id: "general", label: "通用设置", icon: "⚙️" },
+  { id: "providers", label: "模型服务", icon: "🤖" },
+  { id: "channels", label: "渠道接入", icon: "🔌" },
+  { id: "skills", label: "技能扩展", icon: "🛠️" },
+  { id: "persona", label: "Agent 人设", icon: "🧠" },
+];
+
 export function Setup({ onConfigSuccess }: SetupProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "providers" | "channels" | "skills" | "persona" | "account" | "backup" | "privacy">("general");
+  const [activeTab, setActiveTab] = useState<SetupTab>("general");
   const [config, setConfig] = useState<Config>(initialConfig);
+  const [previewCollapsed, setPreviewCollapsed] = useState(true);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
-    url: "http://127.0.0.1:42617",
+    url: "http://127.0.0.1:10809",
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
@@ -330,7 +342,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
                         omninoval_gateway_url: event.target.value,
                       })
                     }
-                    placeholder="http://localhost:18789"
+                    placeholder="http://localhost:10809"
                   />
                 </label>
                 <label>
@@ -373,40 +385,19 @@ export function Setup({ onConfigSuccess }: SetupProps) {
         return (
           <div className="setup-section">
             <h2>Agent 人设 (灵魂系统)</h2>
-            <PersonaConfigForm
+            <PersonaConfigForm 
               config={config.agent || { name: "omninova", max_tool_iterations: 20, compact_context: true }}
               onChange={(agent) => setConfig({ ...config, agent })}
             />
-          </div>
-        );
-      case "account":
-        return (
-          <div className="setup-section">
-            <h2>账户管理</h2>
-            <AccountSettingsForm />
-          </div>
-        );
-      case "backup":
-        return (
-          <div className="setup-section">
-            <h2>备份与恢复</h2>
-            <BackupSettings onImportComplete={loadSetupState} />
-          </div>
-        );
-      case "privacy":
-        return (
-          <div className="setup-section">
-            <h2>隐私与安全</h2>
-            <PrivacySettings />
           </div>
         );
     }
   };
 
   return (
-    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#090909' }}>
+    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#070b16' }}>
       {/* Sidebar */}
-      <aside style={{ width: '280px', backgroundColor: 'rgba(255, 255, 255, 0.03)', borderRight: '1px solid rgba(255, 255, 255, 0.1)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
+      <aside style={{ width: '280px', backgroundColor: 'rgba(133, 152, 255, 0.08)', borderRight: '1px solid rgba(156, 176, 255, 0.24)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
         <div className="flex items-center gap-4 mb-8">
           <img src={omninovalLogo} alt="Logo" style={{ width: '48px', height: '48px', borderRadius: '12px' }} />
           <div>
@@ -416,30 +407,21 @@ export function Setup({ onConfigSuccess }: SetupProps) {
         </div>
 
         <nav className="flex-1 space-y-2">
-          {[
-            { id: 'general', label: '通用设置', icon: '⚙️' },
-            { id: 'providers', label: '模型服务', icon: '🤖' },
-            { id: 'channels', label: '渠道接入', icon: '🔌' },
-            { id: 'skills', label: '技能扩展', icon: '🛠️' },
-            { id: 'persona', label: 'Agent 人设', icon: '🧠' },
-            { id: 'account', label: '账户管理', icon: '👤' },
-            { id: 'privacy', label: '隐私与安全', icon: '🔒' },
-            { id: 'backup', label: '备份恢复', icon: '💾' },
-          ].map((tab) => (
+          {setupTabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
+              onClick={() => setActiveTab(tab.id)}
               style={{
                 width: '100%',
                 textAlign: 'left',
                 padding: '12px 16px',
                 borderRadius: '12px',
-                backgroundColor: activeTab === tab.id ? 'rgba(255, 255, 255, 0.1)' : 'transparent',
+                backgroundColor: activeTab === tab.id ? 'rgba(124, 151, 255, 0.26)' : 'transparent',
                 border: 'none',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '12px',
-                color: activeTab === tab.id ? '#fff' : 'rgba(255, 255, 255, 0.5)',
+                color: activeTab === tab.id ? '#eef3ff' : 'rgba(227, 235, 255, 0.62)',
                 cursor: 'pointer',
                 transition: 'all 0.2s'
               }}
@@ -459,7 +441,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
           </div>
 
           <button
-            className="w-full py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl font-medium border border-white/10 transition-all cursor-pointer"
+            className="w-full py-3 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-100 rounded-xl font-medium border border-indigo-300/30 transition-all cursor-pointer"
             onClick={handleSaveConfig}
             disabled={busyAction !== null}
           >
@@ -468,7 +450,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
 
           {!gatewayStatus.running ? (
             <button
-              className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-xl font-bold shadow-lg shadow-orange-900/20 transition-all cursor-pointer"
+              className="w-full py-3 bg-indigo-500 hover:bg-indigo-400 text-white rounded-xl font-bold shadow-lg shadow-indigo-900/30 transition-all cursor-pointer"
               onClick={handleSaveAndStartGateway}
               disabled={busyAction !== null}
             >
@@ -476,7 +458,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             </button>
           ) : (
             <button
-              className="w-full py-3 bg-red-600/20 hover:bg-red-600/30 text-red-500 rounded-xl font-medium border border-red-600/20 transition-all cursor-pointer"
+              className="w-full py-3 bg-red-500/20 hover:bg-red-500/30 text-red-200 rounded-xl font-medium border border-red-400/30 transition-all cursor-pointer"
               onClick={handleStopGateway}
               disabled={busyAction !== null}
             >
@@ -501,23 +483,33 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             <div className="setup-preview">
               <div className="setup-preview-header">
                 <span>配置预览 (JSON)</span>
-                <button
-                  className="setup-preview-copy"
-                  onClick={() => {
-                    navigator.clipboard.writeText(jsonPreview);
-                    setActionMessage("配置已复制到剪贴板。");
-                  }}
-                >
-                  复制
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="setup-preview-copy"
+                    onClick={() => {
+                      setPreviewCollapsed((prev) => !prev);
+                    }}
+                  >
+                    {previewCollapsed ? "展开" : "折叠"}
+                  </button>
+                  <button
+                    className="setup-preview-copy"
+                    onClick={() => {
+                      navigator.clipboard.writeText(jsonPreview);
+                      setActionMessage("配置已复制到剪贴板。");
+                    }}
+                  >
+                    复制
+                  </button>
+                </div>
               </div>
-              <pre className="setup-preview-content">{jsonPreview}</pre>
+              {!previewCollapsed ? (
+                <pre className="setup-preview-content">{jsonPreview}</pre>
+              ) : null}
             </div>
           </div>
         </div>
       </main>
-
-      <ControlPanel />
     </div>
   );
 }

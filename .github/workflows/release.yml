@@ -272,10 +272,25 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Generate Checksums
+      - name: Collect and deduplicate artifacts
         working-directory: release-assets
         run: |
-          find . -type f -not -name 'SHA256SUMS.txt' -print0 | xargs -0 sha256sum > SHA256SUMS.txt
+          rm -f SHA256SUMS.txt
+          find . -mindepth 2 -name "SHA256SUMS.txt" -type f -delete
+          mapfile -t release_files < <(
+            find . -type f \
+              \( -name "*.dmg" -o -name "*.deb" -o -name "*.appimage" -o -name "*.rpm" -o -name "*.exe" -o -name "*.msi" -o -name "*.tar.gz" \) \
+              -print | sort
+          )
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No release artifacts found after download."
+            exit 1
+          fi
+          sha256sum "${release_files[@]}" > SHA256SUMS.txt
+          if [ ! -s SHA256SUMS.txt ]; then
+            echo "Generated SHA256SUMS.txt is empty."
+            exit 1
+          fi
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -284,4 +299,11 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           overwrite_files: true
           files: |
-            release-assets/**
+            release-assets/**/*.dmg
+            release-assets/**/*.deb
+            release-assets/**/*.appimage
+            release-assets/**/*.rpm
+            release-assets/**/*.exe
+            release-assets/**/*.msi
+            release-assets/**/*.tar.gz
+            release-assets/SHA256SUMS.txt

@@ -29,6 +29,7 @@ use crate::tools::{
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
+use std::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1860,7 +1861,7 @@ async fn acquire_lockfile_guard(
     timeout_ms: u64,
     stale_lock_ms: u64,
 ) -> anyhow::Result<LockfileGuard> {
-    let lock_path = target.with_extension("lock");
+    let lock_path = resolve_session_lock_path(target);
     let wait_started = std::time::Instant::now();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut retries: u32 = 0;
@@ -1911,6 +1912,29 @@ async fn acquire_lockfile_guard(
             Err(e) => return Err(anyhow::anyhow!("failed to acquire lock: {e}")),
         }
     }
+}
+
+fn resolve_session_lock_path(target: &PathBuf) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target.hash(&mut hasher);
+    let hash = hasher.finish();
+    let lock_name = format!("session_{hash:016x}.lock");
+
+    let candidates = [
+        std::env::var("OMNINOVA_LOCK_DIR").ok().map(PathBuf::from),
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".omninova").join("locks")),
+        Some(std::env::temp_dir().join("omninova-locks")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if std::fs::create_dir_all(&candidate).is_ok() {
+            return candidate.join(&lock_name);
+        }
+    }
+
+    target.with_extension("lock")
 }
 
 async fn http_estop_status(
@@ -2233,6 +2257,8 @@ pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn
         tools.push(Box::new(BrowserTool::new(
             config.browser.allowed_domains.clone(),
             config.browser.native_headless,
+            config.browser.attach_only,
+            config.browser.cdp_url.clone(),
         )));
     }
 

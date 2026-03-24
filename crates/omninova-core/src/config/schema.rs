@@ -178,8 +178,8 @@ impl Default for Config {
             config_path: omninova_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".into()),
-            default_model: Some("anthropic/claude-sonnet-4-20250514".into()),
+            default_provider: Some("doubao".into()),
+            default_model: Some("doubao-seed-2-0-pro-260215".into()),
             default_temperature: 0.7,
             provider_api: None,
             model_providers: HashMap::new(),
@@ -754,130 +754,26 @@ pub struct MemoryConfig {
     pub qdrant_url: Option<String>,
     pub qdrant_collection: Option<String>,
     pub qdrant_api_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub search_expand_query: bool,
+    #[serde(default = "default_memory_search_recency_weight")]
+    pub search_recency_weight: f64,
+    #[serde(default = "default_memory_search_half_life_days")]
+    pub search_recency_half_life_days: f64,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
-    /// Working memory (L1) capacity - number of entries to keep in short-term memory
-    /// Default: 100 entries (approximately 4096 tokens of context)
-    #[serde(default = "default_working_memory_capacity")]
-    pub working_memory_capacity: usize,
-    /// Enable L2 episodic memory for long-term storage
-    /// Default: true
-    #[serde(default = "default_episodic_memory_enabled")]
-    pub episodic_memory_enabled: bool,
-    /// Enable L3 semantic memory for vector-based similarity search
-    /// Default: true
-    #[serde(default = "default_semantic_memory_enabled")]
-    pub semantic_memory_enabled: bool,
-    /// Vector embedding dimension (e.g., 1536 for text-embedding-3-small)
-    /// Default: 1536
-    #[serde(default = "default_embedding_dim")]
-    pub embedding_dim: usize,
-    /// Minimum similarity threshold for semantic search results (0.0-1.0)
-    /// Default: 0.7
-    #[serde(default = "default_similarity_threshold")]
-    pub similarity_threshold: f32,
-    /// Maximum number of results to return from semantic search
-    /// Default: 10
-    #[serde(default = "default_max_semantic_results")]
-    pub max_semantic_results: usize,
-    /// Memory context configuration for context-enhanced responses
-    /// [Source: Story 5.9 - 上下文增强响应]
-    #[serde(default)]
-    pub context: MemoryContextConfig,
-}
-
-/// Configuration for memory context enhancement
-///
-/// Controls how memories are retrieved and injected into LLM prompts
-/// to provide context-enhanced responses.
-///
-/// [Source: Story 5.9 - 上下文增强响应]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryContextConfig {
-    /// Enable memory context enhancement
-    /// When enabled, relevant memories are automatically retrieved and injected into prompts
-    /// Default: true
-    #[serde(default = "default_memory_context_enabled")]
-    pub enabled: bool,
-    /// Maximum number of memories to inject into context
-    /// Default: 5
-    #[serde(default = "default_max_memories")]
-    pub max_memories: usize,
-    /// Maximum total characters for memory context
-    /// Prevents context window overflow
-    /// Default: 1000
-    #[serde(default = "default_max_context_chars")]
-    pub max_chars: usize,
-    /// Minimum similarity threshold for memory retrieval (0.0-1.0)
-    /// Memories below this threshold are excluded
-    /// Default: 0.7
-    #[serde(default = "default_context_similarity_threshold")]
-    pub min_similarity_threshold: f32,
-    /// Time decay factor for memory relevance (0.0-1.0)
-    /// Higher values mean recent memories are weighted more heavily
-    /// Default: 0.1
-    #[serde(default = "default_time_decay_factor")]
-    pub time_decay_factor: f32,
-}
-
-fn default_memory_context_enabled() -> bool {
-    true
-}
-
-fn default_max_memories() -> usize {
-    5
-}
-
-fn default_max_context_chars() -> usize {
-    1000
-}
-
-fn default_context_similarity_threshold() -> f32 {
-    0.7
-}
-
-fn default_time_decay_factor() -> f32 {
-    0.1
-}
-
-impl Default for MemoryContextConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_memory_context_enabled(),
-            max_memories: default_max_memories(),
-            max_chars: default_max_context_chars(),
-            min_similarity_threshold: default_context_similarity_threshold(),
-            time_decay_factor: default_time_decay_factor(),
-        }
-    }
 }
 
 fn default_memory_backend() -> String {
     "sqlite".into()
 }
 
-fn default_working_memory_capacity() -> usize {
-    100
+fn default_memory_search_recency_weight() -> f64 {
+    2.0
 }
 
-fn default_episodic_memory_enabled() -> bool {
-    true
-}
-
-fn default_semantic_memory_enabled() -> bool {
-    true
-}
-
-fn default_embedding_dim() -> usize {
-    1536
-}
-
-fn default_similarity_threshold() -> f32 {
-    0.7
-}
-
-fn default_max_semantic_results() -> usize {
-    10
+fn default_memory_search_half_life_days() -> f64 {
+    7.0
 }
 
 impl Default for MemoryConfig {
@@ -888,14 +784,10 @@ impl Default for MemoryConfig {
             qdrant_url: None,
             qdrant_collection: None,
             qdrant_api_key: None,
+            search_expand_query: default_true(),
+            search_recency_weight: default_memory_search_recency_weight(),
+            search_recency_half_life_days: default_memory_search_half_life_days(),
             embedding: EmbeddingConfig::default(),
-            working_memory_capacity: default_working_memory_capacity(),
-            episodic_memory_enabled: default_episodic_memory_enabled(),
-            semantic_memory_enabled: default_semantic_memory_enabled(),
-            embedding_dim: default_embedding_dim(),
-            similarity_threshold: default_similarity_threshold(),
-            max_semantic_results: default_max_semantic_results(),
-            context: MemoryContextConfig::default(),
         }
     }
 }
@@ -950,67 +842,6 @@ pub struct ObservabilityConfig {
 // Gateway
 // ---------------------------------------------------------------------------
 
-/// CORS configuration for HTTP Gateway
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CorsConfig {
-    /// Enable CORS support
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Allowed origins (use ["*"] for all origins)
-    #[serde(default = "default_cors_origins")]
-    pub allowed_origins: Vec<String>,
-    /// Allowed HTTP methods
-    #[serde(default = "default_cors_methods")]
-    pub allowed_methods: Vec<String>,
-    /// Allowed headers
-    #[serde(default = "default_cors_headers")]
-    pub allowed_headers: Vec<String>,
-    /// Allow credentials (cookies, authorization headers)
-    #[serde(default)]
-    pub allow_credentials: bool,
-    /// Max age in seconds for preflight cache
-    #[serde(default = "default_cors_max_age")]
-    pub max_age: u64,
-}
-
-fn default_cors_origins() -> Vec<String> {
-    vec!["*".to_string()]
-}
-fn default_cors_methods() -> Vec<String> {
-    vec!["GET".to_string(), "POST".to_string(), "PUT".to_string(), "DELETE".to_string(), "OPTIONS".to_string()]
-}
-fn default_cors_headers() -> Vec<String> {
-    vec!["Content-Type".to_string(), "Authorization".to_string(), "X-Requested-With".to_string()]
-}
-fn default_cors_max_age() -> u64 {
-    3600
-}
-
-impl Default for CorsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            allowed_origins: default_cors_origins(),
-            allowed_methods: default_cors_methods(),
-            allowed_headers: default_cors_headers(),
-            allow_credentials: false,
-            max_age: default_cors_max_age(),
-        }
-    }
-}
-
-/// TLS/HTTPS configuration for HTTP Gateway
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TlsConfig {
-    /// Enable HTTPS
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to TLS certificate file (PEM format)
-    pub cert_path: Option<String>,
-    /// Path to TLS private key file (PEM format)
-    pub key_path: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_gateway_host")]
@@ -1041,19 +872,13 @@ pub struct GatewayConfig {
     pub webhook_signing_include_timestamp: bool,
     #[serde(default)]
     pub webhook_signing_require_timestamp: bool,
-    /// CORS configuration
-    #[serde(default)]
-    pub cors: CorsConfig,
-    /// TLS/HTTPS configuration
-    #[serde(default)]
-    pub tls: TlsConfig,
 }
 
 fn default_gateway_host() -> String {
     "127.0.0.1".into()
 }
 fn default_gateway_port() -> u16 {
-    42617
+    10809
 }
 fn default_gateway_session_ttl_secs() -> u64 {
     24 * 60 * 60
@@ -1094,8 +919,6 @@ impl Default for GatewayConfig {
             webhook_signature_strict_priority: false,
             webhook_signing_include_timestamp: false,
             webhook_signing_require_timestamp: false,
-            cors: CorsConfig::default(),
-            tls: TlsConfig::default(),
         }
     }
 }
@@ -1143,6 +966,9 @@ pub struct BrowserConfig {
     pub backend: String,
     #[serde(default)]
     pub native_headless: bool,
+    #[serde(default)]
+    pub attach_only: bool,
+    pub cdp_url: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -1156,6 +982,8 @@ impl Default for BrowserConfig {
             allowed_domains: Vec::new(),
             backend: default_browser_backend(),
             native_headless: false,
+            attach_only: false,
+            cdp_url: None,
         }
     }
 }

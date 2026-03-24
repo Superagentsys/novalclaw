@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import type { SkillsConfig } from "../../types/config";
 import { invokeTauri } from "../../utils/tauri";
 
@@ -7,10 +7,41 @@ interface Props {
   onChange: (config: SkillsConfig) => void;
 }
 
+interface SkillsPackageSummary {
+  dir: string;
+  total: number;
+  names: string[];
+}
+
 export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const [importPath, setImportPath] = useState("");
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [summary, setSummary] = useState<SkillsPackageSummary | null>(null);
+  const [isLoadingSummary, setIsLoadingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+
+  const refreshSummary = useCallback(async () => {
+    if (!config.open_skills_enabled) {
+      setSummary(null);
+      setSummaryError(null);
+      return;
+    }
+    setIsLoadingSummary(true);
+    setSummaryError(null);
+    try {
+      const payload = await invokeTauri<SkillsPackageSummary>("skills_package_summary");
+      setSummary(payload);
+    } catch (e) {
+      setSummaryError(String(e));
+    } finally {
+      setIsLoadingSummary(false);
+    }
+  }, [config.open_skills_enabled]);
+
+  useEffect(() => {
+    void refreshSummary();
+  }, [refreshSummary, config.open_skills_dir]);
 
   const handleImport = async () => {
     if (!importPath) return;
@@ -19,6 +50,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     try {
       const result = await invokeTauri<string>("import_skills", { sourceDir: importPath });
       setImportStatus(`✅ ${result}`);
+      await refreshSummary();
     } catch (e) {
       setImportStatus(`❌ 导入失败: ${String(e)}`);
     } finally {
@@ -84,6 +116,39 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                 <option value="summary">仅注入摘要</option>
                 <option value="disabled">不注入</option>
               </select>
+            </div>
+
+            <div className="p-3 rounded-md border border-indigo-300/20 bg-indigo-500/10 space-y-2">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-indigo-100 text-sm font-medium">技能包概览</span>
+                <span className="px-2 py-1 rounded-full text-xs font-semibold bg-indigo-400/20 text-indigo-100 border border-indigo-300/30">
+                  {isLoadingSummary ? "读取中..." : `共 ${summary?.total ?? 0} 个`}
+                </span>
+              </div>
+              <div className="text-xs text-indigo-100/80 break-all">
+                目录：{summary?.dir || config.open_skills_dir || "~/.omninova/skills"}
+              </div>
+              {summaryError ? (
+                <div className="text-xs text-red-200">读取失败：{summaryError}</div>
+              ) : summary && summary.names.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {summary.names.slice(0, 8).map((name) => (
+                    <span
+                      key={name}
+                      className="px-2 py-1 rounded-md text-xs bg-white/10 text-white/90 border border-white/15"
+                    >
+                      {name}
+                    </span>
+                  ))}
+                  {summary.names.length > 8 ? (
+                    <span className="px-2 py-1 rounded-md text-xs bg-white/10 text-white/70 border border-white/15">
+                      +{summary.names.length - 8} 更多
+                    </span>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="text-xs text-white/60">当前未发现可用技能包（包含 SKILL.md 的文件夹）。</div>
+              )}
             </div>
           </div>
 

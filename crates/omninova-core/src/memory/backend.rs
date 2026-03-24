@@ -1,4 +1,5 @@
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::memory::search::{rank_entries_with_options, SearchOptions};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -60,11 +61,19 @@ impl Memory for MockMemory {
 #[derive(Clone, Default)]
 pub struct InMemoryMemory {
     entries: Arc<RwLock<HashMap<String, MemoryEntry>>>,
+    search_options: SearchOptions,
 }
 
 impl InMemoryMemory {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_options(SearchOptions::default())
+    }
+
+    pub fn new_with_options(search_options: SearchOptions) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            search_options,
+        }
     }
 
     fn now_timestamp() -> String {
@@ -127,8 +136,7 @@ impl Memory for InMemoryMemory {
             })
             .cloned()
             .collect::<Vec<_>>();
-
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        items = rank_entries_with_options(query, items, &self.search_options);
         if limit > 0 {
             items.truncate(limit);
         }
@@ -181,10 +189,18 @@ impl Memory for InMemoryMemory {
 pub struct JsonFileMemory {
     entries: Arc<RwLock<HashMap<String, MemoryEntry>>>,
     path: PathBuf,
+    search_options: SearchOptions,
 }
 
 impl JsonFileMemory {
     pub async fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        Self::open_with_options(path, SearchOptions::default()).await
+    }
+
+    pub async fn open_with_options(
+        path: impl Into<PathBuf>,
+        search_options: SearchOptions,
+    ) -> anyhow::Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -203,6 +219,7 @@ impl JsonFileMemory {
         Ok(Self {
             entries: Arc::new(RwLock::new(entries)),
             path,
+            search_options,
         })
     }
 
@@ -267,7 +284,7 @@ impl Memory for JsonFileMemory {
             })
             .cloned()
             .collect::<Vec<_>>();
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        items = rank_entries_with_options(query, items, &self.search_options);
         if limit > 0 {
             items.truncate(limit);
         }
