@@ -670,6 +670,194 @@ DROP INDEX IF EXISTS idx_messages_is_marked;
 -- The application code will handle this gracefully
 "#;
 
+/// Channel behavior config migration SQL
+/// [Source: Story 6.6 - 渠道行为配置]
+const CHANNEL_BEHAVIOR_CONFIG_SQL: &str = r#"
+-- Migration: 011_channel_behavior_config
+-- Description: Add channel_behavior_config table for per-channel behavior settings
+
+CREATE TABLE IF NOT EXISTS channel_behavior_config (
+    channel_id TEXT PRIMARY KEY,
+    config TEXT NOT NULL,  -- JSON serialized ChannelBehaviorConfig
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for channel lookups
+CREATE INDEX IF NOT EXISTS idx_behavior_config_channel ON channel_behavior_config(channel_id);
+"#;
+
+/// Channel behavior config rollback SQL
+const CHANNEL_BEHAVIOR_CONFIG_DOWN_SQL: &str = r#"
+-- Rollback: 011_channel_behavior_config
+DROP INDEX IF EXISTS idx_behavior_config_channel;
+DROP TABLE IF EXISTS channel_behavior_config;
+"#;
+
+/// Agent style config migration SQL
+/// [Source: Story 7.1 - 代理响应风格配置]
+const AGENT_STYLE_CONFIG_SQL: &str = r#"
+-- Migration: 012_agent_style_config
+-- Description: Add style_config column to agents table for response style configuration
+
+-- Add style_config column to agents table
+ALTER TABLE agents ADD COLUMN style_config TEXT;
+
+-- Create index for agents with style config
+-- Note: Partial index not needed since style_config is optional
+"#;
+
+/// Agent style config rollback SQL
+const AGENT_STYLE_CONFIG_DOWN_SQL: &str = r#"
+-- Rollback: 012_agent_style_config
+-- Note: SQLite doesn't support DROP COLUMN directly
+-- The column will remain but unused; application code handles this gracefully
+"#;
+
+/// Agent context window config migration SQL
+/// [Source: Story 7.2 - 上下文窗口配置]
+const AGENT_CONTEXT_WINDOW_CONFIG_SQL: &str = r#"
+-- Migration: 013_agent_context_window_config
+-- Description: Add context_window_config column to agents table for context window configuration
+
+-- Add context_window_config column to agents table
+ALTER TABLE agents ADD COLUMN context_window_config TEXT;
+
+-- Note: Default value is applied via application code when reading
+-- Default JSON: {"maxTokens": 4096, "overflowStrategy": "truncate", "includeSystemPrompt": true, "responseReserve": 1024}
+"#;
+
+/// Agent context window config rollback SQL
+const AGENT_CONTEXT_WINDOW_CONFIG_DOWN_SQL: &str = r#"
+-- Rollback: 013_agent_context_window_config
+-- Note: SQLite doesn't support DROP COLUMN directly
+-- The column will remain but unused; application code handles this gracefully
+"#;
+
+/// Agent trigger keywords config migration SQL
+/// [Source: Story 7.3 - 触发关键词配置]
+const AGENT_TRIGGER_KEYWORDS_CONFIG_SQL: &str = r#"
+-- Migration: 014_agent_trigger_keywords_config
+-- Description: Add trigger_keywords_config column to agents table for trigger keyword configuration
+
+-- Add trigger_keywords_config column to agents table
+ALTER TABLE agents ADD COLUMN trigger_keywords_config TEXT;
+
+-- Default JSON: {"keywords": [], "enabled": true, "defaultMatchType": "exact", "defaultCaseSensitive": false}
+"#;
+
+/// Agent trigger keywords config rollback SQL
+const AGENT_TRIGGER_KEYWORDS_CONFIG_DOWN_SQL: &str = r#"
+-- Rollback: 014_agent_trigger_keywords_config
+-- Note: SQLite doesn't support DROP COLUMN directly
+-- The column will remain but unused; application code handles this gracefully
+"#;
+
+/// Agent privacy config migration SQL
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+const AGENT_PRIVACY_CONFIG_SQL: &str = r#"
+-- Migration: 015_agent_privacy_config
+-- Description: Add privacy_config column to agents table for data processing and privacy settings
+
+-- Add privacy_config column to agents table
+ALTER TABLE agents ADD COLUMN privacy_config TEXT;
+
+-- Default JSON: {"dataRetention":{"episodicMemoryDays":90,"workingMemoryHours":24,"autoCleanup":true},"sensitiveFilter":{"enabled":false,"filterEmail":true,"filterPhone":true,"filterIdCard":true,"filterBankCard":true,"filterIpAddress":false,"customPatterns":[]},"memorySharingScope":"singleSession","exclusionRules":[],"verboseLogging":false}
+"#;
+
+/// Agent privacy config rollback SQL
+const AGENT_PRIVACY_CONFIG_DOWN_SQL: &str = r#"
+-- Rollback: 015_agent_privacy_config
+-- Note: SQLite doesn't support DROP COLUMN directly
+-- The column will remain but unused; application code handles this gracefully
+"#;
+
+/// API Keys migration SQL
+/// [Source: Story 8.3 - API 认证与授权]
+const API_KEYS_SQL: &str = r#"
+-- Migration: 016_api_keys
+-- Description: Add api_keys table for API authentication and authorization
+
+-- API Keys table: Store API key hashes for authentication
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash TEXT NOT NULL UNIQUE,      -- SHA-256 hash of the API key
+    key_prefix TEXT NOT NULL,           -- First 8 characters for display
+    name TEXT NOT NULL,                 -- Human-readable name
+    permissions TEXT NOT NULL,          -- JSON array of permissions: ["read", "write", "admin"]
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    expires_at INTEGER,                 -- Unix timestamp, NULL means no expiration
+    last_used_at INTEGER,               -- Unix timestamp of last successful use
+    is_revoked INTEGER NOT NULL DEFAULT 0
+);
+
+-- Index for fast key hash lookup
+CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+
+-- Index for filtering revoked keys
+CREATE INDEX IF NOT EXISTS idx_api_keys_is_revoked ON api_keys(is_revoked);
+
+-- Index for listing active keys
+CREATE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name);
+"#;
+
+/// API Keys rollback SQL
+const API_KEYS_DOWN_SQL: &str = r#"
+-- Rollback: 016_api_keys
+DROP INDEX IF EXISTS idx_api_keys_name;
+DROP INDEX IF EXISTS idx_api_keys_is_revoked;
+DROP INDEX IF EXISTS idx_api_keys_key_hash;
+DROP TABLE IF EXISTS api_keys;
+"#;
+
+/// API Request Logs migration SQL
+/// [Source: Story 8.4 - API 使用日志系统]
+const API_REQUEST_LOGS_SQL: &str = r#"
+-- Migration: 017_api_request_logs
+-- Description: Add api_request_logs table for API usage logging and monitoring
+
+-- API Request Logs table: Store detailed records of API requests
+CREATE TABLE IF NOT EXISTS api_request_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,            -- Unix timestamp of the request
+    method TEXT NOT NULL,                  -- HTTP method (GET, POST, PUT, DELETE, etc.)
+    endpoint TEXT NOT NULL,                -- Request endpoint path
+    status_code INTEGER NOT NULL,          -- HTTP response status code
+    response_time_ms INTEGER NOT NULL,     -- Response time in milliseconds
+    api_key_id INTEGER,                    -- Associated API Key ID (NULL for unauthenticated)
+    ip_address TEXT,                       -- Client IP address
+    user_agent TEXT,                       -- User-Agent header value
+    request_size INTEGER,                  -- Request body size in bytes
+    response_size INTEGER                  -- Response body size in bytes
+);
+
+-- Index for time-based queries (most common query pattern)
+CREATE INDEX IF NOT EXISTS idx_api_logs_timestamp ON api_request_logs(timestamp);
+
+-- Index for endpoint filtering
+CREATE INDEX IF NOT EXISTS idx_api_logs_endpoint ON api_request_logs(endpoint);
+
+-- Index for status code filtering
+CREATE INDEX IF NOT EXISTS idx_api_logs_status_code ON api_request_logs(status_code);
+
+-- Index for API Key based queries
+CREATE INDEX IF NOT EXISTS idx_api_logs_api_key_id ON api_request_logs(api_key_id);
+
+-- Index for method filtering
+CREATE INDEX IF NOT EXISTS idx_api_logs_method ON api_request_logs(method);
+"#;
+
+/// API Request Logs rollback SQL
+const API_REQUEST_LOGS_DOWN_SQL: &str = r#"
+-- Rollback: 017_api_request_logs
+DROP INDEX IF EXISTS idx_api_logs_method;
+DROP INDEX IF EXISTS idx_api_logs_api_key_id;
+DROP INDEX IF EXISTS idx_api_logs_status_code;
+DROP INDEX IF EXISTS idx_api_logs_endpoint;
+DROP INDEX IF EXISTS idx_api_logs_timestamp;
+DROP TABLE IF EXISTS api_request_logs;
+"#;
+
 /// Get the built-in migrations
 ///
 /// Returns a list of migrations that are embedded in the binary.
@@ -703,6 +891,27 @@ pub fn get_builtin_migrations() -> Vec<Migration> {
         Migration::new("010_message_memory_mark", "Add is_marked column to messages and episodic_memories for important fragment marking")
             .up(MESSAGE_MEMORY_MARK_SQL)
             .down(MESSAGE_MEMORY_MARK_DOWN_SQL),
+        Migration::new("011_channel_behavior_config", "Add channel_behavior_config table for per-channel behavior settings")
+            .up(CHANNEL_BEHAVIOR_CONFIG_SQL)
+            .down(CHANNEL_BEHAVIOR_CONFIG_DOWN_SQL),
+        Migration::new("012_agent_style_config", "Add style_config column to agents table for response style configuration")
+            .up(AGENT_STYLE_CONFIG_SQL)
+            .down(AGENT_STYLE_CONFIG_DOWN_SQL),
+        Migration::new("013_agent_context_window_config", "Add context_window_config column to agents table for context window configuration")
+            .up(AGENT_CONTEXT_WINDOW_CONFIG_SQL)
+            .down(AGENT_CONTEXT_WINDOW_CONFIG_DOWN_SQL),
+        Migration::new("014_agent_trigger_keywords_config", "Add trigger_keywords_config column to agents table for trigger keyword configuration")
+            .up(AGENT_TRIGGER_KEYWORDS_CONFIG_SQL)
+            .down(AGENT_TRIGGER_KEYWORDS_CONFIG_DOWN_SQL),
+        Migration::new("015_agent_privacy_config", "Add privacy_config column to agents table for data processing and privacy settings")
+            .up(AGENT_PRIVACY_CONFIG_SQL)
+            .down(AGENT_PRIVACY_CONFIG_DOWN_SQL),
+        Migration::new("016_api_keys", "Add api_keys table for API authentication and authorization")
+            .up(API_KEYS_SQL)
+            .down(API_KEYS_DOWN_SQL),
+        Migration::new("017_api_request_logs", "Add api_request_logs table for API usage logging and monitoring")
+            .up(API_REQUEST_LOGS_SQL)
+            .down(API_REQUEST_LOGS_DOWN_SQL),
     ]
 }
 
@@ -920,7 +1129,7 @@ mod tests {
     #[test]
     fn test_builtin_migrations_include_agent_enhancements() {
         let migrations = get_builtin_migrations();
-        assert_eq!(migrations.len(), 10);
+        assert_eq!(migrations.len(), 15);
         assert_eq!(migrations[0].id, "001_initial");
         assert_eq!(migrations[1].id, "002_agent_enhancements");
         assert!(migrations[1].down_sql.is_some());
@@ -950,7 +1159,7 @@ mod tests {
         let runner = create_builtin_runner();
         let report = runner.run(&conn).expect("Failed to run migrations");
 
-        assert_eq!(report.applied.len(), 10);
+        assert_eq!(report.applied.len(), 15);
 
         // Verify agent_uuid column exists
         let uuid_count: i32 = conn
@@ -1047,12 +1256,12 @@ mod tests {
         // Run migrations twice
         let runner = create_builtin_runner();
         let report1 = runner.run(&conn).expect("First run failed");
-        assert_eq!(report1.applied.len(), 10);
+        assert_eq!(report1.applied.len(), 15);
 
         // Second run should skip all
         let report2 = runner.run(&conn).expect("Second run failed");
         assert_eq!(report2.applied.len(), 0);
-        assert_eq!(report2.skipped.len(), 10);
+        assert_eq!(report2.skipped.len(), 15);
     }
 
     #[test]

@@ -929,6 +929,10 @@ mod tests {
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are a test assistant.".to_string()),
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
         agent_store.create(&agent).expect("Failed to create agent").id
     }

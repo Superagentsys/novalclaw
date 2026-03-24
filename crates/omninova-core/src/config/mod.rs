@@ -8,7 +8,7 @@ pub mod watcher;
 pub use schema::{
     AgentConfig, AgentsIpcConfig, ArduinoConfig, AuditConfig, AudioConfig, AutonomyConfig,
     BrowserConfig, CameraConfig, ChannelEntry, ChannelsConfig, ComposioConfig, Config,
-    CoordinationConfig, CostConfig, CronConfig, CronJobConfig, DelegateAgentConfig, DriveConfig,
+    CoordinationConfig, CorsConfig, CostConfig, CronConfig, CronJobConfig, DelegateAgentConfig, DriveConfig,
     EmbeddingConfig, EmbeddingRouteConfig, Esp32Config, EstopConfig, GatewayConfig,
     GoalLoopConfig, HardwareConfig, HeartbeatConfig, HooksConfig, HttpRequestConfig,
     IdentityConfig, MemoryConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
@@ -17,7 +17,7 @@ pub use schema::{
     RobotConfig, RpiGpioConfig, RuntimeConfig, SafetyConfig, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SensorsConfig, SkillsConfig, Stm32Config,
     StorageConfig, StorageProviderConfig, StorageProviderInner, SyscallAnomalyConfig,
-    TranscriptionConfig, TunnelConfig, WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig,
+    TlsConfig, TranscriptionConfig, TunnelConfig, WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig,
     WebSearchConfig,
 };
 

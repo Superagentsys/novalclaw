@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use super::style_config::AgentStyleConfig;
+use super::context_window_config::ContextWindowConfig;
+use super::trigger_config::AgentTriggerConfig;
+use super::privacy_config::AgentPrivacyConfig;
 
 /// Agent status enum representing the lifecycle state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,10 +87,78 @@ pub struct AgentModel {
     pub status: AgentStatus,
     /// Default LLM provider ID for this agent
     pub default_provider_id: Option<String>,
+    /// Style configuration (JSON serialized)
+    pub style_config: Option<String>,
+    /// Context window configuration (JSON serialized)
+    /// [Source: Story 7.2 - 上下文窗口配置]
+    pub context_window_config: Option<String>,
+    /// Trigger keywords configuration (JSON serialized)
+    /// [Source: Story 7.3 - 触发关键词配置]
+    pub trigger_keywords_config: Option<String>,
+    /// Privacy configuration (JSON serialized)
+    /// [Source: Story 7.4 - 数据处理与隐私设置]
+    pub privacy_config: Option<String>,
     /// Unix timestamp of creation
     pub created_at: i64,
     /// Unix timestamp of last update
     pub updated_at: i64,
+}
+
+impl AgentModel {
+    /// Get the parsed style configuration
+    pub fn get_style_config(&self) -> AgentStyleConfig {
+        self.style_config
+            .as_ref()
+            .and_then(|s| AgentStyleConfig::from_json(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set the style configuration
+    pub fn set_style_config(&mut self, config: &AgentStyleConfig) {
+        self.style_config = config.to_json().ok();
+    }
+
+    /// Get the parsed context window configuration
+    /// [Source: Story 7.2 - 上下文窗口配置]
+    pub fn get_context_window_config(&self) -> ContextWindowConfig {
+        self.context_window_config
+            .as_ref()
+            .and_then(|s| ContextWindowConfig::from_json(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set the context window configuration
+    pub fn set_context_window_config(&mut self, config: &ContextWindowConfig) {
+        self.context_window_config = config.to_json().ok();
+    }
+
+    /// Get the parsed trigger keywords configuration
+    /// [Source: Story 7.3 - 触发关键词配置]
+    pub fn get_trigger_keywords_config(&self) -> AgentTriggerConfig {
+        self.trigger_keywords_config
+            .as_ref()
+            .and_then(|s| AgentTriggerConfig::from_json(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set the trigger keywords configuration
+    pub fn set_trigger_keywords_config(&mut self, config: &AgentTriggerConfig) {
+        self.trigger_keywords_config = config.to_json().ok();
+    }
+
+    /// Get the parsed privacy configuration
+    /// [Source: Story 7.4 - 数据处理与隐私设置]
+    pub fn get_privacy_config(&self) -> AgentPrivacyConfig {
+        self.privacy_config
+            .as_ref()
+            .and_then(|s| AgentPrivacyConfig::from_json(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set the privacy configuration
+    pub fn set_privacy_config(&mut self, config: &AgentPrivacyConfig) {
+        self.privacy_config = config.to_json().ok();
+    }
 }
 
 /// Data required to create a new agent
@@ -105,6 +177,17 @@ pub struct NewAgent {
     pub system_prompt: Option<String>,
     /// Optional default LLM provider ID
     pub default_provider_id: Option<String>,
+    /// Optional style configuration
+    pub style_config: Option<String>,
+    /// Optional context window configuration
+    /// [Source: Story 7.2 - 上下文窗口配置]
+    pub context_window_config: Option<String>,
+    /// Optional trigger keywords configuration
+    /// [Source: Story 7.3 - 触发关键词配置]
+    pub trigger_keywords_config: Option<String>,
+    /// Optional privacy configuration
+    /// [Source: Story 7.4 - 数据处理与隐私设置]
+    pub privacy_config: Option<String>,
 }
 
 /// Error type for agent validation
@@ -153,6 +236,17 @@ pub struct AgentUpdate {
     pub status: Option<AgentStatus>,
     /// New default provider ID
     pub default_provider_id: Option<String>,
+    /// New style configuration (JSON)
+    pub style_config: Option<String>,
+    /// New context window configuration (JSON)
+    /// [Source: Story 7.2 - 上下文窗口配置]
+    pub context_window_config: Option<String>,
+    /// New trigger keywords configuration (JSON)
+    /// [Source: Story 7.3 - 触发关键词配置]
+    pub trigger_keywords_config: Option<String>,
+    /// New privacy configuration (JSON)
+    /// [Source: Story 7.4 - 数据处理与隐私设置]
+    pub privacy_config: Option<String>,
 }
 
 impl NewAgent {
@@ -216,6 +310,10 @@ mod tests {
             system_prompt: Some("You are a helpful assistant.".to_string()),
             status: AgentStatus::Active,
             default_provider_id: Some("openai-provider".to_string()),
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
             created_at: 1700000000,
             updated_at: 1700000000,
         };
@@ -240,6 +338,10 @@ mod tests {
             mbti_type: Some("ENFP".to_string()),
             system_prompt: None,
             default_provider_id: Some("anthropic-provider".to_string()),
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let json = serde_json::to_string(&new_agent).unwrap();
@@ -290,6 +392,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
         assert!(agent.validate().is_ok());
     }
@@ -303,6 +409,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
         assert!(matches!(agent.validate(), Err(AgentValidationError::EmptyName)));
     }
@@ -316,6 +426,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
         assert!(matches!(agent.validate(), Err(AgentValidationError::NameTooLong(100))));
     }
@@ -329,6 +443,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
         assert!(agent.validate().is_ok());
     }

@@ -950,6 +950,67 @@ pub struct ObservabilityConfig {
 // Gateway
 // ---------------------------------------------------------------------------
 
+/// CORS configuration for HTTP Gateway
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsConfig {
+    /// Enable CORS support
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Allowed origins (use ["*"] for all origins)
+    #[serde(default = "default_cors_origins")]
+    pub allowed_origins: Vec<String>,
+    /// Allowed HTTP methods
+    #[serde(default = "default_cors_methods")]
+    pub allowed_methods: Vec<String>,
+    /// Allowed headers
+    #[serde(default = "default_cors_headers")]
+    pub allowed_headers: Vec<String>,
+    /// Allow credentials (cookies, authorization headers)
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Max age in seconds for preflight cache
+    #[serde(default = "default_cors_max_age")]
+    pub max_age: u64,
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+fn default_cors_methods() -> Vec<String> {
+    vec!["GET".to_string(), "POST".to_string(), "PUT".to_string(), "DELETE".to_string(), "OPTIONS".to_string()]
+}
+fn default_cors_headers() -> Vec<String> {
+    vec!["Content-Type".to_string(), "Authorization".to_string(), "X-Requested-With".to_string()]
+}
+fn default_cors_max_age() -> u64 {
+    3600
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: default_cors_origins(),
+            allowed_methods: default_cors_methods(),
+            allowed_headers: default_cors_headers(),
+            allow_credentials: false,
+            max_age: default_cors_max_age(),
+        }
+    }
+}
+
+/// TLS/HTTPS configuration for HTTP Gateway
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    /// Enable HTTPS
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to TLS certificate file (PEM format)
+    pub cert_path: Option<String>,
+    /// Path to TLS private key file (PEM format)
+    pub key_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_gateway_host")]
@@ -980,6 +1041,12 @@ pub struct GatewayConfig {
     pub webhook_signing_include_timestamp: bool,
     #[serde(default)]
     pub webhook_signing_require_timestamp: bool,
+    /// CORS configuration
+    #[serde(default)]
+    pub cors: CorsConfig,
+    /// TLS/HTTPS configuration
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 fn default_gateway_host() -> String {
@@ -1027,6 +1094,8 @@ impl Default for GatewayConfig {
             webhook_signature_strict_priority: false,
             webhook_signing_include_timestamp: false,
             webhook_signing_require_timestamp: false,
+            cors: CorsConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }

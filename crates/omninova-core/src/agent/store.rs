@@ -60,8 +60,8 @@ impl AgentStore {
         let timestamp = NewAgent::current_timestamp();
 
         conn.execute(
-            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, style_config, context_window_config, trigger_keywords_config, privacy_config, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 &uuid,
                 &agent.name,
@@ -71,6 +71,10 @@ impl AgentStore {
                 &agent.system_prompt,
                 "active", // default status
                 &agent.default_provider_id,
+                &agent.style_config,
+                &agent.context_window_config,
+                &agent.trigger_keywords_config,
+                &agent.privacy_config,
                 timestamp,
                 timestamp,
             ],
@@ -87,6 +91,10 @@ impl AgentStore {
             system_prompt: agent.system_prompt.clone(),
             status: AgentStatus::Active,
             default_provider_id: agent.default_provider_id.clone(),
+            style_config: agent.style_config.clone(),
+            context_window_config: agent.context_window_config.clone(),
+            trigger_keywords_config: agent.trigger_keywords_config.clone(),
+            privacy_config: agent.privacy_config.clone(),
             created_at: timestamp,
             updated_at: timestamp,
         })
@@ -96,7 +104,7 @@ impl AgentStore {
     pub fn find_by_uuid(&self, uuid: &str) -> Result<Option<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, style_config, context_window_config, trigger_keywords_config, privacy_config, created_at, updated_at
              FROM agents WHERE agent_uuid = ?1"
         )?;
 
@@ -113,8 +121,12 @@ impl AgentStore {
                 system_prompt: row.get(6)?,
                 status,
                 default_provider_id: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                style_config: row.get(9)?,
+                context_window_config: row.get(10)?,
+                trigger_keywords_config: row.get(11)?,
+                privacy_config: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         });
 
@@ -129,7 +141,7 @@ impl AgentStore {
     pub fn find_by_id(&self, id: i64) -> Result<Option<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, style_config, context_window_config, trigger_keywords_config, privacy_config, created_at, updated_at
              FROM agents WHERE id = ?1"
         )?;
 
@@ -146,8 +158,12 @@ impl AgentStore {
                 system_prompt: row.get(6)?,
                 status,
                 default_provider_id: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                style_config: row.get(9)?,
+                context_window_config: row.get(10)?,
+                trigger_keywords_config: row.get(11)?,
+                privacy_config: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         });
 
@@ -162,7 +178,7 @@ impl AgentStore {
     pub fn find_all(&self) -> Result<Vec<AgentModel>, AgentStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at
+            "SELECT id, agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, style_config, context_window_config, trigger_keywords_config, privacy_config, created_at, updated_at
              FROM agents ORDER BY created_at DESC"
         )?;
 
@@ -179,8 +195,12 @@ impl AgentStore {
                 system_prompt: row.get(6)?,
                 status,
                 default_provider_id: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                style_config: row.get(9)?,
+                context_window_config: row.get(10)?,
+                trigger_keywords_config: row.get(11)?,
+                privacy_config: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })?;
 
@@ -207,10 +227,14 @@ impl AgentStore {
         let new_prompt = updates.system_prompt.as_ref().or(existing.system_prompt.as_ref());
         let new_status = updates.status.unwrap_or(existing.status);
         let new_provider_id = updates.default_provider_id.as_ref().or(existing.default_provider_id.as_ref());
+        let new_style_config = updates.style_config.as_ref().or(existing.style_config.as_ref());
+        let new_context_window_config = updates.context_window_config.as_ref().or(existing.context_window_config.as_ref());
+        let new_trigger_keywords_config = updates.trigger_keywords_config.as_ref().or(existing.trigger_keywords_config.as_ref());
+        let new_privacy_config = updates.privacy_config.as_ref().or(existing.privacy_config.as_ref());
 
         conn.execute(
-            "UPDATE agents SET name = ?1, description = ?2, domain = ?3, mbti_type = ?4, system_prompt = ?5, status = ?6, default_provider_id = ?7, updated_at = ?8
-             WHERE agent_uuid = ?9",
+            "UPDATE agents SET name = ?1, description = ?2, domain = ?3, mbti_type = ?4, system_prompt = ?5, status = ?6, default_provider_id = ?7, style_config = ?8, context_window_config = ?9, trigger_keywords_config = ?10, privacy_config = ?11, updated_at = ?12
+             WHERE agent_uuid = ?13",
             params![
                 new_name,
                 new_description,
@@ -219,6 +243,10 @@ impl AgentStore {
                 new_prompt,
                 new_status.to_string(),
                 new_provider_id,
+                new_style_config,
+                new_context_window_config,
+                new_trigger_keywords_config,
+                new_privacy_config,
                 timestamp,
                 uuid,
             ],
@@ -234,6 +262,10 @@ impl AgentStore {
             system_prompt: new_prompt.cloned(),
             status: new_status,
             default_provider_id: new_provider_id.cloned(),
+            style_config: new_style_config.cloned(),
+            context_window_config: new_context_window_config.cloned(),
+            trigger_keywords_config: new_trigger_keywords_config.cloned(),
+            privacy_config: new_privacy_config.cloned(),
             created_at: existing.created_at,
             updated_at: timestamp,
         })
@@ -259,6 +291,42 @@ impl AgentStore {
         })
     }
 
+    /// Update agent style config
+    /// [Source: Story 7.1 - 代理响应风格配置]
+    pub fn update_style_config(&self, uuid: &str, style_config: &str) -> Result<AgentModel, AgentStoreError> {
+        self.update(uuid, &AgentUpdate {
+            style_config: Some(style_config.to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Update agent context window config
+    /// [Source: Story 7.2 - 上下文窗口配置]
+    pub fn update_context_window_config(&self, uuid: &str, context_window_config: &str) -> Result<AgentModel, AgentStoreError> {
+        self.update(uuid, &AgentUpdate {
+            context_window_config: Some(context_window_config.to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Update agent trigger keywords config
+    /// [Source: Story 7.3 - 触发关键词配置]
+    pub fn update_trigger_keywords_config(&self, uuid: &str, trigger_keywords_config: &str) -> Result<AgentModel, AgentStoreError> {
+        self.update(uuid, &AgentUpdate {
+            trigger_keywords_config: Some(trigger_keywords_config.to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Update agent privacy config
+    /// [Source: Story 7.4 - 数据处理与隐私设置]
+    pub fn update_privacy_config(&self, uuid: &str, privacy_config: &str) -> Result<AgentModel, AgentStoreError> {
+        self.update(uuid, &AgentUpdate {
+            privacy_config: Some(privacy_config.to_string()),
+            ..Default::default()
+        })
+    }
+
     /// Duplicate an agent, creating a copy with a new UUID
     ///
     /// # Arguments
@@ -270,7 +338,7 @@ impl AgentStore {
     /// # Behavior
     /// - Generates a new UUID for the duplicate
     /// - Appends " (副本)" to the original name
-    /// - Copies all configuration fields (description, domain, mbti_type, system_prompt, default_provider_id)
+    /// - Copies all configuration fields (description, domain, mbti_type, system_prompt, default_provider_id, style_config)
     /// - Sets status to 'active' regardless of original status
     /// - Sets new created_at and updated_at timestamps
     pub fn duplicate(&self, uuid: &str) -> Result<AgentModel, AgentStoreError> {
@@ -285,8 +353,8 @@ impl AgentStore {
 
         let conn = self.get_conn()?;
         conn.execute(
-            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO agents (agent_uuid, name, description, domain, mbti_type, system_prompt, status, default_provider_id, style_config, context_window_config, trigger_keywords_config, privacy_config, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 &new_uuid,
                 &duplicated_name,
@@ -296,6 +364,10 @@ impl AgentStore {
                 &original.system_prompt,
                 "active", // Always set status to active
                 &original.default_provider_id,
+                &original.style_config,
+                &original.context_window_config,
+                &original.trigger_keywords_config,
+                &original.privacy_config,
                 timestamp,
                 timestamp,
             ],
@@ -312,6 +384,10 @@ impl AgentStore {
             system_prompt: original.system_prompt,
             status: AgentStatus::Active,
             default_provider_id: original.default_provider_id,
+            style_config: original.style_config,
+            context_window_config: original.context_window_config,
+            trigger_keywords_config: original.trigger_keywords_config,
+            privacy_config: original.privacy_config,
             created_at: timestamp,
             updated_at: timestamp,
         })
@@ -344,6 +420,10 @@ mod tests {
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             default_provider_id: Some("openai-provider".to_string()),
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -366,6 +446,10 @@ mod tests {
             mbti_type: Some("ENFP".to_string()),
             system_prompt: None,
             default_provider_id: Some("anthropic-provider".to_string()),
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -396,6 +480,10 @@ mod tests {
                 mbti_type: None,
                 system_prompt: None,
                 default_provider_id: None,
+                style_config: None,
+                context_window_config: None,
+                trigger_keywords_config: None,
+                privacy_config: None,
             }).expect("Failed to create agent");
         }
 
@@ -414,6 +502,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: Some("original-provider".to_string()),
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         let updates = AgentUpdate {
@@ -455,6 +547,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         // Delete the agent
@@ -485,6 +581,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         let updated = store.update_status(&created.agent_uuid, AgentStatus::Archived).expect("Failed to update status");
@@ -502,6 +602,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         let found = store.find_by_id(created.id).expect("Failed to find by id");
@@ -523,6 +627,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let result = store.create(&invalid_agent);
@@ -541,6 +649,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let result = store.create(&invalid_agent);
@@ -559,6 +671,10 @@ mod tests {
             mbti_type: Some("INTJ".to_string()),
             system_prompt: Some("You are helpful.".to_string()),
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         };
 
         let created = store.create(&new_agent).expect("Failed to create agent");
@@ -604,6 +720,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         // Set original agent to inactive
@@ -625,6 +745,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         // Archive the original
@@ -655,6 +779,10 @@ mod tests {
             mbti_type: None,
             system_prompt: None,
             default_provider_id: None,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
         }).expect("Failed to create agent");
 
         let all = store.find_all().expect("Failed to find all");

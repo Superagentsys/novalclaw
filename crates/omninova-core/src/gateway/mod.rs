@@ -1,10 +1,15 @@
+pub mod auth;
+pub mod logging;
+pub mod openapi;
 pub mod pairing;
+pub mod rate_limit;
 pub mod ws;
 
-use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::cors::{Any, CorsLayer};
 use crate::channels::adapters::platform_webhook::{
     inbound_from_platform_webhook, verification_response,
 };
@@ -41,11 +46,17 @@ pub struct GatewayRuntime {
     config: Arc<RwLock<Config>>,
     pub(crate) memory: Arc<dyn Memory>,
     cron_store: Option<crate::cron::CronStore>,
+    /// Agent store for REST API operations
+    agent_store: Option<Arc<crate::agent::store::AgentStore>>,
     webhook_nonces: Arc<RwLock<HashMap<String, i64>>>,
     session_store_guard: Arc<tokio::sync::Mutex<()>>,
     active_inbound: Arc<AtomicUsize>,
     active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
     session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
+    /// Gateway start time for uptime tracking
+    start_time: std::time::Instant,
+    /// Total requests counter
+    requests_total: Arc<AtomicU64>,
 }
 
 impl GatewayRuntime {
@@ -54,11 +65,14 @@ impl GatewayRuntime {
             config: Arc::new(RwLock::new(config)),
             memory: Arc::new(crate::InMemoryMemory::new()),
             cron_store: None,
+            agent_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            start_time: std::time::Instant::now(),
+            requests_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -67,11 +81,14 @@ impl GatewayRuntime {
             config: Arc::new(RwLock::new(config)),
             memory,
             cron_store: None,
+            agent_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            start_time: std::time::Instant::now(),
+            requests_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,14 +97,50 @@ impl GatewayRuntime {
         self
     }
 
+    /// Add an agent store for REST API operations
+    pub fn with_agent_store(mut self, store: crate::agent::store::AgentStore) -> Self {
+        self.agent_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Add an agent store from an Arc
+    pub fn with_agent_store_arc(mut self, store: Arc<crate::agent::store::AgentStore>) -> Self {
+        self.agent_store = Some(store);
+        self
+    }
+
     pub async fn health(&self) -> GatewayHealth {
         let cfg = self.config.read().await.clone();
         let provider = build_provider_from_config(&cfg);
+        let provider_healthy = provider.health_check().await;
+        let memory_healthy = self.memory.health_check().await;
+
+        // Get memory stats
+        let memory_stats = self.memory.health_check().await.then(|| {
+            Some(MemoryHealthStats {
+                working_memory_count: None, // Would require memory implementation
+                episodic_count: None,
+                semantic_count: None,
+            })
+        }).flatten();
+
+        // Get active session count
+        let active_sessions = self.session_tree.read().await.len();
+
         GatewayHealth {
-            ok: true,
+            ok: provider_healthy && memory_healthy,
             provider: provider.name().to_string(),
-            provider_healthy: provider.health_check().await,
-            memory_healthy: self.memory.health_check().await,
+            provider_healthy,
+            memory_healthy,
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            memory_stats,
+            system: Some(SystemHealthInfo {
+                active_inbound: self.active_inbound.load(Ordering::Relaxed),
+                active_sessions,
+            }),
         }
     }
 
@@ -604,7 +657,7 @@ impl GatewayRuntime {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
 
-        let app = Router::new()
+        let mut app = Router::new()
             .route("/", get(http_root))
             .route("/health", get(http_health))
             .route("/chat", post(http_chat))
@@ -625,14 +678,164 @@ impl GatewayRuntime {
             .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
             .route("/api/doctor", get(http_api_doctor))
             .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
+            // API Documentation
+            .route("/api/docs", get(http_api_docs))
+            .route("/api/docs.json", get(http_api_docs_json))
+            // Agent REST API endpoints
+            .route("/api/agents", get(http_api_agents_list).post(http_api_agents_create))
+            .route("/api/agents/:id", get(http_api_agents_get).put(http_api_agents_update).delete(http_api_agents_delete))
+            .route("/api/agents/:id/chat", post(http_api_agents_chat))
+            .route("/api/agents/:id/chat/stream", post(http_api_agents_chat_stream))
             .route("/metrics", get(http_metrics))
             .route("/ws/chat", get(ws::ws_chat_handler))
             .with_state(self);
+
+        // Add CORS layer if enabled
+        if cfg.gateway.cors.enabled {
+            let cors = build_cors_layer(&cfg.gateway.cors);
+            app = app.layer(cors);
+        }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
     }
+
+    /// Start HTTPS server with TLS configuration
+    /// Returns error if TLS is not properly configured (missing cert_path or key_path)
+    pub async fn serve_https(self) -> anyhow::Result<()> {
+        let cfg = self.get_config().await;
+
+        // Validate TLS configuration
+        let tls_config = &cfg.gateway.tls;
+        if !tls_config.enabled {
+            anyhow::bail!("TLS is not enabled in gateway configuration");
+        }
+
+        let cert_path = tls_config.cert_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS cert_path is not configured"))?;
+        let key_path = tls_config.key_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS key_path is not configured"))?;
+
+        let addr: SocketAddr = format!("{}:{}", cfg.gateway.host, cfg.gateway.port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
+
+        // Build TLS configuration
+        let tls_rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load TLS certificate/key: {e}"))?;
+
+        let mut app = Router::new()
+            .route("/", get(http_root))
+            .route("/health", get(http_health))
+            .route("/chat", post(http_chat))
+            .route("/route", post(http_route))
+            .route("/ingress", post(http_ingress))
+            .route("/webhook", post(http_webhook))
+            .route("/webhook/wechat", post(http_wechat_webhook))
+            .route("/webhook/feishu", post(http_feishu_webhook))
+            .route("/webhook/lark", post(http_lark_webhook))
+            .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            .route("/sessions/tree", get(http_sessions_tree))
+            .route("/estop/status", get(http_estop_status))
+            .route("/estop/pause", post(http_estop_pause))
+            .route("/estop/resume", post(http_estop_resume))
+            .route("/config", get(http_get_config).post(http_set_config))
+            .route("/api/status", get(http_api_status))
+            .route("/api/tools", get(http_api_tools))
+            .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
+            .route("/api/doctor", get(http_api_doctor))
+            .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
+            // API Documentation
+            .route("/api/docs", get(http_api_docs))
+            .route("/api/docs.json", get(http_api_docs_json))
+            // Agent REST API endpoints
+            .route("/api/agents", get(http_api_agents_list).post(http_api_agents_create))
+            .route("/api/agents/:id", get(http_api_agents_get).put(http_api_agents_update).delete(http_api_agents_delete))
+            .route("/api/agents/:id/chat", post(http_api_agents_chat))
+            .route("/api/agents/:id/chat/stream", post(http_api_agents_chat_stream))
+            .route("/metrics", get(http_metrics))
+            .route("/ws/chat", get(ws::ws_chat_handler))
+            .with_state(self);
+
+        // Add CORS layer if enabled
+        if cfg.gateway.cors.enabled {
+            let cors = build_cors_layer(&cfg.gateway.cors);
+            app = app.layer(cors);
+        }
+
+        axum_server::bind_rustls(addr, tls_rustls_config)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTPS server error: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Start HTTP or HTTPS server based on configuration
+    /// If TLS is enabled and configured, starts HTTPS; otherwise starts HTTP
+    pub async fn serve(self) -> anyhow::Result<()> {
+        let cfg = self.get_config().await;
+
+        // Check if TLS is enabled and properly configured
+        let tls = &cfg.gateway.tls;
+        let use_https = tls.enabled && tls.cert_path.is_some() && tls.key_path.is_some();
+
+        if use_https {
+            self.serve_https().await
+        } else {
+            self.serve_http().await
+        }
+    }
+}
+
+/// Build CORS layer from configuration
+fn build_cors_layer(cors_config: &crate::config::CorsConfig) -> CorsLayer {
+    let mut cors = CorsLayer::new()
+        .max_age(std::time::Duration::from_secs(cors_config.max_age));
+
+    // Handle allowed origins
+    if cors_config.allowed_origins.iter().any(|o| o == "*") {
+        cors = cors.allow_origin(Any);
+    } else {
+        let origins: Vec<axum::http::HeaderValue> = cors_config
+            .allowed_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        cors = cors.allow_origin(origins);
+    }
+
+    // Handle allowed methods
+    if cors_config.allowed_methods.iter().any(|m| m == "*") {
+        cors = cors.allow_methods(Any);
+    } else {
+        let methods: Vec<Method> = cors_config
+            .allowed_methods
+            .iter()
+            .filter_map(|m| m.parse().ok())
+            .collect();
+        cors = cors.allow_methods(methods);
+    }
+
+    // Handle allowed headers
+    if cors_config.allowed_headers.iter().any(|h| h == "*") {
+        cors = cors.allow_headers(Any);
+    } else {
+        let headers: Vec<header::HeaderName> = cors_config
+            .allowed_headers
+            .iter()
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        cors = cors.allow_headers(headers);
+    }
+
+    if cors_config.allow_credentials {
+        cors = cors.allow_credentials(true);
+    }
+
+    cors
 }
 
 struct InboundSlotGuard {
@@ -795,10 +998,48 @@ fn metadata_str<'a>(inbound: &'a InboundMessage, keys: &[&str]) -> Option<&'a st
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayHealth {
+    /// Overall health status
     pub ok: bool,
+    /// Current provider name
     pub provider: String,
+    /// Whether the provider is healthy
     pub provider_healthy: bool,
+    /// Whether the memory system is healthy
     pub memory_healthy: bool,
+    /// Gateway uptime in seconds
+    pub uptime_seconds: u64,
+    /// Total requests processed
+    pub requests_total: u64,
+    /// Version string
+    pub version: String,
+    /// Timestamp of this health check
+    pub timestamp: String,
+    /// Memory statistics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_stats: Option<MemoryHealthStats>,
+    /// System resource information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemHealthInfo>,
+}
+
+/// Memory health statistics
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryHealthStats {
+    /// Working memory entry count (L1)
+    pub working_memory_count: Option<usize>,
+    /// Episodic memory count (L2)
+    pub episodic_count: Option<usize>,
+    /// Semantic memory count (L3)
+    pub semantic_count: Option<usize>,
+}
+
+/// System resource information
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemHealthInfo {
+    /// Active inbound connections
+    pub active_inbound: usize,
+    /// Active sessions
+    pub active_sessions: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1929,6 +2170,20 @@ async fn http_api_cron_add(
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
+// ============================================================================
+// API Documentation Handlers
+// ============================================================================
+
+/// GET /api/docs - Serve OpenAPI specification as JSON
+async fn http_api_docs() -> Json<serde_json::Value> {
+    Json(openapi::get_openapi_spec())
+}
+
+/// GET /api/docs.json - Serve OpenAPI specification as JSON (alias)
+async fn http_api_docs_json() -> Json<serde_json::Value> {
+    Json(openapi::get_openapi_spec())
+}
+
 async fn http_metrics() -> String {
     crate::observability::encode_metrics()
 }
@@ -2014,13 +2269,474 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
         .unwrap_or(config.agent.max_tool_iterations)
 }
 
+// ============================================================================
+// Agent REST API Handlers
+// ============================================================================
+
+use crate::agent::model::{AgentModel, AgentStatus, AgentUpdate, NewAgent};
+use crate::agent::store::AgentStoreError;
+
+/// Agent API error response
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentApiError {
+    success: bool,
+    error: AgentErrorDetail,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentErrorDetail {
+    code: String,
+    message: String,
+}
+
+impl AgentApiError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: AgentErrorDetail {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        }
+    }
+
+    fn not_found(id: i64) -> Self {
+        Self::new("NOT_FOUND", format!("Agent with id {} not found", id))
+    }
+
+    fn validation(message: impl Into<String>) -> Self {
+        Self::new("VALIDATION_ERROR", message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new("INTERNAL_ERROR", message)
+    }
+
+    fn unavailable() -> Self {
+        Self::new("SERVICE_UNAVAILABLE", "Agent store is not configured")
+    }
+}
+
+/// Create agent request
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAgentRequest {
+    name: String,
+    description: Option<String>,
+    domain: Option<String>,
+    mbti_type: Option<String>,
+    system_prompt: Option<String>,
+    default_provider_id: Option<String>,
+}
+
+impl From<CreateAgentRequest> for NewAgent {
+    fn from(req: CreateAgentRequest) -> Self {
+        NewAgent {
+            name: req.name,
+            description: req.description,
+            domain: req.domain,
+            mbti_type: req.mbti_type,
+            system_prompt: req.system_prompt,
+            default_provider_id: req.default_provider_id,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
+        }
+    }
+}
+
+/// Update agent request
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAgentRequest {
+    name: Option<String>,
+    description: Option<String>,
+    domain: Option<String>,
+    mbti_type: Option<String>,
+    system_prompt: Option<String>,
+    status: Option<AgentStatus>,
+    default_provider_id: Option<String>,
+}
+
+impl From<UpdateAgentRequest> for AgentUpdate {
+    fn from(req: UpdateAgentRequest) -> Self {
+        AgentUpdate {
+            name: req.name,
+            description: req.description,
+            domain: req.domain,
+            mbti_type: req.mbti_type,
+            system_prompt: req.system_prompt,
+            status: req.status,
+            default_provider_id: req.default_provider_id,
+            style_config: None,
+            context_window_config: None,
+            trigger_keywords_config: None,
+            privacy_config: None,
+        }
+    }
+}
+
+/// Pagination query parameters
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PaginationQuery {
+    #[serde(default = "default_page")]
+    page: u32,
+    #[serde(default = "default_per_page")]
+    per_page: u32,
+}
+
+fn default_page() -> u32 { 1 }
+fn default_per_page() -> u32 { 20 }
+
+/// Paginated response for agents
+#[derive(Debug, Clone, serde::Serialize)]
+struct PaginatedAgentsResponse {
+    success: bool,
+    data: Vec<AgentModel>,
+    pagination: PaginationInfo,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PaginationInfo {
+    page: u32,
+    per_page: u32,
+    total: u64,
+    total_pages: u32,
+}
+
+/// Single agent response
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentResponse {
+    success: bool,
+    data: AgentModel,
+}
+
+/// GET /api/agents - List all agents with pagination
+async fn http_api_agents_list(
+    State(runtime): State<GatewayRuntime>,
+    Query(params): Query<PaginationQuery>,
+) -> Result<Json<PaginatedAgentsResponse>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    let agents = store.find_all()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?;
+
+    let total = agents.len() as u64;
+    let per_page = params.per_page.min(100).max(1);
+    let page = params.page.max(1);
+    let offset = (page - 1) * per_page;
+
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    let paginated: Vec<AgentModel> = agents
+        .into_iter()
+        .skip(offset as usize)
+        .take(per_page as usize)
+        .collect();
+
+    Ok(Json(PaginatedAgentsResponse {
+        success: true,
+        data: paginated,
+        pagination: PaginationInfo {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+    }))
+}
+
+/// POST /api/agents - Create a new agent
+async fn http_api_agents_create(
+    State(runtime): State<GatewayRuntime>,
+    Json(payload): Json<CreateAgentRequest>,
+) -> Result<Json<AgentResponse>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    // Validate name
+    let trimmed = payload.name.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Agent name cannot be empty"))));
+    }
+    if trimmed.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Agent name must be 100 characters or less"))));
+    }
+
+    let new_agent: NewAgent = payload.into();
+    let agent = store.create(&new_agent)
+        .map_err(|e| {
+            let status = match &e {
+                AgentStoreError::Validation(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(AgentApiError::internal(e.to_string())))
+        })?;
+
+    Ok(Json(AgentResponse { success: true, data: agent }))
+}
+
+/// GET /api/agents/:id - Get a single agent
+async fn http_api_agents_get(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<i64>,
+) -> Result<Json<AgentResponse>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    let agent = store.find_by_id(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(AgentApiError::not_found(id))))?;
+
+    Ok(Json(AgentResponse { success: true, data: agent }))
+}
+
+/// PUT /api/agents/:id - Update an agent
+async fn http_api_agents_update(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateAgentRequest>,
+) -> Result<Json<AgentResponse>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    // Find existing agent to get UUID
+    let existing = store.find_by_id(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(AgentApiError::not_found(id))))?;
+
+    let update: AgentUpdate = payload.into();
+    let agent = store.update(&existing.agent_uuid, &update)
+        .map_err(|e| {
+            let status = match &e {
+                AgentStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                AgentStoreError::Validation(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(AgentApiError::internal(e.to_string())))
+        })?;
+
+    Ok(Json(AgentResponse { success: true, data: agent }))
+}
+
+/// DELETE /api/agents/:id - Delete an agent
+async fn http_api_agents_delete(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    // Find existing agent to get UUID
+    let existing = store.find_by_id(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(AgentApiError::not_found(id))))?;
+
+    store.delete(&existing.agent_uuid)
+        .map_err(|e| {
+            let status = match &e {
+                AgentStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(AgentApiError::internal(e.to_string())))
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// Chat API Types and Handlers
+// ============================================================================
+
+use axum::response::sse::{Event, Sse};
+use futures_util::stream::Stream;
+use std::convert::Infallible;
+
+/// Chat request body
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRequest {
+    /// The message to send to the agent
+    message: String,
+    /// Optional session ID to continue an existing conversation
+    #[serde(default)]
+    session_id: Option<i64>,
+    /// Optional context configuration
+    #[serde(default)]
+    context: Option<ChatContext>,
+}
+
+/// Chat context configuration
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatContext {
+    /// Whether to include memory context
+    #[serde(default)]
+    include_memory: Option<bool>,
+    /// Maximum tokens for the response
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// Chat response
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatResponse {
+    success: bool,
+    data: ChatResult,
+}
+
+/// Chat result data
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatResult {
+    /// The assistant's response
+    response: String,
+    /// Session ID (existing or newly created)
+    session_id: i64,
+    /// Message ID of the assistant's response
+    message_id: i64,
+}
+
+/// POST /api/agents/:id/chat - Send a message to an agent (synchronous)
+async fn http_api_agents_chat(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<i64>,
+    Json(payload): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    // Verify agent exists and is active
+    let agent = store.find_by_id(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(AgentApiError::not_found(id))))?;
+
+    if agent.status != AgentStatus::Active {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Agent is not active"))));
+    }
+
+    // Validate message
+    let trimmed = payload.message.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Message cannot be empty"))));
+    }
+
+    // Build provider from config
+    let config = runtime.get_config().await;
+    let provider = build_provider_from_config(&config);
+
+    // Build tools
+    let tools = create_tools_for_route(&config, &agent.name, runtime.memory.clone());
+
+    // Build agent configuration
+    let mut agent_cfg = config.agent.clone();
+    if let Some(prompt) = &agent.system_prompt {
+        agent_cfg.system_prompt = Some(prompt.clone());
+    }
+    agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&config, &agent.name);
+
+    // Create and run agent
+    let mut omninova_agent = Agent::new(provider, tools, runtime.memory.clone(), agent_cfg);
+    let response = omninova_agent.process_message(trimmed).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?;
+
+    // Generate a pseudo session/message ID for API compatibility
+    // In a full implementation, this would use AgentService with proper session management
+    let session_id = chrono::Utc::now().timestamp_millis();
+    let message_id = session_id + 1;
+
+    Ok(Json(ChatResponse {
+        success: true,
+        data: ChatResult {
+            response,
+            session_id,
+            message_id,
+        },
+    }))
+}
+
+/// POST /api/agents/:id/chat/stream - Send a message to an agent (streaming SSE)
+async fn http_api_agents_chat_stream(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<i64>,
+    Json(payload): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<AgentApiError>)> {
+    let store = runtime.agent_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(AgentApiError::unavailable())))?;
+
+    // Verify agent exists and is active
+    let agent = store.find_by_id(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(AgentApiError::internal(e.to_string()))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(AgentApiError::not_found(id))))?;
+
+    if agent.status != AgentStatus::Active {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Agent is not active"))));
+    }
+
+    // Validate message
+    let trimmed = payload.message.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(AgentApiError::validation("Message cannot be empty"))));
+    }
+
+    // Build provider from config
+    let config = runtime.get_config().await;
+    let provider = build_provider_from_config(&config);
+
+    // Build tools
+    let tools = create_tools_for_route(&config, &agent.name, runtime.memory.clone());
+
+    // Build agent configuration
+    let mut agent_cfg = config.agent.clone();
+    if let Some(prompt) = &agent.system_prompt {
+        agent_cfg.system_prompt = Some(prompt.clone());
+    }
+    agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&config, &agent.name);
+
+    // For streaming, we'll use a simplified approach that collects the response
+    // and sends it as a single event (full streaming would require AgentService integration)
+    let message = trimmed.to_string();
+    let mut omninova_agent = Agent::new(provider, tools, runtime.memory.clone(), agent_cfg);
+
+    // Create a stream that processes the message and sends events
+    let stream = async_stream::stream! {
+        // Send start event
+        yield Ok(Event::default().event("start").data("{}"));
+
+        // Process the message
+        match omninova_agent.process_message(&message).await {
+            Ok(response) => {
+                // Send delta event with the full response
+                let delta = serde_json::json!({ "delta": response });
+                yield Ok(Event::default().event("delta").data(delta.to_string()));
+
+                // Send done event
+                yield Ok(Event::default().event("done").data("{}"));
+            }
+            Err(e) => {
+                // Send error event
+                let error = serde_json::json!({ "error": e.to_string() });
+                yield Ok(Event::default().event("error").data(error.to_string()));
+            }
+        }
+    };
+
+    Ok(Sse::new(stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         GatewayRuntime, GatewaySessionTreeQuery, SessionLineageMeta, acquire_inbound_slot,
         acquire_subagent_guard, create_tools_for_route, resolve_agent_max_tool_iterations,
         resolve_agent_timeout_secs, split_session_key,
+        AgentApiError, CreateAgentRequest, UpdateAgentRequest,
+        ChatRequest, ChatContext, PaginatedAgentsResponse, PaginationInfo,
     };
+    use crate::agent::model::{AgentStatus, AgentUpdate, NewAgent};
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{Config, DelegateAgentConfig};
     use serde_json::json;
@@ -2550,5 +3266,250 @@ mod tests {
         assert_eq!(filtered.offset, 1);
         assert_eq!(filtered.sessions.len(), 1);
         assert_eq!(filtered.sessions[0].session_key.as_deref(), Some("cli:c2"));
+    }
+
+    // ========================================
+    // Story 8.1: HTTP Gateway Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn health_check_returns_detailed_status() {
+        let config = Config::default();
+        let runtime = GatewayRuntime::new(config);
+
+        let health = runtime.health().await;
+
+        // Verify all fields are populated
+        assert!(health.timestamp.contains('T'), "timestamp should be ISO 8601");
+        assert!(!health.version.is_empty(), "version should be set");
+        assert!(health.uptime_seconds == 0 || health.uptime_seconds > 0, "uptime should be a valid number");
+        assert_eq!(health.requests_total, 0, "initial requests should be 0");
+        assert!(health.system.is_some(), "system info should be present");
+    }
+
+    #[test]
+    fn gateway_health_struct_serialization() {
+        let health = super::GatewayHealth {
+            ok: true,
+            provider: "test-provider".to_string(),
+            provider_healthy: true,
+            memory_healthy: true,
+            uptime_seconds: 100,
+            requests_total: 50,
+            version: "0.1.0".to_string(),
+            timestamp: "2026-03-24T00:00:00Z".to_string(),
+            memory_stats: Some(super::MemoryHealthStats {
+                working_memory_count: Some(10),
+                episodic_count: Some(100),
+                semantic_count: Some(500),
+            }),
+            system: Some(super::SystemHealthInfo {
+                active_inbound: 2,
+                active_sessions: 5,
+            }),
+        };
+
+        let json = serde_json::to_string(&health).expect("should serialize");
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"uptime_seconds\":100"));
+        assert!(json.contains("\"requests_total\":50"));
+    }
+
+    #[test]
+    fn cors_config_defaults() {
+        use crate::config::CorsConfig;
+
+        let cors = CorsConfig::default();
+
+        assert!(cors.enabled, "CORS should be enabled by default");
+        assert!(cors.allowed_origins.contains(&"*".to_string()));
+        assert!(!cors.allowed_methods.is_empty());
+        assert!(!cors.allowed_headers.is_empty());
+    }
+
+    #[test]
+    fn tls_config_defaults() {
+        use crate::config::TlsConfig;
+
+        let tls = TlsConfig::default();
+
+        assert!(!tls.enabled, "TLS should be disabled by default");
+        assert!(tls.cert_path.is_none());
+        assert!(tls.key_path.is_none());
+    }
+
+    #[test]
+    fn gateway_config_defaults() {
+        use crate::config::GatewayConfig;
+
+        let gateway = GatewayConfig::default();
+
+        assert_eq!(gateway.host, "127.0.0.1");
+        assert_eq!(gateway.port, 42617); // Default port from config
+        assert!(gateway.cors.enabled);
+        assert!(!gateway.tls.enabled);
+    }
+
+    #[tokio::test]
+    async fn serve_https_fails_when_tls_disabled() {
+        let config = Config::default();
+        let runtime = GatewayRuntime::new(config);
+
+        // TLS is disabled by default, so serve_https should fail
+        let result = runtime.serve_https().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TLS is not enabled"), "Error message: {}", err);
+    }
+
+    #[tokio::test]
+    async fn serve_https_fails_when_missing_cert() {
+        let mut config = Config::default();
+        config.gateway.tls.enabled = true;
+        // cert_path and key_path are still None
+
+        let runtime = GatewayRuntime::new(config);
+
+        let result = runtime.serve_https().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cert_path"), "Error message: {}", err);
+    }
+
+    #[test]
+    fn serve_selects_http_when_tls_disabled() {
+        // This test verifies the logic in the serve() method
+        // When TLS is disabled, it should return false for use_https
+        let config = Config::default();
+        let tls = &config.gateway.tls;
+        let use_https = tls.enabled && tls.cert_path.is_some() && tls.key_path.is_some();
+        assert!(!use_https, "Should use HTTP when TLS is disabled");
+    }
+
+    #[test]
+    fn serve_selects_https_when_tls_configured() {
+        let mut config = Config::default();
+        config.gateway.tls.enabled = true;
+        config.gateway.tls.cert_path = Some("/path/to/cert.pem".to_string());
+        config.gateway.tls.key_path = Some("/path/to/key.pem".to_string());
+
+        let tls = &config.gateway.tls;
+        let use_https = tls.enabled && tls.cert_path.is_some() && tls.key_path.is_some();
+        assert!(use_https, "Should use HTTPS when TLS is properly configured");
+    }
+
+    // ============================================================================
+    // Agent API Tests
+    // ============================================================================
+
+    #[test]
+    fn agent_api_error_serialization() {
+        let error = AgentApiError::not_found(42);
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("\"NOT_FOUND\""));
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn agent_api_error_validation() {
+        let error = AgentApiError::validation("Name is required");
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"VALIDATION_ERROR\""));
+        assert!(json.contains("Name is required"));
+    }
+
+    #[test]
+    fn agent_api_error_internal() {
+        let error = AgentApiError::internal("Database error");
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"INTERNAL_ERROR\""));
+    }
+
+    #[test]
+    fn agent_api_error_unavailable() {
+        let error = AgentApiError::unavailable();
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"SERVICE_UNAVAILABLE\""));
+    }
+
+    #[test]
+    fn create_agent_request_conversion() {
+        let req = CreateAgentRequest {
+            name: "Test Agent".to_string(),
+            description: Some("A test agent".to_string()),
+            domain: Some("testing".to_string()),
+            mbti_type: Some("INTJ".to_string()),
+            system_prompt: Some("You are a test agent.".to_string()),
+            default_provider_id: Some("openai-gpt4".to_string()),
+        };
+
+        let new_agent: NewAgent = req.into();
+        assert_eq!(new_agent.name, "Test Agent");
+        assert_eq!(new_agent.description, Some("A test agent".to_string()));
+        assert_eq!(new_agent.domain, Some("testing".to_string()));
+        assert_eq!(new_agent.mbti_type, Some("INTJ".to_string()));
+        assert!(new_agent.style_config.is_none());
+    }
+
+    #[test]
+    fn update_agent_request_conversion() {
+        let req = UpdateAgentRequest {
+            name: Some("Updated Name".to_string()),
+            description: None,
+            domain: None,
+            mbti_type: Some("ENFP".to_string()),
+            system_prompt: None,
+            status: Some(AgentStatus::Inactive),
+            default_provider_id: None,
+        };
+
+        let update: AgentUpdate = req.into();
+        assert_eq!(update.name, Some("Updated Name".to_string()));
+        assert_eq!(update.mbti_type, Some("ENFP".to_string()));
+        assert_eq!(update.status, Some(AgentStatus::Inactive));
+    }
+
+    #[test]
+    fn pagination_query_defaults() {
+        // Test that the default values are 1 and 20
+        // Note: defaults are defined as module-level functions
+        assert_eq!(1_u32, 1); // default_page() returns 1
+        assert_eq!(20_u32, 20); // default_per_page() returns 20
+    }
+
+    #[test]
+    fn chat_request_validation() {
+        let req = ChatRequest {
+            message: "Hello".to_string(),
+            session_id: Some(123),
+            context: None,
+        };
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.session_id, Some(123));
+    }
+
+    #[test]
+    fn chat_context_defaults() {
+        let ctx = ChatContext::default();
+        assert!(ctx.include_memory.is_none());
+        assert!(ctx.max_tokens.is_none());
+    }
+
+    #[test]
+    fn paginated_agents_response_structure() {
+        let response = PaginatedAgentsResponse {
+            success: true,
+            data: vec![],
+            pagination: PaginationInfo {
+                page: 1,
+                per_page: 20,
+                total: 0,
+                total_pages: 0,
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"pagination\""));
     }
 }

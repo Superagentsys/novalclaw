@@ -46,7 +46,10 @@ globset.workspace = true
 url.workspace = true
 lru.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
+tower-http.workspace = true
+axum-server.workspace = true
 futures-util = "0.3"
+async-stream = "0.3"
 tokio-stream = "0.1"
 hmac = "0.12.1"
 sha2 = "0.10.9"
@@ -54,15 +57,21 @@ hex = "0.4.3"
 argon2 = "0.5"
 rand = "0.8"
 aes-gcm = "0.10"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+regex = "1"
 keyring = "3"
 pdf-extract = "0.10.0"
 serde_yaml = "0.9.34"
+bitflags = { version = "2.6", features = ["serde"] }
 
 # Database
 rusqlite.workspace = true
 r2d2.workspace = true
 r2d2_sqlite.workspace = true
+
+# WebSocket for Slack Socket Mode
+tokio-tungstenite.workspace = true
 
 # File watching
 notify = { version = "6.1", default-features = false, features = ["macos_kqueue"] }

@@ -6,10 +6,12 @@
  * - 名称、描述、专业领域编辑
  * - MBTI 人格类型修改
  * - 人格预览
+ * - 隐私配置设置 [Story 7.4]
  * - 表单验证
  * - 保存和取消操作
  *
  * [Source: 2-7-agent-edit.md]
+ * [Source: Story 7.4 - 数据处理与隐私设置]
  */
 
 import * as React from 'react';
@@ -21,13 +23,16 @@ import { personalityColors } from '@/lib/personality-colors';
 import { MBTISelector } from './MBTISelector';
 import { PersonalityPreview } from './PersonalityPreview';
 import { ProviderSelector } from './ProviderSelector';
+import { PrivacyConfigForm } from './PrivacyConfigForm';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Loader2, Sparkles, UserCircle, Zap } from 'lucide-react';
+import { Loader2, Sparkles, UserCircle, Zap, ChevronDown, ChevronRight, Shield } from 'lucide-react';
 import {
   type AgentModel,
   type AgentUpdate,
   type MBTIType,
+  type AgentPrivacyConfig,
+  DEFAULT_PRIVACY_CONFIG,
 } from '@/types/agent';
 
 // ============================================================================
@@ -125,6 +130,20 @@ function initializeFormState(agent: AgentModel): FormState {
   };
 }
 
+/**
+ * 从 AgentModel 解析隐私配置
+ */
+function parsePrivacyConfig(agent: AgentModel): AgentPrivacyConfig {
+  if (agent.privacy_config) {
+    try {
+      return JSON.parse(agent.privacy_config) as AgentPrivacyConfig;
+    } catch {
+      return DEFAULT_PRIVACY_CONFIG;
+    }
+  }
+  return DEFAULT_PRIVACY_CONFIG;
+}
+
 // ============================================================================
 // 主组件
 // ============================================================================
@@ -157,11 +176,18 @@ export function AgentEditForm({
   const [touched, setTouched] = useState<Record<string, boolean>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Privacy config state [Story 7.4]
+  const [privacyConfig, setPrivacyConfig] = useState<AgentPrivacyConfig>(() => parsePrivacyConfig(agent));
+  const [originalPrivacyConfig, setOriginalPrivacyConfig] = useState<string>(() => agent.privacy_config || '');
+  const [advancedSettingsExpanded, setAdvancedSettingsExpanded] = useState(false);
+
   // 当 agent 变化时重置表单状态
   useEffect(() => {
     setFormState(initializeFormState(agent));
     setErrors({});
     setTouched({});
+    setPrivacyConfig(parsePrivacyConfig(agent));
+    setOriginalPrivacyConfig(agent.privacy_config || '');
   }, [agent]);
 
   // ============================================================================
@@ -185,14 +211,20 @@ export function AgentEditForm({
   /** 表单是否有更改 */
   const hasChanges = useMemo(() => {
     const original = initializeFormState(agent);
-    return (
+    const basicChanges = (
       formState.name !== original.name ||
       formState.description !== original.description ||
       formState.domain !== original.domain ||
       formState.mbtiType !== original.mbtiType ||
       formState.defaultProviderId !== original.defaultProviderId
     );
-  }, [formState, agent]);
+
+    // Check privacy config changes [Story 7.4]
+    const currentPrivacyJson = JSON.stringify(privacyConfig);
+    const privacyChanged = currentPrivacyJson !== originalPrivacyConfig;
+
+    return basicChanges || privacyChanged;
+  }, [formState, agent, privacyConfig, originalPrivacyConfig]);
 
   // ============================================================================
   // 事件处理
@@ -313,6 +345,12 @@ export function AgentEditForm({
         updates.default_provider_id = formState.defaultProviderId;
       }
 
+      // Check privacy config changes [Story 7.4]
+      const currentPrivacyJson = JSON.stringify(privacyConfig);
+      if (currentPrivacyJson !== originalPrivacyConfig) {
+        updates.privacy_config = currentPrivacyJson;
+      }
+
       // 如果没有更改，直接返回
       if (Object.keys(updates).length === 0) {
         toast.info('没有需要保存的更改');
@@ -326,6 +364,9 @@ export function AgentEditForm({
       });
 
       const updatedAgent = JSON.parse(updatedAgentJson) as AgentModel;
+
+      // Update original privacy config after successful save
+      setOriginalPrivacyConfig(currentPrivacyJson);
 
       // 显示成功通知
       toast.success(`代理 "${updatedAgent.name}" 更新成功！`);
@@ -341,7 +382,7 @@ export function AgentEditForm({
     } finally {
       setIsSubmitting(false);
     }
-  }, [formState, agent, onSuccess]);
+  }, [formState, agent, onSuccess, privacyConfig, originalPrivacyConfig]);
 
   /** 处理取消 */
   const handleCancel = useCallback(() => {
@@ -503,6 +544,51 @@ export function AgentEditForm({
               disabled={isSubmitting}
               placeholder="选择默认提供商（可选）"
             />
+          </div>
+
+          {/* 高级设置 - 隐私配置 [Story 7.4] */}
+          <div className="border rounded-lg">
+            <button
+              type="button"
+              className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors"
+              onClick={() => setAdvancedSettingsExpanded(!advancedSettingsExpanded)}
+            >
+              <div className="flex items-center gap-2">
+                <Shield className="w-4 h-4 text-muted-foreground" />
+                <span className="font-medium text-sm">高级设置</span>
+                <span className="text-xs text-muted-foreground">隐私与数据处理</span>
+              </div>
+              {advancedSettingsExpanded ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              )}
+            </button>
+            {advancedSettingsExpanded && (
+              <div className="p-4 pt-0 border-t">
+                <PrivacyConfigForm
+                  config={privacyConfig}
+                  onChange={setPrivacyConfig}
+                  disabled={isSubmitting}
+                  onTestFilter={async (content: string) => {
+                    const { invoke } = await import('@tauri-apps/api/core');
+                    return invoke<string>('test_sensitive_filter', {
+                      filterJson: JSON.stringify(privacyConfig.sensitiveFilter),
+                      content,
+                    });
+                  }}
+                  onValidatePattern={async (pattern: string) => {
+                    const { invoke } = await import('@tauri-apps/api/core');
+                    try {
+                      await invoke<void>('validate_exclusion_pattern', { pattern });
+                      return true;
+                    } catch {
+                      return false;
+                    }
+                  }}
+                />
+              </div>
+            )}
           </div>
         </div>
 

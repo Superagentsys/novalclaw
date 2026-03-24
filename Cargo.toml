@@ -60,3 +60,13 @@ lru = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+
+# WebSocket for Slack Socket Mode
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# HTTP middleware for CORS support
+tower-http = { version = "0.6", features = ["cors"] }
+
+# HTTPS/TLS support for Axum
+axum-server = { version = "0.7", features = ["tls-rustls"] }

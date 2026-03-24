@@ -1,17 +1,22 @@
 use omninova_core::account::{AccountStore, AccountInfo, NewAccount, AccountUpdate};
-use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig, AgentService, ChatResult, StreamManager, StreamEvent, CommandRegistry, CommandContext, CommandResult, CommandInfo, parse_command};
+use omninova_core::agent::{AgentStore, AgentUpdate, NewAgent, MbtiType, PersonalityTraits, PersonalityConfig, AgentService, ChatResult, StreamManager, StreamEvent, CommandRegistry, CommandContext, CommandResult, CommandInfo, parse_command, AgentStyleConfig};
 use omninova_core::memory::{WorkingMemory, WorkingMemoryEntry, MemoryStats, EpisodicMemoryStore, EpisodicMemory, NewEpisodicMemory, EpisodicMemoryStats, SemanticMemoryStore, SemanticMemory, SemanticMemoryStats, SemanticSearchResult, NewSemanticMemory, EmbeddingService, DEFAULT_EMBEDDING_DIM, DEFAULT_OPENAI_EMBEDDING_MODEL, MemoryManager, MemoryLayer, MemoryQuery, MemoryQueryResult, MemoryManagerStats, UnifiedMemoryEntry, PerformanceStats, BenchmarkResults};
 use omninova_core::backup::{
     BackupService, BackupMeta, BackupFormat,
     ImportMode, ImportOptions,
     deserialize_backup, validate_backup,
 };
-use omninova_core::channels::{ChannelKind, InboundMessage};
+use omninova_core::channels::{ChannelKind, InboundMessage, ChannelManager, ChannelInfo as CoreChannelInfo};
+use omninova_core::channels::traits::{ChannelConfig, ChannelSettings};
+use omninova_core::channels::types::Credentials;
+use omninova_core::channels::behavior::{ChannelBehaviorConfig, ChannelBehaviorStore};
 use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig, ChannelsConfig, ChannelEntry, ConfigManager};
 use omninova_core::db::{create_pool, create_builtin_runner, DbPool, DbPoolConfig};
 use omninova_core::gateway::{
     GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionTreeQuery,
     GatewaySessionTreeResponse,
+    auth::{ApiKeyStore, ApiKeyPermission, CreateApiKeyRequest, ApiKeyCreated, ApiKeyInfo},
+    logging::{ApiLogStore, ApiRequestLog, RequestLogFilter, ApiUsageStats, EndpointStats, ApiKeyStats},
 };
 use omninova_core::memory::factory::build_memory_from_config;
 use omninova_core::privacy::{
@@ -19,17 +24,17 @@ use omninova_core::privacy::{
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection, ProviderStore, NewProviderConfig, ProviderConfigUpdate};
 use omninova_core::routing::RouteDecision;
-use omninova_core::security::EncryptionKeyManager;
-use omninova_core::security::KeyringService;
+use omninova_core::security::{EncryptionKeyManager, KeyringService, KeyReference};
 use omninova_core::session::{Message, MessageStore, NewMessage, NewSession, Session, SessionStore, SessionUpdate};
 use omninova_core::skills::import_skills_from_dir;
+use omninova_core::skills::{SkillRegistry, SkillExecutor, SkillMetadata, SkillResult, SkillError, SkillContext, Skill, OpenClawSkillAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
@@ -37,6 +42,8 @@ struct AppState {
     runtime: GatewayRuntime,
     gateway_task: Option<JoinHandle<Result<(), String>>>,
     last_gateway_error: Option<String>,
+    /// Broadcast channel for gateway status events (Task 2.5)
+    gateway_status_tx: broadcast::Sender<GatewayStatusPayload>,
     db_pool: Option<DbPool>,
     agent_store: Option<AgentStore>,
     account_store: Option<AccountStore>,
@@ -61,6 +68,18 @@ struct AppState {
     semantic_memory_store: Option<Arc<SemanticMemoryStore>>,
     /// Unified Memory Manager coordinating L1, L2, and L3
     memory_manager: Option<Arc<Mutex<MemoryManager>>>,
+    /// Channel manager for multi-channel connectivity (Story 6.7)
+    channel_manager: Option<Arc<Mutex<ChannelManager>>>,
+    /// Channel behavior config store (Story 6.8)
+    channel_behavior_store: Option<Arc<omninova_core::channels::behavior::SqliteBehaviorStore>>,
+    /// Skill registry for skill management (Story 7.5)
+    skill_registry: Option<Arc<SkillRegistry>>,
+    /// Skill executor for tracking execution logs (Story 7.6)
+    skill_executor: Option<Arc<SkillExecutor>>,
+    /// API Key store for gateway authentication (Story 8.3)
+    api_key_store: Option<Arc<ApiKeyStore>>,
+    /// API Log store for request logging (Story 8.4)
+    api_log_store: Option<Arc<ApiLogStore>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +560,7 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
 
 #[tauri::command]
 async fn start_gateway(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
@@ -562,6 +582,8 @@ async fn start_gateway(
     let status = gateway_status_from_state(&state_ref).await;
 
     if !status.running {
+        // Emit error event
+        let _ = app.emit("gateway:error", &status);
         return Err(
             status
                 .last_error
@@ -570,16 +592,33 @@ async fn start_gateway(
         );
     }
 
+    // Emit started event via broadcast channel and Tauri event
+    {
+        let app_state = state_ref.lock().await;
+        let _ = app_state.gateway_status_tx.send(status.clone());
+    }
+    let _ = app.emit("gateway:started", &status);
+
     Ok(status)
 }
 
 #[tauri::command]
 async fn stop_gateway(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
     stop_gateway_inner(&state_ref).await;
-    Ok(gateway_status_from_state(&state_ref).await)
+    let status = gateway_status_from_state(&state_ref).await;
+
+    // Emit stopped event via broadcast channel and Tauri event
+    {
+        let app_state = state_ref.lock().await;
+        let _ = app_state.gateway_status_tx.send(status.clone());
+    }
+    let _ = app.emit("gateway:stopped", &status);
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -860,6 +899,659 @@ async fn duplicate_agent(
 
     let duplicated = store.duplicate(&uuid).map_err(|e| e.to_string())?;
     serde_json::to_string(&duplicated).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Agent Style Configuration Commands (Story 7.1)
+// ============================================================================
+
+/// Get agent style configuration
+#[tauri::command]
+async fn get_agent_style_config(
+    uuid: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    let agent = store.find_by_uuid(&uuid).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", uuid))?;
+
+    let style_config = agent.get_style_config();
+    serde_json::to_string(&style_config).map_err(|e| e.to_string())
+}
+
+/// Update agent style configuration
+#[tauri::command]
+async fn update_agent_style_config(
+    uuid: String,
+    style_config_json: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    // Validate the style config JSON by parsing it
+    let _config: omninova_core::agent::AgentStyleConfig = serde_json::from_str(&style_config_json)
+        .map_err(|e| format!("Invalid style config JSON: {e}"))?;
+
+    let updated = store.update_style_config(&uuid, &style_config_json).map_err(|e| e.to_string())?;
+    serde_json::to_string(&updated).map_err(|e| e.to_string())
+}
+
+/// Preview style effect on sample text
+#[tauri::command]
+async fn preview_style_effect(
+    style_config_json: String,
+    sample_text: String,
+) -> Result<String, String> {
+    use omninova_core::channels::behavior::ResponseStyleProcessor;
+
+    let config: omninova_core::agent::AgentStyleConfig = serde_json::from_str(&style_config_json)
+        .map_err(|e| format!("Invalid style config JSON: {e}"))?;
+
+    // Apply style transformation
+    let mut result = ResponseStyleProcessor::apply_style(&sample_text, config.response_style);
+
+    // Apply max length if specified
+    if config.max_response_length > 0 {
+        result = ResponseStyleProcessor::truncate(&result, config.max_response_length);
+    }
+
+    Ok(result)
+}
+
+/// Get agent context window configuration
+/// [Source: Story 7.2 - 上下文窗口配置]
+#[tauri::command]
+async fn get_context_window_config(
+    uuid: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    let agent = store.find_by_uuid(&uuid).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", uuid))?;
+
+    let config = agent.get_context_window_config();
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Update agent context window configuration
+/// [Source: Story 7.2 - 上下文窗口配置]
+#[tauri::command]
+async fn update_context_window_config(
+    uuid: String,
+    config_json: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    // Validate the config JSON by parsing it
+    let _config: omninova_core::agent::ContextWindowConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("Invalid context window config JSON: {e}"))?;
+
+    let updated = store.update_context_window_config(&uuid, &config_json).map_err(|e| e.to_string())?;
+    serde_json::to_string(&updated).map_err(|e| e.to_string())
+}
+
+/// Estimate token count for text
+/// [Source: Story 7.2 - 上下文窗口配置]
+#[tauri::command]
+async fn estimate_tokens(
+    text: String,
+) -> Result<usize, String> {
+    use omninova_core::agent::TokenCounter;
+    Ok(TokenCounter::count_text(&text))
+}
+
+/// Get model context window recommendations
+/// [Source: Story 7.2 - 上下文窗口配置]
+#[tauri::command]
+async fn get_model_context_recommendations(
+    model_name: String,
+) -> Result<Option<(usize, usize)>, String> {
+    use omninova_core::agent::get_model_context_recommendation;
+    Ok(get_model_context_recommendation(&model_name))
+}
+
+// ============================================================================
+// Agent Trigger Keywords Configuration Commands (Story 7.3)
+// ============================================================================
+
+/// Get agent trigger keywords configuration
+/// [Source: Story 7.3 - 触发关键词配置]
+#[tauri::command]
+async fn get_trigger_keywords_config(
+    uuid: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    let agent = store.find_by_uuid(&uuid).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", uuid))?;
+
+    let config = agent.get_trigger_keywords_config();
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Update agent trigger keywords configuration
+/// [Source: Story 7.3 - 触发关键词配置]
+#[tauri::command]
+async fn update_trigger_keywords_config(
+    uuid: String,
+    config_json: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    // Validate the config JSON by parsing it
+    let _config: omninova_core::agent::AgentTriggerConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("Invalid trigger keywords config JSON: {e}"))?;
+
+    let updated = store.update_trigger_keywords_config(&uuid, &config_json).map_err(|e| e.to_string())?;
+    serde_json::to_string(&updated).map_err(|e| e.to_string())
+}
+
+/// Test trigger keyword match against sample text
+/// [Source: Story 7.3 - 触发关键词配置]
+#[tauri::command]
+async fn test_trigger_match(
+    config_json: String,
+    test_text: String,
+) -> Result<String, String> {
+    use omninova_core::agent::TriggerConfigService;
+
+    let config: omninova_core::agent::AgentTriggerConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("Invalid trigger keywords config JSON: {e}"))?;
+
+    let result = TriggerConfigService::test_all_keywords(&config.keywords, &test_text);
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+/// Test a single trigger keyword against sample text
+/// [Source: Story 7.3 - 触发关键词配置]
+#[tauri::command]
+async fn test_single_trigger(
+    keyword_json: String,
+    test_text: String,
+) -> Result<String, String> {
+    use omninova_core::agent::TriggerConfigService;
+    use omninova_core::channels::behavior::TriggerKeyword;
+
+    let keyword: TriggerKeyword = serde_json::from_str(&keyword_json)
+        .map_err(|e| format!("Invalid trigger keyword JSON: {e}"))?;
+
+    let result = TriggerConfigService::test_trigger(&keyword, &test_text);
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+/// Validate a trigger keyword pattern
+/// [Source: Story 7.3 - 触发关键词配置]
+#[tauri::command]
+async fn validate_trigger_keyword(
+    keyword_json: String,
+) -> Result<(), String> {
+    use omninova_core::agent::TriggerConfigService;
+    use omninova_core::channels::behavior::TriggerKeyword;
+
+    let keyword: TriggerKeyword = serde_json::from_str(&keyword_json)
+        .map_err(|e| format!("Invalid trigger keyword JSON: {e}"))?;
+
+    TriggerConfigService::validate_keyword(&keyword)
+}
+
+// ============================================================================
+// Privacy Config Commands
+// ============================================================================
+
+/// Get agent privacy configuration
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+#[tauri::command]
+async fn get_privacy_config(
+    uuid: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    let agent = store.find_by_uuid(&uuid).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", uuid))?;
+
+    let config = agent.get_privacy_config();
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Update agent privacy configuration
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+#[tauri::command]
+async fn update_privacy_config(
+    uuid: String,
+    config_json: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    // Validate the config JSON by parsing it
+    let _config: omninova_core::agent::AgentPrivacyConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("Invalid privacy config JSON: {e}"))?;
+
+    let updated = store.update_privacy_config(&uuid, &config_json).map_err(|e| e.to_string())?;
+    serde_json::to_string(&updated).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Unified Agent Configuration Commands (Story 7.7)
+// ============================================================================
+
+/// Unified agent configuration response
+#[derive(serde::Serialize)]
+struct AgentConfigurationResponse {
+    style_config: Option<String>,
+    context_window_config: Option<String>,
+    trigger_keywords_config: Option<String>,
+    privacy_config: Option<String>,
+}
+
+/// Get unified agent configuration
+/// [Source: Story 7.7 - ConfigurationPanel 组件]
+#[tauri::command]
+async fn get_agent_configuration(
+    agent_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AgentConfigurationResponse, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    let agent = store.find_by_uuid(&agent_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", agent_id))?;
+
+    // Get all configs
+    let style_config = Some(serde_json::to_string(&agent.get_style_config()).map_err(|e| e.to_string())?);
+    let context_window_config = Some(serde_json::to_string(&agent.get_context_window_config()).map_err(|e| e.to_string())?);
+    let trigger_keywords_config = Some(serde_json::to_string(&agent.get_trigger_keywords_config()).map_err(|e| e.to_string())?);
+    let privacy_config = Some(serde_json::to_string(&agent.get_privacy_config()).map_err(|e| e.to_string())?);
+
+    Ok(AgentConfigurationResponse {
+        style_config,
+        context_window_config,
+        trigger_keywords_config,
+        privacy_config,
+    })
+}
+
+/// Update unified agent configuration
+/// [Source: Story 7.7 - ConfigurationPanel 组件]
+#[tauri::command]
+async fn update_agent_configuration(
+    agent_id: String,
+    style_config: Option<String>,
+    context_config: Option<String>,
+    trigger_config: Option<String>,
+    privacy_config: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.agent_store.as_ref()
+        .ok_or_else(|| "Agent store not initialized. Call init_agent_store first.".to_string())?;
+
+    // Verify agent exists
+    let _agent = store.find_by_uuid(&agent_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent not found: {}", agent_id))?;
+
+    // Update each config if provided
+    if let Some(config) = style_config {
+        let _parsed: omninova_core::agent::AgentStyleConfig = serde_json::from_str(&config)
+            .map_err(|e| format!("Invalid style config JSON: {e}"))?;
+        store.update_style_config(&agent_id, &config).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(config) = context_config {
+        let _parsed: omninova_core::agent::ContextWindowConfig = serde_json::from_str(&config)
+            .map_err(|e| format!("Invalid context config JSON: {e}"))?;
+        store.update_context_window_config(&agent_id, &config).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(config) = trigger_config {
+        let _parsed: omninova_core::agent::AgentTriggerConfig = serde_json::from_str(&config)
+            .map_err(|e| format!("Invalid trigger config JSON: {e}"))?;
+        store.update_trigger_keywords_config(&agent_id, &config).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(config) = privacy_config {
+        let _parsed: omninova_core::agent::AgentPrivacyConfig = serde_json::from_str(&config)
+            .map_err(|e| format!("Invalid privacy config JSON: {e}"))?;
+        store.update_privacy_config(&agent_id, &config).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Test sensitive data filter against sample content
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+#[tauri::command]
+async fn test_sensitive_filter(
+    filter_json: String,
+    content: String,
+) -> Result<String, String> {
+    use omninova_core::agent::PrivacyConfigService;
+    use omninova_core::agent::SensitiveDataFilter;
+
+    let filter: SensitiveDataFilter = serde_json::from_str(&filter_json)
+        .map_err(|e| format!("Invalid sensitive filter JSON: {e}"))?;
+
+    let filtered = PrivacyConfigService::filter_content(&filter, &content);
+    serde_json::to_string(&filtered).map_err(|e| e.to_string())
+}
+
+/// Validate exclusion rule pattern
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+#[tauri::command]
+async fn validate_exclusion_pattern(
+    pattern: String,
+) -> Result<(), String> {
+    use omninova_core::agent::PrivacyConfigService;
+
+    PrivacyConfigService::validate_exclusion_pattern(&pattern)
+}
+
+/// Validate custom filter pattern
+/// [Source: Story 7.4 - 数据处理与隐私设置]
+#[tauri::command]
+async fn validate_filter_pattern(
+    pattern: String,
+) -> Result<(), String> {
+    use omninova_core::agent::PrivacyConfigService;
+
+    PrivacyConfigService::validate_filter_pattern(&pattern)
+}
+
+// ============================================================================
+// Skill System Commands (Story 7.5)
+// ============================================================================
+
+/// Initialize the skill registry
+#[tauri::command]
+async fn init_skill_registry(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock().await;
+    let registry = Arc::new(SkillRegistry::new());
+    let executor = Arc::new(SkillExecutor::new(Arc::clone(&registry), None));
+    app_state.skill_registry = Some(registry);
+    app_state.skill_executor = Some(executor);
+    Ok(())
+}
+
+/// List all available skills
+#[tauri::command]
+async fn list_available_skills(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let skills = registry.list_all().await;
+    serde_json::to_string(&skills).map_err(|e| e.to_string())
+}
+
+/// Get skill info by ID
+#[tauri::command]
+async fn get_skill_info(
+    skill_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let skill = registry.get(&skill_id).await
+        .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+
+    serde_json::to_string(skill.metadata()).map_err(|e| e.to_string())
+}
+
+/// Skill execution request from frontend
+#[derive(Debug, Deserialize)]
+struct SkillExecutionRequest {
+    skill_id: String,
+    agent_id: String,
+    session_id: Option<String>,
+    user_input: String,
+    config: HashMap<String, Value>,
+}
+
+/// Execute a skill
+#[tauri::command]
+async fn execute_skill(
+    request: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let req: SkillExecutionRequest = serde_json::from_str(&request)
+        .map_err(|e| format!("Invalid request: {}", e))?;
+
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    // Create executor
+    let executor = SkillExecutor::new(Arc::clone(registry), None);
+
+    // Build context
+    let context = SkillContext::new(&req.agent_id, &req.user_input)
+        .with_session_opt(req.session_id.as_deref())
+        .with_config_map(req.config.into_iter()
+            .map(|(k, v)| (k, v))
+            .collect());
+
+    // Execute (need to release lock before executing)
+    drop(app_state);
+
+    let result = executor.execute(&req.skill_id, context).await
+        .map_err(|e| e.to_string())?;
+
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+/// Validate skill configuration
+#[tauri::command]
+async fn validate_skill_config(
+    skill_id: String,
+    config: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let skill = registry.get(&skill_id).await
+        .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+
+    let config: HashMap<String, Value> = serde_json::from_str(&config)
+        .map_err(|e| format!("Invalid config JSON: {}", e))?;
+
+    skill.validate(&config).map_err(|e| e.to_string())
+}
+
+/// Register a custom skill from OpenClaw format
+#[tauri::command]
+async fn register_custom_skill(
+    skill_yaml: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    use omninova_core::skills::OpenClawSkillAdapter;
+
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let skill = OpenClawSkillAdapter::from_yaml(&skill_yaml)
+        .map_err(|e| format!("Failed to parse skill: {}", e))?;
+
+    let metadata = skill.metadata().clone();
+    registry.register(Arc::new(skill)).await
+        .map_err(|e| format!("Failed to register skill: {}", e))?;
+
+    serde_json::to_string(&metadata).map_err(|e| e.to_string())
+}
+
+/// List skills by tag
+#[tauri::command]
+async fn list_skills_by_tag(
+    tag: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let skills = registry.list_by_tag(&tag).await;
+    serde_json::to_string(&skills).map_err(|e| e.to_string())
+}
+
+/// Get all available skill tags
+#[tauri::command]
+async fn list_skill_tags(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+    let registry = app_state.skill_registry.as_ref()
+        .ok_or("Skill registry not initialized")?;
+
+    let tags = registry.list_tags().await;
+    serde_json::to_string(&tags).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Agent Skill Configuration Commands (Story 7.6)
+// ============================================================================
+
+/// Agent skill configuration from frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentSkillConfigRequest {
+    agent_id: String,
+    enabled_skills: Vec<String>,
+    skill_configs: HashMap<String, Value>,
+}
+
+/// Get skill configuration for an agent
+#[tauri::command]
+async fn get_agent_skill_config(
+    agent_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    // For now, return default empty config
+    // TODO: Implement persistent storage for agent skill configs
+    let config = AgentSkillConfigRequest {
+        agent_id,
+        enabled_skills: Vec::new(),
+        skill_configs: HashMap::new(),
+    };
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Update skill configuration for an agent
+#[tauri::command]
+async fn update_agent_skill_config(
+    config: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let _config: AgentSkillConfigRequest = serde_json::from_str(&config)
+        .map_err(|e| format!("Invalid config JSON: {}", e))?;
+
+    // TODO: Implement persistent storage for agent skill configs
+    // For now, this is a no-op that just validates the input
+
+    Ok(())
+}
+
+/// Toggle a skill for an agent
+#[tauri::command]
+async fn toggle_agent_skill(
+    agent_id: String,
+    skill_id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    // For now, return updated config
+    // TODO: Implement persistent storage for agent skill configs
+    let config = AgentSkillConfigRequest {
+        agent_id,
+        enabled_skills: if enabled { vec![skill_id] } else { Vec::new() },
+        skill_configs: HashMap::new(),
+    };
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Get execution logs for skills
+#[tauri::command]
+async fn get_skill_execution_logs(
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    // Use the skill executor if available
+    if let Some(ref executor) = app_state.skill_executor {
+        let logs = executor.get_execution_logs(limit.unwrap_or(50)).await;
+        return serde_json::to_string(&logs).map_err(|e| e.to_string());
+    }
+
+    // Return empty array if executor not initialized
+    serde_json::to_string(&Vec::<omninova_core::skills::ExecutionLog>::new())
+        .map_err(|e| e.to_string())
+}
+
+/// Get usage statistics for skills
+#[tauri::command]
+async fn get_skill_usage_stats(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    // Use the skill executor if available
+    if let Some(ref executor) = app_state.skill_executor {
+        let logs = executor.get_execution_logs(1000).await;
+
+        // Calculate statistics from logs
+        let mut stats: HashMap<String, omninova_core::skills::ExecutionLog> = HashMap::new();
+
+        for log in logs {
+            // This is a simplified version - in production we'd want proper aggregation
+            stats.insert(log.skill_id.clone(), log);
+        }
+
+        return serde_json::to_string(&stats).map_err(|e| e.to_string());
+    }
+
+    // Return empty map if executor not initialized
+    serde_json::to_string(&HashMap::<String, omninova_core::skills::ExecutionLog>::new())
+        .map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -2056,6 +2748,322 @@ async fn get_keyring_store_type(
         .ok_or_else(|| "Keyring service not initialized. Call init_keyring_service first.".to_string())?;
 
     Ok(service.store_type().to_string())
+}
+
+// ============================================================================
+// API Key Management Commands (Story 8.3)
+// ============================================================================
+
+/// Initialize the API key store
+#[tauri::command]
+async fn init_api_key_store(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock().await;
+
+    // Check if already initialized
+    if app_state.api_key_store.is_some() {
+        return Ok(());
+    }
+
+    // Ensure database pool is initialized
+    let pool = if let Some(pool) = &app_state.db_pool {
+        pool.clone()
+    } else {
+        let db_path = omninova_core::db::pool::default_db_path()
+            .map_err(|e| format!("Failed to get database path: {e}"))?;
+
+        let pool = create_pool(&db_path, DbPoolConfig::default())
+            .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+        // Run migrations
+        let conn = pool.get()
+            .map_err(|e| format!("Failed to get database connection: {e}"))?;
+
+        let runner = create_builtin_runner();
+        runner.run(&conn)
+            .map_err(|e| format!("Failed to run migrations: {e}"))?;
+
+        app_state.db_pool = Some(pool.clone());
+        pool
+    };
+
+    // Create API key store
+    app_state.api_key_store = Some(Arc::new(ApiKeyStore::new(Arc::new(pool))));
+
+    Ok(())
+}
+
+/// Create a new API key
+#[tauri::command]
+async fn create_api_key(
+    name: String,
+    permissions: Vec<String>,
+    expires_in_days: Option<u32>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ApiKeyCreated, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_key_store.as_ref()
+        .ok_or_else(|| "API key store not initialized. Call init_api_key_store first.".to_string())?;
+
+    // Parse permissions
+    let perms: Vec<ApiKeyPermission> = permissions
+        .iter()
+        .filter_map(|p| match p.to_lowercase().as_str() {
+            "read" => Some(ApiKeyPermission::Read),
+            "write" => Some(ApiKeyPermission::Write),
+            "admin" => Some(ApiKeyPermission::Admin),
+            _ => None,
+        })
+        .collect();
+
+    if perms.is_empty() {
+        return Err("At least one valid permission (read, write, admin) is required".to_string());
+    }
+
+    let request = CreateApiKeyRequest {
+        name,
+        permissions: perms,
+        expires_in_days,
+    };
+
+    store.create(request).map_err(|e| e.to_string())
+}
+
+/// List all API keys
+#[tauri::command]
+async fn list_api_keys(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<ApiKeyInfo>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_key_store.as_ref()
+        .ok_or_else(|| "API key store not initialized. Call init_api_key_store first.".to_string())?;
+
+    store.list_all().map_err(|e| e.to_string())
+}
+
+/// Revoke an API key
+#[tauri::command]
+async fn revoke_api_key(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_key_store.as_ref()
+        .ok_or_else(|| "API key store not initialized. Call init_api_key_store first.".to_string())?;
+
+    store.revoke(id).map_err(|e| e.to_string())
+}
+
+/// Delete a gateway API key permanently
+#[tauri::command]
+async fn delete_gateway_api_key(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_key_store.as_ref()
+        .ok_or_else(|| "API key store not initialized. Call init_api_key_store first.".to_string())?;
+
+    store.delete(id).map_err(|e| e.to_string())
+}
+
+/// Get gateway API key by ID
+#[tauri::command]
+async fn get_gateway_api_key(
+    id: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<ApiKeyInfo>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_key_store.as_ref()
+        .ok_or_else(|| "API key store not initialized. Call init_api_key_store first.".to_string())?;
+
+    match store.find_by_id(id).map_err(|e| e.to_string())? {
+        Some(key) => Ok(Some(ApiKeyInfo::from(key))),
+        None => Ok(None),
+    }
+}
+
+// ============================================================================
+// API Log Management Commands (Story 8.4)
+// ============================================================================
+
+/// Initialize the API log store
+#[tauri::command]
+async fn init_api_log_store(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock().await;
+
+    // Check if already initialized
+    if app_state.api_log_store.is_some() {
+        return Ok(());
+    }
+
+    // Ensure database pool is initialized
+    let pool = if let Some(pool) = &app_state.db_pool {
+        pool.clone()
+    } else {
+        let db_path = omninova_core::db::pool::default_db_path()
+            .map_err(|e| format!("Failed to get database path: {e}"))?;
+
+        let pool = create_pool(&db_path, DbPoolConfig::default())
+            .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+        // Run migrations
+        let conn = pool.get()
+            .map_err(|e| format!("Failed to get database connection: {e}"))?;
+
+        let runner = create_builtin_runner();
+        runner.run(&conn)
+            .map_err(|e| format!("Failed to run migrations: {e}"))?;
+
+        app_state.db_pool = Some(pool.clone());
+        pool
+    };
+
+    // Create API log store
+    app_state.api_log_store = Some(Arc::new(ApiLogStore::new(Arc::new(pool))));
+
+    Ok(())
+}
+
+/// List API request logs with filtering and pagination
+#[tauri::command]
+async fn list_api_logs(
+    filter: RequestLogFilter,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<ApiRequestLog>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    let limit = limit.unwrap_or(100);
+    let offset = offset.unwrap_or(0);
+
+    // Cap limit to prevent excessive queries
+    let limit = std::cmp::min(limit, 1000);
+
+    store.query(&filter, limit, offset).map_err(|e| e.to_string())
+}
+
+/// Get count of API logs matching filter
+#[tauri::command]
+async fn count_api_logs(
+    filter: RequestLogFilter,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<u64, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    store.count(&filter).map_err(|e| e.to_string())
+}
+
+/// Get API usage statistics for a time range
+#[tauri::command]
+async fn get_api_usage_stats(
+    start_time: i64,
+    end_time: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ApiUsageStats, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    store.get_stats(start_time, end_time).map_err(|e| e.to_string())
+}
+
+/// Get per-endpoint statistics
+#[tauri::command]
+async fn get_endpoint_stats(
+    start_time: i64,
+    end_time: i64,
+    limit: Option<u64>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EndpointStats>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    let limit = limit.unwrap_or(20);
+
+    store.get_endpoint_stats(start_time, end_time, limit).map_err(|e| e.to_string())
+}
+
+/// Get per-API-key statistics
+#[tauri::command]
+async fn get_api_key_stats(
+    start_time: i64,
+    end_time: i64,
+    limit: Option<u64>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<ApiKeyStats>, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    let limit = limit.unwrap_or(20);
+
+    store.get_api_key_stats(start_time, end_time, limit).map_err(|e| e.to_string())
+}
+
+/// Export API logs to JSON or CSV format
+#[tauri::command]
+async fn export_api_logs(
+    filter: RequestLogFilter,
+    format: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<String, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    match format.to_lowercase().as_str() {
+        "json" => store.export_json(&filter).map_err(|e| e.to_string()),
+        "csv" => store.export_csv(&filter).map_err(|e| e.to_string()),
+        _ => Err("Invalid format. Use 'json' or 'csv'.".to_string()),
+    }
+}
+
+/// Clear API logs before a specific timestamp
+#[tauri::command]
+async fn clear_api_logs(
+    before_timestamp: i64,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<u64, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    store.clear_before(before_timestamp).map_err(|e| e.to_string())
+}
+
+/// Clear all API logs
+#[tauri::command]
+async fn clear_all_api_logs(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<u64, String> {
+    let app_state = state.lock().await;
+
+    let store = app_state.api_log_store.as_ref()
+        .ok_or_else(|| "API log store not initialized. Call init_api_log_store first.".to_string())?;
+
+    store.clear_all().map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -3321,6 +4329,480 @@ async fn memory_benchmark(
     manager.benchmark().await.map_err(|e| format!("Benchmark failed: {}", e))
 }
 
+// ============================================================================
+// Channel Status Commands (Story 6.7)
+// ============================================================================
+
+/// Channel info for frontend (matches TypeScript interface)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiChannelInfo {
+    id: String,
+    name: String,
+    kind: String,
+    status: String,
+    capabilities: u32,
+    messages_sent: u64,
+    messages_received: u64,
+    last_activity: Option<i64>,
+    error_message: Option<String>,
+}
+
+impl From<CoreChannelInfo> for UiChannelInfo {
+    fn from(info: CoreChannelInfo) -> Self {
+        Self {
+            id: info.id,
+            name: info.name,
+            kind: info.kind.to_string(),
+            status: format!("{:?}", info.status).to_lowercase(),
+            capabilities: info.capabilities.bits(),
+            messages_sent: info.messages_sent,
+            messages_received: info.messages_received,
+            last_activity: info.last_activity,
+            error_message: info.error_message,
+        }
+    }
+}
+
+/// Initialize channel manager
+///
+/// Creates the channel manager instance. Call this after database initialization.
+#[tauri::command]
+async fn init_channel_manager(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock().await;
+
+    if app_state.channel_manager.is_some() {
+        return Ok(());
+    }
+
+    let manager = ChannelManager::new();
+    app_state.channel_manager = Some(Arc::new(Mutex::new(manager)));
+
+    Ok(())
+}
+
+/// Get all channels with their status
+///
+/// Returns a list of all configured channels with their current connection status.
+#[tauri::command]
+async fn get_all_channels(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<UiChannelInfo>, String> {
+    let app_state = state.lock().await;
+
+    // If channel manager is initialized, get channels from it
+    if let Some(ref channel_manager) = app_state.channel_manager {
+        let manager = channel_manager.lock().await;
+        let channels = manager.list_channels();
+        return Ok(channels.into_iter().map(UiChannelInfo::from).collect());
+    }
+
+    // Otherwise, return channels from config as "disconnected"
+    let runtime = app_state.runtime.clone();
+    let cfg = runtime.get_config().await;
+
+    let mut channels = Vec::new();
+
+    // Helper to add channel if enabled
+    let add_channel = |kind: &str, entry: &omninova_core::config::ChannelEntry, list: &mut Vec<UiChannelInfo>| {
+        if entry.enabled {
+            list.push(UiChannelInfo {
+                id: format!("{}-config", kind.to_lowercase()),
+                name: kind.to_string(),
+                kind: kind.to_lowercase(),
+                status: "disconnected".to_string(),
+                capabilities: 0,
+                messages_sent: 0,
+                messages_received: 0,
+                last_activity: None,
+                error_message: None,
+            });
+        }
+    };
+
+    if let Some(ref telegram) = cfg.channels_config.telegram {
+        add_channel("Telegram", telegram, &mut channels);
+    }
+    if let Some(ref discord) = cfg.channels_config.discord {
+        add_channel("Discord", discord, &mut channels);
+    }
+    if let Some(ref slack) = cfg.channels_config.slack {
+        add_channel("Slack", slack, &mut channels);
+    }
+    if let Some(ref whatsapp) = cfg.channels_config.whatsapp {
+        add_channel("WhatsApp", whatsapp, &mut channels);
+    }
+    if let Some(ref wechat) = cfg.channels_config.wechat {
+        add_channel("WeChat", wechat, &mut channels);
+    }
+    if let Some(ref feishu) = cfg.channels_config.feishu {
+        add_channel("Feishu", feishu, &mut channels);
+    }
+    if let Some(ref lark) = cfg.channels_config.lark {
+        add_channel("Lark", lark, &mut channels);
+    }
+    if let Some(ref dingtalk) = cfg.channels_config.dingtalk {
+        add_channel("DingTalk", dingtalk, &mut channels);
+    }
+    if let Some(ref matrix) = cfg.channels_config.matrix {
+        add_channel("Matrix", matrix, &mut channels);
+    }
+    if let Some(ref email) = cfg.channels_config.email {
+        add_channel("Email", email, &mut channels);
+    }
+    if let Some(ref msteams) = cfg.channels_config.msteams {
+        add_channel("MSTeams", msteams, &mut channels);
+    }
+    if let Some(ref irc) = cfg.channels_config.irc {
+        add_channel("IRC", irc, &mut channels);
+    }
+    if let Some(ref webhook) = cfg.channels_config.webhook {
+        add_channel("Webhook", webhook, &mut channels);
+    }
+
+    Ok(channels)
+}
+
+/// Connect a channel
+///
+/// Attempts to establish connection to the specified channel.
+#[tauri::command]
+async fn connect_channel(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+    manager.connect_channel(&channel_id).await
+        .map_err(|e| format!("连接渠道失败: {}", e))
+}
+
+/// Disconnect a channel
+///
+/// Gracefully disconnects the specified channel.
+#[tauri::command]
+async fn disconnect_channel(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+    manager.disconnect_channel(&channel_id).await
+        .map_err(|e| format!("断开渠道失败: {}", e))
+}
+
+/// Retry channel connection
+///
+/// Retries connection for a channel in error state.
+#[tauri::command]
+async fn retry_channel_connection(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+    manager.try_reconnect(&channel_id).await
+        .map_err(|e| format!("重试连接失败: {}", e))
+}
+
+// ============================================================================
+// Channel Configuration Commands (Story 6.8)
+// ============================================================================
+
+/// Channel config for create/update requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelConfigRequest {
+    name: String,
+    kind: String,
+    enabled: bool,
+    behavior: serde_json::Value,
+    agent_id: Option<String>,
+}
+
+/// Create a new channel
+///
+/// Creates a new channel configuration and returns the channel info.
+#[tauri::command]
+async fn create_channel(
+    config: ChannelConfigRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<UiChannelInfo, String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+
+    // Generate a new channel ID
+    let channel_id = format!("{}-{}", config.kind.to_lowercase(), uuid::Uuid::new_v4());
+
+    // Parse channel kind from string using serde
+    let kind: ChannelKind = serde_json::from_value(serde_json::json!(config.kind))
+        .map_err(|e| format!("无效的渠道类型: {}", e))?;
+
+    // Parse behavior config
+    let behavior: ChannelBehaviorConfig =
+        serde_json::from_value(config.behavior.clone())
+            .map_err(|e| format!("解析行为配置失败: {}", e))?;
+
+    // Create ChannelSettings with the behavior config
+    let settings = ChannelSettings {
+        behavior: behavior.clone(),
+        ..Default::default()
+    };
+
+    // Create channel config (credentials will be set separately via save_channel_credentials)
+    let channel_config = ChannelConfig::new(
+        channel_id.clone(),
+        kind.clone(),
+        Credentials::None,
+    )
+    .with_name(config.name.clone())
+    .with_settings(settings);
+
+    // Create channel in manager
+    manager.create_channel(channel_config)
+        .map_err(|e| format!("创建渠道失败: {}", e))?;
+
+    // Save behavior config to database if available
+    if let Some(ref behavior_store) = app_state.channel_behavior_store {
+        ChannelBehaviorStore::save(behavior_store.as_ref(), &channel_id, &behavior)
+            .map_err(|e| format!("保存行为配置失败: {}", e))?;
+    }
+
+    Ok(UiChannelInfo {
+        id: channel_id,
+        name: config.name,
+        kind: config.kind,
+        status: "disconnected".to_string(),
+        capabilities: 0,
+        messages_sent: 0,
+        messages_received: 0,
+        last_activity: None,
+        error_message: None,
+    })
+}
+
+/// Update an existing channel
+///
+/// Updates the channel configuration.
+#[tauri::command]
+async fn update_channel(
+    channel_id: String,
+    config: ChannelConfigRequest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+
+    // Parse behavior config
+    let behavior: ChannelBehaviorConfig =
+        serde_json::from_value(config.behavior.clone())
+            .map_err(|e| format!("解析行为配置失败: {}", e))?;
+
+    // Update behavior config in manager
+    manager.update_behavior_config(&channel_id, behavior.clone())
+        .map_err(|e| format!("更新渠道行为配置失败: {}", e))?;
+
+    // Update behavior config in database if available
+    if let Some(ref behavior_store) = app_state.channel_behavior_store {
+        ChannelBehaviorStore::save(behavior_store.as_ref(), &channel_id, &behavior)
+            .map_err(|e| format!("保存行为配置失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Delete a channel
+///
+/// Removes a channel configuration and disconnects it.
+#[tauri::command]
+async fn delete_channel(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+
+    // Disconnect and remove channel
+    manager.remove_channel(&channel_id)
+        .map_err(|e| format!("删除渠道失败: {}", e))?;
+
+    // Delete behavior config from database if available
+    if let Some(ref behavior_store) = app_state.channel_behavior_store {
+        let _ = ChannelBehaviorStore::delete(behavior_store.as_ref(), &channel_id); // Ignore error if not found
+    }
+
+    Ok(())
+}
+
+/// Test channel connection
+///
+/// Tests if the channel configuration is valid by attempting to connect.
+#[tauri::command]
+async fn test_channel_connection(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized. Call init_channel_manager first.".to_string())?;
+
+    let mut manager = channel_manager.lock().await;
+
+    // Try to connect and check status
+    match manager.connect_channel(&channel_id).await {
+        Ok(()) => {
+            // Wait a moment and check status
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let status = manager.get_channel_info(&channel_id)
+                .map(|info| info.status)
+                .unwrap_or(omninova_core::channels::types::ChannelStatus::Disconnected);
+            Ok(status == omninova_core::channels::types::ChannelStatus::Connected)
+        }
+        Err(e) => {
+            Err(format!("连接测试失败: {}", e))
+        }
+    }
+}
+
+/// Save channel credentials
+///
+/// Saves channel credentials to secure storage (OS Keychain).
+#[tauri::command]
+async fn save_channel_credentials(
+    channel_id: String,
+    credentials: serde_json::Value,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    // Use keyring service if available
+    if let Some(ref keyring) = app_state.keyring_service {
+        let credentials_json = serde_json::to_string(&credentials)
+            .map_err(|e| format!("序列化凭据失败: {}", e))?;
+
+        let reference = KeyReference::new("channels", &channel_id, "credentials");
+        keyring.save_secret(&reference, &credentials_json)
+            .await
+            .map_err(|e| format!("保存凭据失败: {}", e))?;
+
+        return Ok(());
+    }
+
+    // Fallback: store in config (not recommended for production)
+    Err("Keychain service not available. Credentials storage requires OS keychain integration.".to_string())
+}
+
+/// Get channel credentials
+///
+/// Retrieves channel credentials from secure storage.
+#[tauri::command]
+async fn get_channel_credentials(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.lock().await;
+
+    // Use keyring service if available
+    if let Some(ref keyring) = app_state.keyring_service {
+        let reference = KeyReference::new("channels", &channel_id, "credentials");
+        let credentials_json = keyring.get_secret(&reference)
+            .await
+            .map_err(|e| format!("获取凭据失败: {}", e))?;
+
+        let credentials: serde_json::Value = serde_json::from_str(&credentials_json)
+            .map_err(|e| format!("解析凭据失败: {}", e))?;
+
+        return Ok(credentials);
+    }
+
+    Err("Keychain service not available. Credentials retrieval requires OS keychain integration.".to_string())
+}
+
+/// Get channel config
+///
+/// Retrieves the full channel configuration including behavior settings.
+#[tauri::command]
+async fn get_channel_config(
+    channel_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.lock().await;
+
+    let channel_manager = app_state.channel_manager.as_ref()
+        .ok_or_else(|| "Channel manager not initialized".to_string())?;
+
+    let manager = channel_manager.lock().await;
+
+    // Get channel info from manager
+    let channel_info = manager.get_channel_info(&channel_id)
+        .ok_or_else(|| format!("渠道不存在: {}", channel_id))?;
+
+    // Get behavior config from database if available
+    let behavior = if let Some(ref behavior_store) = app_state.channel_behavior_store {
+        ChannelBehaviorStore::load(behavior_store.as_ref(), &channel_id)
+            .map_err(|e| format!("加载行为配置失败: {}", e))?
+            .unwrap_or_default()
+    } else {
+        ChannelBehaviorConfig::default()
+    };
+
+    Ok(serde_json::json!({
+        "id": channel_info.id,
+        "name": channel_info.name,
+        "kind": channel_info.kind,
+        "enabled": channel_info.status != omninova_core::channels::types::ChannelStatus::Disconnected,
+        "behavior": behavior,
+        "status": channel_info.status,
+    }))
+}
+
+/// Save channel behavior config
+///
+/// Updates just the behavior configuration for a channel.
+#[tauri::command]
+async fn save_channel_behavior(
+    channel_id: String,
+    behavior: omninova_core::channels::behavior::ChannelBehaviorConfig,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let app_state = state.lock().await;
+
+    if let Some(ref behavior_store) = app_state.channel_behavior_store {
+        ChannelBehaviorStore::save(behavior_store.as_ref(), &channel_id, &behavior)
+            .map_err(|e| format!("保存行为配置失败: {}", e))?;
+        return Ok(());
+    }
+
+    Err("Behavior store not initialized".to_string())
+}
+
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
     let (runtime, running, last_error): (GatewayRuntime, bool, Option<String>) = {
         let app_state = state.lock().await;
@@ -3365,7 +4847,19 @@ async fn sync_gateway_task_state(state: &Arc<Mutex<AppState>>) {
     };
 
     let mut app_state = state.lock().await;
-    app_state.last_gateway_error = last_error;
+    app_state.last_gateway_error = last_error.clone();
+
+    // Emit error event via broadcast if gateway failed
+    if let Some(error) = last_error {
+        let runtime = app_state.runtime.clone();
+        let cfg = runtime.get_config().await;
+        let status = GatewayStatusPayload {
+            running: false,
+            url: format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+            last_error: Some(error),
+        };
+        let _ = app_state.gateway_status_tx.send(status);
+    }
 }
 
 async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
@@ -3730,10 +5224,14 @@ pub fn run() {
 
     let config_manager = Arc::new(config_manager);
 
+    // Create broadcast channel for gateway status events (Task 2.5)
+    let (gateway_status_tx, _) = broadcast::channel::<GatewayStatusPayload>(16);
+
     let state = Arc::new(Mutex::new(AppState {
         runtime,
         gateway_task: None,
         last_gateway_error: None,
+        gateway_status_tx,
         db_pool: None,
         agent_store: None,
         account_store: None,
@@ -3748,6 +5246,12 @@ pub fn run() {
         episodic_memory_store: None,
         semantic_memory_store: None,
         memory_manager: None,
+        channel_manager: None,
+        channel_behavior_store: None,
+        skill_registry: None,
+        skill_executor: None,
+        api_key_store: None,
+        api_log_store: None,
     }));
 
     tauri::Builder::default()
@@ -3784,6 +5288,45 @@ pub fn run() {
             update_agent,
             delete_agent,
             duplicate_agent,
+            // Agent Style Config commands (Story 7.1)
+            get_agent_style_config,
+            update_agent_style_config,
+            preview_style_effect,
+            // Context Window Config commands (Story 7.2)
+            get_context_window_config,
+            update_context_window_config,
+            estimate_tokens,
+            get_model_context_recommendations,
+            // Trigger Keywords Config commands (Story 7.3)
+            get_trigger_keywords_config,
+            update_trigger_keywords_config,
+            test_trigger_match,
+            test_single_trigger,
+            validate_trigger_keyword,
+            // Privacy Config commands (Story 7.4)
+            get_privacy_config,
+            update_privacy_config,
+            // Unified Agent Configuration commands (Story 7.7)
+            get_agent_configuration,
+            update_agent_configuration,
+            test_sensitive_filter,
+            validate_exclusion_pattern,
+            validate_filter_pattern,
+            // Skill System commands (Story 7.5)
+            init_skill_registry,
+            list_available_skills,
+            get_skill_info,
+            execute_skill,
+            validate_skill_config,
+            register_custom_skill,
+            list_skills_by_tag,
+            list_skill_tags,
+            // Agent Skill Configuration commands (Story 7.6)
+            get_agent_skill_config,
+            update_agent_skill_config,
+            toggle_agent_skill,
+            get_skill_execution_logs,
+            get_skill_usage_stats,
             get_mbti_types,
             get_mbti_traits,
             get_mbti_config,
@@ -3829,6 +5372,23 @@ pub fn run() {
             delete_api_key,
             api_key_exists,
             get_keyring_store_type,
+            // API Key commands (Story 8.3)
+            init_api_key_store,
+            create_api_key,
+            list_api_keys,
+            revoke_api_key,
+            delete_gateway_api_key,
+            get_gateway_api_key,
+            // API Log commands (Story 8.4)
+            init_api_log_store,
+            list_api_logs,
+            count_api_logs,
+            get_api_usage_stats,
+            get_endpoint_stats,
+            get_api_key_stats,
+            export_api_logs,
+            clear_api_logs,
+            clear_all_api_logs,
             // Session commands (Story 4.1)
             init_session_store,
             create_session,
@@ -3888,6 +5448,21 @@ pub fn run() {
             // Performance metrics commands (Story 5.5)
             memory_get_performance_stats,
             memory_benchmark,
+            // Channel status commands (Story 6.7)
+            init_channel_manager,
+            get_all_channels,
+            connect_channel,
+            disconnect_channel,
+            retry_channel_connection,
+            // Channel configuration commands (Story 6.8)
+            create_channel,
+            update_channel,
+            delete_channel,
+            test_channel_connection,
+            save_channel_credentials,
+            get_channel_credentials,
+            get_channel_config,
+            save_channel_behavior,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]
