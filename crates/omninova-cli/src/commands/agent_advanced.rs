@@ -3,7 +3,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-use crate::api::Client;
+use crate::api::{Client, SessionHistory, SessionInfo};
 use crate::OutputFormat;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +224,135 @@ pub enum BatchOperation {
     Enable,
     Disable,
     Delete,
+}
+
+/// Show session history for agents
+pub async fn show_history(
+    client: &Client,
+    agent_id: Option<&str>,
+    limit: usize,
+    detailed: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let history = client.get_session_history(agent_id, limit, detailed).await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&history)?);
+        }
+        OutputFormat::Text => {
+            println!("{}", "Session History".bold().underline());
+            println!();
+            
+            if history.sessions.is_empty() {
+                println!("{}", "No sessions found.".dimmed());
+                return Ok(());
+            }
+
+            for session in &history.sessions {
+                println!("{} {} [{}]", 
+                    "Session:".bold(), 
+                    session.session_id.dimmed(),
+                    session.agent_name.as_deref().unwrap_or(&session.agent_id)
+                );
+                println!("  {} {}", "Created:".dimmed(), session.created_at);
+                println!("  {} {}", "Updated:".dimmed(), session.updated_at);
+                println!("  {} {} messages", "Messages:".dimmed(), session.message_count);
+                
+                if detailed {
+                    if let Some(messages) = &session.messages {
+                        println!("\n  {}", "Messages:".underline());
+                        for msg in messages {
+                            let role_color = match msg.role.as_str() {
+                                "user" => "You".cyan(),
+                                "assistant" => "AI".green(),
+                                "system" => "System".yellow(),
+                                _ => msg.role.normal(),
+                            };
+                            println!("  [{}] {}: {}", 
+                                msg.timestamp.dimmed(),
+                                role_color,
+                                msg.content.chars().take(100).collect::<String>()
+                                    + if msg.content.len() > 100 { "..." } else { "" }
+                            );
+                        }
+                    }
+                }
+                println!();
+            }
+
+            println!("{} {} sessions shown", "Total:".dimmed(), history.total);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_operation_debug() {
+        assert_eq!(format!("{:?}", BatchOperation::Enable), "Enable");
+        assert_eq!(format!("{:?}", BatchOperation::Disable), "Disable");
+        assert_eq!(format!("{:?}", BatchOperation::Delete), "Delete");
+    }
+
+    #[test]
+    fn test_session_history_deserialization() {
+        let json = r#"{
+            "sessions": [
+                {
+                    "session_id": "test-123",
+                    "agent_id": "agent-1",
+                    "agent_name": "Test Agent",
+                    "created_at": "2026-03-26T10:00:00Z",
+                    "updated_at": "2026-03-26T11:00:00Z",
+                    "message_count": 5
+                }
+            ],
+            "total": 1
+        }"#;
+
+        let history: SessionHistory = serde_json::from_str(json).unwrap();
+        assert_eq!(history.sessions.len(), 1);
+        assert_eq!(history.sessions[0].session_id, "test-123");
+        assert_eq!(history.total, 1);
+    }
+
+    #[test]
+    fn test_session_info_with_messages() {
+        let json = r#"{
+            "session_id": "test-456",
+            "agent_id": "agent-2",
+            "agent_name": null,
+            "created_at": "2026-03-26T10:00:00Z",
+            "updated_at": "2026-03-26T11:00:00Z",
+            "message_count": 2,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello",
+                    "timestamp": "2026-03-26T10:00:00Z"
+                },
+                {
+                    "role": "assistant",
+                    "content": "Hi there!",
+                    "timestamp": "2026-03-26T10:00:05Z"
+                }
+            ]
+        }"#;
+
+        let session: SessionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(session.session_id, "test-456");
+        assert!(session.agent_name.is_none());
+        assert!(session.messages.is_some());
+        let messages = session.messages.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].content, "Hi there!");
+    }
 }
 
 

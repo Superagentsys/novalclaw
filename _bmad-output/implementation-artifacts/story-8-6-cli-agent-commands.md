@@ -2,7 +2,7 @@
 story_key: 8-6-cli-agent-commands
 epic_key: epic-8
 epic_name: 开发者工具与API
-status: in-progress
+status: done
 priority: high
 created_date: 2026-03-25
 ---

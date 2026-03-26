@@ -150,6 +150,9 @@ pub async fn execute(cmd: AgentsCommands, client: &Client, format: OutputFormat)
         AgentsCommands::Stats { id } => {
             agent_advanced::show_stats(client, id, format).await?;
         }
+        AgentsCommands::History { agent, limit, detailed } => {
+            agent_advanced::show_history(client, agent.as_deref(), limit, detailed, format).await?;
+        }
     }
 
     Ok(())

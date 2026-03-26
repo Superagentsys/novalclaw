@@ -246,6 +246,33 @@ impl Client {
         response.json().await
             .context("Failed to parse response")
     }
+
+    pub async fn get_session_history(&self, agent_id: Option<&str>, limit: usize, detailed: bool) -> Result<SessionHistory> {
+        let mut url = format!("{}/api/sessions?", self.base_url);
+        
+        if let Some(id) = agent_id {
+            url.push_str(&format!("agent_id={}&", id));
+        }
+        url.push_str(&format!("limit={}", limit));
+        if detailed {
+            url.push_str("&detailed=true");
+        }
+
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to send request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("API error: {} - {}", status, text);
+        }
+
+        response.json().await
+            .context("Failed to parse response")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,4 +283,28 @@ pub struct AgentStats {
     pub avg_response_time_ms: u64,
     pub session_count: u64,
     pub last_active: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistory {
+    pub sessions: Vec<SessionInfo>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: usize,
+    pub messages: Option<Vec<SessionMessage>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
 }

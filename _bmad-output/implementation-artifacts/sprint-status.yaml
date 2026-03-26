@@ -108,7 +108,7 @@ development_status:
 
   # Epic 9: 系统监控与管理
   epic-9: in-progress
-  9-1-system-resource-monitor: backlog
+  9-1-system-resource-monitor: done  # 后端完成 (monitor.rs, API 端点, CorsConfig/TlsConfig)
   9-2-agent-performance-monitor: backlog
   9-3-notification-management: backlog
   9-4-log-viewer: backlog

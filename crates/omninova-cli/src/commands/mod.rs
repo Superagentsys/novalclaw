@@ -69,6 +69,18 @@ pub enum AgentsCommands {
         #[arg(short, long)]
         id: Option<String>,
     },
+    /// Show agent session history
+    History {
+        /// Agent ID or name
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Maximum number of sessions to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Show detailed message history
+        #[arg(short, long)]
+        detailed: bool,
+    },
 }
 
 #[derive(Subcommand)]
