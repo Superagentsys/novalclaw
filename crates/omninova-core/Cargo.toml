@@ -64,6 +64,7 @@ keyring = "3"
 pdf-extract = "0.10.0"
 serde_yaml = "0.9.34"
 bitflags = { version = "2.6", features = ["serde"] }
+sysinfo.workspace = true
 
 # Database
 rusqlite.workspace = true

@@ -839,6 +839,77 @@ pub struct ObservabilityConfig {
 }
 
 // ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cors_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+    #[serde(default = "default_cors_allowed_methods")]
+    pub allowed_methods: Vec<String>,
+    #[serde(default = "default_cors_allowed_headers")]
+    pub allowed_headers: Vec<String>,
+    #[serde(default)]
+    pub allow_credentials: bool,
+    #[serde(default = "default_cors_max_age")]
+    pub max_age: u64,
+}
+
+fn default_cors_allowed_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn default_cors_allowed_methods() -> Vec<String> {
+    vec!["GET".to_string(), "POST".to_string(), "PUT".to_string(), "DELETE".to_string(), "PATCH".to_string(), "OPTIONS".to_string()]
+}
+
+fn default_cors_allowed_headers() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn default_cors_max_age() -> u64 {
+    3600
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: default_cors_allowed_origins(),
+            allowed_methods: default_cors_allowed_methods(),
+            allowed_headers: default_cors_allowed_headers(),
+            allow_credentials: false,
+            max_age: default_cors_max_age(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gateway
 // ---------------------------------------------------------------------------
 
@@ -872,6 +943,10 @@ pub struct GatewayConfig {
     pub webhook_signing_include_timestamp: bool,
     #[serde(default)]
     pub webhook_signing_require_timestamp: bool,
+    #[serde(default)]
+    pub cors: CorsConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 fn default_gateway_host() -> String {
@@ -919,6 +994,8 @@ impl Default for GatewayConfig {
             webhook_signature_strict_priority: false,
             webhook_signing_include_timestamp: false,
             webhook_signing_require_timestamp: false,
+            cors: CorsConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -2025,6 +2102,41 @@ pub struct ModelAliasConfig {
     #[serde(default)]
     pub params: HashMap<String, serde_json::Value>,
     pub streaming: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Memory Context Config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryContextConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_context_max_memories")]
+    pub max_memories: usize,
+    #[serde(default = "default_memory_context_min_similarity")]
+    pub min_similarity_threshold: f32,
+    #[serde(default = "default_memory_context_time_decay")]
+    pub time_decay_factor: f32,
+    #[serde(default = "default_memory_context_max_chars")]
+    pub max_chars: usize,
+}
+
+fn default_memory_context_max_memories() -> usize { 10 }
+fn default_memory_context_min_similarity() -> f32 { 0.3 }
+fn default_memory_context_time_decay() -> f32 { 0.1 }
+fn default_memory_context_max_chars() -> usize { 4000 }
+
+impl Default for MemoryContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_memories: default_memory_context_max_memories(),
+            min_similarity_threshold: default_memory_context_min_similarity(),
+            time_decay_factor: default_memory_context_time_decay(),
+            max_chars: default_memory_context_max_chars(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

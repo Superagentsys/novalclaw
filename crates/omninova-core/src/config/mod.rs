@@ -11,7 +11,7 @@ pub use schema::{
     CoordinationConfig, CorsConfig, CostConfig, CronConfig, CronJobConfig, DelegateAgentConfig, DriveConfig,
     EmbeddingConfig, EmbeddingRouteConfig, Esp32Config, EstopConfig, GatewayConfig,
     GoalLoopConfig, HardwareConfig, HeartbeatConfig, HooksConfig, HttpRequestConfig,
-    IdentityConfig, MemoryConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
+    IdentityConfig, MemoryConfig, MemoryContextConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, OtpConfig, PeripheralsConfig, ProviderApiMode, ProviderBehaviorConfig,
     ProviderConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     RobotConfig, RpiGpioConfig, RuntimeConfig, SafetyConfig, SandboxConfig, SchedulerConfig,

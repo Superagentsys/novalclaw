@@ -2,6 +2,7 @@
 members = [
     "apps/omninova-tauri/src-tauri",
     "crates/omninova-core",
+    "crates/omninova-cli",
 ]
 resolver = "2"
 
@@ -70,3 +71,6 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 # HTTPS/TLS support for Axum
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# System monitoring
+sysinfo = "0.33"

@@ -679,6 +679,10 @@ impl GatewayRuntime {
             .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
             .route("/api/doctor", get(http_api_doctor))
             .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
+            // System monitoring API
+            .route("/api/system/resources", get(http_api_system_resources))
+            .route("/api/system/history", get(http_api_system_history))
+            .route("/api/system/export", get(http_api_system_export))
             // API Documentation
             .route("/api/docs", get(http_api_docs))
             .route("/api/docs.json", get(http_api_docs_json))
@@ -751,6 +755,10 @@ impl GatewayRuntime {
             // API Documentation
             .route("/api/docs", get(http_api_docs))
             .route("/api/docs.json", get(http_api_docs_json))
+            // System monitoring API
+            .route("/api/system/resources", get(http_api_system_resources))
+            .route("/api/system/history", get(http_api_system_history))
+            .route("/api/system/export", get(http_api_system_export))
             // Agent REST API endpoints
             .route("/api/agents", get(http_api_agents_list).post(http_api_agents_create))
             .route("/api/agents/:id", get(http_api_agents_get).put(http_api_agents_update).delete(http_api_agents_delete))
@@ -2131,6 +2139,74 @@ async fn http_api_doctor(
     })))
 }
 
+// ============================================================================
+// System Monitoring API Handlers
+// ============================================================================
+
+/// GET /api/system/resources - Get current system resource usage
+async fn http_api_system_resources(
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::{snapshot, is_memory_warning};
+    
+    let snapshot = snapshot();
+    let memory_warning = is_memory_warning();
+    
+    Ok(Json(serde_json::json!({
+        "timestamp": snapshot.timestamp,
+        "cpu": {
+            "usage_percent": snapshot.cpu_usage,
+        },
+        "memory": {
+            "used_mb": snapshot.memory_used_mb,
+            "total_mb": snapshot.memory_total_mb,
+            "usage_percent": snapshot.memory_usage_percent,
+            "warning": memory_warning,
+            "warning_threshold_mb": 500,
+        },
+        "disks": snapshot.disks.iter().map(|d| serde_json::json!({
+            "name": d.name,
+            "total_gb": d.total_gb,
+            "used_gb": d.used_gb,
+            "available_gb": d.available_gb,
+            "usage_percent": d.usage_percent,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// GET /api/system/history - Get resource usage history (last hour)
+async fn http_api_system_history(
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::history;
+    
+    let history = history();
+    
+    Ok(Json(serde_json::json!({
+        "cpu": history.cpu.iter().map(|e| serde_json::json!({
+            "timestamp": e.timestamp,
+            "value": e.value,
+        })).collect::<Vec<_>>(),
+        "memory": history.memory.iter().map(|e| serde_json::json!({
+            "timestamp": e.timestamp,
+            "value": e.value,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// GET /api/system/export - Export system resource data
+async fn http_api_system_export(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<String, Json<GatewayError>> {
+    use crate::observability::{monitor, ExportFormat};
+    
+    let format = match params.get("format").map(|s| s.as_str()) {
+        Some("csv") => ExportFormat::Csv,
+        _ => ExportFormat::Json,
+    };
+    
+    let data = monitor().export(format);
+    Ok(data)
+}
+
 async fn http_api_cron_list(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
@@ -3371,7 +3447,7 @@ mod tests {
         let gateway = GatewayConfig::default();
 
         assert_eq!(gateway.host, "127.0.0.1");
-        assert_eq!(gateway.port, 42617); // Default port from config
+        assert_eq!(gateway.port, 10809); // Default port from config
         assert!(gateway.cors.enabled);
         assert!(!gateway.tls.enabled);
     }

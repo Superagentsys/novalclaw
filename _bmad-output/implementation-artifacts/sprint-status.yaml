@@ -95,19 +95,19 @@ development_status:
   epic-7-retrospective: optional
 
   # Epic 8: 开发者工具与API
-  epic-8: in-progress
+  epic-8: done
   8-1-http-gateway: done
   8-2-restful-api: done
   8-3-api-auth: done
   8-4-api-logging: done
-  8-5-cli-basic: backlog
-  8-6-cli-agent-commands: backlog
-  8-7-custom-skill-framework: backlog
-  8-8-developer-docs: backlog
+  8-5-cli-basic: done
+  8-6-cli-agent-commands: done
+  8-7-custom-skill-framework: done
+  8-8-developer-docs: done
   epic-8-retrospective: optional
 
   # Epic 9: 系统监控与管理
-  epic-9: backlog
+  epic-9: in-progress
   9-1-system-resource-monitor: backlog
   9-2-agent-performance-monitor: backlog
   9-3-notification-management: backlog
