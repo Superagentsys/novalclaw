@@ -6,6 +6,9 @@ use std::fs;
 use crate::api::{Client, SessionHistory, SessionInfo};
 use crate::OutputFormat;
 
+#[allow(unused_imports)]
+use serde_json;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExport {
     pub id: String,

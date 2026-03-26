@@ -2,12 +2,17 @@
 story_key: 8-7-custom-skill-framework
 epic_key: epic-8
 epic_name: 开发者工具与API
-status: in-progress
+status: done
 priority: high
 created_date: 2026-03-25
 ---
 
 # Story 8.7: Custom Skill Framework CLI
+
+## Implementation Status
+- [x] Research & Analysis
+- [x] Implementation - all commands (list, install, uninstall, show, validate, package)
+- [x] Testing
 
 ## User Story
 
