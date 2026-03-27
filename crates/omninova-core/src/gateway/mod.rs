@@ -691,6 +691,11 @@ impl GatewayRuntime {
             .route("/api/agents/:id", get(http_api_agents_get).put(http_api_agents_update).delete(http_api_agents_delete))
             .route("/api/agents/:id/chat", post(http_api_agents_chat))
             .route("/api/agents/:id/chat/stream", post(http_api_agents_chat_stream))
+            // Agent Performance Metrics API
+            .route("/api/metrics/agents", get(http_api_metrics_agents))
+            .route("/api/metrics/agents/:id", get(http_api_metrics_agents_id))
+            .route("/api/metrics/agents/:id/timeseries", get(http_api_metrics_agents_timeseries))
+            .route("/api/metrics/providers", get(http_api_metrics_providers))
             .route("/metrics", get(http_metrics))
             .route("/ws/chat", get(ws::ws_chat_handler))
             .with_state(self);
@@ -764,6 +769,11 @@ impl GatewayRuntime {
             .route("/api/agents/:id", get(http_api_agents_get).put(http_api_agents_update).delete(http_api_agents_delete))
             .route("/api/agents/:id/chat", post(http_api_agents_chat))
             .route("/api/agents/:id/chat/stream", post(http_api_agents_chat_stream))
+            // Agent Performance Metrics API
+            .route("/api/metrics/agents", get(http_api_metrics_agents))
+            .route("/api/metrics/agents/:id", get(http_api_metrics_agents_id))
+            .route("/api/metrics/agents/:id/timeseries", get(http_api_metrics_agents_timeseries))
+            .route("/api/metrics/providers", get(http_api_metrics_providers))
             .route("/metrics", get(http_metrics))
             .route("/ws/chat", get(ws::ws_chat_handler))
             .with_state(self);
@@ -2827,6 +2837,101 @@ async fn http_api_agents_chat_stream(
     };
 
     Ok(Sse::new(stream))
+}
+
+// ============================================================================
+// Agent Performance Metrics API Endpoints
+// ============================================================================
+
+/// GET /api/metrics/agents - Get all agent performance statistics
+async fn http_api_metrics_agents(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::{get_all_agent_stats, TimeRange};
+
+    let time_range = parse_time_range(&params);
+
+    let stats = get_all_agent_stats(time_range);
+
+    Ok(Json(serde_json::json!({
+        "data": stats,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+/// GET /api/metrics/agents/:id - Get single agent performance statistics
+async fn http_api_metrics_agents_id(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::{get_agent_stats, TimeRange};
+
+    let time_range = parse_time_range(&params);
+
+    let stats = get_agent_stats(&id, time_range);
+
+    Ok(Json(serde_json::json!({
+        "data": stats,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+/// GET /api/metrics/providers - Get provider performance comparison
+async fn http_api_metrics_providers(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::{get_provider_stats, TimeRange};
+
+    let time_range = parse_time_range(&params);
+
+    let stats = get_provider_stats(time_range);
+
+    Ok(Json(serde_json::json!({
+        "data": stats,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+/// GET /api/metrics/agents/:id/timeseries - Get time series data for an agent
+async fn http_api_metrics_agents_timeseries(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    use crate::observability::{global_monitor, MetricType, TimeRange};
+
+    let time_range = parse_time_range(&params);
+    let metric_type = parse_metric_type(params.get("metric"));
+    let interval = params
+        .get("interval")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(60); // Default: 1 minute intervals
+
+    let monitor = global_monitor();
+    let data = monitor.get_time_series(&id, metric_type, time_range, Some(interval));
+
+    Ok(Json(serde_json::json!({
+        "data": data,
+        "agent_id": id,
+        "metric_type": params.get("metric").map(|s| s.as_str()).unwrap_or("response_time"),
+        "interval_seconds": interval,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+/// Parse time range from query parameters
+fn parse_time_range(params: &HashMap<String, String>) -> Option<TimeRange> {
+    let from = params.get("from").and_then(|s| s.parse::<i64>().ok())?;
+    let to = params.get("to").and_then(|s| s.parse::<i64>().ok())?;
+    Some(TimeRange { from, to })
+}
+
+/// Parse metric type from query parameter
+fn parse_metric_type(metric: Option<&String>) -> MetricType {
+    match metric.map(|s| s.as_str()) {
+        Some("success_rate") => MetricType::SuccessRate,
+        Some("request_count") => MetricType::RequestCount,
+        _ => MetricType::ResponseTime,
+    }
 }
 
 #[cfg(test)]

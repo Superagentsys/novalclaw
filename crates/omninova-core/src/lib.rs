@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod db;
 pub mod gateway;
 pub mod memory;
+pub mod notification;
 pub mod observability;
 pub mod privacy;
 pub mod providers;

@@ -1,5 +1,5 @@
 # generated: 2026-03-14
-last_updated: 2026-03-24
+last_updated: 2026-03-27
 project_key: NOKEY
 tracking_system: file-system
 story_location: /Users/haitaofu/Projects/novalclaw/_bmad-output/implementation-artifacts
@@ -107,23 +107,23 @@ development_status:
   epic-8-retrospective: optional
 
   # Epic 9: 系统监控与管理
-  epic-9: in-progress
+  epic-9: done
   9-1-system-resource-monitor: done  # 后端完成 (monitor.rs, API 端点, CorsConfig/TlsConfig)
-  9-2-agent-performance-monitor: backlog
-  9-3-notification-management: backlog
-  9-4-log-viewer: backlog
-  9-5-runtime-mode-switch: backlog
-  9-6-startup-optimization: backlog
-  9-7-memory-optimization: backlog
+  9-2-agent-performance-monitor: done  # 后端 + 前端完成 (agent_metrics.rs, API 端点, React 组件)
+  9-3-notification-management: done  # Backend + Frontend complete, code review passed
+  9-4-log-viewer: done  # Backend + Frontend complete, code review passed
+  9-5-runtime-mode-switch: done  # 托盘、运行模式切换、开机自启动实现完成
+  9-6-startup-optimization: done  # 启动优化：StartupTracker、启动进度指示器
+  9-7-memory-optimization: done  # 内存优化：MemoryMonitor、缓存清理、内存使用显示
   epic-9-retrospective: optional
 
   # Epic 10: 界面与导航体验
-  epic-10: backlog
-  10-1-agent-quick-switch: backlog
-  10-2-history-navigation: backlog
-  10-3-global-search: backlog
-  10-4-layout-customization: backlog
-  10-5-workspace-management: backlog
-  10-6-keyboard-shortcuts: backlog
-  10-7-accessibility: backlog
+  epic-10: done
+  10-1-agent-quick-switch: done
+  10-2-history-navigation: done
+  10-3-global-search: done
+  10-4-layout-customization: done
+  10-5-workspace-management: done
+  10-6-keyboard-shortcuts: done
+  10-7-accessibility: done
   epic-10-retrospective: optional

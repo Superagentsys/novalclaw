@@ -21,6 +21,11 @@ chrono = "0.4"
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
 rusqlite = "0.32"
+parking_lot = "0.12"
+dirs = "6.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 
 [features]
 default = ["custom-protocol"]

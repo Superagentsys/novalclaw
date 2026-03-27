@@ -793,3 +793,81 @@ export interface MemoryContextInfo {
   /** Time taken for retrieval in milliseconds */
   retrievalTimeMs: number;
 }
+
+// ============================================================================
+// System Memory Monitor Types (Story 9.7 - 内存使用优化)
+// ============================================================================
+
+/**
+ * System memory statistics
+ */
+export interface SystemMemoryStats {
+  /** Used memory in bytes */
+  usedBytes: number;
+  /** Available memory in bytes */
+  availableBytes: number;
+  /** Memory usage percentage */
+  usagePercent: number;
+  /** Timestamp of measurement */
+  timestamp: number;
+}
+
+/**
+ * Cache eviction policy
+ */
+export type CacheEvictionPolicy = 'lru' | 'fifo' | 'lfu';
+
+/**
+ * Cache configuration
+ */
+export interface SystemCacheConfig {
+  /** Maximum cache size in bytes */
+  maxSize: number;
+  /** Eviction policy */
+  evictionPolicy: CacheEvictionPolicy;
+  /** Check interval in seconds */
+  checkIntervalSecs: number;
+  /** Warning threshold percentage */
+  warningThresholdPercent: number;
+}
+
+/**
+ * Default cache configuration
+ */
+export const DEFAULT_SYSTEM_CACHE_CONFIG: SystemCacheConfig = {
+  maxSize: 100 * 1024 * 1024, // 100MB
+  evictionPolicy: 'lru',
+  checkIntervalSecs: 30,
+  warningThresholdPercent: 80,
+};
+
+/**
+ * Cache eviction policy labels
+ */
+export const CACHE_EVICTION_POLICY_LABELS: Record<CacheEvictionPolicy, string> = {
+  lru: '最近最少使用 (LRU)',
+  fifo: '先进先出 (FIFO)',
+  lfu: '最不常用 (LFU)',
+};
+
+/**
+ * Format bytes to human readable string
+ */
+export function formatSystemBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const k = 1024;
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${units[i]}`;
+}
+
+/**
+ * Get memory status color
+ */
+export function getSystemMemoryStatusColor(percent: number): string {
+  if (percent < 50) return 'text-green-600';
+  if (percent < 80) return 'text-amber-600';
+  return 'text-red-600';
+}

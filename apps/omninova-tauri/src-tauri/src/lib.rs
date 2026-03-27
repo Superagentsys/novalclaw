@@ -4,16 +4,25 @@ use omninova_core::gateway::{
     GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionTreeQuery,
     GatewaySessionTreeResponse,
 };
+use omninova_core::observability::{
+    get_memory_stats, clear_cache, CacheConfig, MemoryStats,
+};
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{import_skills_from_dir, load_skills_from_dir};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
-use tauri::Manager;
+use std::time::Instant;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{TrayIcon, TrayIconBuilder},
+    Manager, WindowEvent,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -22,6 +31,136 @@ struct AppState {
     runtime: GatewayRuntime,
     gateway_task: Option<JoinHandle<Result<(), String>>>,
     last_gateway_error: Option<String>,
+}
+
+// ============================================================================
+// Run Mode Management
+// ============================================================================
+
+/// 运行模式枚举
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// 桌面模式（显示窗口）
+    Desktop,
+    /// 后台服务模式（最小化到托盘）
+    Background,
+}
+
+impl Default for RunMode {
+    fn default() -> Self {
+        Self::Desktop
+    }
+}
+
+/// 运行模式管理器
+pub struct RunModeManager {
+    mode: RwLock<RunMode>,
+    auto_start: RwLock<bool>,
+}
+
+impl RunModeManager {
+    pub fn new() -> Self {
+        Self {
+            mode: RwLock::new(RunMode::Desktop),
+            auto_start: RwLock::new(false),
+        }
+    }
+
+    pub fn get_mode(&self) -> RunMode {
+        *self.mode.read()
+    }
+
+    pub fn set_mode(&self, mode: RunMode) {
+        *self.mode.write() = mode;
+    }
+
+    pub fn is_auto_start(&self) -> bool {
+        *self.auto_start.read()
+    }
+
+    pub fn set_auto_start(&self, enabled: bool) {
+        *self.auto_start.write() = enabled;
+    }
+}
+
+impl Default for RunModeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Startup Performance Tracking
+// ============================================================================
+
+/// 启动里程碑
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupMilestone {
+    /// 里程碑名称
+    pub name: String,
+    /// 相对于启动的时间（秒）
+    pub elapsed_seconds: f64,
+}
+
+/// 启动报告
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupReport {
+    /// 总启动时间（秒）
+    pub total_seconds: f64,
+    /// 各阶段里程碑
+    pub milestones: Vec<StartupMilestone>,
+    /// 是否已完成启动
+    pub is_ready: bool,
+}
+
+/// 启动性能追踪器
+pub struct StartupTracker {
+    start_time: Instant,
+    milestones: RwLock<Vec<StartupMilestone>>,
+    is_ready: RwLock<bool>,
+}
+
+impl StartupTracker {
+    pub fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            milestones: RwLock::new(Vec::new()),
+            is_ready: RwLock::new(false),
+        }
+    }
+
+    /// 记录启动里程碑
+    pub fn record_milestone(&self, name: &str) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        self.milestones.write().push(StartupMilestone {
+            name: name.to_string(),
+            elapsed_seconds: elapsed,
+        });
+        eprintln!("[startup] {} - {:.3}s", name, elapsed);
+    }
+
+    /// 标记启动完成
+    pub fn mark_ready(&self) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        *self.is_ready.write() = true;
+        eprintln!("[startup] Application ready - {:.3}s", elapsed);
+    }
+
+    /// 获取启动报告
+    pub fn get_report(&self) -> StartupReport {
+        StartupReport {
+            total_seconds: self.start_time.elapsed().as_secs_f64(),
+            milestones: self.milestones.read().clone(),
+            is_ready: *self.is_ready.read(),
+        }
+    }
+}
+
+impl Default for StartupTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
@@ -675,6 +814,277 @@ async fn skills_package_summary(
     })
 }
 
+// ============================================================================
+// Run Mode Commands
+// ============================================================================
+
+/// 获取当前运行模式
+#[tauri::command]
+fn get_run_mode(manager: tauri::State<'_, RunModeManager>) -> RunMode {
+    manager.get_mode()
+}
+
+/// 设置运行模式
+#[tauri::command]
+fn set_run_mode(
+    mode: RunMode,
+    app: tauri::AppHandle,
+    manager: tauri::State<'_, RunModeManager>,
+) -> Result<(), String> {
+    manager.set_mode(mode);
+
+    match mode {
+        RunMode::Desktop => {
+            // 显示窗口
+            if let Some(window) = app.get_webview_window("main") {
+                window.show().map_err(|e| e.to_string())?;
+                window.set_focus().map_err(|e| e.to_string())?;
+            }
+        }
+        RunMode::Background => {
+            // 隐藏窗口到托盘
+            if let Some(window) = app.get_webview_window("main") {
+                window.hide().map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 获取开机自启动状态
+#[tauri::command]
+fn get_auto_start(manager: tauri::State<'_, RunModeManager>) -> bool {
+    manager.is_auto_start()
+}
+
+/// 设置开机自启动
+#[tauri::command]
+async fn set_auto_start(
+    enabled: bool,
+    manager: tauri::State<'_, RunModeManager>,
+) -> Result<(), String> {
+    manager.set_auto_start(enabled);
+
+    // 跨平台自启动实现
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = "OmniNova Claw";
+        let bundle_id = "com.omninova.claw";
+        let launch_agent_path = dirs::home_dir()
+            .map(|h| h.join("Library/LaunchAgents").join(format!("{}.plist", bundle_id)));
+
+        if enabled {
+            // 创建 LaunchAgent plist
+            if let Some(path) = launch_agent_path {
+                let executable = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let plist_content = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>--hidden</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>"#,
+                    bundle_id, executable
+                );
+
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&path, plist_content) {
+                    eprintln!("[autostart] Failed to create LaunchAgent: {}", e);
+                }
+            }
+        } else {
+            // 删除 LaunchAgent
+            if let Some(path) = launch_agent_path {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+        if let Ok(run_key) = hkcu.open_subkey_with_flags(path, KEY_WRITE) {
+            if enabled {
+                let executable = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = run_key.set_value("OmniNovaClaw", &format!("\"{}\" --hidden", executable));
+            } else {
+                let _ = run_key.delete_value("OmniNovaClaw");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let desktop_entry_path = dirs::config_dir()
+            .map(|c| c.join("autostart").join("omninova-claw.desktop"));
+
+        if enabled {
+            if let Some(path) = desktop_entry_path {
+                let executable = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let desktop_content = format!(
+                    r#"[Desktop Entry]
+Type=Application
+Name=OmniNova Claw
+Exec={} --hidden
+Icon=omninova-claw
+Comment=AI Agent Platform
+Categories=Utility;
+Terminal=false
+"#,
+                    executable
+                );
+
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, desktop_content);
+            }
+        } else {
+            if let Some(path) = desktop_entry_path {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Startup Performance Commands
+// ============================================================================
+
+/// 获取启动报告
+#[tauri::command]
+fn get_startup_report(tracker: tauri::State<'_, StartupTracker>) -> StartupReport {
+    tracker.get_report()
+}
+
+/// 记录启动里程碑
+#[tauri::command]
+fn record_startup_milestone(
+    name: String,
+    tracker: tauri::State<'_, StartupTracker>,
+) {
+    tracker.record_milestone(&name);
+}
+
+// ============================================================================
+// Memory Management Commands
+// ============================================================================
+
+/// 获取内存使用统计
+#[tauri::command]
+fn get_app_memory_stats() -> MemoryStats {
+    get_memory_stats()
+}
+
+/// 清理缓存
+#[tauri::command]
+fn clear_app_cache() -> Result<u64, String> {
+    clear_cache().map_err(|e| e.to_string())
+}
+
+/// 获取缓存配置
+#[tauri::command]
+fn get_cache_config_command() -> CacheConfig {
+    omninova_core::observability::memory_monitor().get_config()
+}
+
+/// 设置缓存配置
+#[tauri::command]
+fn set_cache_config_command(config: CacheConfig) -> Result<(), String> {
+    omninova_core::observability::memory_monitor().set_config(config);
+    Ok(())
+}
+
+// ============================================================================
+// System Tray Setup
+// ============================================================================
+
+/// 设置系统托盘
+fn setup_tray(app: &tauri::AppHandle) -> Result<TrayIcon, Box<dyn std::error::Error>> {
+    // 创建菜单项
+    let show_window = MenuItem::new(app, "显示窗口", true, None::<&str>)?;
+    let quit = MenuItem::new(app, "退出", true, None::<&str>)?;
+
+    let menu = Menu::with_items(app, &[&show_window, &quit])?;
+
+    // 创建托盘图标
+    let tray = TrayIconBuilder::new()
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&menu)
+        .menu_on_left_click(true)
+        .on_menu_event(|app, event| {
+            match event.id.as_ref() {
+                "显示窗口" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                "退出" => {
+                    app.exit(0);
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            // 双击托盘图标显示窗口
+            if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(tray)
+}
+
+/// 设置窗口关闭行为：关闭时最小化到托盘而非退出
+fn setup_window_close_behavior(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let app_handle = app.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // 阻止默认关闭行为
+                api.prevent_close();
+                // 隐藏窗口到托盘
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+        });
+    }
+}
+
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
     let (runtime, running, last_error): (GatewayRuntime, bool, Option<String>) = {
         let app_state = state.lock().await;
@@ -1167,9 +1577,15 @@ pub fn run() {
         last_gateway_error: None,
     }));
 
+    let run_mode_manager = RunModeManager::new();
+    let startup_tracker = StartupTracker::new();
+    startup_tracker.record_milestone("app_init");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .manage(run_mode_manager)
+        .manage(startup_tracker)
         .invoke_handler(tauri::generate_handler![
             process_message,
             get_config,
@@ -1189,16 +1605,174 @@ pub fn run() {
             stop_gateway,
             import_skills,
             skills_package_summary,
+            // Run mode commands
+            get_run_mode,
+            set_run_mode,
+            get_auto_start,
+            set_auto_start,
+            // Startup tracking commands
+            get_startup_report,
+            record_startup_milestone,
+            // Memory management commands
+            get_app_memory_stats,
+            clear_app_cache,
+            get_cache_config_command,
+            set_cache_config_command,
         ])
-        .setup(|_app| {
-            configure_embedded_agent_browser_env(_app.handle());
+        .setup(|app| {
+            // Get startup tracker from state
+            let startup_tracker = app.state::<StartupTracker>();
+            startup_tracker.record_milestone("setup_start");
+
+            configure_embedded_agent_browser_env(app.handle());
+            startup_tracker.record_milestone("browser_env_configured");
+
+            // Setup system tray
+            match setup_tray(app.handle()) {
+                Ok(_tray) => {
+                    eprintln!("[tray] System tray initialized successfully");
+                }
+                Err(e) => {
+                    eprintln!("[tray] Failed to initialize system tray: {}", e);
+                }
+            }
+            startup_tracker.record_milestone("tray_setup_complete");
+
+            // Setup window close behavior (minimize to tray)
+            setup_window_close_behavior(app.handle());
+            startup_tracker.record_milestone("window_behavior_configured");
+
             #[cfg(debug_assertions)]
             {
-                let window = _app.get_webview_window("main").unwrap();
-                window.open_devtools();
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
             }
+
+            // Mark startup as ready
+            startup_tracker.mark_ready();
+
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_mode_default() {
+        let manager = RunModeManager::new();
+        assert_eq!(manager.get_mode(), RunMode::Desktop);
+    }
+
+    #[test]
+    fn test_run_mode_switch() {
+        let manager = RunModeManager::new();
+        assert_eq!(manager.get_mode(), RunMode::Desktop);
+
+        manager.set_mode(RunMode::Background);
+        assert_eq!(manager.get_mode(), RunMode::Background);
+
+        manager.set_mode(RunMode::Desktop);
+        assert_eq!(manager.get_mode(), RunMode::Desktop);
+    }
+
+    #[test]
+    fn test_auto_start_default() {
+        let manager = RunModeManager::new();
+        assert!(!manager.is_auto_start());
+    }
+
+    #[test]
+    fn test_auto_start_toggle() {
+        let manager = RunModeManager::new();
+        assert!(!manager.is_auto_start());
+
+        manager.set_auto_start(true);
+        assert!(manager.is_auto_start());
+
+        manager.set_auto_start(false);
+        assert!(!manager.is_auto_start());
+    }
+
+    #[test]
+    fn test_run_mode_serialization() {
+        let mode = RunMode::Desktop;
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, r#""desktop""#);
+
+        let mode = RunMode::Background;
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, r#""background""#);
+    }
+
+    #[test]
+    fn test_run_mode_deserialization() {
+        let mode: RunMode = serde_json::from_str(r#""desktop""#).unwrap();
+        assert_eq!(mode, RunMode::Desktop);
+
+        let mode: RunMode = serde_json::from_str(r#""background""#).unwrap();
+        assert_eq!(mode, RunMode::Background);
+    }
+
+    // ========================================
+    // Startup Tracker Tests
+    // ========================================
+
+    #[test]
+    fn test_startup_tracker_new() {
+        let tracker = StartupTracker::new();
+        let report = tracker.get_report();
+        assert!(!report.is_ready);
+        assert!(report.milestones.is_empty());
+        assert!(report.total_seconds >= 0.0);
+    }
+
+    #[test]
+    fn test_startup_tracker_milestones() {
+        let tracker = StartupTracker::new();
+        tracker.record_milestone("config_loaded");
+        tracker.record_milestone("ui_ready");
+
+        let report = tracker.get_report();
+        assert_eq!(report.milestones.len(), 2);
+        assert_eq!(report.milestones[0].name, "config_loaded");
+        assert_eq!(report.milestones[1].name, "ui_ready");
+        assert!(report.milestones[0].elapsed_seconds <= report.milestones[1].elapsed_seconds);
+    }
+
+    #[test]
+    fn test_startup_tracker_mark_ready() {
+        let tracker = StartupTracker::new();
+        assert!(!tracker.get_report().is_ready);
+
+        tracker.mark_ready();
+        assert!(tracker.get_report().is_ready);
+    }
+
+    #[test]
+    fn test_startup_report_serialization() {
+        let report = StartupReport {
+            total_seconds: 1.234,
+            milestones: vec![
+                StartupMilestone {
+                    name: "init".to_string(),
+                    elapsed_seconds: 0.5,
+                },
+            ],
+            is_ready: true,
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"total_seconds\":1.234"));
+        assert!(json.contains("\"is_ready\":true"));
+        assert!(json.contains("\"name\":\"init\""));
+    }
 }
