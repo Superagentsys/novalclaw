@@ -2,9 +2,9 @@
   font-family: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color-scheme: dark;
-  color: rgba(241, 245, 255, 0.94);
-  background-color: #070b16;
+  color-scheme: light;
+  color: rgba(30, 30, 40, 0.92);
+  background-color: #f4f5f7;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -14,18 +14,18 @@
 
 a {
   font-weight: 500;
-  color: #8ea6ff;
+  color: #4a62c8;
   text-decoration: inherit;
 }
 a:hover {
-  color: #b4c3ff;
+  color: #6a82df;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   height: 100vh;
-  background-color: #070b16;
+  background-color: #eef0f3;
   overflow: hidden;
 }
 
@@ -45,12 +45,13 @@ button {
   font-size: 1em;
   font-weight: 500;
   font-family: inherit;
-  background-color: #151b2d;
+  background-color: #ffffff;
+  color: #1a1a2e;
   cursor: pointer;
   transition: border-color 0.25s;
 }
 button:hover {
-  border-color: #4a62b8;
+  border-color: #c0c8e0;
 }
 button:focus,
 button:focus-visible {

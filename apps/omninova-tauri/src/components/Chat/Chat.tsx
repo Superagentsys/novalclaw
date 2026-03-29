@@ -101,6 +101,8 @@ export function Chat({ onBack }: ChatProps) {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
+  const [availableModels] = useState<string[]>(["auto", "openai", "anthropic", "gemini", "ollama"]);
+  const [selectedModel, setSelectedModel] = useState("auto");
   const listEndRef = useRef<HTMLDivElement>(null);
   const cancelledRef = useRef(false);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -227,7 +229,7 @@ export function Chat({ onBack }: ChatProps) {
         text,
         sessionId,
         userId: USER_ID,
-        metadata: {},
+        metadata: { preferred_provider: selectedModel === "auto" ? undefined : selectedModel },
       };
       route = await invokeTauri<RouteDecision>("route_inbound_message", {
         payload,
@@ -515,7 +517,18 @@ export function Chat({ onBack }: ChatProps) {
 
           <div className="chat-footer">
             <span className="chat-footer-status">{statusText}</span>
-            <span className="chat-footer-model">OmniNova</span>
+            <select
+              className="chat-model-select"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              title="选择模型"
+            >
+              {availableModels.map((m) => (
+                <option key={m} value={m}>
+                  {m === "auto" ? "🤖 自动选择" : `⚡ ${m.toUpperCase()}`}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="chat-input-row">
             <textarea

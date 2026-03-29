@@ -395,14 +395,14 @@ export function Setup({ onConfigSuccess }: SetupProps) {
   };
 
   return (
-    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#070b16' }}>
+    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#eef0f3' }}>
       {/* Sidebar */}
-      <aside style={{ width: '280px', backgroundColor: 'rgba(133, 152, 255, 0.08)', borderRight: '1px solid rgba(156, 176, 255, 0.24)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
+      <aside style={{ width: '280px', backgroundColor: 'rgba(255, 255, 255, 0.85)', borderRight: '1px solid rgba(80, 100, 180, 0.20)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
         <div className="flex items-center gap-4 mb-8">
           <img src={omninovalLogo} alt="Logo" style={{ width: '48px', height: '48px', borderRadius: '12px' }} />
           <div>
-            <div className="text-sm font-bold opacity-50 uppercase tracking-wider">OmniNova</div>
-            <div className="text-lg font-bold">Claw 控制面</div>
+            <div className="text-sm font-bold opacity-40 uppercase tracking-wider">OmniNova</div>
+            <div className="text-lg font-bold text-gray-800">Claw 控制面</div>
           </div>
         </div>
 
@@ -416,12 +416,12 @@ export function Setup({ onConfigSuccess }: SetupProps) {
                 textAlign: 'left',
                 padding: '12px 16px',
                 borderRadius: '12px',
-                backgroundColor: activeTab === tab.id ? 'rgba(124, 151, 255, 0.26)' : 'transparent',
+                backgroundColor: activeTab === tab.id ? 'rgba(80, 120, 220, 0.18)' : 'transparent',
                 border: 'none',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '12px',
-                color: activeTab === tab.id ? '#eef3ff' : 'rgba(227, 235, 255, 0.62)',
+                color: activeTab === tab.id ? '#3a4aaa' : 'rgba(60, 70, 120, 0.70)',
                 cursor: 'pointer',
                 transition: 'all 0.2s'
               }}
@@ -432,16 +432,16 @@ export function Setup({ onConfigSuccess }: SetupProps) {
           ))}
         </nav>
 
-        <div className="mt-auto pt-6 space-y-3 border-t border-white/10">
+        <div className="mt-auto pt-6 space-y-3 border-t border-gray-200">
           <div className="flex items-center gap-3 px-2 py-2 mb-2">
-            <div className={`w-3 h-3 rounded-full ${gatewayStatus.running ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500'}`} />
-            <span className="text-sm font-medium opacity-80">
+            <div className={`w-3 h-3 rounded-full ${gatewayStatus.running ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500'}`} />
+            <span className="text-sm font-medium opacity-70">
               网关{gatewayStatus.running ? '运行中' : '已停止'}
             </span>
           </div>
 
           <button
-            className="w-full py-3 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-100 rounded-xl font-medium border border-indigo-300/30 transition-all cursor-pointer"
+            className="w-full py-3 bg-white hover:bg-gray-50 text-gray-700 rounded-xl font-medium border border-gray-200 transition-all cursor-pointer shadow-sm"
             onClick={handleSaveConfig}
             disabled={busyAction !== null}
           >
@@ -450,7 +450,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
 
           {!gatewayStatus.running ? (
             <button
-              className="w-full py-3 bg-indigo-500 hover:bg-indigo-400 text-white rounded-xl font-bold shadow-lg shadow-indigo-900/30 transition-all cursor-pointer"
+              className="w-full py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-bold shadow-sm transition-all cursor-pointer"
               onClick={handleSaveAndStartGateway}
               disabled={busyAction !== null}
             >
@@ -458,7 +458,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
             </button>
           ) : (
             <button
-              className="w-full py-3 bg-red-500/20 hover:bg-red-500/30 text-red-200 rounded-xl font-medium border border-red-400/30 transition-all cursor-pointer"
+              className="w-full py-3 bg-white hover:bg-gray-50 text-red-500 rounded-xl font-medium border border-red-200 transition-all cursor-pointer"
               onClick={handleStopGateway}
               disabled={busyAction !== null}
             >
@@ -467,7 +467,7 @@ export function Setup({ onConfigSuccess }: SetupProps) {
           )}
 
           {actionMessage && (
-            <div className="mt-4 p-3 bg-white/5 rounded-lg text-xs opacity-60 text-center italic">
+            <div className="mt-4 p-3 bg-gray-50 rounded-lg text-xs opacity-60 text-center italic">
               {actionMessage}
             </div>
           )}
@@ -475,11 +475,23 @@ export function Setup({ onConfigSuccess }: SetupProps) {
       </aside>
 
       {/* Main Content */}
-      <main style={{ flex: 1, overflowY: 'auto', padding: '40px', backgroundColor: 'transparent' }}>
-        <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+      <main style={{ flex: 1, overflowY: 'auto', padding: '40px 48px', backgroundColor: '#f4f5f7' }}>
+        <div style={{ maxWidth: '860px', margin: '0 auto' }}>
+          <div className="setup-header mb-10">
+            <img src={omninovalLogo} alt="Logo" className="setup-logo-frame" />
+            <div className="ml-5">
+              <div className="setup-chip mb-3">OmniNova Claw</div>
+              <h1 style={{ fontSize: '1.8em', fontWeight: 700, color: '#1a1a2e', lineHeight: 1.2 }}>
+                智能助手配置中心
+              </h1>
+              <p style={{ marginTop: '8px', color: 'rgba(60,70,120,0.72)', fontSize: '0.95em' }}>
+                设置你的 AI 模型、渠道连接与扩展技能
+              </p>
+            </div>
+          </div>
           {renderTabContent()}
           
-          <div className="mt-12 pt-8 border-t border-white/5">
+          <div className="mt-12 pt-8 border-t border-gray-200">
             <div className="setup-preview">
               <div className="setup-preview-header">
                 <span>配置预览 (JSON)</span>

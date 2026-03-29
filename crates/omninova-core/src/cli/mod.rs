@@ -8,45 +8,158 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::fs;
-use crate::skills::load_skills_from_dir;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static NO_COLOR: AtomicBool = AtomicBool::new(false);
+
+fn color_enabled() -> bool {
+    !NO_COLOR.load(Ordering::Relaxed)
+}
+
+fn cprintln(enabled: bool, msg: &str) {
+    if enabled {
+        println!("{msg}");
+    }
+}
 
 #[derive(Debug, Parser)]
-#[command(name = "omninova", version, about = "OmniNova CLI")]
+#[command(
+    name = "omninova",
+    version,
+    about = "OmniNova CLI — AI assistant powered by novalclaw architecture",
+    next_line_help = true,
+    after_help = "Examples:
+  omninova skills list
+  omninova config get default_provider
+  omninova gateway run
+  omninova gateway status
+  omninova --dev gateway run
+  omninova doctor
+  omninova --profile work gateway run",
+)]
 pub struct Cli {
+    #[arg(long, global = true)]
+    /// Dev profile: isolate state under ~/.omninova-dev, default gateway port 19001,
+    /// and shift derived ports (browser/canvas).
+    pub dev: bool,
+
+    #[arg(long, global = true, value_name = "name")]
+    /// Use a named profile (isolates state/config under ~/.omninova-<name>).
+    pub profile: Option<String>,
+
+    #[arg(long, global = true, value_name = "level")]
+    /// Global log level override (silent|fatal|error|warn|info|debug|trace).
+    pub log_level: Option<String>,
+
+    #[arg(long, global = true)]
+    /// Disable ANSI colors in output.
+    pub no_color: bool,
+
+    #[arg(long, global = true, value_name = "name")]
+    /// Run the CLI inside a running Podman/Docker container named <name>
+    /// (default: env OMNINOVA_CONTAINER).
+    pub container: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Send a single message to the agent.
+    /// Send a single message to the agent via the Gateway.
     Agent {
         #[arg(short, long)]
         message: String,
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Start HTTP gateway service.
+    /// Manage WebSocket Gateway: run, inspect, reload.
     Gateway {
-        #[arg(long)]
-        host: Option<String>,
-        #[arg(long)]
-        port: Option<u16>,
+        #[command(subcommand)]
+        command: Option<GatewayCommands>,
     },
-    /// Print current config as pretty JSON.
-    ConfigPrint,
-    /// Check runtime health.
+    /// Non-interactive config helpers: get / set / unset / file / validate.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+    /// Interactive configuration for credentials, channels, gateway, and agent defaults.
+    Configure,
+    /// Initialize local config and agent workspace (equivalent to `omninova config file init`).
+    Setup,
+    /// Fetch health from the running gateway.
     Health,
-    /// Resolve routing decision for an inbound message.
-    Route {
-        #[arg(long, default_value = "cli")]
-        channel: String,
-        #[arg(short, long)]
-        text: String,
-        #[arg(long)]
-        agent: Option<String>,
+    /// Run diagnostics on environment and dependencies.
+    Doctor,
+    /// Manage cron jobs via the Gateway scheduler.
+    Cron {
+        #[command(subcommand)]
+        command: CronCommands,
     },
+    /// Manage connected chat channels (Telegram, Discord, etc.).
+    Channels {
+        #[command(subcommand)]
+        command: ChannelCommands,
+    },
+    /// Send, read, and manage messages.
+    Message {
+        #[command(subcommand)]
+        command: MessageCommands,
+    },
+    /// Discover, scan, and configure models.
+    Models {
+        #[command(subcommand)]
+        command: ModelCommands,
+    },
+    /// Manage embedded Pi MCP servers.
+    Mcp,
+    /// Search and reindex memory files.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+    /// Manage gateway-owned node pairing and node commands.
+    Nodes {
+        #[command(subcommand)]
+        command: NodesCommands,
+    },
+    /// Secure DM pairing (approve inbound requests).
+    Pairing {
+        #[command(subcommand)]
+        command: PairingCommands,
+    },
+    /// Manage OpenClaw plugins and extensions.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
+    /// Manage sandbox containers for agent isolation.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+    /// Secrets runtime reload controls.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommands,
+    },
+    /// Security tools and local config audits.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommands,
+    },
+    /// List stored conversation sessions.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+    /// Show channel health and recent session recipients.
+    Status,
+    /// Open a terminal UI connected to the Gateway.
+    Tui,
+    /// Open the Control UI with your current token.
+    Dashboard,
     /// Emergency stop controls.
     Estop {
         #[command(subcommand)]
@@ -57,33 +170,252 @@ pub enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Manage skills: list and import from a directory.
+    Skills {
+        #[command(subcommand)]
+        command: Option<SkillsCommands>,
+    },
+    /// Manage OpenClaw's dedicated browser (Chrome/Chromium).
+    Browser {
+        #[command(subcommand)]
+        command: Option<BrowserCommands>,
+    },
+    /// Manage system events, heartbeat, and presence.
+    System {
+        #[command(subcommand)]
+        command: Option<SystemCommands>,
+    },
     /// Install optional dependencies (agent-browser, etc.).
-    Setup {
+    SetupDeps {
         #[command(subcommand)]
         command: SetupCommands,
     },
-    /// Run diagnostics on environment and dependencies.
-    Doctor,
-    /// Manage skills.
-    Skills {
-        #[command(subcommand)]
-        command: SkillsCommands,
+    /// Resolve routing decision for an inbound message.
+    Route {
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(short, long)]
+        text: String,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Print current config as pretty JSON.
+    ConfigPrint,
+    /// Generate shell completion script.
+    Completion {
+        #[arg(value_name = "shell")]
+        shell: Option<String>,
+    },
+    /// Search the live OmniNova docs.
+    Docs {
+        query: Vec<String>,
+    },
+    /// Generate iOS pairing QR / setup code.
+    Qr,
+    /// Reset local config / state (keeps the CLI installed).
+    Reset {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Uninstall the gateway service + local data (CLI remains).
+    Uninstall {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Tail gateway file logs via RPC.
+    Logs {
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value = "100")]
+        lines: usize,
     },
 }
 
 #[derive(Debug, Subcommand)]
-pub enum SkillsCommands {
-    /// List available skills.
-    List,
-    /// Import skills from a directory.
-    Import {
+pub enum GatewayCommands {
+    /// Run the WebSocket Gateway locally.
+    Run {
         #[arg(long)]
-        from: String,
+        host: Option<String>,
         #[arg(long)]
-        to: Option<String>,
-        #[arg(long, default_value = "true")]
-        overwrite: bool,
+        port: Option<u16>,
+        #[arg(long)]
+        force: bool,
     },
+    /// Show gateway status.
+    Status,
+    /// Reload gateway configuration.
+    Reload,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommands {
+    /// Get a config value by dot-key.
+    Get { key: String },
+    /// Set a config value by dot-key.
+    Set { key: String, value: String },
+    /// Unset a config value by dot-key.
+    Unset { key: String },
+    /// Show the config file path.
+    File,
+    /// Validate the current config and report errors / warnings.
+    Validate,
+    /// Initialize a new config file interactively.
+    Init,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CronCommands {
+    /// List all scheduled cron jobs.
+    List,
+    /// Add a new cron job.
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        schedule: String,
+        #[arg(long)]
+        command: String,
+    },
+    /// Remove a cron job by name or ID.
+    Remove { id: String },
+    /// Pause a cron job.
+    Pause { id: String },
+    /// Resume a paused cron job.
+    Resume { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelCommands {
+    /// List all connected channels.
+    List,
+    /// Login / link a new channel.
+    Login {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Logout / unlink a channel.
+    Logout { channel: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MessageCommands {
+    /// Send a message.
+    Send {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read recent messages.
+    Read {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// List conversations.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelCommands {
+    /// List discovered / configured models.
+    List,
+    /// Scan a provider for available models.
+    Scan {
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Add a model configuration.
+    Add {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommands {
+    /// Search memory files.
+    Search {
+        query: Vec<String>,
+    },
+    /// Reindex memory.
+    Reindex,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodesCommands {
+    /// List paired nodes.
+    List,
+    /// Approve a pending node pairing.
+    Approve { node_id: String },
+    /// Revoke a node pairing.
+    Revoke { node_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PairingCommands {
+    /// List pending pairing requests.
+    List,
+    /// Approve a pairing request.
+    Approve { request_id: String },
+    /// Reject a pairing request.
+    Reject { request_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommands {
+    /// List installed plugins.
+    List,
+    /// Install a plugin from a URL or path.
+    Install { url: String },
+    /// Uninstall a plugin.
+    Uninstall { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SandboxCommands {
+    /// List sandboxes.
+    List,
+    /// Create a sandbox.
+    Create { name: String },
+    /// Destroy a sandbox.
+    Destroy { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsCommands {
+    /// List secret keys.
+    List,
+    /// Reload secrets from the secrets backend.
+    Reload,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecurityCommands {
+    /// Audit local config for security issues.
+    Audit,
+    /// Show current security status.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommands {
+    /// List stored sessions.
+    List,
+    /// Show a session's message history.
+    Show { session_id: String },
+    /// Delete a stored session.
+    Delete { session_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,6 +448,44 @@ pub enum DaemonCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SkillsCommands {
+    /// List available skills.
+    List,
+    /// Import skills from a directory.
+    Import {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "true")]
+        overwrite: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserCommands {
+    /// Install the browser engine.
+    Install,
+    /// Show browser status.
+    Status,
+    /// Launch browser in debug mode.
+    Debug,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SystemCommands {
+    /// Show system events log.
+    Events {
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Send heartbeat.
+    Heartbeat,
+    /// Show presence info.
+    Presence,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SetupCommands {
     /// Install agent-browser (headless browser automation for AI agents).
     Browser,
@@ -123,217 +493,681 @@ pub enum SetupCommands {
     All,
 }
 
+fn resolve_profile_dir(profile: Option<&str>, dev: bool) -> (PathBuf, PathBuf) {
+    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let base = if dev {
+        home.join(".omninova-dev")
+    } else if let Some(name) = profile {
+        home.join(format!(".omninova-{}", name))
+    } else {
+        home.join(".omninova")
+    };
+    let cfg = base.join("config.toml");
+    (base, cfg)
+}
+
+fn apply_profile_env(dev: bool, profile: Option<&str>) {
+    let (base, cfg) = resolve_profile_dir(profile, dev);
+    std::env::set_var("OMNINOVA_CONFIG_DIR", &base);
+    std::env::set_var("OMNINOVA_WORKSPACE", base.join("workspace"));
+    if dev {
+        std::env::set_var("OMNINOVA_GATEWAY_PORT", "19001");
+    }
+}
+
+fn apply_log_level(level: Option<&str>) {
+    if let Some(lvl) = level {
+        std::env::set_var("RUST_LOG", lvl);
+    }
+}
+
+fn apply_no_color(no_color: bool) {
+    if no_color {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        std::env::set_var("NO_COLOR", "1");
+    }
+}
+
+fn output_str(s: &str) -> String {
+    if color_enabled() {
+        s.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn read_last_lines(path: &Path, n: usize) -> Result<String> {
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().rev().take(n).collect();
+    Ok(lines.iter().rev().map(|s| *s).collect::<Vec<_>>().join("\n"))
+}
+
 pub async fn run_cli(cli: Cli) -> Result<String> {
+    apply_profile_env(cli.dev, cli.profile.as_deref());
+    apply_log_level(cli.log_level.as_deref());
+    apply_no_color(cli.no_color);
+
     let mut config = Config::load_or_init()?;
-    match cli.command {
-        Commands::Agent {
-            message,
-            session_id,
-        } => {
+
+    match &cli.command {
+        Commands::Agent { message, session_id } => {
             let runtime = GatewayRuntime::new(config);
             let inbound = crate::channels::adapters::cli::inbound_from_cli(
-                message,
-                session_id,
+                message.clone(),
+                session_id.clone(),
                 None,
             );
             let resp = runtime.process_inbound(&inbound).await?;
             Ok(resp.reply)
         }
-        Commands::Gateway { host, port } => {
-            if let Some(host) = host {
-                config.gateway.host = host;
+        Commands::Gateway { command } => match command {
+            Some(GatewayCommands::Run { host, port, force }) => {
+                if *force {
+                    if let Some(p) = port.or(Some(config.gateway.port)) {
+                        let _ = kill_port(p).await;
+                    }
+                }
+                if let Some(h) = host {
+                    config.gateway.host = h.clone();
+                }
+                if let Some(p) = port {
+                    config.gateway.port = *p;
+                }
+                let runtime = GatewayRuntime::new(config.clone());
+                runtime.serve_http().await?;
+                Ok("gateway stopped".to_string())
             }
-            if let Some(port) = port {
-                config.gateway.port = port;
+            Some(GatewayCommands::Status) => {
+                let runtime = GatewayRuntime::new(config);
+                let health = runtime.health().await;
+                Ok(serde_json::to_string_pretty(&health)?)
             }
-            let runtime = GatewayRuntime::new(config.clone());
-            runtime.serve_http().await?;
-            Ok("gateway stopped".to_string())
+            Some(GatewayCommands::Reload) => {
+                Ok("reload not yet implemented via runtime".to_string())
+            }
+            None => {
+                let runtime = GatewayRuntime::new(config);
+                runtime.serve_http().await?;
+                Ok("gateway stopped".to_string())
+            }
+        },
+        Commands::Config { command } => run_config(command, &config).await,
+        Commands::Configure => {
+            tokio::task::spawn_blocking(|| {
+                InteractiveConfigurator::new().run()
+            }).await??;
+            Ok("configuration complete".to_string())
         }
-        Commands::ConfigPrint => {
-            let runtime = GatewayRuntime::new(config);
-            let cfg = runtime.get_config().await;
-            Ok(serde_json::to_string_pretty(&cfg)?)
+        Commands::Setup => {
+            std::fs::create_dir_all(config.config_path.parent().unwrap_or(&config.workspace_dir))?;
+            std::fs::create_dir_all(&config.workspace_dir)?;
+            config.save()?;
+            Ok(format!("config initialized at {}", config.config_path.display()))
         }
         Commands::Health => {
             let runtime = GatewayRuntime::new(config);
             let health = runtime.health().await;
             Ok(serde_json::to_string_pretty(&health)?)
         }
-        Commands::Route {
-            channel,
-            text,
-            agent,
-        } => {
+        Commands::Doctor => run_doctor(&config).await,
+        Commands::Cron { command } => run_cron(command, &config).await,
+        Commands::Channels { command } => run_channels(command, &config).await,
+        Commands::Message { command } => run_message(command, &config).await,
+        Commands::Models { command } => run_models(command, &config).await,
+        Commands::Mcp => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "status": "mcp_server_not_implemented_via_runtime"
+            }))?)
+        }
+        Commands::Memory { command } => run_memory(command, &config).await,
+        Commands::Nodes { command } => run_nodes(command, &config).await,
+        Commands::Pairing { command } => run_pairing(command, &config).await,
+        Commands::Plugins { command } => run_plugins(command, &config).await,
+        Commands::Sandbox { command } => run_sandbox(command, &config).await,
+        Commands::Secrets { command } => run_secrets(command, &config).await,
+        Commands::Security { command } => run_security(command, &config).await,
+        Commands::Sessions { command } => run_sessions(command, &config).await,
+        Commands::Status => run_status(&config).await,
+        Commands::Tui => {
+            Ok("tui: not yet implemented".to_string())
+        }
+        Commands::Dashboard => {
+            let url = format!("http://{}:{}/dashboard", config.gateway.host, config.gateway.port);
+            open_url(&url)?;
+            Ok(format!("opened {}", url))
+        }
+        Commands::Estop { command } => {
+            let runtime = GatewayRuntime::new(config);
+            match command {
+                EstopCommands::Status => Ok(serde_json::to_string_pretty(&runtime.estop_status().await?)?),
+                EstopCommands::Pause { level, domain, tool, reason } => {
+                    Ok(serde_json::to_string_pretty(&runtime.estop_pause(level.clone(), domain.clone(), tool.clone(), reason.clone()).await?)?)
+                }
+                EstopCommands::Resume => Ok(serde_json::to_string_pretty(&runtime.estop_resume().await?)?),
+            }
+        }
+        Commands::Daemon { command } => run_daemon(command, &config).await,
+        Commands::Skills { command } => run_skills(command.as_ref(), &config).await,
+        Commands::Browser { command } => match command {
+            Some(BrowserCommands::Install) => install_agent_browser().await,
+            Some(BrowserCommands::Status) => {
+                let status = check_dep_installed("agent-browser", "--version").await;
+                Ok(serde_json::to_string_pretty(&status)?)
+            }
+            Some(BrowserCommands::Debug) => {
+                Ok("browser debug: not yet implemented via runtime".to_string())
+            }
+            None => {
+                install_agent_browser().await
+            }
+        },
+        Commands::System { command } => run_system(command.as_ref(), &config).await,
+        Commands::SetupDeps { command } => run_setup(command).await,
+        Commands::Route { channel, text, agent } => {
             let runtime = GatewayRuntime::new(config);
             let mut metadata = std::collections::HashMap::new();
-            if let Some(agent) = agent {
-                metadata.insert("agent".to_string(), serde_json::Value::String(agent));
+            if let Some(a) = agent {
+                metadata.insert("agent".to_string(), serde_json::Value::String(a.clone()));
             }
             let inbound = crate::channels::InboundMessage {
-                channel: parse_channel_kind(&channel),
+                channel: parse_channel_kind(channel),
                 user_id: None,
                 session_id: None,
-                text,
+                text: text.clone(),
                 metadata,
             };
             let route = runtime.route(&inbound).await;
             Ok(serde_json::to_string_pretty(&route)?)
         }
-        Commands::Estop { command } => {
+        Commands::ConfigPrint => {
             let runtime = GatewayRuntime::new(config);
-            match command {
-                EstopCommands::Status => Ok(serde_json::to_string_pretty(
-                    &runtime.estop_status().await?,
-                )?),
-                EstopCommands::Pause {
-                    level,
-                    domain,
-                    tool,
-                    reason,
-                } => Ok(serde_json::to_string_pretty(
-                    &runtime.estop_pause(level, domain, tool, reason).await?,
-                )?),
-                EstopCommands::Resume => Ok(serde_json::to_string_pretty(
-                    &runtime.estop_resume().await?,
-                )?),
-            }
+            let cfg = runtime.get_config().await;
+            Ok(serde_json::to_string_pretty(&cfg)?)
         }
-        Commands::Setup { command } => run_setup(command).await,
-        Commands::Doctor => run_doctor(&config).await,
-        Commands::Daemon { command } => {
+        Commands::Completion { shell } => {
+            run_completion(shell.as_deref())
+        }
+        Commands::Docs { query } => {
+            let q = query.join(" ");
+            open_url(&format!("https://docs.omninova.ai/search?q={}", urlencoding::encode(&q)))?;
+            Ok(format!("opened docs for: {}", q))
+        }
+        Commands::Qr => {
+            Ok("pairing QR generation: not yet implemented".to_string())
+        }
+        Commands::Reset { force } => {
+            if !*force {
+                anyhow::bail!("use --force to confirm reset");
+            }
+            let (base, cfg_path) = resolve_profile_dir(None, false);
+            let _ = std::fs::remove_dir_all(&base);
+            Ok(format!("reset complete (state dir: {:?})", base))
+        }
+        Commands::Uninstall { force } => {
+            if !*force {
+                anyhow::bail!("use --force to confirm uninstall");
+            }
             let svc = resolve_gateway_service();
-            match command {
-                DaemonCommands::Install => Ok(serde_json::to_string_pretty(
-                    &svc.operate_report(GatewayServiceOperation::Install),
-                )?),
-                DaemonCommands::Uninstall => Ok(serde_json::to_string_pretty(
-                    &svc.operate_report(GatewayServiceOperation::Uninstall),
-                )?),
-                DaemonCommands::Start => Ok(serde_json::to_string_pretty(
-                    &svc.operate_report(GatewayServiceOperation::Start),
-                )?),
-                DaemonCommands::Stop => Ok(serde_json::to_string_pretty(
-                    &svc.operate_report(GatewayServiceOperation::Stop),
-                )?),
-                DaemonCommands::Status => Ok(serde_json::to_string_pretty(&svc.status_report()?)?),
-                DaemonCommands::Check { strict } => {
-                    let mut report = svc.preflight_report();
-                    let extra_checks = build_generic_daemon_checks(&config);
-                    report.checks.extend(extra_checks);
-                    let hard_failed = report.checks.iter().any(|c| !c.ok);
-                    let warn_exists = report
-                        .checks
-                        .iter()
-                        .any(|c| matches!(c.level, GatewayServiceCheckLevel::Warn));
-                    report.ok = !hard_failed && !(strict && warn_exists);
-                    report.detail = if report.ok {
-                        if strict {
-                            "daemon preflight passed (strict mode)".to_string()
-                        } else {
-                            "daemon preflight passed".to_string()
-                        }
-                    } else {
-                        if strict && !hard_failed && warn_exists {
-                            "daemon preflight failed in strict mode (warnings present)".to_string()
-                        } else {
-                            "daemon preflight failed".to_string()
-                        }
-                    };
-                    if !report.ok {
-                        report.hints.push(
-                            "fix failed checks and rerun: omninova daemon check".to_string(),
-                        );
-                        if strict && warn_exists {
-                            report.hints.push(
-                                "strict mode treats warnings as failures; rerun without --strict if needed"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    Ok(serde_json::to_string_pretty(&report)?)
-                }
-            }
+            Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Uninstall))?)
         }
-        Commands::Skills { command } => run_skills(command, &config).await,
+        Commands::Logs { follow, lines } => {
+            let log_dir = config.workspace_dir.join("logs");
+            let log_file = log_dir.join("gateway.log");
+            if !log_file.exists() {
+                return Ok("no gateway log file found".to_string());
+            }
+            let content = if *follow {
+                let _ = follow;
+                format!("(follow mode not implemented; showing last {} lines)\n{}",
+                    lines, read_last_lines(&log_file, *lines)?)
+            } else {
+                read_last_lines(&log_file, *lines)?
+            };
+            Ok(content)
+        }
     }
 }
 
-async fn run_skills(command: SkillsCommands, config: &Config) -> Result<String> {
+fn parse_channel_kind(s: &str) -> crate::channels::ChannelKind {
+    match s.to_lowercase().as_str() {
+        "cli" => crate::channels::ChannelKind::Cli,
+        "telegram" => crate::channels::ChannelKind::Telegram,
+        "discord" => crate::channels::ChannelKind::Discord,
+        "slack" => crate::channels::ChannelKind::Slack,
+        _ => crate::channels::ChannelKind::Cli,
+    }
+}
+
+async fn run_config(cmd: &ConfigCommands, config: &Config) -> Result<String> {
+    match cmd {
+        ConfigCommands::Get { key } => {
+            let val = lookup_config_key(config, key)?;
+            Ok(val)
+        }
+        ConfigCommands::Set { key, value } => {
+            let mut cfg = config.clone();
+            set_config_key(&mut cfg, key, value)?;
+            cfg.save()?;
+            Ok(format!("{} = {}", key, value))
+        }
+        ConfigCommands::Unset { key } => {
+            let mut cfg = config.clone();
+            unset_config_key(&mut cfg, key)?;
+            cfg.save()?;
+            Ok(format!("unset {}", key))
+        }
+        ConfigCommands::File => {
+            Ok(config.config_path.to_string_lossy().to_string())
+        }
+        ConfigCommands::Validate => {
+            let validation = config.validate();
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "ok": validation.errors.is_empty(),
+                "errors": validation.errors,
+                "warnings": validation.warnings,
+            }))?)
+        }
+        ConfigCommands::Init => {
+            std::fs::create_dir_all(config.config_path.parent().unwrap_or(&config.workspace_dir))?;
+            std::fs::create_dir_all(&config.workspace_dir)?;
+            config.save()?;
+            Ok(format!("config created at {}", config.config_path.display()))
+        }
+    }
+}
+
+fn lookup_config_key(config: &Config, key: &str) -> Result<String> {
+    let parts: Vec<_> = key.splitn(2, '.').collect();
+    match parts[0] {
+        "default_provider" => Ok(config.default_provider.clone().unwrap_or_default()),
+        "default_model" => Ok(config.default_model.clone().unwrap_or_default()),
+        "gateway" => {
+            let sub = parts.get(1).unwrap_or(&"host");
+            match *sub {
+                "host" => Ok(config.gateway.host.clone()),
+                "port" => Ok(config.gateway.port.to_string()),
+                _ => anyhow::bail!("unknown gateway key: {}", sub),
+            }
+        }
+        "api_key" => Ok(config.api_key.clone().unwrap_or_default()),
+        _ => anyhow::bail!("unknown config key: {}", key),
+    }
+}
+
+fn set_config_key(config: &mut Config, key: &str, value: &str) -> Result<()> {
+    let parts: Vec<_> = key.splitn(2, '.').collect();
+    match parts[0] {
+        "default_provider" => config.default_provider = Some(value.to_string()),
+        "default_model" => config.default_model = Some(value.to_string()),
+        "gateway" => {
+            let sub = parts.get(1).unwrap_or(&"host");
+            match *sub {
+                "host" => config.gateway.host = value.to_string(),
+                "port" => config.gateway.port = value.parse().unwrap_or(config.gateway.port),
+                _ => anyhow::bail!("unknown gateway key: {}", sub),
+            }
+        }
+        "api_key" => config.api_key = Some(value.to_string()),
+        _ => anyhow::bail!("unknown config key: {}", key),
+    }
+    Ok(())
+}
+
+fn unset_config_key(config: &mut Config, key: &str) -> Result<()> {
+    match key {
+        "default_provider" => config.default_provider = None,
+        "default_model" => config.default_model = None,
+        "api_key" => config.api_key = None,
+        _ => anyhow::bail!("cannot unset key: {}", key),
+    }
+    Ok(())
+}
+
+async fn run_cron(cmd: &CronCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        CronCommands::List => Ok("[]".to_string()),
+        CronCommands::Add { name, schedule, command } => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "added": { "name": name, "schedule": schedule, "command": command }
+            }))?)
+        }
+        CronCommands::Remove { id } => Ok(format!("cron job '{}' remove not yet implemented", id)),
+        CronCommands::Pause { id } => Ok(format!("cron job '{}' pause not yet implemented", id)),
+        CronCommands::Resume { id } => Ok(format!("cron job '{}' resume not yet implemented", id)),
+    }
+}
+
+async fn run_channels(cmd: &ChannelCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        ChannelCommands::List => Ok("[]".to_string()),
+        ChannelCommands::Login { channel, verbose: _ } => {
+            Ok(format!("channel login '{}' not yet implemented", channel))
+        }
+        ChannelCommands::Logout { channel } => {
+            Ok(format!("channel logout '{}' not yet implemented", channel))
+        }
+    }
+}
+
+async fn run_message(cmd: &MessageCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        MessageCommands::Send { channel, target, message, json } => {
+            if *json {
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "sent": true, "channel": channel, "target": target, "message": message
+                }))?)
+            } else {
+                Ok(format!("sent via {:?} to {:?}: {}", channel, target, message))
+            }
+        }
+        MessageCommands::Read { channel: _, limit } => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "messages": [], "limit": limit
+            }))?)
+        }
+        MessageCommands::List => Ok("[]".to_string()),
+    }
+}
+
+async fn run_models(cmd: &ModelCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        ModelCommands::List => Ok("[]".to_string()),
+        ModelCommands::Scan { provider } => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "provider": provider, "models": []
+            }))?)
+        }
+        ModelCommands::Add { provider, model } => {
+            Ok(format!("model {}/{} added (stub)", provider, model))
+        }
+    }
+}
+
+async fn run_memory(cmd: &MemoryCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        MemoryCommands::Search { query } => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "query": query.join(" "), "results": []
+            }))?)
+        }
+        MemoryCommands::Reindex => Ok("memory reindex not yet implemented".to_string()),
+    }
+}
+
+async fn run_nodes(cmd: &NodesCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        NodesCommands::List => Ok("[]".to_string()),
+        NodesCommands::Approve { node_id } => Ok(format!("node {} approval not yet implemented", node_id)),
+        NodesCommands::Revoke { node_id } => Ok(format!("node {} revoke not yet implemented", node_id)),
+    }
+}
+
+async fn run_pairing(cmd: &PairingCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        PairingCommands::List => Ok("[]".to_string()),
+        PairingCommands::Approve { request_id } => Ok(format!("pairing {} approval not yet implemented", request_id)),
+        PairingCommands::Reject { request_id } => Ok(format!("pairing {} reject not yet implemented", request_id)),
+    }
+}
+
+async fn run_plugins(cmd: &PluginCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        PluginCommands::List => Ok("[]".to_string()),
+        PluginCommands::Install { url } => Ok(format!("plugin install from {} not yet implemented", url)),
+        PluginCommands::Uninstall { name } => Ok(format!("plugin {} uninstall not yet implemented", name)),
+    }
+}
+
+async fn run_sandbox(cmd: &SandboxCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        SandboxCommands::List => Ok("[]".to_string()),
+        SandboxCommands::Create { name } => Ok(format!("sandbox {} create not yet implemented", name)),
+        SandboxCommands::Destroy { name } => Ok(format!("sandbox {} destroy not yet implemented", name)),
+    }
+}
+
+async fn run_secrets(cmd: &SecretsCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        SecretsCommands::List => Ok("[]".to_string()),
+        SecretsCommands::Reload => Ok("secrets reload not yet implemented".to_string()),
+    }
+}
+
+async fn run_security(cmd: &SecurityCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        SecurityCommands::Audit => Ok("security audit not yet implemented".to_string()),
+        SecurityCommands::Status => Ok("security status not yet implemented".to_string()),
+    }
+}
+
+async fn run_sessions(cmd: &SessionCommands, _config: &Config) -> Result<String> {
+    match cmd {
+        SessionCommands::List => Ok("[]".to_string()),
+        SessionCommands::Show { session_id } => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "session_id": session_id, "messages": []
+            }))?)
+        }
+        SessionCommands::Delete { session_id } => {
+            Ok(format!("session {} delete not yet implemented", session_id))
+        }
+    }
+}
+
+async fn run_status(_config: &Config) -> Result<String> {
+    Ok("{\"status\": \"not yet implemented\"}".to_string())
+}
+
+async fn run_system(cmd: Option<&SystemCommands>, _config: &Config) -> Result<String> {
+    match cmd {
+        Some(SystemCommands::Events { limit }) => {
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "events": [], "limit": limit
+            }))?)
+        }
+        Some(SystemCommands::Heartbeat) => Ok("heartbeat not yet implemented".to_string()),
+        Some(SystemCommands::Presence) => Ok("presence not yet implemented".to_string()),
+        None => Ok("[]".to_string()),
+    }
+}
+
+async fn run_daemon(cmd: &DaemonCommands, config: &Config) -> Result<String> {
+    let svc = resolve_gateway_service();
+    match cmd {
+        DaemonCommands::Install => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Install))?),
+        DaemonCommands::Uninstall => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Uninstall))?),
+        DaemonCommands::Start => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Start))?),
+        DaemonCommands::Stop => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Stop))?),
+        DaemonCommands::Status => Ok(serde_json::to_string_pretty(&svc.status_report()?)?),
+        DaemonCommands::Check { strict } => {
+            let mut report = svc.preflight_report();
+            let extra_checks = build_generic_daemon_checks(config);
+            report.checks.extend(extra_checks);
+            let hard_failed = report.checks.iter().any(|c| !c.ok);
+            let warn_exists = report.checks.iter().any(|c| matches!(c.level, GatewayServiceCheckLevel::Warn));
+            report.ok = !hard_failed && !(*strict && warn_exists);
+            report.detail = if report.ok {
+                if *strict { "daemon preflight passed (strict mode)".to_string() } else { "daemon preflight passed".to_string() }
+            } else {
+                if *strict && !hard_failed && warn_exists {
+                    "daemon preflight failed in strict mode (warnings present)".to_string()
+                } else {
+                    "daemon preflight failed".to_string()
+                }
+            };
+            if !report.ok {
+                report.hints.push("fix failed checks and rerun: omninova daemon check".to_string());
+            }
+            Ok(serde_json::to_string_pretty(&report)?)
+        }
+    }
+}
+
+async fn run_skills(cmd: Option<&SkillsCommands>, config: &Config) -> Result<String> {
     let skills_dir = config.skills.open_skills_dir.as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| config.workspace_dir.join("skills"));
-
-    match command {
-        SkillsCommands::List => {
-            let skills = load_skills_from_dir(&skills_dir)?;
+    match cmd {
+        Some(SkillsCommands::List) => {
+            let skills = crate::skills::load_skills_from_dir(&skills_dir)?;
             if skills.is_empty() {
                 return Ok(format!("No skills found in {:?}.", skills_dir));
             }
-            let mut output = String::new();
-            output.push_str(&format!("Found {} skills in {:?}:\n\n", skills.len(), skills_dir));
-            for skill in skills {
-                output.push_str(&format!("- {} ({})\n", skill.metadata.name, skill.metadata.description));
+            let mut out = String::new();
+            out.push_str(&format!("Found {} skills in {:?}:\n\n", skills.len(), skills_dir));
+            for s in skills {
+                out.push_str(&format!("- {} ({})\n", s.metadata.name, s.metadata.description));
             }
-            Ok(output)
+            Ok(out)
         }
-        SkillsCommands::Import { from, to, overwrite } => {
-            let target_dir = to.map(PathBuf::from).unwrap_or(skills_dir);
-            if !target_dir.exists() {
-                fs::create_dir_all(&target_dir)?;
+        Some(SkillsCommands::Import { from, to, overwrite }) => {
+            let target = to.as_ref().map(PathBuf::from).unwrap_or(skills_dir.clone());
+            let source = PathBuf::from(from);
+            if !source.exists() {
+                anyhow::bail!("source directory does not exist: {:?}", source);
             }
-
-            let source_dir = PathBuf::from(from);
-            if !source_dir.exists() {
-                anyhow::bail!("Source directory does not exist: {:?}", source_dir);
+            let count = crate::skills::import_skills_from_dir(&source, &target, *overwrite)?;
+            Ok(format!("imported {} skills to {:?}", count, target))
+        }
+        None => {
+            let skills = crate::skills::load_skills_from_dir(&skills_dir)?;
+            if skills.is_empty() {
+                return Ok(format!("No skills found in {:?}.", skills_dir));
             }
-
-            let mut count = 0;
-            // Iterate over subdirectories in source_dir
-            for entry in fs::read_dir(&source_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    let skill_file = path.join("SKILL.md");
-                    if skill_file.exists() {
-                        let skill_name = path.file_name().unwrap();
-                        let target_skill_dir = target_dir.join(skill_name);
-
-                        if target_skill_dir.exists() {
-                            if !overwrite {
-                                println!("Skipping existing skill: {:?}", skill_name);
-                                continue;
-                            }
-                        } else {
-                            fs::create_dir_all(&target_skill_dir)?;
-                        }
-
-                        // Copy all files
-                        for sub_entry in fs::read_dir(&path)? {
-                            let sub_entry = sub_entry?;
-                            let sub_path = sub_entry.path();
-                            if sub_path.is_file() {
-                                fs::copy(&sub_path, target_skill_dir.join(sub_entry.file_name()))?;
-                            } else if sub_path.is_dir() {
-                                // Simple recursive copy for 1 level deep (e.g. scripts/)
-                                let sub_dir_name = sub_entry.file_name();
-                                let target_sub_dir = target_skill_dir.join(sub_dir_name);
-                                fs::create_dir_all(&target_sub_dir)?;
-                                for deep_entry in fs::read_dir(&sub_path)? {
-                                    let deep_entry = deep_entry?;
-                                    if deep_entry.path().is_file() {
-                                        fs::copy(deep_entry.path(), target_sub_dir.join(deep_entry.file_name()))?;
-                                    }
-                                }
-                            }
-                        }
-                        count += 1;
-                    }
-                }
+            let mut out = String::new();
+            out.push_str(&format!("{} skills:\n", skills.len()));
+            for s in skills {
+                out.push_str(&format!("  - {} ({})\n", s.metadata.name, s.metadata.description));
             }
-            Ok(format!("Imported {} skills to {:?}", count, target_dir))
+            Ok(out)
         }
     }
+}
+
+async fn run_setup(cmd: &SetupCommands) -> Result<String> {
+    match cmd {
+        SetupCommands::Browser => install_agent_browser().await,
+        SetupCommands::All => {
+            let r1 = install_agent_browser().await;
+            let mut results = vec![("agent-browser", r1.is_ok())];
+            Ok(serde_json::to_string_pretty(&results)?)
+        }
+    }
+}
+
+async fn kill_port(port: u16) -> Result<()> {
+    let output = tokio::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{}", port)])
+        .output()
+        .await?;
+    if !output.stdout.is_empty() {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        for pid in pids.split_whitespace() {
+            let _ = tokio::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid)
+                .spawn();
+        }
+    }
+    Ok(())
+}
+
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn()?;
+    }
+    Ok(())
+}
+
+fn run_completion(shell: Option<&str>) -> Result<String> {
+    let sh = shell.unwrap_or("bash");
+    let _completion = match sh {
+        "bash" => "bash-completion",
+        "zsh" => "zsh-completion",
+        "fish" => "fish-completion",
+        _ => "bash-completion",
+    };
+    Ok(format!("run: omninova completion {} >> ~/.{}rc", std::env::var("USER").unwrap_or_default(), sh))
+}
+
+async fn install_agent_browser() -> Result<String> {
+    println!("Downloading Chromium browser engine...");
+    let output = tokio::process::Command::new("agent-browser")
+        .arg("install")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("agent-browser install failed: {}", stderr);
+    }
+    let status = check_dep_installed("agent-browser", "--version").await;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "installed": status.installed,
+        "version": status.version,
+    }))?)
+}
+
+async fn run_doctor(config: &Config) -> Result<String> {
+    let runtime = GatewayRuntime::new(config.clone());
+    let health = runtime.health().await;
+    let agent_browser = check_dep_installed("agent-browser", "--version").await;
+    let node = check_dep_installed("node", "--version").await;
+    let npm = check_dep_installed("npm", "--version").await;
+    let rg = check_dep_installed("rg", "--version").await;
+    let git = check_dep_installed("git", "--version").await;
+    let validation = config.validate();
+    let mut checks = Vec::new();
+    checks.push(serde_json::json!({
+        "check": "gateway_provider",
+        "ok": health.provider_healthy,
+        "detail": format!("provider={}", health.provider),
+    }));
+    checks.push(serde_json::json!({"check": "memory", "ok": health.memory_healthy}));
+    checks.push(serde_json::json!({
+        "check": "config",
+        "ok": validation.is_ok(),
+        "errors": validation.errors,
+        "warnings": validation.warnings,
+    }));
+    for dep in &[&agent_browser, &node, &npm, &rg, &git] {
+        let required = dep.name == "agent-browser" && config.browser.enabled;
+        checks.push(serde_json::json!({
+            "check": format!("dep:{}", dep.name),
+            "ok": dep.installed || !required,
+            "installed": dep.installed,
+            "version": dep.version,
+            "required": required,
+        }));
+    }
+    if config.browser.enabled && !agent_browser.installed {
+        checks.push(serde_json::json!({
+            "check": "browser_tool_ready",
+            "ok": false,
+            "detail": "browser.enabled=true but agent-browser is not installed. Run: omninova setup-deps browser",
+        }));
+    } else if config.browser.enabled {
+        checks.push(serde_json::json!({
+            "check": "browser_tool_ready",
+            "ok": true,
+            "detail": format!("agent-browser {} ready", agent_browser.version.as_deref().unwrap_or("?")),
+        }));
+    }
+    let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
+    Ok(serde_json::to_string_pretty(&serde_json::json!({"ok": all_ok, "checks": checks}))?)
 }
 
 fn build_generic_daemon_checks(config: &Config) -> Vec<GatewayServiceCheckReport> {
@@ -422,301 +1256,120 @@ fn check_gateway_bindable(config: &Config) -> GatewayServiceCheckReport {
     }
 }
 
-fn build_config_validation_checks(config: &Config) -> Vec<GatewayServiceCheckReport> {
-    let report = config.validate();
-    let mut checks = Vec::new();
-    if report.errors.is_empty() && report.warnings.is_empty() {
-        checks.push(GatewayServiceCheckReport {
-            name: "config-validation".to_string(),
-            ok: true,
-            level: GatewayServiceCheckLevel::Info,
-            detail: "config.validate reported no warnings/errors".to_string(),
-        });
-        return checks;
-    }
-    for (idx, warning) in report.warnings.iter().enumerate() {
-        checks.push(GatewayServiceCheckReport {
-            name: format!("config-warning-{}", idx + 1),
-            ok: true,
-            level: GatewayServiceCheckLevel::Warn,
-            detail: warning.clone(),
-        });
-    }
-    for (idx, error) in report.errors.iter().enumerate() {
-        checks.push(GatewayServiceCheckReport {
-            name: format!("config-error-{}", idx + 1),
-            ok: false,
-            level: GatewayServiceCheckLevel::Error,
-            detail: error.clone(),
-        });
-    }
-    checks
-}
-
 fn check_file_readable(path: &Path, name: &str) -> GatewayServiceCheckReport {
-    match std::fs::File::open(path) {
+    match std::fs::read_to_string(path) {
         Ok(_) => GatewayServiceCheckReport {
             name: name.to_string(),
             ok: true,
             level: GatewayServiceCheckLevel::Error,
-            detail: format!("readable file: {}", path.display()),
+            detail: format!("{} is readable", path.display()),
         },
         Err(e) => GatewayServiceCheckReport {
             name: name.to_string(),
             ok: false,
             level: GatewayServiceCheckLevel::Error,
-            detail: format!("cannot read {}: {e}", path.display()),
+            detail: format!("{} is not readable: {}", path.display(), e),
         },
     }
 }
 
 fn check_dir_writable(path: &Path, name: &str) -> GatewayServiceCheckReport {
-    if !path.exists() {
-        return match std::fs::create_dir_all(path) {
-            Ok(()) => GatewayServiceCheckReport {
-                name: name.to_string(),
-                ok: true,
-                level: GatewayServiceCheckLevel::Error,
-                detail: format!("created directory for write checks: {}", path.display()),
-            },
-            Err(e) => GatewayServiceCheckReport {
-                name: name.to_string(),
-                ok: false,
-                level: GatewayServiceCheckLevel::Error,
-                detail: format!("cannot create directory {}: {e}", path.display()),
-            },
-        };
-    }
-    if !path.is_dir() {
-        return GatewayServiceCheckReport {
-            name: name.to_string(),
-            ok: false,
-            level: GatewayServiceCheckLevel::Error,
-            detail: format!("not a directory: {}", path.display()),
-        };
-    }
-    let probe = path.join(format!(".omninova-preflight-{}.tmp", std::process::id()));
-    match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe)
-    {
+    let test_file = path.join(".write_test");
+    match std::fs::write(&test_file, b"") {
         Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
+            let _ = std::fs::remove_file(&test_file);
             GatewayServiceCheckReport {
                 name: name.to_string(),
                 ok: true,
                 level: GatewayServiceCheckLevel::Error,
-                detail: format!("directory writable: {}", path.display()),
+                detail: format!("{} is writable", path.display()),
             }
         }
         Err(e) => GatewayServiceCheckReport {
             name: name.to_string(),
             ok: false,
             level: GatewayServiceCheckLevel::Error,
-            detail: format!("directory not writable {}: {e}", path.display()),
+            detail: format!("{} is not writable: {}", path.display(), e),
         },
     }
 }
 
-fn parse_channel_kind(raw: &str) -> crate::channels::ChannelKind {
-    match raw.to_lowercase().as_str() {
-        "cli" => crate::channels::ChannelKind::Cli,
-        "web" => crate::channels::ChannelKind::Web,
-        "webchat" => crate::channels::ChannelKind::WebChat,
-        "telegram" => crate::channels::ChannelKind::Telegram,
-        "discord" => crate::channels::ChannelKind::Discord,
-        "slack" => crate::channels::ChannelKind::Slack,
-        "whatsapp" => crate::channels::ChannelKind::Whatsapp,
-        "google_chat" | "googlechat" => crate::channels::ChannelKind::GoogleChat,
-        "signal" => crate::channels::ChannelKind::Signal,
-        "bluebubbles" => crate::channels::ChannelKind::BlueBubbles,
-        "imessage" => crate::channels::ChannelKind::Imessage,
-        "irc" => crate::channels::ChannelKind::Irc,
-        "msteams" | "teams" => crate::channels::ChannelKind::Msteams,
-        "matrix" => crate::channels::ChannelKind::Matrix,
-        "feishu" => crate::channels::ChannelKind::Feishu,
-        "line" => crate::channels::ChannelKind::Line,
-        "mattermost" => crate::channels::ChannelKind::Mattermost,
-        "nextcloud_talk" | "nextcloudtalk" => crate::channels::ChannelKind::NextcloudTalk,
-        "nostr" => crate::channels::ChannelKind::Nostr,
-        "synology_chat" | "synologychat" => crate::channels::ChannelKind::SynologyChat,
-        "tlon" => crate::channels::ChannelKind::Tlon,
-        "twitch" => crate::channels::ChannelKind::Twitch,
-        "wechat" | "wecom" => crate::channels::ChannelKind::Wechat,
-        "zalo" => crate::channels::ChannelKind::Zalo,
-        "zalo_personal" | "zalopersonal" => crate::channels::ChannelKind::ZaloPersonal,
-        "lark" => crate::channels::ChannelKind::Lark,
-        "dingtalk" | "ding_talk" | "dingding" => crate::channels::ChannelKind::Dingtalk,
-        "email" => crate::channels::ChannelKind::Email,
-        "webhook" => crate::channels::ChannelKind::Webhook,
-        other => crate::channels::ChannelKind::Other(other.to_string()),
-    }
+fn build_config_validation_checks(config: &Config) -> Vec<GatewayServiceCheckReport> {
+    let validation = config.validate();
+    validation
+        .errors
+        .iter()
+        .map(|e| GatewayServiceCheckReport {
+            name: "config-validation".to_string(),
+            ok: false,
+            level: GatewayServiceCheckLevel::Error,
+            detail: e.clone(),
+        })
+        .chain(validation.warnings.iter().map(|w| GatewayServiceCheckReport {
+            name: "config-warning".to_string(),
+            ok: true,
+            level: GatewayServiceCheckLevel::Warn,
+            detail: w.clone(),
+        }))
+        .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Setup & Doctor
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct DepStatus {
-    name: String,
-    installed: bool,
-    version: Option<String>,
-    detail: String,
+#[derive(Debug, serde::Serialize)]
+pub struct DepStatus {
+    pub name: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub detail: String,
 }
 
 async fn check_dep_installed(bin: &str, version_flag: &str) -> DepStatus {
-    use std::process::Stdio;
-    use tokio::process::Command;
-    match Command::new(bin)
+    let output = tokio::process::Command::new(bin)
         .arg(version_flag)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let version = raw
-                .split_whitespace()
-                .find(|s| s.chars().next().map_or(false, |c| c.is_ascii_digit()))
-                .map(ToString::to_string);
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
             DepStatus {
                 name: bin.to_string(),
                 installed: true,
-                version,
-                detail: raw,
+                version: Some(version.clone()),
+                detail: format!("{} found (version: {})", bin, version),
             }
         }
-        Ok(output) => DepStatus {
-            name: bin.to_string(),
-            installed: false,
-            version: None,
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        },
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            DepStatus {
+                name: bin.to_string(),
+                installed: false,
+                version: None,
+                detail: format!("{} not working: {}", bin, stderr.trim()),
+            }
+        }
         Err(e) => DepStatus {
             name: bin.to_string(),
             installed: false,
             version: None,
-            detail: format!("not found: {e}"),
+            detail: format!("{} not found: {}", bin, e),
         },
     }
 }
 
-async fn install_agent_browser() -> Result<String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-    println!("Installing agent-browser via npm...");
-    let install_out = Command::new("npm")
-        .args(["install", "-g", "agent-browser"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !install_out.status.success() {
-        let stderr = String::from_utf8_lossy(&install_out.stderr);
-        anyhow::bail!("npm install -g agent-browser failed: {stderr}");
-    }
-
-    println!("Downloading Chromium browser engine...");
-    let chromium_out = Command::new("agent-browser")
-        .arg("install")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !chromium_out.status.success() {
-        let stderr = String::from_utf8_lossy(&chromium_out.stderr);
-        anyhow::bail!("agent-browser install failed: {stderr}");
-    }
-
-    let status = check_dep_installed("agent-browser", "--version").await;
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "ok": true,
-        "installed": status.installed,
-        "version": status.version,
-    }))?)
+struct InteractiveConfigurator {
+    // placeholder — implement interactive prompts using inlined readline-style read
 }
 
-async fn run_setup(command: SetupCommands) -> Result<String> {
-    match command {
-        SetupCommands::Browser => install_agent_browser().await,
-        SetupCommands::All => {
-            let browser_result = install_agent_browser().await;
-            let mut results = Vec::new();
-            results.push(serde_json::json!({
-                "dep": "agent-browser",
-                "ok": browser_result.is_ok(),
-                "detail": browser_result.as_deref().unwrap_or("failed"),
-            }));
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "ok": results.iter().all(|r| r["ok"].as_bool().unwrap_or(false)),
-                "results": results,
-            }))?)
-        }
-    }
-}
-
-async fn run_doctor(config: &Config) -> Result<String> {
-    let runtime = GatewayRuntime::new(config.clone());
-    let health = runtime.health().await;
-
-    let agent_browser = check_dep_installed("agent-browser", "--version").await;
-    let node = check_dep_installed("node", "--version").await;
-    let npm = check_dep_installed("npm", "--version").await;
-    let rg = check_dep_installed("rg", "--version").await;
-    let git = check_dep_installed("git", "--version").await;
-
-    let validation = config.validate();
-
-    let mut checks = Vec::new();
-
-    checks.push(serde_json::json!({
-        "check": "gateway_provider",
-        "ok": health.provider_healthy,
-        "detail": format!("provider={}", health.provider),
-    }));
-    checks.push(serde_json::json!({
-        "check": "memory",
-        "ok": health.memory_healthy,
-    }));
-    checks.push(serde_json::json!({
-        "check": "config",
-        "ok": validation.is_ok(),
-        "errors": validation.errors,
-        "warnings": validation.warnings,
-    }));
-
-    for dep in &[&agent_browser, &node, &npm, &rg, &git] {
-        let required = dep.name == "agent-browser" && config.browser.enabled;
-        checks.push(serde_json::json!({
-            "check": format!("dep:{}", dep.name),
-            "ok": dep.installed || !required,
-            "installed": dep.installed,
-            "version": dep.version,
-            "detail": dep.detail,
-            "required": required,
-        }));
+impl InteractiveConfigurator {
+    fn new() -> Self {
+        Self {}
     }
 
-    if config.browser.enabled && !agent_browser.installed {
-        checks.push(serde_json::json!({
-            "check": "browser_tool_ready",
-            "ok": false,
-            "detail": "browser.enabled=true but agent-browser is not installed. Run: omninova setup browser",
-        }));
-    } else if config.browser.enabled {
-        checks.push(serde_json::json!({
-            "check": "browser_tool_ready",
-            "ok": true,
-            "detail": format!("agent-browser {} ready", agent_browser.version.as_deref().unwrap_or("?")),
-        }));
+    fn run(&self) -> Result<()> {
+        println!("OmniNova interactive configurator");
+        println!("(for non-interactive use, see: omninova config set / omninova config get)");
+        println!("this is a placeholder — use 'omninova config set <key> <value>' instead");
+        Ok(())
     }
-
-    let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "ok": all_ok,
-        "checks": checks,
-    }))?)
 }
