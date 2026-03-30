@@ -28,6 +28,7 @@ use crate::tools::{
     WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
+use crate::observability::{TimeRange, MetricType};
 use crate::Agent;
 use std::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
@@ -227,6 +228,7 @@ impl GatewayRuntime {
         let selection = ProviderSelection {
             provider: route.provider.clone(),
             model: route.model.clone(),
+            api_protocol: None,
         };
         let provider = build_provider_with_selection(&cfg, &selection);
         let tools = create_tools_for_route(&cfg, &route.agent_name, self.memory.clone());
@@ -2206,13 +2208,13 @@ async fn http_api_system_history(
 async fn http_api_system_export(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<String, Json<GatewayError>> {
-    use crate::observability::{monitor, ExportFormat};
-    
+    use crate::observability::{monitor, MonitorExportFormat as ExportFormat};
+
     let format = match params.get("format").map(|s| s.as_str()) {
         Some("csv") => ExportFormat::Csv,
         _ => ExportFormat::Json,
     };
-    
+
     let data = monitor().export(format);
     Ok(data)
 }

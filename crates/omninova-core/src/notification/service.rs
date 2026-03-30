@@ -9,7 +9,7 @@
 use crate::notification::{
     Notification, NotificationConfig, NotificationError, NotificationType,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use parking_lot::RwLock;
 use std::sync::OnceLock;
 

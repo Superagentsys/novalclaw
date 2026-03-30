@@ -554,6 +554,7 @@ async fn provider_health_overview(
                 &ProviderSelection {
                     provider: Some(id.clone()),
                     model: model.clone(),
+                    api_protocol: None,
                 },
             );
             Some(provider.health_check().await)
@@ -1038,7 +1039,7 @@ fn setup_tray(app: &tauri::AppHandle) -> Result<TrayIcon, Box<dyn std::error::Er
     let tray = TrayIconBuilder::new()
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
-        .menu_on_left_click(true)
+        .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
             match event.id.as_ref() {
                 "显示窗口" => {

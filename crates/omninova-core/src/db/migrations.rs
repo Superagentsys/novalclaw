@@ -858,6 +858,48 @@ DROP INDEX IF EXISTS idx_api_logs_timestamp;
 DROP TABLE IF EXISTS api_request_logs;
 "#;
 
+/// Provider API protocol migration SQL
+const PROVIDER_API_PROTOCOL_SQL: &str = r#"
+-- Migration: 018_provider_api_protocol
+-- Description: Add api_protocol column to provider_configs for custom provider API protocol selection
+
+-- Add api_protocol column to provider_configs table
+ALTER TABLE provider_configs ADD COLUMN api_protocol TEXT DEFAULT 'openai';
+"#;
+
+/// Provider API protocol rollback SQL
+const PROVIDER_API_PROTOCOL_DOWN_SQL: &str = r#"
+-- Rollback: 018_provider_api_protocol
+-- Note: SQLite doesn't support DROP COLUMN, so we recreate the table
+
+-- Create a backup of the schema without api_protocol
+CREATE TABLE provider_configs_backup (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    provider_type TEXT NOT NULL,
+    api_key_ref TEXT,
+    base_url TEXT,
+    default_model TEXT,
+    settings TEXT,
+    is_default INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+);
+
+-- Copy data back (excluding api_protocol)
+INSERT INTO provider_configs_backup (id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at)
+SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+FROM provider_configs;
+
+-- Drop old table and rename backup
+DROP TABLE provider_configs;
+ALTER TABLE provider_configs_backup RENAME TO provider_configs;
+
+-- Recreate indexes
+CREATE INDEX IF NOT EXISTS idx_provider_configs_type ON provider_configs(provider_type);
+CREATE INDEX IF NOT EXISTS idx_provider_configs_default ON provider_configs(is_default);
+"#;
+
 /// Get the built-in migrations
 ///
 /// Returns a list of migrations that are embedded in the binary.
@@ -912,6 +954,9 @@ pub fn get_builtin_migrations() -> Vec<Migration> {
         Migration::new("017_api_request_logs", "Add api_request_logs table for API usage logging and monitoring")
             .up(API_REQUEST_LOGS_SQL)
             .down(API_REQUEST_LOGS_DOWN_SQL),
+        Migration::new("018_provider_api_protocol", "Add api_protocol column to provider_configs for custom provider API protocol selection")
+            .up(PROVIDER_API_PROTOCOL_SQL)
+            .down(PROVIDER_API_PROTOCOL_DOWN_SQL),
     ]
 }
 
@@ -1129,7 +1174,7 @@ mod tests {
     #[test]
     fn test_builtin_migrations_include_agent_enhancements() {
         let migrations = get_builtin_migrations();
-        assert_eq!(migrations.len(), 15);
+        assert_eq!(migrations.len(), 18);
         assert_eq!(migrations[0].id, "001_initial");
         assert_eq!(migrations[1].id, "002_agent_enhancements");
         assert!(migrations[1].down_sql.is_some());
@@ -1159,7 +1204,7 @@ mod tests {
         let runner = create_builtin_runner();
         let report = runner.run(&conn).expect("Failed to run migrations");
 
-        assert_eq!(report.applied.len(), 15);
+        assert_eq!(report.applied.len(), 18);
 
         // Verify agent_uuid column exists
         let uuid_count: i32 = conn
@@ -1256,12 +1301,12 @@ mod tests {
         // Run migrations twice
         let runner = create_builtin_runner();
         let report1 = runner.run(&conn).expect("First run failed");
-        assert_eq!(report1.applied.len(), 15);
+        assert_eq!(report1.applied.len(), 18);
 
         // Second run should skip all
         let report2 = runner.run(&conn).expect("Second run failed");
         assert_eq!(report2.applied.len(), 0);
-        assert_eq!(report2.skipped.len(), 15);
+        assert_eq!(report2.skipped.len(), 18);
     }
 
     #[test]

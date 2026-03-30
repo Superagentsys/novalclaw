@@ -1,10 +1,13 @@
 use crate::config::{Config, ModelProviderConfig};
+use crate::providers::config::{ApiProtocol, ProviderConfig};
 use crate::providers::{AnthropicProvider, GeminiProvider, MockProvider, OpenAiProvider, Provider};
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderSelection {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// API protocol for custom providers (optional)
+    pub api_protocol: Option<ApiProtocol>,
 }
 
 pub fn build_provider_from_config(config: &Config) -> Box<dyn Provider> {
@@ -70,24 +73,110 @@ pub fn build_provider_with_selection(
         | "cloudflare"
         | "sglang"
         | "vllm"
-        | "llamacpp" => Box::new(OpenAiProvider::new(
-            base_url.as_deref(),
-            api_key.as_deref(),
-            model,
-            temp,
-            None,
-        )),
+        | "llamacpp"
+        | "custom" => {
+            // For custom providers, check api_protocol
+            let protocol = selection.api_protocol.unwrap_or(ApiProtocol::Openai);
+            match protocol {
+                ApiProtocol::Anthropic => Box::new(AnthropicProvider::new(
+                    base_url.as_deref(),
+                    api_key.as_deref(),
+                    model,
+                    temp,
+                    None,
+                )),
+                ApiProtocol::Openai => Box::new(OpenAiProvider::new(
+                    base_url.as_deref(),
+                    api_key.as_deref(),
+                    model,
+                    temp,
+                    None,
+                )),
+            }
+        }
         _ if provider_name.starts_with("custom:") => {
             let custom_url = provider_name.strip_prefix("custom:").unwrap_or_default();
-            Box::new(OpenAiProvider::new(
-                Some(custom_url),
-                api_key.as_deref(),
-                model,
-                temp,
-                None,
-            ))
+            // Use api_protocol from selection, default to OpenAI
+            let protocol = selection.api_protocol.unwrap_or(ApiProtocol::Openai);
+            match protocol {
+                ApiProtocol::Anthropic => Box::new(AnthropicProvider::new(
+                    Some(custom_url),
+                    api_key.as_deref(),
+                    model,
+                    temp,
+                    None,
+                )),
+                ApiProtocol::Openai => Box::new(OpenAiProvider::new(
+                    Some(custom_url),
+                    api_key.as_deref(),
+                    model,
+                    temp,
+                    None,
+                )),
+            }
         }
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
+    }
+}
+
+/// Build a provider from a database-stored ProviderConfig
+///
+/// This function is used when the provider configuration comes from the database
+/// (e.g., user-configured providers in the UI) rather than from the config file.
+pub fn build_provider_from_provider_config(
+    config: &ProviderConfig,
+    api_key: Option<&str>,
+    temperature: f64,
+) -> Box<dyn Provider> {
+    let model = config.default_model.clone().unwrap_or_else(|| {
+        config.provider_type.default_model().to_string()
+    });
+    let base_url = config.base_url.clone();
+    let api_protocol = config.api_protocol.unwrap_or(ApiProtocol::Openai);
+
+    match config.provider_type {
+        crate::providers::config::ProviderType::Anthropic => Box::new(AnthropicProvider::new(
+            base_url.as_deref(),
+            api_key,
+            model,
+            temperature,
+            None,
+        )),
+        crate::providers::config::ProviderType::Gemini => Box::new(GeminiProvider::new(
+            base_url.as_deref(),
+            api_key,
+            model,
+            temperature,
+            None,
+        )),
+        crate::providers::config::ProviderType::Mock => Box::new(MockProvider::new("mock-provider")),
+        crate::providers::config::ProviderType::Custom => {
+            // For custom providers, use api_protocol to determine the provider type
+            match api_protocol {
+                ApiProtocol::Anthropic => Box::new(AnthropicProvider::new(
+                    base_url.as_deref(),
+                    api_key,
+                    model,
+                    temperature,
+                    None,
+                )),
+                ApiProtocol::Openai => Box::new(OpenAiProvider::new(
+                    base_url.as_deref(),
+                    api_key,
+                    model,
+                    temperature,
+                    None,
+                )),
+            }
+        }
+        // All other providers use OpenAI-compatible API
+        _ => Box::new(OpenAiProvider::new(
+            base_url.as_deref(),
+            api_key,
+            model,
+            temperature,
+            None,
+        )),
     }
 }
 

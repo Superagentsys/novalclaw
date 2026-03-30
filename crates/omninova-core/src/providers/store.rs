@@ -5,7 +5,7 @@
 
 use crate::db::{DbConnection, DbPool};
 use crate::providers::config::{
-    NewProviderConfig, ProviderConfig, ProviderConfigUpdate, ProviderConfigValidationError,
+    ApiProtocol, NewProviderConfig, ProviderConfig, ProviderConfigUpdate, ProviderConfigValidationError,
     ProviderType,
 };
 use anyhow::Result;
@@ -75,9 +75,12 @@ impl ProviderStore {
             .clone()
             .or_else(|| config.provider_type.default_base_url().map(|s| s.to_string()));
 
+        // Resolve API protocol (only for custom provider)
+        let api_protocol = config.api_protocol.unwrap_or(ApiProtocol::Openai);
+
         conn.execute(
-            "INSERT INTO provider_configs (id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO provider_configs (id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &id,
                 &config.name,
@@ -87,6 +90,7 @@ impl ProviderStore {
                 &Some(default_model.clone()),
                 &config.settings,
                 config.is_default as i32,
+                api_protocol.to_string(),
                 timestamp,
                 timestamp,
             ],
@@ -108,6 +112,7 @@ impl ProviderStore {
             default_model: Some(default_model),
             settings: config.settings.clone(),
             is_default: config.is_default,
+            api_protocol: Some(api_protocol),
             created_at: timestamp,
             updated_at: timestamp,
         })
@@ -117,13 +122,17 @@ impl ProviderStore {
     pub fn find_by_id(&self, id: &str) -> Result<Option<ProviderConfig>, ProviderStoreError> {
         let conn = self.get_conn()?;
         let result = conn.query_row(
-            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at
              FROM provider_configs WHERE id = ?1",
             params![id],
             |row| {
                 let provider_type_str: String = row.get(2)?;
                 let provider_type = ProviderType::from_db_string(&provider_type_str, 2)?;
                 let is_default: i32 = row.get(7)?;
+                let api_protocol_str: Option<String> = row.get(8)?;
+                let api_protocol = api_protocol_str
+                    .as_deref()
+                    .and_then(|s| s.parse::<ApiProtocol>().ok());
                 Ok(ProviderConfig {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -133,8 +142,9 @@ impl ProviderStore {
                     default_model: row.get(5)?,
                     settings: row.get(6)?,
                     is_default: is_default != 0,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    api_protocol,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         );
@@ -150,13 +160,17 @@ impl ProviderStore {
     pub fn find_by_name(&self, name: &str) -> Result<Option<ProviderConfig>, ProviderStoreError> {
         let conn = self.get_conn()?;
         let result = conn.query_row(
-            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at
              FROM provider_configs WHERE name = ?1",
             params![name],
             |row| {
                 let provider_type_str: String = row.get(2)?;
                 let provider_type = ProviderType::from_db_string(&provider_type_str, 2)?;
                 let is_default: i32 = row.get(7)?;
+                let api_protocol_str: Option<String> = row.get(8)?;
+                let api_protocol = api_protocol_str
+                    .as_deref()
+                    .and_then(|s| s.parse::<ApiProtocol>().ok());
                 Ok(ProviderConfig {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -166,8 +180,9 @@ impl ProviderStore {
                     default_model: row.get(5)?,
                     settings: row.get(6)?,
                     is_default: is_default != 0,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    api_protocol,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         );
@@ -183,7 +198,7 @@ impl ProviderStore {
     pub fn find_all(&self) -> Result<Vec<ProviderConfig>, ProviderStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at
              FROM provider_configs ORDER BY is_default DESC, created_at ASC",
         )?;
 
@@ -191,6 +206,10 @@ impl ProviderStore {
             let provider_type_str: String = row.get(2)?;
             let provider_type = ProviderType::from_db_string(&provider_type_str, 2)?;
             let is_default: i32 = row.get(7)?;
+            let api_protocol_str: Option<String> = row.get(8)?;
+            let api_protocol = api_protocol_str
+                .as_deref()
+                .and_then(|s| s.parse::<ApiProtocol>().ok());
             Ok(ProviderConfig {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -200,8 +219,9 @@ impl ProviderStore {
                 default_model: row.get(5)?,
                 settings: row.get(6)?,
                 is_default: is_default != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                api_protocol,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })?;
 
@@ -216,12 +236,16 @@ impl ProviderStore {
     pub fn find_default(&self) -> Result<Option<ProviderConfig>, ProviderStoreError> {
         let conn = self.get_conn()?;
         let result = conn.query_row(
-            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at
              FROM provider_configs WHERE is_default = 1 LIMIT 1",
             [],
             |row| {
                 let provider_type_str: String = row.get(2)?;
                 let provider_type = ProviderType::from_db_string(&provider_type_str, 2)?;
+                let api_protocol_str: Option<String> = row.get(8)?;
+                let api_protocol = api_protocol_str
+                    .as_deref()
+                    .and_then(|s| s.parse::<ApiProtocol>().ok());
                 Ok(ProviderConfig {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -231,8 +255,9 @@ impl ProviderStore {
                     default_model: row.get(5)?,
                     settings: row.get(6)?,
                     is_default: true,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    api_protocol,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         );
@@ -251,7 +276,7 @@ impl ProviderStore {
     ) -> Result<Vec<ProviderConfig>, ProviderStoreError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, created_at, updated_at
+            "SELECT id, name, provider_type, api_key_ref, base_url, default_model, settings, is_default, api_protocol, created_at, updated_at
              FROM provider_configs WHERE provider_type = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -259,6 +284,10 @@ impl ProviderStore {
             let provider_type_str: String = row.get(2)?;
             let parsed_type = ProviderType::from_db_string(&provider_type_str, 2)?;
             let is_default: i32 = row.get(7)?;
+            let api_protocol_str: Option<String> = row.get(8)?;
+            let api_protocol = api_protocol_str
+                .as_deref()
+                .and_then(|s| s.parse::<ApiProtocol>().ok());
             Ok(ProviderConfig {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -268,8 +297,9 @@ impl ProviderStore {
                 default_model: row.get(5)?,
                 settings: row.get(6)?,
                 is_default: is_default != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                api_protocol,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })?;
 
@@ -308,11 +338,12 @@ impl ProviderStore {
             .or(existing.default_model.as_ref());
         let new_settings = updates.settings.as_ref().or(existing.settings.as_ref());
         let new_is_default = updates.is_default.unwrap_or(existing.is_default);
+        let new_api_protocol = updates.api_protocol.or(existing.api_protocol);
 
         conn.execute(
             "UPDATE provider_configs
-             SET name = ?1, api_key_ref = ?2, base_url = ?3, default_model = ?4, settings = ?5, is_default = ?6, updated_at = ?7
-             WHERE id = ?8",
+             SET name = ?1, api_key_ref = ?2, base_url = ?3, default_model = ?4, settings = ?5, is_default = ?6, api_protocol = ?7, updated_at = ?8
+             WHERE id = ?9",
             params![
                 new_name,
                 new_api_key_ref,
@@ -320,6 +351,7 @@ impl ProviderStore {
                 new_default_model,
                 new_settings,
                 new_is_default as i32,
+                new_api_protocol.map(|p| p.to_string()),
                 timestamp,
                 id,
             ],
@@ -341,6 +373,7 @@ impl ProviderStore {
             default_model: new_default_model.cloned(),
             settings: new_settings.cloned(),
             is_default: new_is_default,
+            api_protocol: new_api_protocol,
             created_at: existing.created_at,
             updated_at: timestamp,
         })
@@ -420,6 +453,7 @@ mod tests {
             base_url: None,
             default_model: Some("gpt-4o".to_string()),
             settings: None,
+            api_protocol: None,
             is_default: true,
         };
 
@@ -441,6 +475,7 @@ mod tests {
             base_url: None, // Should use default
             default_model: None, // Should use default
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -460,6 +495,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -472,6 +508,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -490,6 +527,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -518,6 +556,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -540,6 +579,7 @@ mod tests {
                 base_url: None,
                 default_model: None,
                 settings: None,
+            api_protocol: None,
                 is_default: i == 0,
             };
             store.create(&config).expect("Failed to create config");
@@ -567,6 +607,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: true,
         };
         store.create(&config).expect("Failed to create config");
@@ -588,6 +629,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
         let config2 = NewProviderConfig {
@@ -597,6 +639,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
         let config3 = NewProviderConfig {
@@ -606,6 +649,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -631,6 +675,7 @@ mod tests {
             base_url: None,
             default_model: Some("gpt-3.5-turbo".to_string()),
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -673,6 +718,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -702,6 +748,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: true,
         };
         let config2 = NewProviderConfig {
@@ -711,6 +758,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
 
@@ -746,6 +794,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: false,
         };
         store.create(&config).expect("Failed to create");
@@ -765,6 +814,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: true,
         };
         let created1 = store.create(&config1).expect("Failed to create");
@@ -777,6 +827,7 @@ mod tests {
             base_url: None,
             default_model: None,
             settings: None,
+            api_protocol: None,
             is_default: true,
         };
         store.create(&config2).expect("Failed to create");

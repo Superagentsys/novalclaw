@@ -5,6 +5,11 @@
  */
 
 /**
+ * API protocol type for custom providers
+ */
+export type ApiProtocol = 'openai' | 'anthropic';
+
+/**
  * Provider types matching Rust ProviderType enum
  */
 export type ProviderType =
@@ -49,6 +54,7 @@ export interface ProviderConfig {
   defaultModel?: string;
   settings?: string;
   isDefault: boolean;
+  apiProtocol?: ApiProtocol;
   createdAt: number;
   updatedAt: number;
 }
@@ -64,6 +70,7 @@ export interface NewProviderConfig {
   defaultModel?: string;
   settings?: string;
   isDefault: boolean;
+  apiProtocol?: ApiProtocol;
 }
 
 /**
@@ -76,6 +83,7 @@ export interface ProviderConfigUpdate {
   defaultModel?: string;
   settings?: string;
   isDefault?: boolean;
+  apiProtocol?: ApiProtocol;
 }
 
 /**
@@ -339,6 +347,14 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     category: 'local',
     requiresApiKey: false,
     defaultBaseUrl: 'http://localhost:1234/v1',
+    popularModels: [],
+  },
+  // Custom providers
+  {
+    id: 'custom',
+    name: '自定义服务',
+    category: 'custom',
+    requiresApiKey: false,
     popularModels: [],
   },
 ];

@@ -10,10 +10,10 @@ pub mod traits;
 
 pub use anthropic::AnthropicProvider;
 pub use config::{
-    NewProviderConfig, ProviderConfig, ProviderConfigUpdate, ProviderConfigValidationError,
+    ApiProtocol, NewProviderConfig, ProviderConfig, ProviderConfigUpdate, ProviderConfigValidationError,
     ProviderType,
 };
-pub use factory::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
+pub use factory::{ProviderSelection, build_provider_from_config, build_provider_with_selection, build_provider_from_provider_config};
 pub use gemini::GeminiProvider;
 pub use ollama::OllamaProvider;
 pub use registry::ProviderRegistry;

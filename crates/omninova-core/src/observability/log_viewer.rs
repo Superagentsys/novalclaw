@@ -134,7 +134,7 @@ pub struct LogViewerService {
 
 impl Default for LogViewerService {
     fn default() -> Self {
-        let log_path = dirs::home_dir()
+        let log_path = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(DEFAULT_LOG_PATH);
         Self::new(log_path)
@@ -419,9 +419,14 @@ impl LogViewerService {
 
     /// Parse timestamp from various formats
     fn parse_timestamp(&self, s: &str) -> Option<i64> {
-        // Try ISO format: 2026-03-26T12:00:00
+        // Try ISO format with timezone: 2026-03-26T12:00:00Z or 2026-03-26T12:00:00+00:00
         if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
             return Some(dt.timestamp());
+        }
+
+        // Try ISO format without timezone: 2026-03-26T12:00:00 (assume UTC)
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+            return Some(dt.and_utc().timestamp());
         }
 
         // Try Unix timestamp

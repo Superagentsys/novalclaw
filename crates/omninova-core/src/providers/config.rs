@@ -244,6 +244,56 @@ impl ProviderType {
     }
 }
 
+/// API protocol type for custom providers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiProtocol {
+    /// OpenAI-compatible API (/v1/chat/completions)
+    Openai,
+    /// Anthropic-compatible API (/v1/messages)
+    Anthropic,
+}
+
+impl Default for ApiProtocol {
+    fn default() -> Self {
+        Self::Openai
+    }
+}
+
+impl fmt::Display for ApiProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiProtocol::Openai => write!(f, "openai"),
+            ApiProtocol::Anthropic => write!(f, "anthropic"),
+        }
+    }
+}
+
+impl FromStr for ApiProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "openai" => Ok(ApiProtocol::Openai),
+            "anthropic" => Ok(ApiProtocol::Anthropic),
+            _ => Err(format!("Invalid API protocol: {}", s)),
+        }
+    }
+}
+
+impl ApiProtocol {
+    /// Parse from database string, returning a rusqlite-compatible error on failure
+    pub fn from_db_string(s: &str, column_idx: usize) -> Result<Self, rusqlite::Error> {
+        s.parse::<Self>().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column_idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })
+    }
+}
+
 /// Provider configuration stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,6 +314,8 @@ pub struct ProviderConfig {
     pub settings: Option<String>,
     /// Whether this is the default provider
     pub is_default: bool,
+    /// API protocol (only for custom provider type)
+    pub api_protocol: Option<ApiProtocol>,
     /// Unix timestamp of creation
     pub created_at: i64,
     /// Unix timestamp of last update
@@ -288,6 +340,8 @@ pub struct NewProviderConfig {
     pub settings: Option<String>,
     /// Set as default provider (optional)
     pub is_default: bool,
+    /// API protocol (only for custom provider type)
+    pub api_protocol: Option<ApiProtocol>,
 }
 
 /// Partial data for updating an existing provider configuration
@@ -306,6 +360,8 @@ pub struct ProviderConfigUpdate {
     pub settings: Option<String>,
     /// Set as default
     pub is_default: Option<bool>,
+    /// New API protocol
+    pub api_protocol: Option<ApiProtocol>,
 }
 
 /// Error type for provider configuration validation
@@ -422,6 +478,7 @@ mod tests {
             default_model: Some("gpt-4o".to_string()),
             settings: None,
             is_default: true,
+            api_protocol: None,
             created_at: 1700000000,
             updated_at: 1700000000,
         };
@@ -445,6 +502,7 @@ mod tests {
             default_model: None,
             settings: None,
             is_default: false,
+            api_protocol: None,
         };
 
         let json = serde_json::to_string(&new_config).unwrap();
@@ -495,6 +553,7 @@ mod tests {
             default_model: None,
             settings: None,
             is_default: false,
+            api_protocol: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -509,6 +568,7 @@ mod tests {
             default_model: None,
             settings: None,
             is_default: false,
+            api_protocol: None,
         };
         assert!(matches!(config.validate(), Err(ProviderConfigValidationError::EmptyName)));
     }
@@ -523,6 +583,7 @@ mod tests {
             default_model: None,
             settings: None,
             is_default: false,
+            api_protocol: None,
         };
         assert!(matches!(config.validate(), Err(ProviderConfigValidationError::NameTooLong(100))));
     }
@@ -537,6 +598,7 @@ mod tests {
             default_model: None,
             settings: None,
             is_default: false,
+            api_protocol: None,
         };
         assert!(config.validate().is_ok());
     }

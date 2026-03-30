@@ -178,7 +178,7 @@ export function AgentEditForm({
 
   // Privacy config state [Story 7.4]
   const [privacyConfig, setPrivacyConfig] = useState<AgentPrivacyConfig>(() => parsePrivacyConfig(agent));
-  const [originalPrivacyConfig, setOriginalPrivacyConfig] = useState<string>(() => agent.privacy_config || '');
+  const [originalPrivacyConfig, setOriginalPrivacyConfig] = useState<string>(() => JSON.stringify(parsePrivacyConfig(agent)));
   const [advancedSettingsExpanded, setAdvancedSettingsExpanded] = useState(false);
 
   // 当 agent 变化时重置表单状态
@@ -186,8 +186,9 @@ export function AgentEditForm({
     setFormState(initializeFormState(agent));
     setErrors({});
     setTouched({});
-    setPrivacyConfig(parsePrivacyConfig(agent));
-    setOriginalPrivacyConfig(agent.privacy_config || '');
+    const parsed = parsePrivacyConfig(agent);
+    setPrivacyConfig(parsed);
+    setOriginalPrivacyConfig(JSON.stringify(parsed));
   }, [agent]);
 
   // ============================================================================

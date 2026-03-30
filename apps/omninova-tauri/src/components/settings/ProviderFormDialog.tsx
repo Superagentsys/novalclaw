@@ -17,6 +17,7 @@ import {
   HardDrive,
   Settings2,
   RefreshCw,
+  Cpu,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -43,6 +44,7 @@ import type {
   ProviderConfigUpdate,
   ProviderPreset,
   ProviderWithStatus,
+  ApiProtocol,
 } from '@/types/provider';
 import { PROVIDER_PRESETS, getProviderPreset } from '@/types/provider';
 
@@ -72,6 +74,7 @@ interface FormData {
   baseUrl: string;
   defaultModel: string;
   isDefault: boolean;
+  apiProtocol: ApiProtocol;
 }
 
 interface FormErrors {
@@ -139,6 +142,7 @@ export function ProviderFormDialog({
     baseUrl: '',
     defaultModel: '',
     isDefault: false,
+    apiProtocol: 'openai',
   });
   const [errors, setErrors] = useState<FormErrors>({});
   const [showApiKey, setShowApiKey] = useState(false);
@@ -157,6 +161,7 @@ export function ProviderFormDialog({
         baseUrl: provider.baseUrl || '',
         defaultModel: provider.defaultModel || '',
         isDefault: provider.isDefault,
+        apiProtocol: provider.apiProtocol || 'openai',
       });
     } else {
       // Reset for new provider
@@ -167,6 +172,7 @@ export function ProviderFormDialog({
         baseUrl: '',
         defaultModel: '',
         isDefault: false,
+        apiProtocol: 'openai',
       });
     }
     setErrors({});
@@ -237,6 +243,7 @@ export function ProviderFormDialog({
         baseUrl: formData.baseUrl || undefined,
         defaultModel: formData.defaultModel || undefined,
         isDefault: formData.isDefault,
+        apiProtocol: formData.providerType === 'custom' ? formData.apiProtocol : undefined,
       };
 
       // Only include API key if changed
@@ -257,6 +264,7 @@ export function ProviderFormDialog({
         baseUrl: formData.baseUrl || undefined,
         defaultModel: formData.defaultModel || undefined,
         isDefault: formData.isDefault,
+        apiProtocol: formData.providerType === 'custom' ? formData.apiProtocol : undefined,
       };
 
       const success = await onSubmit(newConfig);
@@ -269,6 +277,7 @@ export function ProviderFormDialog({
   // Get cloud and local presets for select groups
   const cloudPresets = PROVIDER_PRESETS.filter((p) => p.category === 'cloud');
   const localPresets = PROVIDER_PRESETS.filter((p) => p.category === 'local');
+  const customPresets = PROVIDER_PRESETS.filter((p) => p.category === 'custom');
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -318,6 +327,18 @@ export function ProviderFormDialog({
                       本地服务
                     </SelectLabel>
                     {localPresets.map((preset) => (
+                      <SelectItem key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+
+                  <SelectGroup>
+                    <SelectLabel className="flex items-center gap-2">
+                      <Cpu className="h-4 w-4" />
+                      自定义服务
+                    </SelectLabel>
+                    {customPresets.map((preset) => (
                       <SelectItem key={preset.id} value={preset.id}>
                         {preset.name}
                       </SelectItem>
@@ -408,6 +429,30 @@ export function ProviderFormDialog({
               </p>
             )}
           </div>
+
+          {/* API Protocol (only for custom providers) */}
+          {formData.providerType === 'custom' && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium">API 协议</label>
+              <Select
+                value={formData.apiProtocol}
+                onValueChange={(value) =>
+                  handleInputChange('apiProtocol', value as ApiProtocol)
+                }
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="选择 API 协议" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="openai">OpenAI 兼容协议</SelectItem>
+                  <SelectItem value="anthropic">Anthropic 兼容协议</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                选择您的自定义服务使用的 API 协议类型
+              </p>
+            </div>
+          )}
 
           {/* Default Model */}
           <div className="space-y-2">
