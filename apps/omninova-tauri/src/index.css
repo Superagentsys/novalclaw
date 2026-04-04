@@ -1,10 +1,25 @@
 :root {
-  font-family: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  /* ClawX-inspired warm neutrals */
+  --surface-cream: #f3f0e8;
+  --surface-panel: #ebe6dc;
+  --surface-elevated: #faf8f3;
+  --border-soft: rgba(55, 48, 40, 0.08);
+  --text-primary: #2c2824;
+  --text-muted: rgba(44, 40, 36, 0.55);
+  --accent-blue: #2563eb;
+  --accent-blue-soft: rgba(37, 99, 235, 0.12);
+  --sidebar-w: 240px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+  --font-ui: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: "Iowan Old Style", "Palatino Linotype", "Songti SC", "Noto Serif SC", Georgia, serif;
+
+  font-family: var(--font-ui);
   line-height: 1.5;
   font-weight: 400;
   color-scheme: light;
-  color: rgba(30, 30, 40, 0.92);
-  background-color: #f4f5f7;
+  color: var(--text-primary);
+  background-color: var(--surface-cream);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -25,7 +40,7 @@ body {
   margin: 0;
   min-width: 320px;
   height: 100vh;
-  background-color: #eef0f3;
+  background-color: var(--surface-cream);
   overflow: hidden;
 }
 

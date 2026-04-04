@@ -16,6 +16,11 @@ import omninovalLogo from "../../assets/omninoval-logo.png";
 export interface SetupProps {
   /** 配置完成且网关启动成功后调用，用于进入对话界面 */
   onConfigSuccess?: () => void;
+  /** 由 AppShell 导航时使用：仅渲染内容区，不显示内置侧栏 */
+  embedded?: boolean;
+  /** 受控当前标签（与 App 导航同步） */
+  activeTab?: SetupTab;
+  onTabChange?: (tab: SetupTab) => void;
 }
 
 const initialConfig: Config = {
@@ -41,7 +46,7 @@ const initialConfig: Config = {
   },
 };
 
-type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
+export type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
 type SetupTabItem = {
   id: SetupTab;
   label: string;
@@ -56,8 +61,46 @@ const setupTabs: SetupTabItem[] = [
   { id: "persona", label: "Agent 人设", icon: "🧠" },
 ];
 
-export function Setup({ onConfigSuccess }: SetupProps) {
-  const [activeTab, setActiveTab] = useState<SetupTab>("general");
+const SETUP_PAGE_META: Record<
+  SetupTab,
+  { title: string; subtitle: string }
+> = {
+  general: {
+    title: "设置",
+    subtitle: "工作区、网关与连接信息。保存后可在侧栏启动或停止网关。",
+  },
+  providers: {
+    title: "模型",
+    subtitle: "启用模型服务、填写 API 与默认模型，供对话与路由使用。",
+  },
+  channels: {
+    title: "频道",
+    subtitle: "配置飞书、钉钉、Slack 等渠道接入与 Webhook。",
+  },
+  skills: {
+    title: "技能",
+    subtitle: "导入与管理 Open Skills（SKILL.md），扩展 Agent 专业能力。",
+  },
+  persona: {
+    title: "Agents",
+    subtitle: "配置 Agent 名称、工具轮次与人设（灵魂系统）。",
+  },
+};
+
+export function Setup({
+  onConfigSuccess,
+  embedded = false,
+  activeTab: activeTabProp,
+  onTabChange,
+}: SetupProps) {
+  const [activeTabInternal, setActiveTabInternal] = useState<SetupTab>("general");
+  const activeTab = activeTabProp ?? activeTabInternal;
+  const setActiveTab = (tab: SetupTab) => {
+    onTabChange?.(tab);
+    if (activeTabProp === undefined) {
+      setActiveTabInternal(tab);
+    }
+  };
   const [config, setConfig] = useState<Config>(initialConfig);
   const [previewCollapsed, setPreviewCollapsed] = useState(true);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
@@ -394,134 +437,183 @@ export function Setup({ onConfigSuccess }: SetupProps) {
     }
   };
 
-  return (
-    <div className="setup-page" style={{ maxWidth: 'none', margin: 0, padding: 0, height: '100vh', display: 'flex', flexDirection: 'row', backgroundColor: '#eef0f3' }}>
-      {/* Sidebar */}
-      <aside style={{ width: '280px', backgroundColor: 'rgba(255, 255, 255, 0.85)', borderRight: '1px solid rgba(80, 100, 180, 0.20)', display: 'flex', flexDirection: 'column', padding: '24px' }}>
-        <div className="flex items-center gap-4 mb-8">
-          <img src={omninovalLogo} alt="Logo" style={{ width: '48px', height: '48px', borderRadius: '12px' }} />
-          <div>
-            <div className="text-sm font-bold opacity-40 uppercase tracking-wider">OmniNova</div>
-            <div className="text-lg font-bold text-gray-800">Claw 控制面</div>
+  const meta = SETUP_PAGE_META[activeTab];
+
+  const gatewayActions = (
+    <div className="setup-embed-actions">
+      <div className="setup-gateway-pill">
+        <span
+          className={`setup-gateway-dot ${gatewayStatus.running ? "is-on" : "is-off"}`}
+        />
+        <span>网关 {gatewayStatus.running ? "运行中" : "已停止"}</span>
+        {gatewayStatus.url ? (
+          <code className="setup-gateway-url">{gatewayStatus.url}</code>
+        ) : null}
+      </div>
+      <div className="setup-embed-buttons">
+        <button
+          type="button"
+          className="setup-btn setup-btn--secondary"
+          onClick={handleSaveConfig}
+          disabled={busyAction !== null}
+        >
+          {busyAction === "save" ? "保存中…" : "保存配置"}
+        </button>
+        {!gatewayStatus.running ? (
+          <button
+            type="button"
+            className="setup-btn setup-btn--primary"
+            onClick={handleSaveAndStartGateway}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "start" ? "启动中…" : "保存并启动网关"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="setup-btn setup-btn--danger"
+            onClick={handleStopGateway}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "stop" ? "停止中…" : "停止网关"}
+          </button>
+        )}
+      </div>
+      {actionMessage ? <p className="setup-action-hint">{actionMessage}</p> : null}
+    </div>
+  );
+
+  const setupPreviewBlock = (
+    <div className="setup-preview-wrap">
+      <div className="setup-preview">
+        <div className="setup-preview-header">
+          <span>配置预览 (JSON)</span>
+          <div className="setup-preview-actions">
+            <button
+              type="button"
+              className="setup-preview-copy"
+              onClick={() => setPreviewCollapsed((prev) => !prev)}
+            >
+              {previewCollapsed ? "展开" : "折叠"}
+            </button>
+            <button
+              type="button"
+              className="setup-preview-copy"
+              onClick={() => {
+                void navigator.clipboard.writeText(jsonPreview);
+                setActionMessage("配置已复制到剪贴板。");
+              }}
+            >
+              复制
+            </button>
           </div>
         </div>
+        {!previewCollapsed ? (
+          <pre className="setup-preview-content">{jsonPreview}</pre>
+        ) : null}
+      </div>
+    </div>
+  );
 
-        <nav className="flex-1 space-y-2">
+  const setupMainInner = (
+    <>
+      {!embedded ? (
+        <div className="setup-header setup-header--legacy mb-10">
+          <img src={omninovalLogo} alt="" className="setup-logo-frame" />
+          <div className="setup-brand-copy">
+            <div className="setup-chip">OmniNova Claw</div>
+            <h1 className="setup-title">智能助手配置中心</h1>
+            <p className="setup-subtitle">
+              设置你的 AI 模型、渠道连接与扩展技能
+            </p>
+          </div>
+        </div>
+      ) : (
+        <header className="setup-embed-hero">
+          <h1 className="setup-embed-title">{meta.title}</h1>
+          <p className="setup-embed-sub">{meta.subtitle}</p>
+        </header>
+      )}
+
+      {renderTabContent()}
+
+      {embedded ? gatewayActions : null}
+
+      {setupPreviewBlock}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div className="setup-page setup-page--embedded">{setupMainInner}</div>
+    );
+  }
+
+  return (
+    <div className="setup-page setup-page--standalone">
+      <aside className="setup-standalone-sidebar">
+        <div className="setup-standalone-brand">
+          <img src={omninovalLogo} alt="" className="setup-standalone-logo" />
+          <div>
+            <div className="setup-standalone-kicker">OmniNova</div>
+            <div className="setup-standalone-name">Claw 控制面</div>
+          </div>
+        </div>
+        <nav className="setup-standalone-nav">
           {setupTabs.map((tab) => (
             <button
               key={tab.id}
+              type="button"
+              className={`setup-standalone-nav-item ${
+                activeTab === tab.id ? "is-active" : ""
+              }`}
               onClick={() => setActiveTab(tab.id)}
-              style={{
-                width: '100%',
-                textAlign: 'left',
-                padding: '12px 16px',
-                borderRadius: '12px',
-                backgroundColor: activeTab === tab.id ? 'rgba(80, 120, 220, 0.18)' : 'transparent',
-                border: 'none',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '12px',
-                color: activeTab === tab.id ? '#3a4aaa' : 'rgba(60, 70, 120, 0.70)',
-                cursor: 'pointer',
-                transition: 'all 0.2s'
-              }}
             >
               <span>{tab.icon}</span>
-              <span className="font-medium">{tab.label}</span>
+              <span>{tab.label}</span>
             </button>
           ))}
         </nav>
-
-        <div className="mt-auto pt-6 space-y-3 border-t border-gray-200">
-          <div className="flex items-center gap-3 px-2 py-2 mb-2">
-            <div className={`w-3 h-3 rounded-full ${gatewayStatus.running ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500'}`} />
-            <span className="text-sm font-medium opacity-70">
-              网关{gatewayStatus.running ? '运行中' : '已停止'}
-            </span>
+        <div className="setup-standalone-foot">
+          <div className="setup-gateway-pill">
+            <span
+              className={`setup-gateway-dot ${gatewayStatus.running ? "is-on" : "is-off"}`}
+            />
+            <span>网关 {gatewayStatus.running ? "运行中" : "已停止"}</span>
           </div>
-
           <button
-            className="w-full py-3 bg-white hover:bg-gray-50 text-gray-700 rounded-xl font-medium border border-gray-200 transition-all cursor-pointer shadow-sm"
+            type="button"
+            className="setup-btn setup-btn--secondary setup-btn--block"
             onClick={handleSaveConfig}
             disabled={busyAction !== null}
           >
-            {busyAction === "save" ? "保存中..." : "保存配置"}
+            {busyAction === "save" ? "保存中…" : "保存配置"}
           </button>
-
           {!gatewayStatus.running ? (
             <button
-              className="w-full py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-bold shadow-sm transition-all cursor-pointer"
+              type="button"
+              className="setup-btn setup-btn--primary setup-btn--block"
               onClick={handleSaveAndStartGateway}
               disabled={busyAction !== null}
             >
-              {busyAction === "start" ? "启动中..." : "保存并启动网关"}
+              {busyAction === "start" ? "启动中…" : "保存并启动网关"}
             </button>
           ) : (
             <button
-              className="w-full py-3 bg-white hover:bg-gray-50 text-red-500 rounded-xl font-medium border border-red-200 transition-all cursor-pointer"
+              type="button"
+              className="setup-btn setup-btn--danger setup-btn--block"
               onClick={handleStopGateway}
               disabled={busyAction !== null}
             >
-              {busyAction === "stop" ? "停止中..." : "停止网关"}
+              {busyAction === "stop" ? "停止中…" : "停止网关"}
             </button>
           )}
-
-          {actionMessage && (
-            <div className="mt-4 p-3 bg-gray-50 rounded-lg text-xs opacity-60 text-center italic">
-              {actionMessage}
-            </div>
-          )}
+          {actionMessage ? (
+            <p className="setup-action-hint">{actionMessage}</p>
+          ) : null}
         </div>
       </aside>
-
-      {/* Main Content */}
-      <main style={{ flex: 1, overflowY: 'auto', padding: '40px 48px', backgroundColor: '#f4f5f7' }}>
-        <div style={{ maxWidth: '860px', margin: '0 auto' }}>
-          <div className="setup-header mb-10">
-            <img src={omninovalLogo} alt="Logo" className="setup-logo-frame" />
-            <div className="ml-5">
-              <div className="setup-chip mb-3">OmniNova Claw</div>
-              <h1 style={{ fontSize: '1.8em', fontWeight: 700, color: '#1a1a2e', lineHeight: 1.2 }}>
-                智能助手配置中心
-              </h1>
-              <p style={{ marginTop: '8px', color: 'rgba(60,70,120,0.72)', fontSize: '0.95em' }}>
-                设置你的 AI 模型、渠道连接与扩展技能
-              </p>
-            </div>
-          </div>
-          {renderTabContent()}
-          
-          <div className="mt-12 pt-8 border-t border-gray-200">
-            <div className="setup-preview">
-              <div className="setup-preview-header">
-                <span>配置预览 (JSON)</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    className="setup-preview-copy"
-                    onClick={() => {
-                      setPreviewCollapsed((prev) => !prev);
-                    }}
-                  >
-                    {previewCollapsed ? "展开" : "折叠"}
-                  </button>
-                  <button
-                    className="setup-preview-copy"
-                    onClick={() => {
-                      navigator.clipboard.writeText(jsonPreview);
-                      setActionMessage("配置已复制到剪贴板。");
-                    }}
-                  >
-                    复制
-                  </button>
-                </div>
-              </div>
-              {!previewCollapsed ? (
-                <pre className="setup-preview-content">{jsonPreview}</pre>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      </main>
+      <main className="setup-standalone-main">{setupMainInner}</main>
     </div>
   );
 }

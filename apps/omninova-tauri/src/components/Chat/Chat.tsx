@@ -7,6 +7,8 @@ import type {
   ProviderHealthSummary,
   RouteDecision,
 } from "../../types/config";
+
+const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
 
 const USER_ID = "desktop-user";
@@ -52,7 +54,8 @@ const IM_PLATFORM_OPTIONS = [
 ];
 
 interface ChatProps {
-  onBack: () => void;
+  /** 与侧栏「定时任务」入口同步 */
+  initialSidebarTab?: SidebarTab;
 }
 
 function formatTime(date: Date) {
@@ -81,12 +84,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-export function Chat({ onBack }: ChatProps) {
+export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [avatars, setAvatars] = useState<AvatarSession[]>([
-    { id: "main", name: "OmniNova", sessionId: "omninova-chat-session", lastAt: formatTime(new Date()) },
+    { id: "main", name: "Main", sessionId: "omninova-chat-session", lastAt: formatTime(new Date()) },
   ]);
   const [activeAvatarId, setActiveAvatarId] = useState("main");
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("avatars");
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>(initialSidebarTab);
   const [channels, setChannels] = useState<ImChannelEntry[]>([]);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskEntry[]>([]);
   const [newChannelName, setNewChannelName] = useState("");
@@ -101,6 +104,7 @@ export function Chat({ onBack }: ChatProps) {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
+  const [gatewayUrl, setGatewayUrl] = useState<string>("");
   const [availableModels] = useState<string[]>(["auto", "openai", "anthropic", "gemini", "ollama"]);
   const [selectedModel, setSelectedModel] = useState("auto");
   const listEndRef = useRef<HTMLDivElement>(null);
@@ -115,8 +119,12 @@ export function Chat({ onBack }: ChatProps) {
   );
 
   useEffect(() => {
+    setSidebarTab(initialSidebarTab);
+  }, [initialSidebarTab]);
+
+  useEffect(() => {
     void refreshGatewayStatus();
-    const t = setInterval(refreshGatewayStatus, 8000);
+    const t = setInterval(refreshGatewayStatus, GATEWAY_STATUS_POLL_MS);
     return () => clearInterval(t);
   }, []);
 
@@ -133,8 +141,10 @@ export function Chat({ onBack }: ChatProps) {
   const refreshGatewayStatus = async () => {
     try {
       const status = await invokeTauri<GatewayStatus>("gateway_status");
+      setGatewayUrl(status.url ?? "");
       setGatewayStatus(status.running ? "connected" : "disconnected");
     } catch {
+      setGatewayUrl("");
       setGatewayStatus("disconnected");
     }
   };
@@ -198,7 +208,7 @@ export function Chat({ onBack }: ChatProps) {
     if (!text || sending) return;
 
     if (gatewayStatus !== "connected") {
-      setError("网关未连接，请先在配置页启动网关后再发送消息");
+      setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
       return;
     }
 
@@ -302,42 +312,39 @@ export function Chat({ onBack }: ChatProps) {
 
   const statusText =
     gatewayStatus === "connected"
-      ? "Gateway 已连接"
+      ? "gateway 已连接"
       : gatewayStatus === "connecting"
-      ? "正在恢复连接…"
-      : "等待 Gateway 连接…";
+      ? "gateway 正在恢复"
+      : "gateway 未连接";
+
+  const gatewayPort = (() => {
+    try {
+      const u = new URL(gatewayUrl || "http://127.0.0.1:10809");
+      return u.port || (u.protocol === "https:" ? "443" : "80");
+    } catch {
+      return "—";
+    }
+  })();
+
+  const quickPrompts = [
+    { label: "处理任务", text: "请帮我处理当前工作区中的任务，并给出可执行步骤。" },
+    { label: "持续执行", text: "请持续执行直到任务完成，中途如需确认请说明。" },
+    { label: "多智能体并行", text: "请说明如何在本机配置多 Agent 并行与路由。" },
+  ];
 
   return (
     <div className="chat-layout">
-      <header className="chat-topbar">
-        <div className="chat-topbar-left">
-          <img src={omninovalLogo} alt="" className="chat-topbar-logo" />
-          <span className="chat-topbar-title">OmniNova Claw</span>
-          {sending && (
-            <span className="chat-topbar-typing">
-              正在输入中 ({elapsedSec}s)
-            </span>
-          )}
-        </div>
-        <div className="chat-topbar-right">
-          <button
-            type="button"
-            className="chat-topbar-icon-btn"
-            onClick={onBack}
-            title="配置"
-          >
-            配置
-          </button>
-          <span className={`chat-topbar-status chat-topbar-status--${gatewayStatus}`}>
-            {statusText}
-          </span>
-        </div>
-      </header>
-
       <div className="chat-body">
         <aside className="chat-sidebar">
+          <button
+            type="button"
+            className="chat-new-chat-pill"
+            onClick={handleAddAvatar}
+          >
+            + 新对话
+          </button>
           <section className="chat-sidebar-section">
-            <h3 className="chat-sidebar-heading">分身</h3>
+            <h3 className="chat-sidebar-heading">会话</h3>
             <ul className="chat-avatar-list">
               {avatars.map((a) => (
                 <li key={a.id}>
@@ -353,13 +360,6 @@ export function Chat({ onBack }: ChatProps) {
                 </li>
               ))}
             </ul>
-            <button
-              type="button"
-              className="chat-new-avatar"
-              onClick={handleAddAvatar}
-            >
-              + 新分身
-            </button>
           </section>
           <nav className="chat-sidebar-tabs">
             <button
@@ -462,21 +462,52 @@ export function Chat({ onBack }: ChatProps) {
         </aside>
 
         <main className="chat-main">
-          <div className="chat-connection-line">
-            {gatewayStatus === "connecting" && "正在恢复连接…"}
-            {gatewayStatus === "connected" && "已连接"}
-            {gatewayStatus === "disconnected" && (
-              <span className="chat-warn-text">
-                未连接 — 请先在配置页启动网关
+          <div className="chat-main-toolbar">
+            <div className="chat-main-toolbar-spacer" />
+            <div className="chat-target-pill">
+              <span className="chat-target-pill-icon" aria-hidden>
+                <img src={omninovalLogo} alt="" />
               </span>
-            )}
+              <span className="chat-target-pill-text">
+                当前对话对象：{activeSession?.name ?? "Main"}
+              </span>
+            </div>
+            <div className="chat-main-toolbar-actions">
+              <button
+                type="button"
+                className="chat-icon-btn"
+                title="刷新网关状态"
+                onClick={() => void refreshGatewayStatus()}
+              >
+                ↻
+              </button>
+              {sending ? (
+                <span className="chat-typing-badge">
+                  正在回复 {elapsedSec}s
+                </span>
+              ) : null}
+            </div>
           </div>
 
           <div className="chat-messages">
             {messages.length === 0 ? (
-              <div className="chat-welcome">
-                <p>输入消息开始与 {activeSession?.name ?? "OmniNova"} 对话。</p>
-                <p>按 Enter 发送，Shift+Enter 换行。</p>
+              <div className="chat-hero">
+                <h1 className="chat-hero-title">我能为你做些什么？</h1>
+                <p className="chat-hero-sub">
+                  与 {activeSession?.name ?? "Main"} 对话，或通过侧栏管理频道与定时任务。
+                </p>
+                <div className="chat-quick-pills">
+                  {quickPrompts.map((q) => (
+                    <button
+                      key={q.label}
+                      type="button"
+                      className="chat-quick-pill"
+                      onClick={() => setInput(q.text)}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             ) : (
               messages.map((msg, i) => (
@@ -515,53 +546,73 @@ export function Chat({ onBack }: ChatProps) {
             </div>
           )}
 
-          <div className="chat-footer">
-            <span className="chat-footer-status">{statusText}</span>
-            <select
-              className="chat-model-select"
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              title="选择模型"
-            >
-              {availableModels.map((m) => (
-                <option key={m} value={m}>
-                  {m === "auto" ? "🤖 自动选择" : `⚡ ${m.toUpperCase()}`}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="chat-input-row">
-            <textarea
-              className="chat-input"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={
-                gatewayStatus === "connected"
-                  ? "输入消息..."
-                  : "网关未连接，请先启动网关..."
-              }
-              rows={1}
-              disabled={sending || gatewayStatus !== "connected"}
-            />
-            {sending ? (
+          <div className="chat-composer-wrap">
+            <div className="chat-input-row">
               <button
                 type="button"
-                className="chat-cancel-button"
-                onClick={handleCancel}
+                className="chat-attach-btn"
+                title="附件（即将支持）"
+                disabled
               >
-                取消
+                <span aria-hidden>📎</span>
               </button>
-            ) : (
-              <button
-                type="button"
-                className="chat-send-button"
-                onClick={() => void handleSend()}
-                disabled={!input.trim() || gatewayStatus !== "connected"}
+              <textarea
+                className="chat-input"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  gatewayStatus === "connected"
+                    ? "输入消息，Enter 发送…"
+                    : "网关未连接…"
+                }
+                rows={1}
+                disabled={sending || gatewayStatus !== "connected"}
+              />
+              {sending ? (
+                <button
+                  type="button"
+                  className="chat-cancel-button"
+                  onClick={handleCancel}
+                >
+                  取消
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="chat-send-fab"
+                  onClick={() => void handleSend()}
+                  disabled={!input.trim() || gatewayStatus !== "connected"}
+                  aria-label="发送"
+                >
+                  ↑
+                </button>
+              )}
+            </div>
+            <div className="chat-composer-meta">
+              <select
+                className="chat-model-select"
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                title="模型"
               >
-                发送
-              </button>
-            )}
+                {availableModels.map((m) => (
+                  <option key={m} value={m}>
+                    {m === "auto" ? "自动模型" : m}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="chat-gateway-footer">
+              <span
+                className={`chat-gateway-dot chat-gateway-dot--${gatewayStatus}`}
+                aria-hidden
+              />
+              <span className="chat-gateway-footer-text">
+                {statusText} · port: {gatewayPort}
+                {gatewayUrl ? ` · ${gatewayUrl}` : ""}
+              </span>
+            </div>
           </div>
         </main>
       </div>

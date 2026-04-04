@@ -104,6 +104,7 @@ OmniNova Claw follows a modular workspace structure:
 
 ```text
 omninovalclaw/
+├── skills/                  # Bundled SKILL.md packs (import into workspace)
 ├── apps/
 │   └── omninova-tauri/      # Desktop Frontend (React 19 + TypeScript) & Tauri Config
 │       ├── src/             # UI Components (Setup, Chat, Console)
@@ -130,7 +131,7 @@ OmniNova Claw uses a `config.toml` file for configuration, which can be managed 
 The Desktop App provides a **Setup Wizard** to easily configure:
 - **Providers**: API Keys and Base URLs.
 - **Channels**: Bot tokens and Webhook secrets.
-- **Skills**: Enable/Disable Open Skills and set import paths.
+- **Skills**: Enable/Disable Open Skills and set import paths. Bundled examples live under `skills/` (e.g. **financial-analysis**, **financial-valuation**, **quantitative-research**, **quantitative-backtest**); run `omninova skills import --from ./skills` from the repo root to copy them into the default skills directory.
 - **Persona**: Define your agent's system prompt and behavior.
 
 ## 📦 Releases
