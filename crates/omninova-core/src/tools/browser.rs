@@ -1,6 +1,7 @@
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::io::ErrorKind;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -16,6 +17,27 @@ pub struct BrowserTool {
     attach_only: bool,
     cdp_url: Option<String>,
     session: Option<String>,
+}
+
+fn explain_agent_browser_spawn_error(e: std::io::Error) -> anyhow::Error {
+    let bin = BrowserTool::resolve_agent_browser_bin();
+    match e.kind() {
+        ErrorKind::NotFound => anyhow::anyhow!(
+            "未找到浏览器自动化 CLI「{}」({})。\
+             请在终端执行：npm install -g agent-browser && agent-browser install（下载 Chromium）；\
+             或将可执行文件路径写入环境变量 {}。\
+             若暂不需要浏览器能力，请在配置中将 [browser] enabled 设为 false。",
+            bin,
+            e,
+            EMBEDDED_AGENT_BROWSER_BIN_ENV
+        ),
+        ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "无权限执行「{}」：{}。请检查可执行权限、隔离目录或 Gatekeeper。",
+            bin,
+            e
+        ),
+        _ => anyhow::anyhow!("failed to execute agent-browser ({bin}): {e}"),
+    }
 }
 
 impl BrowserTool {
@@ -103,7 +125,7 @@ impl BrowserTool {
         )
         .await
         .map_err(|_| anyhow::anyhow!("agent-browser command timed out after {DEFAULT_TIMEOUT_SECS}s"))?
-        .map_err(|e| anyhow::anyhow!("failed to execute agent-browser: {e}"))?;
+        .map_err(explain_agent_browser_spawn_error)?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -126,14 +148,10 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a headless browser via agent-browser CLI. Supports: open (navigate to URL), \
-         snapshot (get accessibility tree with element refs), click (click element by ref or selector), \
-         fill (fill input by ref or selector), type (type text), screenshot (capture page), \
-         get_text (get element text), get_html (get element HTML), get_url (current URL), \
-         get_title (page title), wait (wait for element/text/time), scroll (scroll page), \
-         select (select dropdown option), press (press keyboard key), eval (run JavaScript), \
-         close (close browser). Use snapshot first to discover element refs (@e1, @e2, etc.), \
-         then interact using those refs."
+        "Control a headless browser via the agent-browser CLI (must be on PATH; run `npm i -g agent-browser && agent-browser install`). \
+         Supports: open (navigate to URL), snapshot (get accessibility tree with element refs), click, fill, type, screenshot, \
+         get_text, get_html, get_url, get_title, wait, scroll, select, press, eval, close, etc. \
+         Use snapshot first to discover element refs (@e1, @e2, …). If the CLI is missing, disable [browser] in config or set OMNINOVA_AGENT_BROWSER_BIN."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -374,15 +392,33 @@ impl Tool for BrowserTool {
 
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         match self.run_agent_browser(&str_args).await {
-            Ok((success, output)) => Ok(ToolResult {
-                success,
-                output,
-                error: if success {
+            Ok((success, output)) => {
+                let error = if success {
                     None
                 } else {
-                    Some("browser command returned non-zero exit code".into())
-                },
-            }),
+                    let hint = if output.contains("not found")
+                        || output.contains("command not found")
+                        || output.contains("ENOENT")
+                    {
+                        format!(
+                            "agent-browser 执行失败（非零退出）。输出可能表明未安装 CLI：{}\n\
+                             安装：npm install -g agent-browser && agent-browser install",
+                            output.chars().take(800).collect::<String>()
+                        )
+                    } else {
+                        format!(
+                            "agent-browser 返回非零退出码。stderr/stdout 摘要：{}",
+                            output.chars().take(1200).collect::<String>()
+                        )
+                    };
+                    Some(hint)
+                };
+                Ok(ToolResult {
+                    success,
+                    output,
+                    error,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),

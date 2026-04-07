@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>OmniNova Claw 需要访问摄像头以在对话界面中预览与视频交互。</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>OmniNova Claw 需要访问麦克风以进行语音输入与音量指示。</string>
+</dict>
+</plist>

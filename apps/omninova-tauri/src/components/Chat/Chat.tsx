@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { invokeTauri } from "../../utils/tauri";
 import type {
   GatewayHealth,
@@ -310,6 +311,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     }
   };
 
+  const appendVoiceTranscript = useCallback((text: string) => {
+    setInput((prev) => (prev.trim() ? `${prev} ${text}` : text));
+  }, []);
+
   const statusText =
     gatewayStatus === "connected"
       ? "gateway 已连接"
@@ -547,6 +552,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           )}
 
           <div className="chat-composer-wrap">
+            <ChatMediaInteraction
+              appendTranscript={appendVoiceTranscript}
+              disabled={sending || gatewayStatus !== "connected"}
+            />
             <div className="chat-input-row">
               <button
                 type="button"
