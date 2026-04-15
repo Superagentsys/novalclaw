@@ -50,10 +50,45 @@ OmniNova Claw 实现了精密的三层认知记忆架构：
 
 ## 🚀 快速开始
 
+### 无桌面环境（Linux / Unix、SSH、服务器）
+
+**不依赖** Tauri 桌面与 Node.js，也**无需**安装 `libwebkit2gtk` 等桌面库；仅需 **Rust 工具链**。在仓库根目录 `omninovalclaw/` 执行：
+
+```bash
+cargo build -p omninova-core --release --bin omninova
+cp target/release/omninova ~/.local/bin/   # 或加入 PATH
+omninova doctor
+omninova setup          # 或 omninova configure
+omninova gateway run    # 前台启动网关（Ctrl+C 结束）
+```
+
+**后台常驻（与 `omninova gateway` 等价）**：下列命令均使用**当前 `omninova` 可执行文件**注册服务，请先将其放到稳定路径（如 `~/.local/bin/omninova`）再执行 `daemon install`。
+
+- **Linux**：**systemd 用户单元**（无需 root），单元文件在 `~/.config/systemd/user/omninova-gateway.service`，日志可用 `journalctl --user -u omninova-gateway.service`。
+
+```bash
+omninova daemon install
+omninova daemon status
+```
+
+- **macOS**：**launchd 用户代理**，plist 在 `~/Library/LaunchAgents/com.omninova.gateway.plist`，标签为 `com.omninova.gateway`；标准输出/错误默认写入 `/tmp/omninova-gateway.out.log` 与 `/tmp/omninova-gateway.err.log`。
+
+```bash
+omninova daemon install
+omninova daemon status
+launchctl list com.omninova.gateway   # 可选：查看是否已加载
+```
+
+- **Windows**：`omninova daemon install` 会通过**任务计划程序**注册网关卡；详见 `omninova daemon check` 与 `omninova doctor`。
+
+配置默认在 **`~/.omninova/config.toml`**，也可用环境变量 **`OMNINOVA_CONFIG_DIR`** 指定配置目录。其余子命令（`agent`、`skills`、`channels`、`cron` 等）与带桌面版相同。
+
 ### 前置要求
 - **Rust**: 最新稳定版 (`rustup update`)
-- **Node.js**: 版本 22+ (`node -v`)
-- **系统依赖**:
+- **仅命令行 / 无桌面**：仅安装 Rust 即可；**不需要** Node.js。
+- **构建桌面应用（Tauri）时另需**:
+  - **Node.js**: 版本 22+ (`node -v`)
+- **系统依赖**（仅构建或运行 **桌面应用** 时需要）:
   - **Linux**: `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`
   - **Windows**: Microsoft Visual Studio C++ Build Tools
 
@@ -85,6 +120,12 @@ OmniNova Claw 实现了精密的三层认知记忆架构：
     ```
     构建产物将生成在 `apps/omninova-tauri/src-tauri/target/release/bundle/` 目录下。
 
+### 桌面应用行为（常驻进程与 `omninova` 命令）
+
+与 **Ollama** 类似：安装后应用**常驻后台**，关闭主窗口不会退出进程（退到**系统托盘**），网关仍在本机端口运行；从托盘选择「退出」才会结束进程。Dock/任务栏再次打开应用会恢复主窗口。
+
+**命令行 `omninova`（全平台）**：若构建前已在工作区编译过 `omninova` 二进制，打包时会将其复制到 `src-tauri/resources/cli/` 并随安装包分发。在桌面应用 **通用设置** 中可使用 **「安装 / 更新 omninova 到 PATH」**：无需管理员权限，会将 CLI 复制到用户目录并写入 PATH——**macOS / Linux** 为 `~/.local/bin/`，**Windows** 为 `%LOCALAPPDATA%\omninova\bin\`（并更新用户级 PATH）。也可手动将该目录加入 PATH，或在 macOS/Linux 下软链到 `/usr/local/bin`（需管理员）。未随包带上时，仍可在仓库根目录执行 `cargo build -p omninova-core --bin omninova`，将 `target/release/omninova` 自行加入 PATH。
+
 ## 🏗️ 架构
 
 OmniNova Claw 采用模块化的工作区结构：
@@ -112,13 +153,13 @@ omninovalclaw/
 
 OmniNova Claw 使用 `config.toml` 文件进行配置，可以通过桌面 UI 管理或手动编辑。
 
-- **配置位置**: `~/.omninoval/config.toml` (默认)
+- **配置位置**: `~/.omninova/config.toml` (默认)
 - **环境变量**: 可以覆盖配置设置 (例如 `OMNINOVA_OPENAI_API_KEY`)。
 
 桌面应用提供了 **设置向导 (Setup Wizard)** 以便轻松配置：
 - **供应商 (Providers)**: API Key 和 Base URL。
 - **渠道 (Channels)**: 机器人 Token 和 Webhook 密钥。
-- **技能 (Skills)**: 启用/禁用 Open Skills 并设置导入路径。仓库内置示例见 `skills/`（含 **金融分析** `financial-analysis`、**估值** `financial-valuation`、**量化研究** `quantitative-research`、**量化回测** `quantitative-backtest`）；可在仓库根目录执行 `omninova skills import --from ./skills` 导入到默认技能目录。
+- **技能 (Skills)**: 启用/禁用 Open Skills 并设置导入路径。仓库内置示例见 `skills/`（含 **金融分析** `financial-analysis`、**估值** `financial-valuation`、**量化研究** `quantitative-research`、**量化回测** `quantitative-backtest`、**渗透评估** `penetration-assessment`）；可在仓库根目录执行 `omninova skills import --from ./skills` 导入到默认技能目录。
 - **人设 (Persona)**: 定义 Agent 的系统提示词和行为。
 
 ### 浏览器自动化（agent-browser）

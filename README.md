@@ -50,10 +50,45 @@ OmniNova Claw implements a sophisticated cognitive architecture with three disti
 
 ## 🚀 Getting Started
 
+### Headless / no desktop (Linux, Unix, SSH, servers)
+
+You do **not** need Tauri, Node.js, or desktop libraries such as `libwebkit2gtk`—only **Rust**. From the repo root `omninovalclaw/`:
+
+```bash
+cargo build -p omninova-core --release --bin omninova
+cp target/release/omninova ~/.local/bin/   # or add target/release to PATH
+omninova doctor
+omninova setup          # or omninova configure
+omninova gateway run    # foreground gateway (Ctrl+C to stop)
+```
+
+**Background service** (equivalent to a long-running `omninova gateway`): commands below register the service using the **current `omninova` binary**—put it on a stable path (e.g. `~/.local/bin/omninova`) before `daemon install`.
+
+- **Linux**: **systemd user unit** (no root). Unit file: `~/.config/systemd/user/omninova-gateway.service`. Logs: `journalctl --user -u omninova-gateway.service`.
+
+```bash
+omninova daemon install
+omninova daemon status
+```
+
+- **macOS**: **launchd user agent**. Plist: `~/Library/LaunchAgents/com.omninova.gateway.plist`, label `com.omninova.gateway`. Default stdout/stderr: `/tmp/omninova-gateway.out.log` and `/tmp/omninova-gateway.err.log`.
+
+```bash
+omninova daemon install
+omninova daemon status
+launchctl list com.omninova.gateway   # optional: see if loaded
+```
+
+- **Windows**: `omninova daemon install` registers via **Task Scheduler**; use `omninova daemon check` and `omninova doctor` for details.
+
+Config defaults to **`~/.omninova/config.toml`**; override with **`OMNINOVA_CONFIG_DIR`** if needed. All other CLI commands (`agent`, `skills`, `channels`, etc.) work the same as with the desktop app.
+
 ### Prerequisites
 - **Rust**: Latest stable version (`rustup update`)
-- **Node.js**: Version 22+ (`node -v`)
-- **System Dependencies**:
+- **CLI-only / headless**: Rust only; **Node.js is not required**.
+- **Desktop (Tauri) builds also require**:
+  - **Node.js**: Version 22+ (`node -v`)
+- **System dependencies** (only for **building or running the desktop app**):
   - **Linux**: `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`
   - **Windows**: Microsoft Visual Studio C++ Build Tools
 
@@ -125,13 +160,13 @@ omninovalclaw/
 
 OmniNova Claw uses a `config.toml` file for configuration, which can be managed via the Desktop UI or edited manually.
 
-- **Config Location**: `~/.omninoval/config.toml` (default)
+- **Config Location**: `~/.omninova/config.toml` (default)
 - **Environment Variables**: Can override config settings (e.g., `OMNINOVA_OPENAI_API_KEY`).
 
 The Desktop App provides a **Setup Wizard** to easily configure:
 - **Providers**: API Keys and Base URLs.
 - **Channels**: Bot tokens and Webhook secrets.
-- **Skills**: Enable/Disable Open Skills and set import paths. Bundled examples live under `skills/` (e.g. **financial-analysis**, **financial-valuation**, **quantitative-research**, **quantitative-backtest**); run `omninova skills import --from ./skills` from the repo root to copy them into the default skills directory.
+- **Skills**: Enable/Disable Open Skills and set import paths. Bundled examples live under `skills/` (e.g. **financial-analysis**, **financial-valuation**, **quantitative-research**, **quantitative-backtest**, **penetration-assessment**); run `omninova skills import --from ./skills` from the repo root to copy them into the default skills directory.
 - **Persona**: Define your agent's system prompt and behavior.
 
 ## 📦 Releases

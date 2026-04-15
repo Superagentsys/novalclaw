@@ -1,3 +1,5 @@
+mod cli_install;
+
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig, ChannelsConfig, ChannelEntry};
 use omninova_core::gateway::{
@@ -13,7 +15,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::AppHandle;
 use tauri::Manager;
+use tauri::WindowEvent;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -574,11 +580,8 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
     }
 }
 
-#[tauri::command]
-async fn start_gateway(
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<GatewayStatusPayload, String> {
-    let state_ref = state.inner().clone();
+/// 启动本机 HTTP 网关（与 `omninova` CLI 使用同一配置与端口，便于后台常驻后命令行调用）。
+async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayStatusPayload, String> {
     sync_gateway_task_state(&state_ref).await;
     let runtime = {
         let app_state = state_ref.lock().await;
@@ -620,12 +623,30 @@ async fn start_gateway(
 }
 
 #[tauri::command]
+async fn start_gateway(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayStatusPayload, String> {
+    let state_ref = state.inner().clone();
+    start_gateway_inner(state_ref).await
+}
+
+#[tauri::command]
 async fn stop_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
     stop_gateway_inner(&state_ref).await;
     Ok(gateway_status_from_state(&state_ref).await)
+}
+
+#[tauri::command]
+fn cli_install_status(app: AppHandle) -> Result<cli_install::CliInstallStatus, String> {
+    cli_install::cli_install_status(&app)
+}
+
+#[tauri::command]
+fn cli_install_to_user_path(app: AppHandle) -> Result<String, String> {
+    cli_install::install_omninova_cli(&app)
 }
 
 #[tauri::command]
@@ -1167,7 +1188,7 @@ pub fn run() {
         last_gateway_error: None,
     }));
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -1187,18 +1208,75 @@ pub fn run() {
             install_browser_dep,
             start_gateway,
             stop_gateway,
+            cli_install_status,
+            cli_install_to_user_path,
             import_skills,
             skills_package_summary,
         ])
-        .setup(|_app| {
-            configure_embedded_agent_browser_env(_app.handle());
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .setup(|app| {
+            configure_embedded_agent_browser_env(app.handle());
+
+            let state = app.state::<Arc<Mutex<AppState>>>().inner().clone();
+
+            // 安装后常驻：启动即拉起网关，便于终端 `omninova` / HTTP 客户端连接本机端口（与 Ollama 常驻类似）。
+            let state_autostart = state.clone();
+            tauri::async_runtime::spawn(async move {
+                sleep(Duration::from_millis(500)).await;
+                match start_gateway_inner(state_autostart).await {
+                    Ok(s) => eprintln!("[gateway] background started: {}", s.url),
+                    Err(e) => eprintln!("[gateway] auto-start failed: {e}"),
+                }
+            });
+
+            let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出 OmniNova Claw", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
+
+            let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("OmniNova Claw — 后台运行中");
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            let _tray = tray
+                .on_menu_event(move |app, event| {
+                    match event.id().as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
             #[cfg(debug_assertions)]
             {
-                let window = _app.get_webview_window("main").unwrap();
+                let window = app.get_webview_window("main").unwrap();
                 window.open_devtools();
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            if let Some(w) = app_handle.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }
+    });
 }

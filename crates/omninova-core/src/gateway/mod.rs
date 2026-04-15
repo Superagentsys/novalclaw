@@ -1881,6 +1881,7 @@ async fn http_api_doctor(
     Ok(Json(serde_json::json!({
         "ok": all_ok,
         "checks": checks,
+        "penetration_assessment": crate::security::penetration_playbook::build_playbook_payload(),
     })))
 }
 

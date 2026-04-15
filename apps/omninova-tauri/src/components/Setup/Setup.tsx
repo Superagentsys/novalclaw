@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
@@ -47,6 +47,16 @@ const initialConfig: Config = {
 };
 
 export type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
+
+interface CliInstallStatus {
+  bundledAvailable: boolean;
+  bundledPath: string | null;
+  installDir: string;
+  installedPath: string | null;
+  installedSameAsBundle: boolean;
+  onPath: boolean;
+  hint: string;
+}
 type SetupTabItem = {
   id: SetupTab;
   label: string;
@@ -112,6 +122,8 @@ export function Setup({
     "load" | "save" | "start" | "stop" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
+  const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
+  const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
     () => config.providers.filter((provider) => provider.enabled),
     [config.providers]
@@ -191,9 +203,24 @@ export function Setup({
       ? `${config.default_provider}::${config.default_model}`
       : "";
 
+  const refreshCliInstall = useCallback(async () => {
+    try {
+      const s = await invokeTauri<CliInstallStatus>("cli_install_status");
+      setCliInstall(s);
+    } catch {
+      setCliInstall(null);
+    }
+  }, []);
+
   useEffect(() => {
     void loadSetupState();
   }, []);
+
+  useEffect(() => {
+    if (activeTab === "general") {
+      void refreshCliInstall();
+    }
+  }, [activeTab, refreshCliInstall]);
 
   const loadSetupState = async () => {
     setBusyAction("load");
@@ -262,6 +289,21 @@ export function Setup({
       setGatewayStatus(nextGatewayStatus);
     } finally {
       setBusyAction(null);
+    }
+  };
+
+  const handleCliInstall = async () => {
+    setCliBusy(true);
+    try {
+      const msg = await invokeTauri<string>("cli_install_to_user_path");
+      setActionMessage(msg);
+      await refreshCliInstall();
+    } catch (error) {
+      setActionMessage(
+        `CLI 安装失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setCliBusy(false);
     }
   };
 
@@ -403,7 +445,58 @@ export function Setup({
                 </label>
               </div>
             </section>
-            
+
+            <section className="setup-section">
+              <h2>命令行 omninova（全平台）</h2>
+              <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
+                将随应用分发的 CLI 安装到用户目录并写入 PATH，无需管理员权限；效果类似 Ollama 安装后可在终端直接使用
+                <code style={{ margin: "0 0.2em" }}>omninova</code>。
+              </p>
+              {cliInstall ? (
+                <div className="setup-grid">
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <p style={{ margin: "0 0 0.5rem", fontSize: "0.9rem" }}>{cliInstall.hint}</p>
+                    <ul
+                      style={{
+                        margin: "0 0 0.75rem",
+                        paddingLeft: "1.25rem",
+                        fontSize: "0.85rem",
+                        opacity: 0.9,
+                      }}
+                    >
+                      <li>
+                        安装目录：<code>{cliInstall.installDir}</code>
+                      </li>
+                      {cliInstall.bundledAvailable ? (
+                        <li>随包 CLI：已检测到</li>
+                      ) : (
+                        <li>随包 CLI：未检测到（开发构建需先编译 omninova）</li>
+                      )}
+                      {cliInstall.installedPath ? (
+                        <li>
+                          当前已安装：<code>{cliInstall.installedPath}</code>
+                        </li>
+                      ) : null}
+                      <li>
+                        当前会话 PATH 已包含安装目录：
+                        {cliInstall.onPath ? "是" : "否"}
+                      </li>
+                    </ul>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--primary"
+                      disabled={cliBusy || !cliInstall.bundledAvailable}
+                      onClick={() => void handleCliInstall()}
+                    >
+                      {cliBusy ? "安装中…" : "安装 / 更新 omninova 到 PATH"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="setup-action-hint">正在读取 CLI 状态…</p>
+              )}
+            </section>
+
              <RobotConfigForm
                 value={config.robot ?? DEFAULT_ROBOT_CONFIG}
                 onChange={(robot) => setConfig({ ...config, robot })}

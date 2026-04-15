@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default permissions for the app","local":true,"windows":["main"],"permissions":["core:default","shell:default"]}}
+{"default":{"identifier":"default","description":"Default permissions for the app","local":true,"windows":["main"],"permissions":["core:default","shell:default","core:tray:default"]}}

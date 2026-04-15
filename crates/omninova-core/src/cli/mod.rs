@@ -36,7 +36,11 @@ fn cprintln(enabled: bool, msg: &str) {
   omninova gateway status
   omninova --dev gateway run
   omninova doctor
-  omninova --profile work gateway run",
+  omninova --profile work gateway run
+
+Headless server (no desktop):
+  omninova gateway run
+  omninova daemon install    # Linux: systemd user unit; macOS: launchd; Windows: Task Scheduler",
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -206,7 +210,7 @@ pub enum Commands {
         #[arg(value_name = "shell")]
         shell: Option<String>,
     },
-    /// Search the live OmniNova docs.
+    /// Built-in reference & live doc search. Run without args for local quick-reference.
     Docs {
         query: Vec<String>,
     },
@@ -436,15 +440,23 @@ pub enum EstopCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommands {
+    /// Install the gateway service (systemd / launchd / Task Scheduler).
     Install,
+    /// Remove the gateway service.
     Uninstall,
+    /// Start the gateway service.
     Start,
+    /// Stop the gateway service.
     Stop,
+    /// Show gateway service status.
     Status,
+    /// Run preflight checks for daemon readiness.
     Check {
         #[arg(long)]
         strict: bool,
     },
+    /// Print platform-specific paths: service file, logs, config, binary.
+    Info,
 }
 
 #[derive(Debug, Subcommand)]
@@ -688,7 +700,14 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             run_completion(shell.as_deref())
         }
         Commands::Docs { query } => {
+            if query.is_empty() {
+                return Ok(builtin_docs_index(&config));
+            }
             let q = query.join(" ");
+            let q_lower = q.to_lowercase();
+            if let Some(section) = builtin_docs_section(&q_lower, &config) {
+                return Ok(section);
+            }
             open_url(&format!("https://docs.omninova.ai/search?q={}", urlencoding::encode(&q)))?;
             Ok(format!("opened docs for: {}", q))
         }
@@ -933,10 +952,15 @@ async fn run_secrets(cmd: &SecretsCommands, _config: &Config) -> Result<String> 
     }
 }
 
-async fn run_security(cmd: &SecurityCommands, _config: &Config) -> Result<String> {
+async fn run_security(cmd: &SecurityCommands, config: &Config) -> Result<String> {
+    use crate::security::penetration_playbook;
     match cmd {
-        SecurityCommands::Audit => Ok("security audit not yet implemented".to_string()),
-        SecurityCommands::Status => Ok("security status not yet implemented".to_string()),
+        SecurityCommands::Audit => Ok(serde_json::to_string_pretty(
+            &penetration_playbook::build_audit_report(config),
+        )?),
+        SecurityCommands::Status => Ok(serde_json::to_string_pretty(
+            &penetration_playbook::build_status_report(config),
+        )?),
     }
 }
 
@@ -979,6 +1003,7 @@ async fn run_daemon(cmd: &DaemonCommands, config: &Config) -> Result<String> {
         DaemonCommands::Start => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Start))?),
         DaemonCommands::Stop => Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Stop))?),
         DaemonCommands::Status => Ok(serde_json::to_string_pretty(&svc.status_report()?)?),
+        DaemonCommands::Info => Ok(daemon_info(config)),
         DaemonCommands::Check { strict } => {
             let mut report = svc.preflight_report();
             let extra_checks = build_generic_daemon_checks(config);
@@ -1001,6 +1026,77 @@ async fn run_daemon(cmd: &DaemonCommands, config: &Config) -> Result<String> {
             Ok(serde_json::to_string_pretty(&report)?)
         }
     }
+}
+
+fn daemon_info(config: &Config) -> String {
+    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
+    let mut out = String::new();
+    out.push_str("OmniNova Daemon — Platform Info\n");
+    out.push_str("═══════════════════════════════════════════════\n\n");
+
+    out.push_str(&format!("  OS / arch      : {} / {}\n", std::env::consts::OS, std::env::consts::ARCH));
+    out.push_str(&format!("  omninova bin   : {}\n", exe));
+    out.push_str(&format!("  config file    : {}\n", config.config_path.display()));
+    out.push_str(&format!("  workspace dir  : {}\n\n", config.workspace_dir.display()));
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist = home.join("Library/LaunchAgents/com.omninova.gateway.plist");
+        out.push_str("  [macOS — launchd]\n");
+        out.push_str(&format!("  service label  : com.omninova.gateway\n"));
+        out.push_str(&format!("  plist path     : {}\n", plist.display()));
+        out.push_str(&format!("  stdout log     : /tmp/omninova-gateway.out.log\n"));
+        out.push_str(&format!("  stderr log     : /tmp/omninova-gateway.err.log\n\n"));
+        out.push_str("  commands:\n");
+        out.push_str("    omninova daemon install     — create plist + launchctl load\n");
+        out.push_str("    omninova daemon uninstall   — launchctl unload + remove plist\n");
+        out.push_str("    omninova daemon start       — launchctl start\n");
+        out.push_str("    omninova daemon stop        — launchctl stop\n");
+        out.push_str("    launchctl list com.omninova.gateway  — manual status check\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit = home.join(".config/systemd/user/omninova-gateway.service");
+        out.push_str("  [Linux — systemd user unit]\n");
+        out.push_str(&format!("  service name   : omninova-gateway.service\n"));
+        out.push_str(&format!("  unit file      : {}\n", unit.display()));
+        out.push_str(&format!("  journal logs   : journalctl --user -u omninova-gateway.service\n\n"));
+        out.push_str("  commands:\n");
+        out.push_str("    omninova daemon install     — write unit + systemctl enable --now\n");
+        out.push_str("    omninova daemon uninstall   — systemctl disable + remove unit\n");
+        out.push_str("    omninova daemon start       — systemctl --user start\n");
+        out.push_str("    omninova daemon stop        — systemctl --user stop\n");
+        out.push_str("    systemctl --user status omninova-gateway  — manual status\n");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        out.push_str("  [Windows — Task Scheduler]\n");
+        out.push_str(&format!("  task name      : OmniNovaGateway\n"));
+        out.push_str(&format!("  logs           : check Event Viewer or gateway workspace logs\n\n"));
+        out.push_str("  commands:\n");
+        out.push_str("    omninova daemon install     — schtasks /Create\n");
+        out.push_str("    omninova daemon uninstall   — schtasks /Delete\n");
+        out.push_str("    omninova daemon start       — schtasks /Run\n");
+        out.push_str("    omninova daemon stop        — schtasks /End\n");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        out.push_str("  [unsupported platform — use `omninova gateway run` in foreground]\n");
+    }
+
+    out.push_str("\n\n  common:\n");
+    out.push_str("    omninova daemon status      — query running state\n");
+    out.push_str("    omninova daemon check       — preflight diagnostics\n");
+    out.push_str("    omninova gateway run        — foreground (no daemon)\n");
+
+    out
 }
 
 async fn run_skills(cmd: Option<&SkillsCommands>, config: &Config) -> Result<String> {
@@ -1070,6 +1166,71 @@ async fn kill_port(port: u16) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn builtin_docs_index(config: &Config) -> String {
+    let mut out = String::new();
+    out.push_str("OmniNova CLI — Quick Reference\n");
+    out.push_str("══════════════════════════════════════════════════\n\n");
+    out.push_str("Available offline topics (run `omninova docs <topic>`):\n\n");
+    out.push_str("  daemon      — Background service paths, logs & commands (per-platform)\n");
+    out.push_str("  config      — Configuration file location & env vars\n");
+    out.push_str("  gateway     — Gateway quick-start (foreground & service)\n\n");
+    out.push_str("Or pass any search terms to open the online docs:\n");
+    out.push_str("  omninova docs skills import\n\n");
+    out.push_str("──────────────────────────────────────────────────\n");
+    out.push_str(&builtin_docs_section("config", config).unwrap_or_default());
+    out.push_str("\n──────────────────────────────────────────────────\n");
+    out.push_str(&daemon_info(config));
+    out
+}
+
+fn builtin_docs_section(topic: &str, config: &Config) -> Option<String> {
+    match topic {
+        t if t.starts_with("daemon") || t.starts_with("service") || t.starts_with("launchd")
+            || t.starts_with("systemd") || t.starts_with("plist") || t.starts_with("schtask") =>
+        {
+            Some(daemon_info(config))
+        }
+        t if t.starts_with("config") || t.starts_with("toml") => {
+            let home = home::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+            let default_config = home.join(".omninova/config.toml");
+            let mut s = String::new();
+            s.push_str("OmniNova Configuration\n");
+            s.push_str("═══════════════════════════════════════════════\n\n");
+            s.push_str(&format!("  active config  : {}\n", config.config_path.display()));
+            s.push_str(&format!("  default path   : {}\n", default_config.display()));
+            s.push_str(&format!("  workspace dir  : {}\n\n", config.workspace_dir.display()));
+            s.push_str("  env overrides:\n");
+            s.push_str("    OMNINOVA_CONFIG_DIR   — override config directory\n");
+            s.push_str("    OMNINOVA_WORKSPACE    — override workspace (config inferred)\n");
+            s.push_str("    OMNINOVA_OPENAI_API_KEY, OMNINOVA_ANTHROPIC_API_KEY, …\n\n");
+            s.push_str("  commands:\n");
+            s.push_str("    omninova config file      — show config path\n");
+            s.push_str("    omninova config get <key>  — read a value by dot-key\n");
+            s.push_str("    omninova config set <k> <v> — write a value\n");
+            s.push_str("    omninova config validate  — check for errors / warnings\n");
+            s.push_str("    omninova configure        — interactive wizard\n");
+            Some(s)
+        }
+        t if t.starts_with("gateway") => {
+            let mut s = String::new();
+            s.push_str("OmniNova Gateway\n");
+            s.push_str("═══════════════════════════════════════════════\n\n");
+            s.push_str(&format!("  default host:port : {}:{}\n", config.gateway.host, config.gateway.port));
+            s.push_str(&format!("  config file       : {}\n\n", config.config_path.display()));
+            s.push_str("  foreground:\n");
+            s.push_str("    omninova gateway run              — start with current config\n");
+            s.push_str("    omninova gateway run --port 8080  — custom port\n");
+            s.push_str("    omninova gateway run --force      — kill existing port holder first\n\n");
+            s.push_str("  background (daemon):\n");
+            s.push_str("    omninova daemon install           — register OS service\n");
+            s.push_str("    omninova daemon info              — show service paths & logs\n");
+            s.push_str("    omninova daemon status            — running?\n");
+            Some(s)
+        }
+        _ => None,
+    }
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -1167,7 +1328,11 @@ async fn run_doctor(config: &Config) -> Result<String> {
         }));
     }
     let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
-    Ok(serde_json::to_string_pretty(&serde_json::json!({"ok": all_ok, "checks": checks}))?)
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": all_ok,
+        "checks": checks,
+        "penetration_assessment": crate::security::penetration_playbook::build_playbook_payload(),
+    }))?)
 }
 
 fn build_generic_daemon_checks(config: &Config) -> Vec<GatewayServiceCheckReport> {

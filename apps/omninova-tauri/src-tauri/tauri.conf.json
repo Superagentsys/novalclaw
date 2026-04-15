@@ -35,7 +35,8 @@
     "resources": [
       "resources/agent-browser/macos",
       "resources/agent-browser/linux",
-      "resources/agent-browser/windows"
+      "resources/agent-browser/windows",
+      "resources/cli"
     ]
   }
 }
