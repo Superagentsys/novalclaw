@@ -2,4 +2,6 @@ target/
 /target/
 release-assets
 /release-assets/
+.DS_Store
+apps/omninova-tauri/src-tauri/resources/cli/omninova
 
