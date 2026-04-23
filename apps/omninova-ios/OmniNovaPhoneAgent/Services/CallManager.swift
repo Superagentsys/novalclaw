@@ -1,3 +1,4 @@
+import AVFoundation
 import CallKit
 import Foundation
 
@@ -38,6 +39,7 @@ final class CallManager: NSObject {
     }
 
     /// 向系统报告一通 VoIP 来电。通常由 PushKit 推送触发。
+    /// 若 `autoAnswer == true`，报告完成后立即发起 `CXAnswerCallAction` 自动接听。
     func reportIncomingCall(
         uuid: UUID = UUID(),
         handle: String = "OmniNova Agent",
@@ -48,6 +50,24 @@ final class CallManager: NSObject {
         update.hasVideo = hasVideo
         update.localizedCallerName = handle
         try await provider.reportNewIncomingCall(with: uuid, update: update)
+        activeCallUUID = uuid
+        if autoAnswer {
+            await autoAnswerCall(uuid: uuid)
+        }
+    }
+
+    /// 通过 CXCallController 主动发起接听动作（仅 VoIP 来电可接管）。
+    func autoAnswerCall(uuid: UUID) async {
+        let action = CXAnswerCallAction(call: uuid)
+        let transaction = CXTransaction(action: action)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            callController.request(transaction) { error in
+                if let error {
+                    print("[CallManager] auto answer failed: \(error)")
+                }
+                cont.resume()
+            }
+        }
     }
 
     /// 手动结束当前通话。

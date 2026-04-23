@@ -48,6 +48,14 @@ OmniNova Claw implements a sophisticated cognitive architecture with three disti
 - **Visual Configuration**: Configure providers, channels, and skills through an intuitive React-based UI.
 - **Local Gateway**: Run the entire stack locally with a built-in HTTP gateway and daemon management.
 
+### 📞 Mobile Phone Agent (iOS / Android)
+- **iOS client**: `apps/omninova-ios/` — SwiftUI + CallKit + `SFSpeechRecognizer` + Call Directory Extension. XcodeGen-driven project generation wired into CI (simulator build).
+- **Android client**: `apps/omninova-android/` — Kotlin + Jetpack Compose + `CallScreeningService` + `InCallService` + foreground service (`phoneCall|microphone`). Supports auto-answer once the user grants default-dialer + `ANSWER_PHONE_CALLS`.
+- **Spam detection**: rule-driven (`skills/phone-call-assistant/spam_detection_rules.json`), hot-loadable from the gateway.
+- **Key-info extraction**: lightweight on-device extractor + gateway-side LLM normalization via `key_info_extraction_schema.json`.
+- **Conversation logging**: fully aligned with `conversation_log_schema.json`; complete JSON is synced to the gateway after every call.
+- **Skill-driven**: all capabilities live in the `skills/phone-call-assistant/` skill and are exposed to the agent as `phone_call_assistant.*` tools.
+
 ## 🚀 Getting Started
 
 ### Headless / no desktop (Linux, Unix, SSH, servers)
@@ -133,6 +141,52 @@ Config defaults to **`~/.omninova/config.toml`**; override with **`OMNINOVA_CONF
     
     Artifacts will be generated in `apps/omninova-tauri/src-tauri/target/release/bundle/`.
 
+### 📞 Mobile (iOS / Android) builds
+
+Mobile targets live under `apps/omninova-ios/` (SwiftUI) and `apps/omninova-android/`
+(Kotlin/Compose). Both are wired into the CI workflow `.github/workflows/release.yml`.
+
+**iOS (requires macOS + Xcode 15+)**
+
+```bash
+brew install xcodegen
+cd apps/omninova-ios
+xcodegen generate --spec project.yml
+# Or via the bundled helper (CI-friendly, unsigned simulator build):
+./scripts/build-ios.sh
+```
+
+Highlights:
+- `CallManager.autoAnswer=true` dispatches `CXAnswerCallAction` through `CXCallController`.
+- `CallDirectoryExtension` consumes a shared App Group JSON for static block/ID entries.
+- `SpamDetector` applies `skills/phone-call-assistant/spam_detection_rules.json` heuristics.
+- `KeyInfoExtractor` does on-device extraction (name / org / phone / intent / summary / sentiment).
+
+**Android (requires JDK 17 + Android SDK 34)**
+
+```bash
+cd apps/omninova-android
+echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+./gradlew assembleDebug          # app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleRelease        # keystore required
+# Or: ./scripts/build-android.sh
+```
+
+Key services:
+- `OmniCallScreeningService` — pre-ring allow/silence/reject via the skill rule set.
+- `OmniInCallService` — auto-answers incoming calls when the app is the default dialer.
+- `CallAgentForegroundService` — foreground service (`phoneCall|microphone`) running ASR → gateway → TTS.
+- Full session JSON is posted to `POST /api/webhook` when the call ends.
+
+**From the Tauri project (optional convenience)**
+
+```bash
+cd apps/omninova-tauri
+npm run build:phone-agent:ios
+npm run build:phone-agent:android
+npm run build:phone-agent:android:release
+```
+
 ## 🏗️ Architecture
 
 OmniNova Claw follows a modular workspace structure:
@@ -140,11 +194,14 @@ OmniNova Claw follows a modular workspace structure:
 ```text
 omninovalclaw/
 ├── skills/                  # Bundled SKILL.md packs (import into workspace)
+│   └── phone-call-assistant/ # Mobile phone-agent skill (spam rules + key-info schema)
 ├── apps/
-│   └── omninova-tauri/      # Desktop Frontend (React 19 + TypeScript) & Tauri Config
-│       ├── src/             # UI Components (Setup, Chat, Console)
-│       ├── src-tauri/       # Tauri Backend Entrypoint
-│       └── public/          # Static Assets
+│   ├── omninova-tauri/      # Desktop Frontend (React 19 + TypeScript) & Tauri Config
+│   │   ├── src/             # UI Components (Setup, Chat, Console)
+│   │   ├── src-tauri/       # Tauri Backend Entrypoint
+│   │   └── public/          # Static Assets
+│   ├── omninova-ios/        # iOS phone agent (SwiftUI + CallKit, XcodeGen project.yml)
+│   └── omninova-android/    # Android phone agent (Kotlin + Compose, Gradle project)
 ├── crates/
 │   └── omninova-core/       # Core Runtime Library
 │       ├── agent/           # Agent Logic & Dispatcher
