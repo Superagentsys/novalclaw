@@ -53,6 +53,29 @@ final class ConversationLogStore {
         persist(sessions[idx])
     }
 
+    func attachExtraction(sessionId: String, extraction: KeyInfoExtractor.ExtractResult) {
+        guard let idx = sessions.firstIndex(where: { $0.sessionId == sessionId }) else { return }
+        var meta = sessions[idx].metadata ?? [:]
+        meta["extracted_intent"] = extraction.callIntent
+        meta["extracted_summary"] = extraction.summary ?? ""
+        meta["extracted_sentiment"] = extraction.sentiment
+        if let name = extraction.callerIdentity?.name { meta["caller_name"] = name }
+        if let org = extraction.callerIdentity?.organization { meta["caller_organization"] = org }
+        if let phone = extraction.contactInfo?.phoneRedacted { meta["caller_phone"] = phone }
+        sessions[idx].metadata = meta
+        persist(sessions[idx])
+    }
+
+    func attachScreening(sessionId: String, decision: SpamDetector.Decision) {
+        guard let idx = sessions.firstIndex(where: { $0.sessionId == sessionId }) else { return }
+        var meta = sessions[idx].metadata ?? [:]
+        meta["screening_severity"] = decision.severity.rawValue
+        if let rule = decision.matchedRuleId { meta["screening_rule_id"] = rule }
+        if let reason = decision.reason { meta["screening_reason"] = reason }
+        sessions[idx].metadata = meta
+        persist(sessions[idx])
+    }
+
     func session(for id: String) -> ConversationSessionFile? {
         sessions.first(where: { $0.sessionId == id })
     }

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OmniNova 通话助手</string>
+    <string name="notif_channel_call">通话代答</string>
+    <string name="notif_channel_call_desc">OmniNova 自动接听与通话记录</string>
+    <string name="notif_title_in_call">通话中 · OmniNova</string>
+    <string name="notif_text_in_call">Agent 正在代您通话</string>
+    <string name="notif_title_screening">骚扰电话已拦截</string>
+    <string name="status_connected">网关已连接</string>
+    <string name="status_disconnected">网关未连接</string>
+    <string name="settings_title">设置</string>
+    <string name="settings_gateway">OmniNova 网关地址</string>
+    <string name="settings_auto_answer">自动接听 VoIP 通话</string>
+    <string name="settings_spam_screening">启用骚扰识别</string>
+    <string name="settings_request_permissions">请求通话与麦克风权限</string>
+    <string name="btn_simulated_call">模拟来电</string>
+    <string name="empty_sessions">暂无对话记录</string>
+    <string name="empty_sessions_hint">来电或模拟通话后将自动记录</string>
+</resources>

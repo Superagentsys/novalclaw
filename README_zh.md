@@ -48,6 +48,14 @@ OmniNova Claw 实现了精密的三层认知记忆架构：
 - **可视化配置**: 通过直观的 React UI 配置供应商、渠道和技能。
 - **本地网关**: 在本地运行完整的技术栈，内置 HTTP 网关和守护进程管理。
 
+### 📞 移动端电话助手（iOS / Android）
+- **iOS 客户端**：`apps/omninova-ios/`，SwiftUI + CallKit + SFSpeechRecognizer + Call Directory Extension。通过 XcodeGen 生成 Xcode 工程，CI 可编译模拟器产物。
+- **Android 客户端**：`apps/omninova-android/`，Kotlin + Jetpack Compose + `CallScreeningService` + `InCallService` + 前台服务（`phoneCall|microphone`），支持真机自动接听（需默认拨号器 + `ANSWER_PHONE_CALLS`）。
+- **骚扰电话识别**：规则驱动（`skills/phone-call-assistant/spam_detection_rules.json`），支持网关动态下发。
+- **关键信息抽取**：本地轻量抽取 + 网关大模型二次归一化（`key_info_extraction_schema.json`）。
+- **对话记录**：严格遵循 `conversation_log_schema.json`，通话结束后 HTTPS 同步到网关。
+- **外挂 skill**：全部能力由 `skills/phone-call-assistant/` 技能驱动，导入 Agent 工作区后即可调用 `phone_call_assistant.*` 工具。
+
 ## 🚀 快速开始
 
 ### 无桌面环境（Linux / Unix、SSH、服务器）
@@ -120,6 +128,52 @@ launchctl list com.omninova.gateway   # 可选：查看是否已加载
     ```
     构建产物将生成在 `apps/omninova-tauri/src-tauri/target/release/bundle/` 目录下。
 
+### 📞 移动端（iOS / Android）构建
+
+移动端位于 `apps/omninova-ios/`（SwiftUI）与 `apps/omninova-android/`（Kotlin/Compose），
+都已接入骨架、通话服务与 `skills/phone-call-assistant/`，并接入到 CI 流水线 `release.yml`。
+
+**iOS（需要 macOS + Xcode 15+）**
+
+```bash
+brew install xcodegen
+cd apps/omninova-ios
+xcodegen generate --spec project.yml
+# 或直接调用封装脚本：
+./scripts/build-ios.sh            # 默认构建 iOS Simulator (Debug)
+```
+
+完整功能：
+- `CallManager.autoAnswer=true` 时由 `CXCallController` 自动发起 `CXAnswerCallAction`
+- `CallDirectoryExtension`（静态黑名单）从 App Group 共享的 JSON 读取号码
+- `SpamDetector` 按 skill 规则进行启发式识别
+- `KeyInfoExtractor` 本地抽取姓名/机构/号码/意图/摘要/情感
+
+**Android（需要 JDK 17 + Android SDK 34）**
+
+```bash
+cd apps/omninova-android
+echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+./gradlew assembleDebug          # 产物：app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleRelease        # 需配置 keystore
+# 或：./scripts/build-android.sh
+```
+
+关键能力：
+- `OmniCallScreeningService`：在振铃前按 `spam_detection_rules.json` 决策 allow/silence/reject
+- `OmniInCallService`：默认拨号器下接到来电自动 `answer(VideoProfile.STATE_AUDIO_ONLY)`
+- `CallAgentForegroundService`：前台常驻（`phoneCall|microphone`）驱动 ASR + 网关 + TTS
+- `KeyInfoExtractor` 与 iOS 同构；结束后 `POST /api/webhook` 同步完整会话 JSON
+
+**从 Tauri 目录统一调用（可选）**
+
+```bash
+cd apps/omninova-tauri
+npm run build:phone-agent:ios
+npm run build:phone-agent:android
+npm run build:phone-agent:android:release
+```
+
 ### 桌面应用行为（常驻进程与 `omninova` 命令）
 
 与 **Ollama** 类似：安装后应用**常驻后台**，关闭主窗口不会退出进程（退到**系统托盘**），网关仍在本机端口运行；从托盘选择「退出」才会结束进程。Dock/任务栏再次打开应用会恢复主窗口。
@@ -133,11 +187,14 @@ OmniNova Claw 采用模块化的工作区结构：
 ```text
 omninovalclaw/
 ├── skills/                  # 内置 SKILL.md 技能包（可导入工作区）
+│   └── phone-call-assistant/ # 移动端电话助手技能（骚扰规则 + 关键信息 Schema）
 ├── apps/
-│   └── omninova-tauri/      # 桌面前端 (React 19 + TypeScript) & Tauri 配置
-│       ├── src/             # UI 组件 (Setup, Chat, Console)
-│       ├── src-tauri/       # Tauri 后端入口
-│       └── public/          # 静态资源
+│   ├── omninova-tauri/      # 桌面前端 (React 19 + TypeScript) & Tauri 配置
+│   │   ├── src/             # UI 组件 (Setup, Chat, Console)
+│   │   ├── src-tauri/       # Tauri 后端入口
+│   │   └── public/          # 静态资源
+│   ├── omninova-ios/        # iOS 电话助手（SwiftUI + CallKit，XcodeGen project.yml）
+│   └── omninova-android/    # Android 电话助手（Kotlin + Compose，Gradle 工程）
 ├── crates/
 │   └── omninova-core/       # 核心运行时库
 │       ├── agent/           # Agent 逻辑 & 调度器

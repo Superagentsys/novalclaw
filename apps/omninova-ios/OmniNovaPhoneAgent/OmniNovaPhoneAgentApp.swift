@@ -7,6 +7,8 @@ struct OmniNovaPhoneAgentApp: App {
     @State private var logStore = ConversationLogStore()
     @State private var gatewayClient = AgentGatewayClient()
     @State private var synthesizer = AgentResponseSynthesizer()
+    @State private var spamDetector = SpamDetector()
+    private let extractor = KeyInfoExtractor()
 
     var body: some Scene {
         WindowGroup {
@@ -16,6 +18,7 @@ struct OmniNovaPhoneAgentApp: App {
                 .environment(logStore)
                 .environment(gatewayClient)
                 .environment(synthesizer)
+                .environment(spamDetector)
                 .task {
                     callManager.configure(
                         onCallAnswered: { uuid in
@@ -25,6 +28,9 @@ struct OmniNovaPhoneAgentApp: App {
                             handleCallEnded(callUUID: uuid)
                         }
                     )
+                    if let data = await gatewayClient.fetchSpamRules() {
+                        spamDetector.updateRules(from: data)
+                    }
                 }
         }
     }
@@ -60,7 +66,14 @@ struct OmniNovaPhoneAgentApp: App {
         speechPipeline.stopListening()
         synthesizer.stop()
         logStore.endSession(sessionId: sessionId)
-        Task { await gatewayClient.syncSession(logStore.session(for: sessionId)) }
+        if let session = logStore.session(for: sessionId) {
+            let extraction = extractor.extract(from: session)
+            logStore.attachExtraction(sessionId: sessionId, extraction: extraction)
+        }
+        Task {
+            await gatewayClient.syncSession(logStore.session(for: sessionId))
+            _ = await gatewayClient.extractKeyInfo(sessionId: sessionId)
+        }
     }
 
     private func sendToAgentAndSpeak(sessionId: String, callerText: String) async {

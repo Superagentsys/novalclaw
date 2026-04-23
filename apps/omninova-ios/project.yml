@@ -1,0 +1,93 @@
+name: OmniNovaPhoneAgent
+options:
+  bundleIdPrefix: com.omninova
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: "2.40.1"
+  developmentLanguage: zh-Hans
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+packages: {}
+
+targets:
+  OmniNovaPhoneAgent:
+    type: application
+    platform: iOS
+    sources:
+      - path: OmniNovaPhoneAgent
+        excludes:
+          - "Info.plist"
+          - "**/.DS_Store"
+    resources:
+      - path: ../../skills/phone-call-assistant/spam_detection_rules.json
+      - path: ../../skills/phone-call-assistant/key_info_extraction_schema.json
+      - path: ../../skills/phone-call-assistant/conversation_log_schema.json
+    info:
+      path: OmniNovaPhoneAgent/Info.plist
+    entitlements:
+      path: OmniNovaPhoneAgent/OmniNovaPhoneAgent.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.omninova.phoneagent
+        PRODUCT_NAME: OmniNovaPhoneAgent
+        INFOPLIST_FILE: OmniNovaPhoneAgent/Info.plist
+        CODE_SIGN_ENTITLEMENTS: OmniNovaPhoneAgent/OmniNovaPhoneAgent.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: "NO"
+    dependencies:
+      - target: CallDirectoryExtension
+        embed: true
+        codeSign: true
+    scheme:
+      testTargets: []
+
+  CallDirectoryExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CallDirectoryExtension
+        excludes:
+          - "Info.plist"
+          - "**/.DS_Store"
+    info:
+      path: CallDirectoryExtension/Info.plist
+    entitlements:
+      path: CallDirectoryExtension/CallDirectoryExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.omninova.phoneagent.CallDirectoryExtension
+        PRODUCT_NAME: CallDirectoryExtension
+        INFOPLIST_FILE: CallDirectoryExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CallDirectoryExtension/CallDirectoryExtension.entitlements
+        GENERATE_INFOPLIST_FILE: "NO"
+
+schemes:
+  OmniNovaPhoneAgent:
+    build:
+      targets:
+        OmniNovaPhoneAgent: all
+        CallDirectoryExtension: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

@@ -5,3 +5,19 @@ release-assets
 .DS_Store
 apps/omninova-tauri/src-tauri/resources/cli/omninova
 
+# Android
+apps/omninova-android/.gradle/
+apps/omninova-android/**/build/
+apps/omninova-android/local.properties
+apps/omninova-android/keystore.properties
+apps/omninova-android/*.keystore
+apps/omninova-android/*.jks
+apps/omninova-android/release-assets/
+
+# iOS / Xcode
+apps/omninova-ios/OmniNovaPhoneAgent.xcodeproj/
+apps/omninova-ios/OmniNovaPhoneAgent.xcworkspace/
+apps/omninova-ios/build/
+apps/omninova-ios/DerivedData/
+apps/omninova-ios/release-assets/
+apps/omninova-ios/*.xcuserdatad/
