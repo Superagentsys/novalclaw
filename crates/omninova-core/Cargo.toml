@@ -51,3 +51,4 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 pdf-extract = "0.10.0"
 serde_yaml = "0.9.34"
+qrcode.workspace = true
