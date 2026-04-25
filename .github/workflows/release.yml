@@ -348,18 +348,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen and xcbeautify
+        run: brew install xcodegen xcbeautify
 
       - name: Select Xcode
-        run: sudo xcode-select -s "/Applications/Xcode_15.4.app" || sudo xcode-select -s "/Applications/Xcode.app"
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_15.4.app" \
+            || sudo xcode-select -s "/Applications/Xcode_15.3.app" \
+            || sudo xcode-select -s "/Applications/Xcode.app"
+          xcodebuild -version
+
+      - name: Show available simulators
+        run: xcrun simctl list runtimes | head -20
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
       - name: Build for iOS Simulator (unsigned)
         run: |
-          set -eo pipefail
+          set -euo pipefail
           xcodebuild \
             -project OmniNovaPhoneAgent.xcodeproj \
             -scheme OmniNovaPhoneAgent \
@@ -369,17 +376,32 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build \
-            | xcpretty || true
+            build 2>&1 \
+            | tee xcodebuild.log \
+            | xcbeautify --renderer github-actions
+          test "${PIPESTATUS[0]}" -eq 0
 
       - name: Stage iOS artifacts
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           APP_DIR="build/Build/Products/Release-iphonesimulator/OmniNovaPhoneAgent.app"
-          if [ -d "$APP_DIR" ]; then
-              tar -czf release-assets/OmniNovaPhoneAgent-simulator-${GITHUB_SHA::7}.tar.gz \
-                  -C "$(dirname $APP_DIR)" "$(basename $APP_DIR)"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "::error::Expected $APP_DIR was not produced by xcodebuild" >&2
+            ls -R build/Build/Products || true
+            exit 1
           fi
+          tar -czf "release-assets/OmniNovaPhoneAgent-simulator-${GITHUB_SHA::7}.tar.gz" \
+              -C "$(dirname "$APP_DIR")" "$(basename "$APP_DIR")"
+          ls -lh release-assets/
+
+      - name: Upload xcodebuild log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcodebuild-log
+          path: apps/omninova-ios/xcodebuild.log
+          if-no-files-found: warn
 
       - name: Upload iOS bundle
         uses: actions/upload-artifact@v4

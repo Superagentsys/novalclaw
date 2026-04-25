@@ -22,7 +22,8 @@ struct ConversationTurn: Codable, Identifiable {
     }
 }
 
-struct ConversationSessionFile: Codable {
+struct ConversationSessionFile: Codable, Identifiable {
+    var id: String { sessionId }
     let schemaVersion: String
     let sessionId: String
     let channel: ConversationChannel
