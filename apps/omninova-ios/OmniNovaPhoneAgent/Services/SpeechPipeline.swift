@@ -3,11 +3,11 @@ import Foundation
 import Speech
 
 /// App 内语音 → 文本（需麦克风与语音识别权限）。**不**访问运营商通话线路。
-@MainActor
-final class SpeechPipeline: NSObject, ObservableObject {
-    @Published var authorizationStatus: SFSpeechRecognizerAuthorizationStatus = .notDetermined
-    @Published var lastTranscript: String = ""
-    @Published var isListening: Bool = false
+@MainActor @Observable
+final class SpeechPipeline: NSObject {
+    var authorizationStatus: SFSpeechRecognizerAuthorizationStatus = .notDetermined
+    var lastTranscript: String = ""
+    var isListening: Bool = false
 
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
