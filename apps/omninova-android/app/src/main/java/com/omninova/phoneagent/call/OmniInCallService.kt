@@ -20,7 +20,7 @@ class OmniInCallService : InCallService() {
         override fun onStateChanged(call: Call, state: Int) {
             super.onStateChanged(call, state)
             if (state == Call.STATE_ACTIVE) {
-                val sessionId = call.details.telecomCallId ?: UUID.randomUUID().toString()
+                val sessionId = telecomSessionId(call)
                 startForegroundAgent(sessionId)
             } else if (state == Call.STATE_DISCONNECTED) {
                 stopForegroundAgent()
@@ -57,5 +57,12 @@ class OmniInCallService : InCallService() {
             action = CallAgentForegroundService.ACTION_STOP
         }
         startService(intent)
+    }
+
+    private fun telecomSessionId(call: Call): String {
+        val handle = call.details?.handle?.schemeSpecificPart
+        val baseSeed = handle?.takeIf { it.isNotEmpty() }
+            ?: System.identityHashCode(call).toString()
+        return UUID.nameUUIDFromBytes(("telecom:$baseSeed").toByteArray()).toString()
     }
 }

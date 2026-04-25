@@ -17,13 +17,16 @@ class AgentResponseSynthesizer(context: Context) {
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
     private var ready = false
-    private val tts: TextToSpeech = TextToSpeech(context.applicationContext) { status ->
-        ready = status == TextToSpeech.SUCCESS
-        if (ready) {
-            tts?.language = Locale.CHINA
+    private lateinit var tts: TextToSpeech
+
+    init {
+        tts = TextToSpeech(context.applicationContext) { status ->
+            ready = status == TextToSpeech.SUCCESS
+            if (ready) {
+                tts.language = Locale.CHINA
+            }
         }
-    }.also { engine ->
-        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) { _isSpeaking.value = true }
             override fun onDone(utteranceId: String?) { _isSpeaking.value = false }
             @Deprecated("Deprecated in Java") override fun onError(utteranceId: String?) { _isSpeaking.value = false }
