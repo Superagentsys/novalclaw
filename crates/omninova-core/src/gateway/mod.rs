@@ -593,11 +593,22 @@ impl GatewayRuntime {
     }
 
     /// Start an HTTP gateway server with `/`, `/health`, `/chat`, `/config`.
-    pub async fn serve_http(self) -> anyhow::Result<()> {
+    pub async fn serve_http(mut self) -> anyhow::Result<()> {
         let cfg = self.get_config().await;
         let addr: SocketAddr = format!("{}:{}", cfg.gateway.host, cfg.gateway.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
+
+        if self.cron_store.is_none() {
+            let cron_path = cfg.workspace_dir.join("cron.json");
+            match crate::cron::CronStore::open(&cron_path).await {
+                Ok(store) => self.cron_store = Some(store),
+                Err(e) => warn!(
+                    "failed to initialize cron store at {}: {e}",
+                    cron_path.display()
+                ),
+            }
+        }
 
         let app = Router::new()
             .route("/", get(http_root))

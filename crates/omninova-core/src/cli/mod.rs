@@ -13,10 +13,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static NO_COLOR: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 fn color_enabled() -> bool {
     !NO_COLOR.load(Ordering::Relaxed)
 }
 
+#[allow(dead_code)]
 fn cprintln(enabled: bool, msg: &str) {
     if enabled {
         println!("{msg}");
@@ -521,6 +523,7 @@ fn resolve_profile_dir(profile: Option<&str>, dev: bool) -> (PathBuf, PathBuf) {
 fn apply_profile_env(dev: bool, profile: Option<&str>) {
     let (base, cfg) = resolve_profile_dir(profile, dev);
     std::env::set_var("OMNINOVA_CONFIG_DIR", &base);
+    std::env::set_var("OMNINOVA_CONFIG_FILE", &cfg);
     std::env::set_var("OMNINOVA_WORKSPACE", base.join("workspace"));
     if dev {
         std::env::set_var("OMNINOVA_GATEWAY_PORT", "19001");
@@ -540,6 +543,7 @@ fn apply_no_color(no_color: bool) {
     }
 }
 
+#[allow(dead_code)]
 fn output_str(s: &str) -> String {
     if color_enabled() {
         s.to_string()
@@ -711,16 +715,17 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             open_url(&format!("https://docs.omninova.ai/search?q={}", urlencoding::encode(&q)))?;
             Ok(format!("opened docs for: {}", q))
         }
-        Commands::Qr => {
-            Ok("pairing QR generation: not yet implemented".to_string())
-        }
+        Commands::Qr => Ok(generate_pairing_qr(&config)?),
         Commands::Reset { force } => {
             if !*force {
                 anyhow::bail!("use --force to confirm reset");
             }
             let (base, cfg_path) = resolve_profile_dir(None, false);
             let _ = std::fs::remove_dir_all(&base);
-            Ok(format!("reset complete (state dir: {:?})", base))
+            Ok(format!(
+                "reset complete (state dir: {:?}, config: {:?})",
+                base, cfg_path
+            ))
         }
         Commands::Uninstall { force } => {
             if !*force {
@@ -964,13 +969,28 @@ async fn run_security(cmd: &SecurityCommands, config: &Config) -> Result<String>
     }
 }
 
-async fn run_sessions(cmd: &SessionCommands, _config: &Config) -> Result<String> {
+async fn run_sessions(cmd: &SessionCommands, config: &Config) -> Result<String> {
     match cmd {
-        SessionCommands::List => Ok("[]".to_string()),
+        SessionCommands::List => {
+            let runtime = GatewayRuntime::new(config.clone());
+            let snapshot = runtime.session_tree_snapshot().await?;
+            Ok(serde_json::to_string_pretty(&snapshot)?)
+        }
         SessionCommands::Show { session_id } => {
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "session_id": session_id, "messages": []
-            }))?)
+            let runtime = GatewayRuntime::new(config.clone());
+            let snapshot = runtime.session_tree_snapshot().await?;
+            let entry = snapshot
+                .sessions
+                .into_iter()
+                .find(|s| s.session_id.as_deref() == Some(session_id.as_str()));
+            match entry {
+                Some(node) => Ok(serde_json::to_string_pretty(&node)?),
+                None => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": session_id,
+                    "found": false,
+                    "messages": []
+                }))?),
+            }
         }
         SessionCommands::Delete { session_id } => {
             Ok(format!("session {} delete not yet implemented", session_id))
@@ -978,8 +998,61 @@ async fn run_sessions(cmd: &SessionCommands, _config: &Config) -> Result<String>
     }
 }
 
-async fn run_status(_config: &Config) -> Result<String> {
-    Ok("{\"status\": \"not yet implemented\"}".to_string())
+fn generate_pairing_qr(config: &Config) -> Result<String> {
+    use qrcode::QrCode;
+    let host = if config.gateway.host == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else {
+        config.gateway.host.clone()
+    };
+    let payload = serde_json::json!({
+        "type": "omninova-pairing",
+        "version": env!("CARGO_PKG_VERSION"),
+        "gateway": format!("http://{}:{}", host, config.gateway.port),
+        "agent": config.agent.name,
+        "issued_at": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    let payload_str = serde_json::to_string(&payload)?;
+    let code = QrCode::new(payload_str.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to encode QR: {e}"))?;
+    let render = code
+        .render::<char>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .dark_color('█')
+        .light_color(' ')
+        .build();
+    Ok(format!(
+        "{render}\n\nPairing payload: {payload_str}\n\nScan the QR with the OmniNova mobile app, or paste the JSON\npayload into Settings → Pair Gateway."
+    ))
+}
+
+async fn run_status(config: &Config) -> Result<String> {
+    let runtime = GatewayRuntime::new(config.clone());
+    let health = runtime.health().await;
+    let cfg = runtime.get_config().await;
+    let tools = crate::gateway::create_default_tools(&cfg);
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let payload = serde_json::json!({
+        "gateway": {
+            "ok": health.ok,
+            "provider": health.provider,
+            "provider_healthy": health.provider_healthy,
+            "memory_healthy": health.memory_healthy,
+        },
+        "config": {
+            "default_provider": cfg.default_provider,
+            "default_model": cfg.default_model,
+            "gateway_host": cfg.gateway.host,
+            "gateway_port": cfg.gateway.port,
+            "agent_name": cfg.agent.name,
+        },
+        "tools": tool_names,
+        "agents": cfg.agents.keys().collect::<Vec<_>>(),
+    });
+    Ok(serde_json::to_string_pretty(&payload)?)
 }
 
 async fn run_system(cmd: Option<&SystemCommands>, _config: &Config) -> Result<String> {
@@ -1145,7 +1218,7 @@ async fn run_setup(cmd: &SetupCommands) -> Result<String> {
         SetupCommands::Browser => install_agent_browser().await,
         SetupCommands::All => {
             let r1 = install_agent_browser().await;
-            let mut results = vec![("agent-browser", r1.is_ok())];
+            let results = vec![("agent-browser", r1.is_ok())];
             Ok(serde_json::to_string_pretty(&results)?)
         }
     }
