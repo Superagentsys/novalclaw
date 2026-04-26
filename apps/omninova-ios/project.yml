@@ -35,10 +35,6 @@ targets:
       - path: ../../skills/phone-call-assistant/spam_detection_rules.json
       - path: ../../skills/phone-call-assistant/key_info_extraction_schema.json
       - path: ../../skills/phone-call-assistant/conversation_log_schema.json
-    info:
-      path: OmniNovaPhoneAgent/Info.plist
-    entitlements:
-      path: OmniNovaPhoneAgent/OmniNovaPhoneAgent.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.omninova.phoneagent
@@ -63,10 +59,6 @@ targets:
         excludes:
           - "Info.plist"
           - "**/.DS_Store"
-    info:
-      path: CallDirectoryExtension/Info.plist
-    entitlements:
-      path: CallDirectoryExtension/CallDirectoryExtension.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.omninova.phoneagent.CallDirectoryExtension
