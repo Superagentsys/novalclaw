@@ -353,20 +353,42 @@ jobs:
 
       - name: Select Xcode
         run: |
+          set -euxo pipefail
+          ls /Applications | grep -i Xcode || true
           sudo xcode-select -s "/Applications/Xcode_15.4.app" \
             || sudo xcode-select -s "/Applications/Xcode_15.3.app" \
+            || sudo xcode-select -s "/Applications/Xcode_15.2.app" \
             || sudo xcode-select -s "/Applications/Xcode.app"
+          xcode-select -p
           xcodebuild -version
 
-      - name: Show available simulators
-        run: xcrun simctl list runtimes | head -20
+      - name: Show toolchain versions
+        run: |
+          set -euxo pipefail
+          xcodegen --version
+          xcbeautify --version
+          xcrun simctl list runtimes | head -20
 
       - name: Generate Xcode project
-        run: xcodegen generate --spec project.yml
+        run: |
+          set -euxo pipefail
+          pwd
+          ls -la
+          rm -rf OmniNovaPhoneAgent.xcodeproj
+          xcodegen generate --spec project.yml 2>&1 | tee xcodegen.log
+          echo "----- after xcodegen -----"
+          ls -la
+          test -d OmniNovaPhoneAgent.xcodeproj || {
+            echo "::error::xcodegen did not produce OmniNovaPhoneAgent.xcodeproj"
+            cat xcodegen.log
+            exit 1
+          }
+          ls -la OmniNovaPhoneAgent.xcodeproj
+          xcodebuild -list -project OmniNovaPhoneAgent.xcodeproj
 
       - name: Build for iOS Simulator (unsigned)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           xcodebuild \
             -project OmniNovaPhoneAgent.xcodeproj \
             -scheme OmniNovaPhoneAgent \
@@ -395,12 +417,14 @@ jobs:
               -C "$(dirname "$APP_DIR")" "$(basename "$APP_DIR")"
           ls -lh release-assets/
 
-      - name: Upload xcodebuild log on failure
+      - name: Upload xcodebuild logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-xcodebuild-log
-          path: apps/omninova-ios/xcodebuild.log
+          name: ios-build-logs
+          path: |
+            apps/omninova-ios/xcodebuild.log
+            apps/omninova-ios/xcodegen.log
           if-no-files-found: warn
 
       - name: Upload iOS bundle
