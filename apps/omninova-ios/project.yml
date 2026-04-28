@@ -4,8 +4,14 @@ options:
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
-  minimumXcodeGenVersion: "2.40.1"
+  minimumXcodeGenVersion: "2.45.0"
   developmentLanguage: zh-Hans
+  # Pin to an Xcode 15-compatible project format. Newer XcodeGen versions
+  # default to xcode16_0 (objectVersion 77), which Xcode 15.4 in CI fails to
+  # open with: "future Xcode project file format (77)". xcode15_3 emits a
+  # format readable by Xcode 15.3+ and is still forward-compatible with 16.x.
+  projectFormat: xcode15_3
+  xcodeVersion: "15.4"
 
 settings:
   base:
