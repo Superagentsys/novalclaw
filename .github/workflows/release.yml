@@ -394,27 +394,96 @@ jobs:
             -scheme OmniNovaPhoneAgent \
             -configuration Release \
             -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath build \
+            -derivedDataPath build-sim \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             build 2>&1 \
-            | tee xcodebuild.log \
+            | tee xcodebuild-sim.log \
             | xcbeautify --renderer github-actions
           test "${PIPESTATUS[0]}" -eq 0
 
-      - name: Stage iOS artifacts
+      - name: Build for iOS Device (unsigned, for IPA)
+        run: |
+          set -euxo pipefail
+          # Device build (iphoneos). No Apple Developer secrets in CI: produce an
+          # unsigned .ipa for sideload / re-sign pipelines (AltStore, Sideloadly,
+          # Xcode with your own team, etc.). Not App Store / TestFlight ready.
+          xcodebuild \
+            -project OmniNovaPhoneAgent.xcodeproj \
+            -scheme OmniNovaPhoneAgent \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO \
+            VALIDATE_PRODUCT=NO \
+            build 2>&1 \
+            | tee xcodebuild-device.log \
+            | xcbeautify --renderer github-actions
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Stage iOS artifacts (Simulator tar.gz + Device unsigned IPA)
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          APP_DIR="build/Build/Products/Release-iphonesimulator/OmniNovaPhoneAgent.app"
-          if [ ! -d "$APP_DIR" ]; then
-            echo "::error::Expected $APP_DIR was not produced by xcodebuild" >&2
-            ls -R build/Build/Products || true
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${GITHUB_SHA::7}"
+          fi
+
+          # ---- Simulator .app -> .tar.gz (xcrun simctl install / Xcode Simulator) ----
+          SIM_APP="build-sim/Build/Products/Release-iphonesimulator/OmniNovaPhoneAgent.app"
+          if [ ! -d "$SIM_APP" ]; then
+            echo "::error::Expected simulator app at $SIM_APP was not produced" >&2
+            ls -R build-sim/Build/Products || true
             exit 1
           fi
-          tar -czf "release-assets/OmniNovaPhoneAgent-simulator-${GITHUB_SHA::7}.tar.gz" \
-              -C "$(dirname "$APP_DIR")" "$(basename "$APP_DIR")"
+          tar -czf "release-assets/OmniNovaPhoneAgent-${VERSION}-simulator.tar.gz" \
+              -C "$(dirname "$SIM_APP")" "$(basename "$SIM_APP")"
+
+          # ---- Device .app -> Payload/.app -> .ipa (unsigned, sideload / re-sign) ----
+          DEVICE_APP="build-device/Build/Products/Release-iphoneos/OmniNovaPhoneAgent.app"
+          if [ ! -d "$DEVICE_APP" ]; then
+            echo "::error::Expected device app at $DEVICE_APP was not produced" >&2
+            ls -R build-device/Build/Products || true
+            exit 1
+          fi
+          STAGING="ipa-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING/Payload"
+          cp -R "$DEVICE_APP" "$STAGING/Payload/"
+          (
+            cd "$STAGING"
+            zip -ry "../release-assets/OmniNovaPhoneAgent-${VERSION}-unsigned.ipa" Payload
+          )
+          rm -rf "$STAGING"
+
+          cat > release-assets/IOS_INSTALL.txt <<EOF
+          OmniNova Phone Agent — iOS 安装说明
+          =====================================
+
+          本 Release 包含两类 iOS 产物：
+
+          1) OmniNovaPhoneAgent-${VERSION}-unsigned.ipa
+             - 真机安装包（未签名）。不能直接双击安装。
+             - 请使用 AltStore / Sideloadly / 自有 Apple 开发者证书重签名后安装，
+               或在 Xcode 中 Archive 并使用你的 Team 重新导出。
+
+          2) OmniNovaPhoneAgent-${VERSION}-simulator.tar.gz
+             - 仅适用于 iOS 模拟器，解压后：
+               xcrun simctl install booted OmniNovaPhoneAgent.app
+
+          如需 App Store / TestFlight 分发，请在 Apple Developer 账号下
+          配置签名与 Provisioning Profile 后重新构建。
+          EOF
+
           ls -lh release-assets/
 
       - name: Upload xcodebuild logs on failure
@@ -423,7 +492,8 @@ jobs:
         with:
           name: ios-build-logs
           path: |
-            apps/omninova-ios/xcodebuild.log
+            apps/omninova-ios/xcodebuild-sim.log
+            apps/omninova-ios/xcodebuild-device.log
             apps/omninova-ios/xcodegen.log
           if-no-files-found: warn
 
@@ -432,7 +502,7 @@ jobs:
         with:
           name: release-ios
           path: apps/omninova-ios/release-assets/**
-          if-no-files-found: warn
+          if-no-files-found: error
 
   release:
     name: Publish GitHub Release
@@ -491,4 +561,5 @@ jobs:
             release-assets/**/*.apk
             release-assets/**/*.aab
             release-assets/**/*.ipa
+            release-assets/**/IOS_INSTALL.txt
             release-assets/SHA256SUMS.txt

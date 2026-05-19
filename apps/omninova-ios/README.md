@@ -39,7 +39,27 @@ SwiftUI 骨架：展示 **对话记录落盘**（JSON）与 **语音转写占位
 
 仓库内技能：`skills/phone-call-assistant/`。导入到 Agent 工作区后，模型应答会遵循蜂窝/Voice 边界说明与记录 schema。
 
+## CI / Release 产物
+
+GitHub Release（打 `v*` tag 后）会产出：
+
+| 文件 | 用途 |
+|------|------|
+| `OmniNovaPhoneAgent-<version>-unsigned.ipa` | 真机安装包（**未签名**），需 AltStore / Sideloadly / 自有证书重签名后安装 |
+| `OmniNovaPhoneAgent-<version>-simulator.tar.gz` | 仅模拟器：`xcrun simctl install booted OmniNovaPhoneAgent.app` |
+| `IOS_INSTALL.txt` | 安装说明 |
+
+本地打包真机 IPA（未签名）：
+
+```bash
+cd apps/omninova-ios
+chmod +x scripts/build-ios.sh
+BUILD_DEVICE=1 ./scripts/build-ios.sh
+# 输出：release-assets/OmniNovaPhoneAgent-local-unsigned.ipa
+```
+
 ## 后续可扩展
 
 - 接入贵司 **VoIP 信令** + CallKit `CXProvider` 报告来电。
 - 将 `ConversationSession` 经 HTTPS 同步到自建 API，再由 `omninova` 网关消费。
+- 在 CI 中配置 `APPLE_CERTIFICATE` 等密钥后可改为签名 IPA / TestFlight。

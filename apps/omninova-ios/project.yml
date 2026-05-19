@@ -53,7 +53,9 @@ targets:
     dependencies:
       - target: CallDirectoryExtension
         embed: true
-        codeSign: true
+        # Unsigned CI / sideload IPA builds cannot re-sign the embedded appex;
+        # keep embed but skip the embed-time codesign step.
+        codeSign: false
     scheme:
       testTargets: []
 
