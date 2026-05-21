@@ -4,13 +4,20 @@
 
 ### 为什么会出现「已损坏，无法打开」？
 
-从浏览器下载的 **未签名 / 未公证** `.dmg` 会被 Gatekeeper 拦截，并显示「已损坏」。应用本身未必损坏。
+从浏览器（Chrome 等）下载的 **未公证** `.dmg` / `.app` 会被 macOS Gatekeeper 拦截，并显示「**已损坏，无法打开**」。**应用通常没有坏**，只是系统拒绝启动。
 
-**临时解决（仅内测）：**
+**立刻能打开（复制到终端执行）：**
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/OmniNova Claw.app"
 open "/Applications/OmniNova Claw.app"
+```
+
+若还在 DMG 里未拖入应用程序：
+
+```bash
+xattr -dr com.apple.quarantine "/Volumes/OmniNova Claw"*/OmniNova\ Claw.app
+open "/Volumes/OmniNova Claw"*/OmniNova\ Claw.app
 ```
 
 或使用仓库脚本：
@@ -19,6 +26,8 @@ open "/Applications/OmniNova Claw.app"
 cd apps/omninova-tauri
 bash ./scripts/strip-quarantine-mac.sh "/Applications/OmniNova Claw.app"
 ```
+
+Release 包内也会附带 `macOS-安装与修复.txt`（同上说明）。
 
 **正式发布：** 必须在 CI 或本机完成 **Developer ID 签名 + Apple 公证（Notarization）**。
 

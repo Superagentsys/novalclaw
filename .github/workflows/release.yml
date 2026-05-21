@@ -156,7 +156,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
-          chmod +x ./scripts/setup-apple-signing.sh ./scripts/verify-macos-signature.sh
+          chmod +x ./scripts/setup-apple-signing.sh ./scripts/verify-macos-signature.sh ./scripts/codesign-macos-fallback.sh
           bash ./scripts/setup-apple-signing.sh
 
       - name: Prepare release metadata
@@ -215,6 +215,11 @@ jobs:
             ls -F ../../target/${{ matrix.target }}/release || echo "workspace target/${{ matrix.target }}/release not found"
             exit 1
           fi
+
+      - name: Ad-hoc codesign macOS bundles (fallback)
+        if: runner.os == 'macOS'
+        run: |
+          bash ./scripts/codesign-macos-fallback.sh "${{ steps.resolve_path.outputs.bundle_path }}"
 
       - name: Verify macOS code signature
         if: runner.os == 'macOS'

@@ -1,0 +1,28 @@
+OmniNova Claw — macOS 安装说明（若提示「已损坏，无法打开」）
+========================================================
+
+这不是应用真的坏了，而是 macOS 对「从浏览器下载的未公证应用」的拦截。
+
+方法一：终端去隔离（推荐）
+------------------------
+1. 打开「终端」
+2. 若你从 DMG 安装，先把 OmniNova Claw.app 拖到「应用程序」文件夹
+3. 执行（路径按实际修改）：
+
+   xattr -dr com.apple.quarantine "/Applications/OmniNova Claw.app"
+   open "/Applications/OmniNova Claw.app"
+
+方法二：右键打开
+----------------
+Finder 中找到 OmniNova Claw.app → 按住 Control 点按 → 选「打开」→ 再点「打开」。
+
+方法三：确认 CPU 架构
+--------------------
+- Apple 芯片 Mac：下载 Release 里带 macos-arm64 的 DMG
+- Intel Mac：下载带 macos-intel 的 DMG
+架构不对可能无法启动（不一定显示「已损坏」）。
+
+根本解决（官方分发）
+--------------------
+维护者需在 GitHub 配置 Apple Developer ID 证书并完成公证后重新发布。
+详见仓库 docs/SIGNING_CN.md

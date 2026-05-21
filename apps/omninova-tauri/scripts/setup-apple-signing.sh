@@ -100,6 +100,12 @@ else
   if [[ -n "${detected}" ]]; then
     emit_env "APPLE_SIGNING_IDENTITY" "${detected}"
     echo "[signing] Using login keychain identity: ${detected}"
+  elif [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    # Ad-hoc sign so Apple Silicon builds are not completely unsigned.
+    # Users still need Developer ID + notarization to avoid Gatekeeper
+    # "damaged" warnings on browser downloads — see docs/SIGNING_CN.md.
+    emit_env "APPLE_SIGNING_IDENTITY" "-"
+    echo "[signing] No Developer ID cert — using ad-hoc identity '-' for CI build."
   else
     echo "[signing] No signing certificate configured (unsigned build)."
   fi
