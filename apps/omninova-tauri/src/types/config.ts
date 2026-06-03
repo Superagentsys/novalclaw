@@ -279,6 +279,7 @@ export interface Config {
   multimodal?: MultimodalConfig;
   observability?: ObservabilityConfig;
   audit?: AuditConfig;
+  require_confirmation?: boolean;
 }
 
 export interface GatewayStatus {
@@ -324,10 +325,54 @@ export interface RouteDecision {
   model?: string | null;
 }
 
+export interface PendingApprovalView {
+  id: string;
+  tool_name: string;
+  reason: string;
+  args_summary: string;
+}
+
+export interface EmployeeManifest {
+  id: string;
+  name: string;
+  description?: string;
+  prompt?: string;
+  enabled?: boolean;
+  created_at?: number;
+  skill_ids?: string[];
+  mcp_servers?: unknown;
+  type?: string;
+  from?: string;
+}
+
+export interface EmployeeSummary {
+  id: string;
+  name: string;
+  description: string;
+  prompt: string;
+  enabled: boolean;
+  created_at: number;
+  skill_ids: string[];
+  skill_names: string[];
+  mcp_server_keys: string[];
+  type: string;
+  from: string;
+}
+
+export interface UserPromptView {
+  id: string;
+  question: string;
+  options?: string[];
+  allow_free_text?: boolean;
+  context?: string | null;
+}
+
 export interface GatewayInboundResponse {
   route: RouteDecision;
   reply: string;
   steps?: ExecutionStep[];
+  pending_approvals?: PendingApprovalView[];
+  user_prompt?: UserPromptView | null;
 }
 
 export interface GatewayChatHistoryMessage {

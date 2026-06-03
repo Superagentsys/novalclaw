@@ -1,11 +1,15 @@
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -123,12 +127,18 @@ impl OpenAiProvider {
         model: impl Into<String>,
         temperature: f64,
         max_tokens: Option<u32>,
+        timeout_secs: Option<u64>,
     ) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let timeout_secs = timeout_secs
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS);
 
         let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS))
             .build()
             .expect("failed to build reqwest client");
 
@@ -143,21 +153,19 @@ impl OpenAiProvider {
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools
-            .filter(|items| !items.is_empty())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|tool| NativeToolSpec {
-                        kind: "function".to_string(),
-                        function: NativeToolFunctionSpec {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.parameters.clone(),
-                        },
-                    })
-                    .collect()
-            })
+        tools.filter(|items| !items.is_empty()).map(|items| {
+            items
+                .iter()
+                .map(|tool| NativeToolSpec {
+                    kind: "function".to_string(),
+                    function: NativeToolFunctionSpec {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
+                    },
+                })
+                .collect()
+        })
     }
 
     fn user_content_value(message: &ChatMessage) -> serde_json::Value {
@@ -304,7 +312,10 @@ impl Provider for MockProvider {
         &self.name
     }
 
-    async fn chat(&self, _request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
+    async fn chat(
+        &self,
+        _request: ProviderChatRequest<'_>,
+    ) -> anyhow::Result<ProviderChatResponse> {
         Ok(ProviderChatResponse {
             text: Some("Mock response from provider".to_string()),
             tool_calls: vec![],

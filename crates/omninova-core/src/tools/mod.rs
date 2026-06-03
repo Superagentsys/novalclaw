@@ -1,3 +1,4 @@
+pub mod ask_user;
 pub mod browser;
 pub mod content_search;
 pub mod file_edit;
@@ -6,6 +7,7 @@ pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
 pub mod http_request;
+pub mod knowledge_search;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod pdf_read;
@@ -14,6 +16,7 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search;
 
+pub use ask_user::{new_user_prompt_sink, AskUserTool, UserPrompt, UserPromptSink};
 pub use browser::BrowserTool;
 pub use content_search::ContentSearchTool;
 pub use file_edit::FileEditTool;
@@ -22,6 +25,7 @@ pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use http_request::HttpRequestTool;
+pub use knowledge_search::KnowledgeSearchTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use pdf_read::PdfReadTool;

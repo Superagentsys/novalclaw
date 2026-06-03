@@ -11,17 +11,33 @@
   --sidebar-w: 240px;
   --radius-lg: 16px;
   --radius-pill: 999px;
-  --font-ui: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --font-display: "Iowan Old Style", "Palatino Linotype", "Songti SC", "Noto Serif SC", Georgia, serif;
+
+  /* CJK-safe stacks: a Latin face first, then guaranteed system CJK faces,
+     and always a generic family so no character ever falls back to a "tofu" box. */
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+    "Source Han Sans SC", "WenQuanYi Micro Hei", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
+  --font-display: var(--font-ui);
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+
+  /* Type scale */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --lh-base: 1.6;
 
   font-family: var(--font-ui);
-  line-height: 1.5;
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
   font-weight: 400;
   color-scheme: light;
   color: var(--text-primary);
   background-color: var(--surface-cream);
 
-  font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -40,6 +56,10 @@ body {
   margin: 0;
   min-width: 320px;
   height: 100vh;
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  color: var(--text-primary);
   background-color: var(--surface-cream);
   overflow: hidden;
 }
@@ -48,27 +68,51 @@ body {
   box-sizing: border-box;
 }
 
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 0;
+}
+
 h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+  font-size: 1.6rem;
+}
+
+p {
+  margin: 0;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
 }
 
 button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
   font-family: inherit;
-  background-color: #ffffff;
-  color: #1a1a2e;
+  font-size: var(--fs-base);
+  font-weight: 500;
+  line-height: 1.2;
   cursor: pointer;
-  transition: border-color 0.25s;
+  /* Neutral fallback for buttons that don't define their own look.
+     Class-based styles override these via higher specificity. */
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 0.5em 1em;
+  background-color: rgba(255, 255, 255, 0.7);
+  color: var(--text-primary);
+  transition: border-color 0.2s, background-color 0.2s;
 }
-button:hover {
-  border-color: #c0c8e0;
+
+input,
+textarea,
+select {
+  font-family: inherit;
 }
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, 0.5);
+  outline-offset: 1px;
 }

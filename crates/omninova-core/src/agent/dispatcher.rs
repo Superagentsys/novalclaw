@@ -127,9 +127,10 @@ impl<'a> AgentDispatcher<'a> {
             }
             crate::security::ToolExecutionGate::ApprovalRequired { pending } => {
                 return Ok(format!(
-                    "tool execution requires approval (id={}, tool={}, reason={}). \
-                     Approve with: omninova approvals approve {}",
-                    pending.id, pending.tool_name, pending.reason, pending.id
+                    "该操作不确定/高风险，已暂停等待用户确认（工具={}，原因={}）。\
+                     请勿假设已执行；用一句话向用户说明你打算做什么并请求确认，\
+                     用户会在界面上点击「批准并继续」或「拒绝」。审批编号：{}",
+                    pending.tool_name, pending.reason, pending.id
                 ));
             }
             crate::security::ToolExecutionGate::Proceed { .. } => {}

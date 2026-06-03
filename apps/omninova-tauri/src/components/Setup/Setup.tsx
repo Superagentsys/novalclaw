@@ -56,6 +56,7 @@ const initialConfig: Config = {
     enabled: false,
     record_arguments: false,
   },
+  require_confirmation: false,
 };
 
 export type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
@@ -506,6 +507,30 @@ export function Setup({
                       })
                     }
                   />
+                </label>
+              </div>
+            </section>
+
+            <section className="setup-section">
+              <h2>执行确认</h2>
+              <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
+                开启后，对于不确定/高风险操作（执行命令 <code>shell</code>、写入/编辑文件、操作浏览器等），
+                Agent 会先在对话中说明意图并暂停，由你点击「批准并继续 / 拒绝」后再执行；
+                读取类等低风险操作仍自动放行。关闭则为本地便捷模式（全部自动执行，不打断）。
+              </p>
+              <div className="setup-grid">
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={config.require_confirmation ?? false}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        require_confirmation: event.target.checked,
+                      })
+                    }
+                  />
+                  <span>不确定/高风险操作需我确认后执行</span>
                 </label>
               </div>
             </section>

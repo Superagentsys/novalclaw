@@ -18,9 +18,17 @@ impl AnthropicProvider {
         model: impl Into<String>,
         temperature: f64,
         max_tokens: Option<u32>,
+        timeout_secs: Option<u64>,
     ) -> Self {
         Self {
-            inner: OpenAiProvider::new(base_url, api_key, model, temperature, max_tokens),
+            inner: OpenAiProvider::new(
+                base_url,
+                api_key,
+                model,
+                temperature,
+                max_tokens,
+                timeout_secs,
+            ),
         }
     }
 }

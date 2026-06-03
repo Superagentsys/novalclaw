@@ -157,6 +157,14 @@
 # capability_escalation_mode = "clamp"   # clamp, deny
 # module_hash_policy = "warn"            # warn, enforce, ignore
 
+# --- Knowledge base (Excel) ---
+# [knowledge]
+# enabled = true
+# dir = "~/.omninova/workspace/knowledge"
+# auto_inject = true
+# auto_inject_limit = 5
+# max_rows_per_sheet = 10000
+
 # --- Memory ---
 # [memory]
 # backend = "sqlite"            # sqlite, markdown, none

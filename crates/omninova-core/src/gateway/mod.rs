@@ -12,6 +12,10 @@ use crate::channels::adapters::platform_webhook::{
 use crate::channels::adapters::webhook::{WebhookInboundPayload, inbound_from_webhook};
 use crate::channels::{ChannelKind, InboundMessage};
 use crate::config::Config;
+use crate::employees::{
+    employee_skill_prompt, EmployeeManifest, EmployeeStore, EmployeeSummary,
+};
+use crate::knowledge::KnowledgeStore;
 use crate::memory::{Memory, factory::build_memory_from_config};
 use crate::providers::ChatMessage;
 use crate::providers::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
@@ -22,9 +26,10 @@ use crate::security::{
 };
 use crate::skills::{format_skills_prompt, load_skills_from_dir};
 use crate::tools::{
-    BrowserTool, ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool,
-    GlobSearchTool, HttpRequestTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool,
-    WebFetchTool, WebSearchTool,
+    AskUserTool, BrowserTool, ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool,
+    GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool,
+    MemoryStoreTool, PdfReadTool, ShellTool, Tool, UserPrompt, UserPromptSink, WebFetchTool,
+    WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::agent::sanitize_messages_for_provider;
@@ -46,6 +51,7 @@ static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub struct GatewayRuntime {
     config: Arc<RwLock<Config>>,
     pub(crate) memory: Arc<dyn Memory>,
+    pub knowledge: Arc<KnowledgeStore>,
     cron_store: Option<crate::cron::CronStore>,
     webhook_nonces: Arc<RwLock<HashMap<String, i64>>>,
     session_store_guard: Arc<tokio::sync::Mutex<()>>,
@@ -56,9 +62,11 @@ pub struct GatewayRuntime {
 
 impl GatewayRuntime {
     pub fn new(config: Config) -> Self {
+        let knowledge = KnowledgeStore::open(&config).expect("failed to open knowledge store");
         Self {
             config: Arc::new(RwLock::new(config)),
             memory: Arc::new(crate::InMemoryMemory::new()),
+            knowledge,
             cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
@@ -69,9 +77,11 @@ impl GatewayRuntime {
     }
 
     pub fn with_memory(config: Config, memory: Arc<dyn Memory>) -> Self {
+        let knowledge = KnowledgeStore::open(&config).expect("knowledge store");
         Self {
             config: Arc::new(RwLock::new(config)),
             memory,
+            knowledge,
             cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
@@ -120,9 +130,16 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
+        let tools = create_tools_for_route(
+            &cfg,
+            &route_agent_name,
+            self.memory.clone(),
+            self.knowledge.clone(),
+            None,
+        );
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
+        inject_knowledge_prompt(&mut agent_cfg, &cfg, &self.knowledge, message);
 
         if cfg.skills.open_skills_enabled {
             let skills_dir = cfg.skills.open_skills_dir.as_ref()
@@ -158,6 +175,19 @@ impl GatewayRuntime {
         security
             .audit_inbound_start(inbound.text.chars().count())
             .await;
+
+        // 记录本轮开始前已存在的待确认项，便于结束后只回传本轮新增的那些。
+        let approvals_before: HashSet<String> = security
+            .approvals()
+            .list(true)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+
+        // 交互执行：收集本轮 Agent 主动向用户发起的提问。
+        let prompt_sink = crate::tools::new_user_prompt_sink();
 
         let mut steps = vec![ExecutionStep::done(
             "接收请求",
@@ -210,7 +240,13 @@ impl GatewayRuntime {
             model: route.model.clone(),
         };
         let provider = build_provider_with_selection(&cfg, &selection);
-        let tools = create_tools_for_route(&cfg, &route.agent_name, self.memory.clone());
+        let tools = create_tools_for_route(
+            &cfg,
+            &route.agent_name,
+            self.memory.clone(),
+            self.knowledge.clone(),
+            Some(prompt_sink.clone()),
+        );
         steps.push(ExecutionStep::done(
             "准备工具",
             format!("可用工具数：{}", tools.len()),
@@ -223,6 +259,64 @@ impl GatewayRuntime {
             }
         }
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
+        {
+            // 交互执行引导：让模型在不确定/需根据结果决定时主动调用 ask_user，而非臆测。
+            let guidance = "## 交互执行\n\
+                当出现以下情况时，调用 `ask_user` 工具向用户提问并等待回答，不要自行假设：\n\
+                - 工具/检索返回的结果含糊、为空、与预期不符或有多种解读；\n\
+                - 存在多个可行方案，且取舍依赖用户偏好或业务判断；\n\
+                - 操作不可逆或影响较大，需要用户确认方向；\n\
+                - 缺少继续所必需的关键信息。\n\
+                提问时尽量给出 2-5 个明确候选项；收到用户回答后再据此继续。";
+            let current = agent_cfg.system_prompt.unwrap_or_default();
+            agent_cfg.system_prompt = Some(format!("{current}\n\n{guidance}"));
+        }
+
+        // 数字员工：若本次请求指定了 employee_id，则以该员工的人设覆盖系统提示，
+        // 并仅注入该员工的专属技能（垂直角色、精简上下文）。
+        if let Some(employee_id) = metadata_str(inbound, &["employee_id", "employeeId"]) {
+            let store = EmployeeStore::open(&cfg);
+            if let Some(manifest) = store.load(employee_id) {
+                if manifest.enabled {
+                    let mut prompt = manifest.prompt.trim().to_string();
+                    if prompt.is_empty() {
+                        prompt = format!(
+                            "你是「{}」数字员工。{}",
+                            manifest.name, manifest.description
+                        );
+                    }
+                    agent_cfg.system_prompt = Some(prompt);
+                    let skill_block = employee_skill_prompt(&store, employee_id);
+                    if !skill_block.is_empty() {
+                        let current = agent_cfg.system_prompt.clone().unwrap_or_default();
+                        agent_cfg.system_prompt = Some(format!("{current}\n{skill_block}"));
+                    }
+                    steps.push(ExecutionStep::done(
+                        "数字员工",
+                        format!("已加载「{}」的人设与专属技能", manifest.name),
+                    ));
+                }
+            }
+        }
+
+        if cfg.knowledge.enabled && cfg.knowledge.auto_inject {
+            let block = self
+                .knowledge
+                .format_context_block(&inbound.text, cfg.knowledge.auto_inject_limit);
+            if !block.is_empty() {
+                let current = agent_cfg.system_prompt.unwrap_or_default();
+                agent_cfg.system_prompt = Some(format!("{current}\n\n{block}"));
+                steps.push(ExecutionStep::done(
+                    "外挂知识库",
+                    format!(
+                        "已注入 {} 条 Excel 相关片段",
+                        self.knowledge
+                            .search(&inbound.text, cfg.knowledge.auto_inject_limit)
+                            .len()
+                    ),
+                ));
+            }
+        }
 
         if cfg.skills.open_skills_enabled {
             let skills_dir = cfg.skills.open_skills_dir.as_ref()
@@ -323,9 +417,54 @@ impl GatewayRuntime {
                 steps.push(ExecutionStep::done("保存会话历史", session_id.to_string()));
             }
         }
-        Ok(GatewayInboundResponse { route, reply, steps })
+        Ok(GatewayInboundResponse {
+            route,
+            reply,
+            steps,
+            pending_approvals: Vec::new(),
+            user_prompt: None,
+        })
         })
         .await;
+
+        let mut result = result;
+
+        // Agent 主动提问（交互执行）：取本轮收集到的第一条提问回传给 UI。
+        if let Ok(resp) = result.as_mut() {
+            let prompt = prompt_sink.lock().await.drain(..).next();
+            if let Some(prompt) = prompt {
+                resp.steps.push(ExecutionStep {
+                    title: "等待用户决定".to_string(),
+                    status: "pending".to_string(),
+                    detail: Some(prompt.question.clone()),
+                });
+                resp.user_prompt = Some(UserPromptView::from(prompt));
+            }
+        }
+
+        // 收集本轮新增的待确认项；若有，附加到响应并加一条「需要确认」步骤，供 UI 交互。
+        if let Ok(resp) = result.as_mut() {
+            let new_pending: Vec<PendingApprovalView> = security
+                .approvals()
+                .list(true)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|item| !approvals_before.contains(&item.id))
+                .map(PendingApprovalView::from)
+                .collect();
+            if !new_pending.is_empty() {
+                resp.steps.push(ExecutionStep {
+                    title: "需要确认".to_string(),
+                    status: "pending".to_string(),
+                    detail: Some(format!(
+                        "有 {} 项不确定/高风险操作等待你确认后再执行",
+                        new_pending.len()
+                    )),
+                });
+                resp.pending_approvals = new_pending;
+            }
+        }
 
         match &result {
             Ok(resp) => {
@@ -535,6 +674,38 @@ impl GatewayRuntime {
         EstopController::from_config(&cfg).resume().await
     }
 
+    pub async fn list_employees(&self) -> Vec<EmployeeSummary> {
+        let cfg = self.config.read().await.clone();
+        EmployeeStore::open(&cfg).list_summaries()
+    }
+
+    pub async fn load_employee(&self, id: &str) -> Option<EmployeeManifest> {
+        let cfg = self.config.read().await.clone();
+        EmployeeStore::open(&cfg).load(id)
+    }
+
+    pub async fn save_employee(
+        &self,
+        manifest: EmployeeManifest,
+    ) -> anyhow::Result<EmployeeManifest> {
+        let cfg = self.config.read().await.clone();
+        EmployeeStore::open(&cfg).save(manifest)
+    }
+
+    pub async fn set_employee_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<EmployeeManifest> {
+        let cfg = self.config.read().await.clone();
+        EmployeeStore::open(&cfg).set_enabled(id, enabled)
+    }
+
+    pub async fn delete_employee(&self, id: &str) -> anyhow::Result<bool> {
+        let cfg = self.config.read().await.clone();
+        EmployeeStore::open(&cfg).delete(id)
+    }
+
     pub async fn list_approvals(&self, pending_only: bool) -> anyhow::Result<Vec<PendingApproval>> {
         let cfg = self.config.read().await.clone();
         ApprovalController::from_workspace(&cfg.workspace_dir)
@@ -572,6 +743,22 @@ impl GatewayRuntime {
     }
 
     /// 供桌面聊天 UI 展示的会话历史（过滤 system/tool 与纯工具调用轮次）。
+    /// 删除持久化会话及其内存中的 lineage 元数据。
+    pub async fn delete_chat_session(
+        &self,
+        channel: &ChannelKind,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        let cfg = self.config.read().await.clone();
+        let key = session_key(channel, session_id);
+        let removed = delete_session_history(&cfg, channel, session_id).await?;
+        if removed {
+            let mut tree = self.session_tree.write().await;
+            tree.remove(&key);
+        }
+        Ok(removed)
+    }
+
     pub async fn get_session_history(
         &self,
         channel: &ChannelKind,
@@ -807,6 +994,11 @@ impl GatewayRuntime {
             .route("/api/status", get(http_api_status))
             .route("/api/tools", get(http_api_tools))
             .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
+            .route("/api/knowledge", get(http_api_knowledge_list).post(http_api_knowledge_upload))
+            .route("/api/knowledge/{id}", axum::routing::delete(http_api_knowledge_delete))
+            .route("/api/employees", get(http_api_employees_list).post(http_api_employees_save))
+            .route("/api/employees/{id}", axum::routing::delete(http_api_employees_delete))
+            .route("/api/employees/{id}/toggle", post(http_api_employees_toggle))
             .route("/api/doctor", get(http_api_doctor))
             .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
             .route("/metrics", get(http_metrics))
@@ -1167,6 +1359,85 @@ pub struct GatewayInboundResponse {
     pub reply: String,
     #[serde(default)]
     pub steps: Vec<ExecutionStep>,
+    /// 本轮执行中因「不确定/高风险」而新产生、等待用户确认的工具调用。
+    /// 桌面端据此渲染交互式「批准并继续 / 拒绝」按钮。
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApprovalView>,
+    /// Agent 主动向用户发起的提问（用于「根据结果作出反应」的交互执行）。
+    /// 用户作答后作为下一条消息继续对话。
+    #[serde(default)]
+    pub user_prompt: Option<UserPromptView>,
+}
+
+/// 面向 UI 的提问视图。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserPromptView {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub allow_free_text: bool,
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+impl From<UserPrompt> for UserPromptView {
+    fn from(p: UserPrompt) -> Self {
+        Self {
+            id: p.id,
+            question: p.question,
+            options: p.options,
+            allow_free_text: p.allow_free_text,
+            context: p.context,
+        }
+    }
+}
+
+/// 面向 UI 的待确认视图（精简自 `PendingApproval`，附带参数摘要）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingApprovalView {
+    pub id: String,
+    pub tool_name: String,
+    pub reason: String,
+    pub args_summary: String,
+}
+
+impl From<PendingApproval> for PendingApprovalView {
+    fn from(item: PendingApproval) -> Self {
+        let args_summary = summarize_tool_args(&item.tool_name, &item.arguments);
+        Self {
+            id: item.id,
+            tool_name: item.tool_name,
+            reason: item.reason,
+            args_summary,
+        }
+    }
+}
+
+/// 为待确认工具生成一行人类可读的参数摘要（避免把超长 JSON 直接塞给用户）。
+fn summarize_tool_args(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let preferred = match tool_name {
+        "shell" => arguments.get("command"),
+        "file_write" | "file_edit" | "file_read" => arguments.get("path"),
+        "http_request" | "web_fetch" => arguments.get("url"),
+        "browser" => arguments.get("url").or_else(|| arguments.get("action")),
+        _ => None,
+    };
+    if let Some(value) = preferred.and_then(|v| v.as_str()) {
+        return truncate_for_summary(value);
+    }
+    truncate_for_summary(&arguments.to_string())
+}
+
+fn truncate_for_summary(text: &str) -> String {
+    const MAX: usize = 160;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(MAX).collect();
+    format!("{cut}…")
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2014,6 +2285,22 @@ async fn save_session_history(
     Ok(())
 }
 
+async fn delete_session_history(
+    config: &Config,
+    channel: &ChannelKind,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let path = session_store_path(config);
+    let mut store = load_session_store(&path).await?;
+    let key = session_key(channel, session_id);
+    let removed = store.sessions.remove(&key).is_some();
+    if removed {
+        let serialized = serde_json::to_string_pretty(&store)?;
+        atomic_write_string(&path, &serialized).await?;
+    }
+    Ok(removed)
+}
+
 async fn load_session_record(
     config: &Config,
     channel: &ChannelKind,
@@ -2344,6 +2631,95 @@ async fn http_api_memory_forget(
     ))
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ApiKnowledgeUploadRequest {
+    source_path: String,
+}
+
+async fn http_api_knowledge_list(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let docs = runtime.knowledge.list_documents();
+    Ok(Json(serde_json::json!({
+        "enabled": runtime.knowledge.is_enabled(),
+        "documents": docs,
+        "document_count": docs.len(),
+        "chunk_count": runtime.knowledge.chunk_count(),
+    })))
+}
+
+async fn http_api_knowledge_upload(
+    State(runtime): State<GatewayRuntime>,
+    Json(req): Json<ApiKnowledgeUploadRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let path = PathBuf::from(req.source_path.trim());
+    let summary = runtime
+        .knowledge
+        .ingest_excel(&path)
+        .map_err(|e| Json(GatewayError {
+            message: e.to_string(),
+        }))?;
+    Ok(Json(serde_json::json!({ "ok": true, "document": summary.document })))
+}
+
+async fn http_api_knowledge_delete(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let removed = runtime.knowledge.delete_document(&id).map_err(|e| {
+        Json(GatewayError {
+            message: e.to_string(),
+        })
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "removed": removed })))
+}
+
+async fn http_api_employees_list(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let employees = runtime.list_employees().await;
+    Ok(Json(serde_json::json!({ "employees": employees })))
+}
+
+async fn http_api_employees_save(
+    State(runtime): State<GatewayRuntime>,
+    Json(manifest): Json<EmployeeManifest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let saved = runtime
+        .save_employee(manifest)
+        .await
+        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+    Ok(Json(serde_json::json!({ "ok": true, "employee": saved })))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ApiEmployeeToggleRequest {
+    enabled: bool,
+}
+
+async fn http_api_employees_toggle(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<String>,
+    Json(req): Json<ApiEmployeeToggleRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let updated = runtime
+        .set_employee_enabled(&id, req.enabled)
+        .await
+        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+    Ok(Json(serde_json::json!({ "ok": true, "employee": updated })))
+}
+
+async fn http_api_employees_delete(
+    State(runtime): State<GatewayRuntime>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let removed = runtime
+        .delete_employee(&id)
+        .await
+        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "removed": removed })))
+}
+
 async fn http_api_doctor(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
@@ -2490,7 +2866,29 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
     ]
 }
 
-pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
+fn inject_knowledge_prompt(
+    agent_cfg: &mut crate::config::AgentConfig,
+    cfg: &Config,
+    knowledge: &KnowledgeStore,
+    query: &str,
+) {
+    if !cfg.knowledge.enabled || !cfg.knowledge.auto_inject {
+        return;
+    }
+    let block = knowledge.format_context_block(query, cfg.knowledge.auto_inject_limit);
+    if block.is_empty() {
+        return;
+    }
+    let current = agent_cfg.system_prompt.clone().unwrap_or_default();
+    agent_cfg.system_prompt = Some(format!("{current}\n\n{block}"));
+}
+
+pub fn create_all_tools(
+    config: &Config,
+    memory: Arc<dyn Memory>,
+    knowledge: Arc<KnowledgeStore>,
+    prompt_sink: Option<UserPromptSink>,
+) -> Vec<Box<dyn Tool>> {
     let mut tools = create_default_tools(config);
 
     if config.http_request.enabled {
@@ -2523,6 +2921,15 @@ pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn
     tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
     tools.push(Box::new(MemoryRecallTool::new(memory)));
 
+    if config.knowledge.enabled {
+        tools.push(Box::new(KnowledgeSearchTool::new(knowledge)));
+    }
+
+    // 交互执行：允许 Agent 在不确定/需要用户根据结果决定时主动提问。
+    if let Some(sink) = prompt_sink {
+        tools.push(Box::new(AskUserTool::new(sink)));
+    }
+
     tools
         .into_iter()
         .filter(|tool| is_tool_globally_allowed(config, tool.name()))
@@ -2533,8 +2940,10 @@ fn create_tools_for_route(
     config: &Config,
     route_agent_name: &str,
     memory: Arc<dyn Memory>,
+    knowledge: Arc<KnowledgeStore>,
+    prompt_sink: Option<UserPromptSink>,
 ) -> Vec<Box<dyn Tool>> {
-    let tools = create_all_tools(config, memory);
+    let tools = create_all_tools(config, memory, knowledge, prompt_sink);
     let Some(delegate) = config.agents.get(route_agent_name) else {
         return tools;
     };
@@ -2585,7 +2994,8 @@ mod tests {
 
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::InMemoryMemory::new());
-        let tools = create_tools_for_route(&config, "researcher", memory);
+        let knowledge = KnowledgeStore::open(&config).expect("knowledge");
+        let tools = create_tools_for_route(&config, "researcher", memory, knowledge, None);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
     }

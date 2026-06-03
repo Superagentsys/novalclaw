@@ -8,10 +8,12 @@ import {
 } from "../../utils/composerAttachments";
 import {
   areStoredMessagesEqual,
+  deleteChatSessionOnGateway,
   fetchSessionHistory,
   fetchWebSessionsFromGateway,
   formatTime,
   loadChatStorage,
+  markSessionDeleted,
   mergeAvatarSessions,
   saveChatStorage,
   type StoredAvatarSession,
@@ -24,6 +26,8 @@ import type {
   GatewayStatus,
   ProviderHealthSummary,
   ExecutionStep,
+  PendingApprovalView,
+  UserPromptView,
   RouteDecision,
 } from "../../types/config";
 
@@ -195,6 +199,13 @@ async function formatDroppedFilesContent(files: FileList | readonly File[]): Pro
 
 interface ChatMessage extends StoredChatMessage {
   steps?: ExecutionStep[];
+  pendingApprovals?: PendingApprovalView[];
+  /** 已被用户处理（批准/拒绝）的审批 id，避免重复点击。 */
+  resolvedApprovalIds?: string[];
+  /** Agent 主动发起的提问（交互执行）。 */
+  userPrompt?: UserPromptView | null;
+  /** 该提问是否已被用户回答，回答后隐藏快捷选项。 */
+  userPromptAnswered?: boolean;
 }
 
 type SidebarTab = "avatars" | "channels" | "scheduled";
@@ -226,9 +237,11 @@ const IM_PLATFORM_OPTIONS = [
 interface ChatProps {
   /** 与侧栏「定时任务」入口同步 */
   initialSidebarTab?: SidebarTab;
+  /** 数字员工会话上下文：进入后该会话以此员工的人设/技能运行 */
+  employeeContext?: { id: string; name: string } | null;
 }
 
-export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
+export function Chat({ initialSidebarTab = "avatars", employeeContext = null }: ChatProps) {
   const initialStorage = useMemo(() => loadChatStorage(), []);
   const [avatars, setAvatars] = useState<StoredAvatarSession[]>(initialStorage.avatars);
   const [activeAvatarId, setActiveAvatarId] = useState(initialStorage.activeAvatarId);
@@ -272,6 +285,25 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   useEffect(() => {
     setSidebarTab(initialSidebarTab);
   }, [initialSidebarTab]);
+
+  // 进入数字员工会话：为该员工建立/复用专属会话并切换到它。
+  useEffect(() => {
+    if (!employeeContext) return;
+    const avatarId = `emp-${employeeContext.id}`;
+    const sessionId = `employee-${employeeContext.id}`;
+    setAvatars((prev) => {
+      if (prev.some((a) => a.id === avatarId)) {
+        return prev.map((a) =>
+          a.id === avatarId ? { ...a, name: employeeContext.name } : a
+        );
+      }
+      return [
+        { id: avatarId, name: employeeContext.name, sessionId, lastAt: formatTime(new Date()) },
+        ...prev,
+      ];
+    });
+    setActiveAvatarId(avatarId);
+  }, [employeeContext]);
 
   const loadSessionHistory = useCallback(
     async (
@@ -421,6 +453,56 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     setActiveAvatarId(id);
   };
 
+  const handleDeleteAvatar = useCallback(
+    async (avatarId: string) => {
+      const target = avatars.find((a) => a.id === avatarId);
+      if (!target) return;
+      if (!window.confirm(`确定删除会话「${target.name}」？\n\n将清除该会话的本地与网关历史记录。`)) {
+        return;
+      }
+
+      markSessionDeleted(target.sessionId);
+      if (gatewayStatus === "connected") {
+        try {
+          await deleteChatSessionOnGateway(target.sessionId);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+      }
+
+      setMessagesBySession((prev) => {
+        const next = { ...prev };
+        delete next[avatarId];
+        return next;
+      });
+
+      const filtered = avatars.filter((a) => a.id !== avatarId);
+      const nextAvatars: StoredAvatarSession[] =
+        filtered.length > 0
+          ? filtered
+          : (() => {
+              const id = `avatar-${Date.now()}`;
+              return [
+                {
+                  id,
+                  name: "对话 1",
+                  sessionId: `session-${id}`,
+                  lastAt: formatTime(new Date()),
+                },
+              ];
+            })();
+
+      setAvatars(nextAvatars);
+      if (activeAvatarId === avatarId) {
+        setActiveAvatarId(nextAvatars[0]?.id ?? "main");
+      }
+
+      void syncChatSessions();
+    },
+    [activeAvatarId, avatars, gatewayStatus, syncChatSessions]
+  );
+
   const handleRefreshHistory = useCallback(() => {
     void refreshGatewayStatus();
     if (gatewayStatus === "connected") {
@@ -490,8 +572,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     });
   }, []);
 
-  const handleSend = async () => {
-    const text = input.trim();
+  const handleSend = async (overrideText?: string) => {
+    const isResume = typeof overrideText === "string";
+    const text = (overrideText ?? input).trim();
     if (!text || sending) return;
 
     if (gatewayStatus !== "connected") {
@@ -499,7 +582,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       return;
     }
 
-    setInput("");
+    if (!isResume) {
+      setInput("");
+    }
     setError(null);
     cancelledRef.current = false;
     setElapsedSec(0);
@@ -530,6 +615,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         preferred_provider: selectedModel === "auto" ? undefined : selectedModel,
       };
 
+      if (activeAvatarId.startsWith("emp-")) {
+        metadata.employee_id = activeAvatarId.slice("emp-".length);
+      }
+
       if (desktopVisionOn && desktopVisionMaster && isTauriEnvironment()) {
         updateStep("桌面视觉", "running", "正在截取主屏幕…");
         try {
@@ -556,7 +645,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             ...prev,
             [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
           }));
-          setInput(text);
+          if (!isResume) setInput(text);
           return;
         }
       }
@@ -590,12 +679,14 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           ...prev,
           [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
         }));
-        setInput(text);
+        if (!isResume) setInput(text);
         return;
       }
 
       const replyText = result?.reply || "(空回复)";
       const steps = result?.steps?.length ? result.steps : activeSteps;
+      const pendingApprovals = result?.pending_approvals ?? [];
+      const userPrompt = result?.user_prompt ?? null;
       setActiveSteps(steps);
       setMessagesBySession((prev) => ({
         ...prev,
@@ -606,6 +697,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             content: replyText,
             agent: result?.route?.agent_name,
             steps,
+            pendingApprovals,
+            userPrompt,
           },
         ],
       }));
@@ -615,7 +708,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           ...prev,
           [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
         }));
-        setInput(text);
+        if (!isResume) setInput(text);
         return;
       }
 
@@ -640,6 +733,81 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       }
     }
   };
+
+  const markApprovalResolved = useCallback(
+    (messageIndex: number, approvalId: string) => {
+      setMessagesBySession((prev) => {
+        const list = prev[activeAvatarId] ?? [];
+        const target = list[messageIndex];
+        if (!target) return prev;
+        const next = list.slice();
+        next[messageIndex] = {
+          ...target,
+          resolvedApprovalIds: [
+            ...(target.resolvedApprovalIds ?? []),
+            approvalId,
+          ],
+        };
+        return { ...prev, [activeAvatarId]: next };
+      });
+    },
+    [activeAvatarId]
+  );
+
+  const handleApproveExecution = useCallback(
+    async (messageIndex: number, approval: PendingApprovalView) => {
+      if (sending) return;
+      try {
+        await invokeTauri("approve_pending_request", { id: approval.id });
+      } catch (e) {
+        setError(`批准失败：${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+      markApprovalResolved(messageIndex, approval.id);
+      void handleSend(
+        `（已批准操作「${approval.tool_name}：${approval.args_summary}」，请继续执行。）`
+      );
+    },
+    [sending, markApprovalResolved]
+  );
+
+  const handleRejectExecution = useCallback(
+    async (messageIndex: number, approval: PendingApprovalView) => {
+      if (sending) return;
+      try {
+        await invokeTauri("reject_pending_request", {
+          id: approval.id,
+          reason: "用户在对话中拒绝执行",
+        });
+      } catch (e) {
+        setError(`拒绝失败：${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+      markApprovalResolved(messageIndex, approval.id);
+      void handleSend(
+        `（我拒绝执行操作「${approval.tool_name}：${approval.args_summary}」，请不要执行该操作，改用其它方式或先向我说明原因。）`
+      );
+    },
+    [sending, markApprovalResolved]
+  );
+
+  const handleAnswerPrompt = useCallback(
+    (messageIndex: number, answer: string) => {
+      if (sending) return;
+      const text = answer.trim();
+      if (!text) return;
+      setMessagesBySession((prev) => {
+        const list = prev[activeAvatarId] ?? [];
+        const target = list[messageIndex];
+        if (!target) return prev;
+        const next = list.slice();
+        next[messageIndex] = { ...target, userPromptAnswered: true };
+        return { ...prev, [activeAvatarId]: next };
+      });
+      void handleSend(text);
+    },
+    [sending, activeAvatarId]
+  );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -818,7 +986,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             <h3 className="chat-sidebar-heading">会话</h3>
             <ul className="chat-avatar-list">
               {avatars.map((a) => (
-                <li key={a.id}>
+                <li
+                  key={a.id}
+                  className={`chat-avatar-row${a.id === activeAvatarId ? " is-active-row" : ""}`}
+                >
                   <button
                     type="button"
                     className={`chat-avatar-item ${a.id === activeAvatarId ? "is-active" : ""}`}
@@ -827,6 +998,18 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     <span className="chat-avatar-icon">◇</span>
                     <span className="chat-avatar-name">{a.name}</span>
                     <span className="chat-avatar-time">{a.lastAt}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-avatar-delete"
+                    title="删除会话"
+                    aria-label={`删除会话 ${a.name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleDeleteAvatar(a.id);
+                    }}
+                  >
+                    ×
                   </button>
                 </li>
               ))}
@@ -1020,6 +1203,23 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     <div className="chat-bubble-meta">Agent: {msg.agent}</div>
                   )}
                   {msg.steps?.length ? <ExecutionSteps steps={msg.steps} /> : null}
+                  {msg.pendingApprovals?.length ? (
+                    <ApprovalConfirm
+                      approvals={msg.pendingApprovals}
+                      resolvedIds={msg.resolvedApprovalIds ?? []}
+                      busy={sending}
+                      onApprove={(approval) => void handleApproveExecution(i, approval)}
+                      onReject={(approval) => void handleRejectExecution(i, approval)}
+                    />
+                  ) : null}
+                  {msg.userPrompt ? (
+                    <UserPromptCard
+                      prompt={msg.userPrompt}
+                      answered={msg.userPromptAnswered ?? false}
+                      busy={sending}
+                      onAnswer={(answer) => handleAnswerPrompt(i, answer)}
+                    />
+                  ) : null}
                 </div>
               ))
             )}
@@ -1180,6 +1380,141 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           </div>
         </main>
       </div>
+    </div>
+  );
+}
+
+function ApprovalConfirm({
+  approvals,
+  resolvedIds,
+  busy,
+  onApprove,
+  onReject,
+}: {
+  approvals: PendingApprovalView[];
+  resolvedIds: string[];
+  busy: boolean;
+  onApprove: (approval: PendingApprovalView) => void;
+  onReject: (approval: PendingApprovalView) => void;
+}) {
+  const pending = approvals.filter((a) => !resolvedIds.includes(a.id));
+  if (pending.length === 0) {
+    return (
+      <div className="chat-approval-card chat-approval-card--done">
+        <span className="chat-approval-done-text">已处理上述确认请求。</span>
+      </div>
+    );
+  }
+  return (
+    <div className="chat-approval-card">
+      <div className="chat-approval-head">需要你确认后再执行</div>
+      <ul className="chat-approval-list">
+        {pending.map((approval) => (
+          <li key={approval.id} className="chat-approval-item">
+            <div className="chat-approval-tool">
+              <span className="chat-approval-tool-name">{approval.tool_name}</span>
+              <span className="chat-approval-reason">{approval.reason}</span>
+            </div>
+            {approval.args_summary ? (
+              <code className="chat-approval-args">{approval.args_summary}</code>
+            ) : null}
+            <div className="chat-approval-actions">
+              <button
+                type="button"
+                className="chat-approval-btn chat-approval-btn--approve"
+                disabled={busy}
+                onClick={() => onApprove(approval)}
+              >
+                批准并继续
+              </button>
+              <button
+                type="button"
+                className="chat-approval-btn chat-approval-btn--reject"
+                disabled={busy}
+                onClick={() => onReject(approval)}
+              >
+                拒绝
+              </button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function UserPromptCard({
+  prompt,
+  answered,
+  busy,
+  onAnswer,
+}: {
+  prompt: UserPromptView;
+  answered: boolean;
+  busy: boolean;
+  onAnswer: (answer: string) => void;
+}) {
+  const [freeText, setFreeText] = useState("");
+  const options = prompt.options ?? [];
+  const allowFreeText = prompt.allow_free_text ?? true;
+
+  if (answered) {
+    return (
+      <div className="chat-prompt-card chat-prompt-card--done">
+        <span className="chat-prompt-done-text">已回复，继续执行中…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-prompt-card">
+      <div className="chat-prompt-head">需要你来决定</div>
+      <div className="chat-prompt-question">{prompt.question}</div>
+      {prompt.context ? (
+        <div className="chat-prompt-context">{prompt.context}</div>
+      ) : null}
+      {options.length > 0 ? (
+        <div className="chat-prompt-options">
+          {options.map((option, idx) => (
+            <button
+              key={`${option}-${idx}`}
+              type="button"
+              className="chat-prompt-option"
+              disabled={busy}
+              onClick={() => onAnswer(option)}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {allowFreeText ? (
+        <form
+          className="chat-prompt-free"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const text = freeText.trim();
+            if (!text) return;
+            setFreeText("");
+            onAnswer(text);
+          }}
+        >
+          <input
+            className="chat-prompt-free-input"
+            value={freeText}
+            disabled={busy}
+            placeholder={options.length > 0 ? "或自由作答…" : "输入你的回答…"}
+            onChange={(e) => setFreeText(e.target.value)}
+          />
+          <button
+            type="submit"
+            className="chat-prompt-free-send"
+            disabled={busy || !freeText.trim()}
+          >
+            回复
+          </button>
+        </form>
+      ) : null}
     </div>
   );
 }

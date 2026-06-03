@@ -4,6 +4,8 @@ import omninovalLogo from "../assets/omninoval-logo.png";
 export type AppNavId =
   | "chat"
   | "cron"
+  | "employees"
+  | "knowledge"
   | "general"
   | "providers"
   | "channels"
@@ -13,15 +15,17 @@ export type AppNavId =
 interface NavItem {
   id: AppNavId;
   label: string;
-  icon: "chat" | "grid" | "bot" | "nodes" | "puzzle" | "clock" | "gear";
+  icon: "chat" | "grid" | "bot" | "nodes" | "puzzle" | "clock" | "gear" | "book" | "users";
 }
 
 const PRIMARY_NAV: NavItem[] = [
   { id: "chat", label: "新对话", icon: "chat" },
   { id: "providers", label: "模型", icon: "grid" },
   { id: "persona", label: "Agents", icon: "bot" },
+  { id: "employees", label: "数字员工", icon: "users" },
   { id: "channels", label: "频道", icon: "nodes" },
   { id: "skills", label: "技能", icon: "puzzle" },
+  { id: "knowledge", label: "知识库", icon: "book" },
   { id: "cron", label: "定时任务", icon: "clock" },
 ];
 
@@ -85,6 +89,22 @@ function NavIcon({ name }: { name: NavItem["icon"] }) {
             strokeLinecap="round"
             d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"
           />
+        </svg>
+      );
+    case "book":
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden {...common}>
+          <path d="M5 4h9a3 3 0 013 3v14H8a3 3 0 00-3 3V4z" strokeLinejoin="round" />
+          <path d="M8 7h7M8 11h7M8 15h5" strokeLinecap="round" />
+          <path d="M14 7h5v14a3 3 0 00-3-3h-2V7z" strokeLinejoin="round" />
+        </svg>
+      );
+    case "users":
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden {...common}>
+          <circle cx="9" cy="8" r="3" />
+          <path d="M3 19c0-3 2.7-5 6-5s6 2 6 5" strokeLinecap="round" />
+          <path d="M16 6.5a2.6 2.6 0 010 5M18 19c0-2.4-1.2-4-3-4.6" strokeLinecap="round" />
         </svg>
       );
     default:

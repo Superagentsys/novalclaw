@@ -29,6 +29,7 @@ pub fn build_provider_with_selection(
         .clone()
         .unwrap_or_else(|| resolve_model(&provider_name, config, profile));
     let base_url = resolve_base_url(&provider_name, config, profile);
+    let timeout_secs = profile.and_then(|p| p.timeout_secs);
     let temp = config.default_temperature;
 
     match provider_name.as_str() {
@@ -38,6 +39,7 @@ pub fn build_provider_with_selection(
             model,
             temp,
             None,
+            timeout_secs,
         )),
         "gemini" => Box::new(GeminiProvider::new(
             base_url.as_deref(),
@@ -45,37 +47,19 @@ pub fn build_provider_with_selection(
             model,
             temp,
             None,
+            timeout_secs,
         )),
         "mock" => Box::new(MockProvider::new("mock-provider")),
-        "openai"
-        | "openrouter"
-        | "ollama"
-        | "deepseek"
-        | "qwen"
-        | "moonshot"
-        | "groq"
-        | "xai"
-        | "mistral"
-        | "lmstudio"
-        | "together"
-        | "fireworks"
-        | "novita"
-        | "perplexity"
-        | "cohere"
-        | "doubao"
-        | "qianfan"
-        | "glm"
-        | "minimax"
-        | "nvidia"
-        | "cloudflare"
-        | "sglang"
-        | "vllm"
-        | "llamacpp" => Box::new(OpenAiProvider::new(
+        "openai" | "openrouter" | "ollama" | "deepseek" | "qwen" | "moonshot" | "groq" | "xai"
+        | "mistral" | "lmstudio" | "together" | "fireworks" | "novita" | "perplexity"
+        | "cohere" | "doubao" | "qianfan" | "glm" | "minimax" | "nvidia" | "cloudflare"
+        | "sglang" | "vllm" | "llamacpp" => Box::new(OpenAiProvider::new(
             base_url.as_deref(),
             api_key.as_deref(),
             model,
             temp,
             None,
+            timeout_secs,
         )),
         _ if provider_name.starts_with("custom:") => {
             let custom_url = provider_name.strip_prefix("custom:").unwrap_or_default();
@@ -85,9 +69,12 @@ pub fn build_provider_with_selection(
                 model,
                 temp,
                 None,
+                timeout_secs,
             ))
         }
-        _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
+        _ => Box::new(MockProvider::new(format!(
+            "unknown-provider:{provider_name}"
+        ))),
     }
 }
 
@@ -156,11 +143,15 @@ fn resolve_base_url(
         "perplexity" => Some("https://api.perplexity.ai".to_string()),
         "cohere" => Some("https://api.cohere.ai/v1".to_string()),
         "doubao" => Some("https://ark.cn-beijing.volces.com/api/v3".to_string()),
-        "qianfan" => Some("https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop".to_string()),
+        "qianfan" => {
+            Some("https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop".to_string())
+        }
         "glm" => Some("https://open.bigmodel.cn/api/paas/v4".to_string()),
         "minimax" => Some("https://api.minimax.chat/v1".to_string()),
         "nvidia" => Some("https://integrate.api.nvidia.com/v1".to_string()),
-        "cloudflare" => Some("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1".to_string()),
+        "cloudflare" => {
+            Some("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1".to_string())
+        }
         "sglang" => Some("http://localhost:30000/v1".to_string()),
         "vllm" => Some("http://localhost:8000/v1".to_string()),
         "llamacpp" => Some("http://localhost:8080/v1".to_string()),

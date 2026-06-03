@@ -53,3 +53,4 @@ home = "=0.5.9"
 avif-serialize = "=0.8.2"
 base64ct = "=1.6.0"
 qrcode = { version = "0.14", default-features = false }
+calamine = "0.26"

@@ -93,6 +93,8 @@ pub struct Config {
     #[serde(default)]
     pub multimodal: MultimodalConfig,
     #[serde(default)]
+    pub knowledge: KnowledgeConfig,
+    #[serde(default)]
     pub transcription: TranscriptionConfig,
     #[serde(default)]
     pub identity: IdentityConfig,
@@ -213,6 +215,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             cost: CostConfig::default(),
             multimodal: MultimodalConfig::default(),
+            knowledge: KnowledgeConfig::default(),
             transcription: TranscriptionConfig::default(),
             identity: IdentityConfig::default(),
             secrets: SecretsConfig::default(),
@@ -1334,6 +1337,40 @@ pub struct CostConfig {
 
 fn default_desktop_vision_max_dimension_px() -> u32 {
     1280
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub dir: Option<String>,
+    /// 处理入站消息时，将相关表格片段注入系统提示
+    #[serde(default = "default_true")]
+    pub auto_inject: bool,
+    #[serde(default = "default_knowledge_auto_inject_limit")]
+    pub auto_inject_limit: usize,
+    #[serde(default = "default_knowledge_max_rows_per_sheet")]
+    pub max_rows_per_sheet: usize,
+}
+
+fn default_knowledge_auto_inject_limit() -> usize {
+    5
+}
+
+fn default_knowledge_max_rows_per_sheet() -> usize {
+    10_000
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+            auto_inject: true,
+            auto_inject_limit: default_knowledge_auto_inject_limit(),
+            max_rows_per_sheet: default_knowledge_max_rows_per_sheet(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

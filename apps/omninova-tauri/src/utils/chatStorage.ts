@@ -2,6 +2,7 @@ import { invokeTauri } from "./tauri";
 import type { SessionTreeResponse } from "../types/config";
 
 export const CHAT_STORAGE_KEY = "omninova-chat-sessions-v1";
+export const DELETED_SESSION_IDS_KEY = "omninova-chat-deleted-session-ids-v1";
 
 export interface StoredAvatarSession {
   id: string;
@@ -96,6 +97,28 @@ export function loadChatStorage(): ChatStorageSnapshot {
   }
 }
 
+export function loadDeletedSessionIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DELETED_SESSION_IDS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((id): id is string => typeof id === "string" && id.length > 0));
+  } catch {
+    return new Set();
+  }
+}
+
+export function markSessionDeleted(sessionId: string): void {
+  const ids = loadDeletedSessionIds();
+  ids.add(sessionId);
+  try {
+    localStorage.setItem(DELETED_SESSION_IDS_KEY, JSON.stringify([...ids]));
+  } catch {
+    // ignore
+  }
+}
+
 export function saveChatStorage(snapshot: ChatStorageSnapshot): void {
   try {
     localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(snapshot));
@@ -151,7 +174,18 @@ export async function fetchSessionHistory(
   return toUiMessages(res.messages ?? []);
 }
 
+export async function deleteChatSessionOnGateway(
+  sessionId: string,
+  channel = "web"
+): Promise<boolean> {
+  return invokeTauri<boolean>("delete_chat_session", {
+    sessionId,
+    channel,
+  });
+}
+
 export async function fetchWebSessionsFromGateway(): Promise<StoredAvatarSession[]> {
+  const deleted = loadDeletedSessionIds();
   const tree = await invokeTauri<SessionTreeResponse>("session_tree_snapshot", {
     query: {
       channel: "web",
@@ -166,7 +200,7 @@ export async function fetchWebSessionsFromGateway(): Promise<StoredAvatarSession
 
   for (const node of sessions) {
     const sessionId = node.session_id?.trim();
-    if (!sessionId || seen.has(sessionId)) continue;
+    if (!sessionId || seen.has(sessionId) || deleted.has(sessionId)) continue;
     seen.add(sessionId);
     out.push({
       id: sessionId === "omninova-chat-session" ? "main" : `sess-${sessionId}`,
@@ -185,13 +219,20 @@ export async function fetchWebSessionsFromGateway(): Promise<StoredAvatarSession
 
 export function mergeAvatarSessions(
   local: StoredAvatarSession[],
-  remote: StoredAvatarSession[]
+  remote: StoredAvatarSession[],
+  deletedSessionIds?: Set<string>
 ): StoredAvatarSession[] {
+  const deleted = deletedSessionIds ?? loadDeletedSessionIds();
   const map = new Map<string, StoredAvatarSession>();
   for (const a of local) {
-    map.set(a.sessionId, a);
+    if (!deleted.has(a.sessionId)) {
+      map.set(a.sessionId, a);
+    }
   }
   for (const a of remote) {
+    if (deleted.has(a.sessionId)) {
+      continue;
+    }
     const existing = map.get(a.sessionId);
     if (!existing) {
       map.set(a.sessionId, a);

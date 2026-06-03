@@ -10,7 +10,10 @@ use omninova_core::gateway::{
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
+use omninova_core::employees::{EmployeeManifest, EmployeeSummary};
+use omninova_core::knowledge::{KnowledgeDocumentSummary, KnowledgeUploadSummary};
 use omninova_core::skills::{import_skills_from_dir, load_skills_from_dir};
+use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -209,6 +212,9 @@ struct SetupAppConfig {
     observability: SetupObservabilityConfig,
     #[serde(default)]
     audit: SetupAuditConfig,
+    /// 执行确认模式：不确定/高风险操作（shell、写文件、浏览器等）先在对话中征求用户同意。
+    #[serde(default)]
+    require_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -326,6 +332,47 @@ async fn save_config(
     let cfg = runtime.get_config().await;
     cfg.save().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn list_knowledge_documents(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<KnowledgeDocumentSummary>, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    Ok(runtime.knowledge.list_documents())
+}
+
+#[tauri::command]
+async fn upload_knowledge_excel(
+    source_path: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<KnowledgeUploadSummary, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .knowledge
+        .ingest_excel(Path::new(source_path.trim()))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_knowledge_document(
+    doc_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .knowledge
+        .delete_document(doc_id.trim())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -514,6 +561,119 @@ struct UiSessionHistoryQuery {
 }
 
 #[tauri::command]
+async fn delete_chat_session(
+    session_id: String,
+    channel: Option<ChannelKind>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let channel = channel.unwrap_or(ChannelKind::Web);
+    runtime
+        .delete_chat_session(&channel, session_id.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_employees(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<EmployeeSummary>, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    Ok(runtime.list_employees().await)
+}
+
+#[tauri::command]
+async fn save_employee(
+    manifest: EmployeeManifest,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<EmployeeManifest, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime.save_employee(manifest).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_employee_enabled(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<EmployeeManifest, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .set_employee_enabled(id.trim(), enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_employee(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .delete_employee(id.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_pending_approvals(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<omninova_core::security::PendingApproval>, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime.list_approvals(true).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn approve_pending_request(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::security::PendingApproval, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .approve_request(id.trim(), Some("desktop-user".to_string()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reject_pending_request(
+    id: String,
+    reason: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::security::PendingApproval, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .reject_request(id.trim(), reason)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_chat_session_history(
     query: UiSessionHistoryQuery,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
@@ -647,7 +807,8 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
         app_state.runtime.clone()
     };
     let mut config = runtime.get_config().await;
-    if ensure_desktop_automation_capabilities(&mut config) {
+    let require_confirmation = matches!(config.autonomy.level.as_str(), "semi" | "supervised");
+    if ensure_desktop_automation_capabilities(&mut config, require_confirmation) {
         if let Err(error) = save_config_with_fallback(&mut config) {
             eprintln!("[config warning] {error}");
         }
@@ -872,6 +1033,10 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             enabled: config.security.audit.enabled,
             record_arguments: config.security.audit.record_arguments,
         },
+        require_confirmation: matches!(
+            config.autonomy.level.as_str(),
+            "semi" | "supervised"
+        ),
     }
 }
 
@@ -1030,7 +1195,7 @@ fn setup_config_to_core(
     current.security.audit.enabled = setup.audit.enabled;
     current.security.audit.record_arguments = setup.audit.record_arguments;
 
-    ensure_desktop_automation_capabilities(&mut current);
+    ensure_desktop_automation_capabilities(&mut current, setup.require_confirmation);
     current.validate_or_bail().map_err(|e| e.to_string())?;
     Ok(current)
 }
@@ -1082,7 +1247,7 @@ fn save_config_with_fallback(config: &mut Config) -> Result<(), String> {
     }
 }
 
-fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
+fn ensure_desktop_automation_capabilities(config: &mut Config, require_confirmation: bool) -> bool {
     let mut changed = false;
 
     if !config.browser.enabled {
@@ -1113,21 +1278,61 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
         }
     }
 
-    if config.autonomy.require_approval_for_medium_risk {
-        config.autonomy.require_approval_for_medium_risk = false;
-        changed = true;
-    }
+    // 高风险工具：开启「执行确认」后不自动批准，由用户在对话中逐项确认。
+    let high_risk_tools = ["browser", "shell", "file_write", "file_edit"];
+    // 低风险工具始终自动放行，避免读取类操作也打断对话。
+    let low_risk_tools = ["file_read"];
 
-    let auto_approved_tools = ["browser", "shell", "file_read", "file_write", "file_edit"];
-    for tool in auto_approved_tools {
-        if !config
+    if require_confirmation {
+        // 不确定/高风险操作 → 进入交互确认。
+        if config.autonomy.level != "semi" {
+            config.autonomy.level = "semi".to_string();
+            changed = true;
+        }
+        if !config.approvals.enabled {
+            config.approvals.enabled = true;
+            changed = true;
+        }
+        if !config.autonomy.require_approval_for_medium_risk {
+            config.autonomy.require_approval_for_medium_risk = true;
+            changed = true;
+        }
+        // 从自动批准名单里移除高风险工具。
+        let before = config.autonomy.auto_approve.len();
+        config
             .autonomy
             .auto_approve
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(tool))
-        {
-            config.autonomy.auto_approve.push(tool.to_string());
+            .retain(|tool| !high_risk_tools.iter().any(|t| t.eq_ignore_ascii_case(tool)));
+        if config.autonomy.auto_approve.len() != before {
             changed = true;
+        }
+        for tool in low_risk_tools {
+            if !config
+                .autonomy
+                .auto_approve
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(tool))
+            {
+                config.autonomy.auto_approve.push(tool.to_string());
+                changed = true;
+            }
+        }
+    } else {
+        // 本地便捷模式：全部自动放行，不打断。
+        if config.autonomy.require_approval_for_medium_risk {
+            config.autonomy.require_approval_for_medium_risk = false;
+            changed = true;
+        }
+        for tool in high_risk_tools.iter().chain(low_risk_tools.iter()) {
+            if !config
+                .autonomy
+                .auto_approve
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(tool))
+            {
+                config.autonomy.auto_approve.push(tool.to_string());
+                changed = true;
+            }
         }
     }
 
@@ -1286,6 +1491,10 @@ pub fn run() {
             provider_health_overview,
             route_inbound_message,
             process_inbound_message,
+            delete_chat_session,
+            list_pending_approvals,
+            approve_pending_request,
+            reject_pending_request,
             get_chat_session_history,
             session_tree_snapshot,
             check_browser_dep,
@@ -1298,6 +1507,13 @@ pub fn run() {
             skills_package_summary,
             composer_attachments::read_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
+            list_knowledge_documents,
+            upload_knowledge_excel,
+            delete_knowledge_document,
+            list_employees,
+            save_employee,
+            set_employee_enabled,
+            delete_employee,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

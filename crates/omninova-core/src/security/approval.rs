@@ -106,10 +106,24 @@ impl ApprovalController {
     ) -> Result<Option<PendingApproval>> {
         let hash = hash_tool_args(tool_name, arguments);
         let mut store = self.load().await?;
-        let idx = store.items.iter().position(|item| {
+        // 优先精确匹配（工具名 + 参数哈希）。
+        let exact = store.items.iter().position(|item| {
             item.status == ApprovalStatus::Approved
                 && item.tool_name == tool_name
                 && item.args_hash == hash
+        });
+        // 兜底：用户已对该工具批准过，但模型重发时参数略有差异（哈希不一致）。
+        // 取同名工具最近一条已批准授权放行，避免交互确认后仍反复要求确认。
+        let idx = exact.or_else(|| {
+            store
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    item.status == ApprovalStatus::Approved && item.tool_name == tool_name
+                })
+                .max_by(|(_, a), (_, b)| a.updated_at.cmp(&b.updated_at))
+                .map(|(i, _)| i)
         });
         let Some(idx) = idx else {
             return Ok(None);
