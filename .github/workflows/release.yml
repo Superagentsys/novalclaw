@@ -503,6 +503,102 @@ jobs:
           path: apps/omninova-ios/release-assets/**
           if-no-files-found: error
 
+  cli:
+    name: CLI ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_platform: linux-x64
+            bin: omninova
+            ext: ""
+          - name: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            asset_platform: macos-intel
+            bin: omninova
+            ext: ""
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+            asset_platform: macos-arm64
+            bin: omninova
+            ext: ""
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_platform: windows-x64
+            bin: omninova.exe
+            ext: ".exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential libssl-dev
+
+      - name: Prepare CLI version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BRANCH_NAME="${GITHUB_REF_NAME:-branch}"
+            SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
+            VERSION="${SANITIZED_BRANCH}-sha-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build omninova CLI
+        shell: bash
+        run: cargo build --release -p omninova-core --bin omninova --target ${{ matrix.target }}
+
+      - name: Stage CLI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cli-assets
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::CLI binary not found at $SRC"
+            ls -R target/${{ matrix.target }}/release | head -50 || true
+            exit 1
+          fi
+          DEST="cli-assets/omninova-${{ steps.meta.outputs.version }}-${{ matrix.asset_platform }}${{ matrix.ext }}"
+          cp "$SRC" "$DEST"
+          ls -lh cli-assets/
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-cli-${{ matrix.asset_platform }}
+          path: cli-assets/**
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -510,6 +606,7 @@ jobs:
       - desktop
       - android
       - ios
+      - cli
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -530,7 +627,7 @@ jobs:
           find . -mindepth 2 -name "SHA256SUMS.txt" -type f -delete
           mapfile -t release_files < <(
             find . -type f \
-              \( -name "*.dmg" -o -name "*.deb" -o -name "*.appimage" -o -name "*.rpm" -o -name "*.exe" -o -name "*.msi" -o -name "*.tar.gz" -o -name "*.apk" -o -name "*.aab" -o -name "*.ipa" \) \
+              \( -name "*.dmg" -o -name "*.deb" -o -name "*.appimage" -o -name "*.rpm" -o -name "*.exe" -o -name "*.msi" -o -name "*.tar.gz" -o -name "*.apk" -o -name "*.aab" -o -name "*.ipa" -o -name "omninova-*-linux-x64" -o -name "omninova-*-macos-intel" -o -name "omninova-*-macos-arm64" \) \
               -print | sort
           )
           if [ "${#release_files[@]}" -eq 0 ]; then
@@ -560,6 +657,10 @@ jobs:
             release-assets/**/*.apk
             release-assets/**/*.aab
             release-assets/**/*.ipa
+            release-assets/**/omninova-*-linux-x64
+            release-assets/**/omninova-*-macos-intel
+            release-assets/**/omninova-*-macos-arm64
+            release-assets/**/omninova-*-windows-x64.exe
             release-assets/**/IOS_INSTALL.txt
             release-assets/**/macOS-安装与修复.txt
             release-assets/SHA256SUMS.txt
