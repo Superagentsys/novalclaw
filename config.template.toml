@@ -85,7 +85,8 @@
 # [skills]
 # open_skills_enabled = true
 # open_skills_dir = "~/.omninova/skills"
-# prompt_injection_mode = "full"
+# prompt_injection_mode = "full"   # full | summary | disabled
+# Use "summary" when loading skills/cybersecurity (754 skills) to avoid context overflow.
 
 # --- Autonomy ---
 # [autonomy]

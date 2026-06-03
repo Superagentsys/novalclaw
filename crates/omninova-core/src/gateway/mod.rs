@@ -20,7 +20,9 @@ use crate::security::{
     ApprovalController, EstopController, EstopState, PendingApproval, SecurityContext,
     is_tool_globally_allowed, resolve_shell_allowlist,
 };
-use crate::skills::{format_skills_prompt, load_skills_from_dir};
+use crate::skills::{
+    format_skills_prompt_with_mode, load_skills_from_dir, SkillPromptMode,
+};
 use crate::tools::{
     BrowserTool, ContentSearchTool, FileEditTool, FileReadTool, FileWriteTool, GitOperationsTool,
     GlobSearchTool, HttpRequestTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool,
@@ -129,7 +131,9 @@ impl GatewayRuntime {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
+                let mode =
+                    SkillPromptMode::from_config(cfg.skills.prompt_injection_mode.as_deref());
+                let prompt = format_skills_prompt_with_mode(&skills, mode);
                 if !prompt.is_empty() {
                     let current = agent_cfg.system_prompt.unwrap_or_default();
                     agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
@@ -229,11 +233,21 @@ impl GatewayRuntime {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
+                let mode =
+                    SkillPromptMode::from_config(cfg.skills.prompt_injection_mode.as_deref());
+                let prompt = format_skills_prompt_with_mode(&skills, mode);
                 if !prompt.is_empty() {
                     let current = agent_cfg.system_prompt.unwrap_or_default();
                     agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
+                    let mode_label = match mode {
+                        SkillPromptMode::Summary => "catalog (summary)",
+                        SkillPromptMode::Full => "full",
+                        SkillPromptMode::Disabled => "disabled",
+                    };
+                    steps.push(ExecutionStep::done(
+                        "加载技能提示",
+                        format!("已注入 {} 个 skills ({mode_label})", skills.len()),
+                    ));
                 }
             }
         }
