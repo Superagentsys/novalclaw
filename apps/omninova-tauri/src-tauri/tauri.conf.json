@@ -1,6 +1,6 @@
 {
   "productName": "OmniNova Claw",
-  "version": "0.2.0-alpha.1",
+  "version": "0.2.0-alpha.2",
   "identifier": "com.omninova.claw",
   "build": {
     "frontendDist": "../dist",
