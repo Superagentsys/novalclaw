@@ -1542,29 +1542,38 @@
 
 .chat-avatar-delete {
   flex-shrink: 0;
-  width: 28px;
+  width: 26px;
+  height: 26px;
   align-self: center;
   padding: 0;
   border: none;
   border-radius: 6px;
   background: transparent;
-  color: #b0b0c8;
+  color: #8a8aa8;
   font-size: 18px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
+  opacity: 0.7;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
 }
 
 .chat-avatar-row:hover .chat-avatar-delete,
-.chat-avatar-row:focus-within .chat-avatar-delete,
-.chat-avatar-row:has(.chat-avatar-item.is-active) .chat-avatar-delete {
+.chat-avatar-row:focus-within .chat-avatar-delete {
   opacity: 1;
+  color: #6a6a88;
 }
 
-.chat-avatar-delete:hover {
-  background: rgba(220, 80, 80, 0.12);
+/* 拆分 :has 选择器，避免在不支持 :has 的 WebView 中使整组规则失效 */
+.chat-avatar-row:has(.chat-avatar-item.is-active) .chat-avatar-delete {
+  opacity: 1;
+  color: #6a6a88;
+}
+
+.chat-avatar-delete:hover,
+.chat-avatar-delete:focus-visible {
+  background: rgba(220, 80, 80, 0.14);
   color: #d04040;
+  opacity: 1;
 }
 
 .chat-avatar-item {
