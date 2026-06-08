@@ -6,6 +6,9 @@ use tracing::info;
 const APP_DIR_NAME: &str = ".omninova";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const ACTIVE_WORKSPACE_FILE: &str = "active_workspace.toml";
+/// Windows async/Tauri worker threads often use ~1 MiB stacks; Config TOML
+/// serialization is deeply nested and can overflow without a larger stack.
+const CONFIG_SAVE_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Resolve the config directory with the following priority:
 ///   1. `OMNINOVA_CONFIG_DIR` env var
@@ -107,6 +110,19 @@ impl Config {
 
     /// Save the current config to disk as TOML.
     pub fn save(&self) -> Result<()> {
+        if cfg!(target_os = "windows") {
+            let cfg = self.clone();
+            return std::thread::Builder::new()
+                .stack_size(CONFIG_SAVE_STACK_BYTES)
+                .spawn(move || cfg.save_inner())
+                .map_err(|e| anyhow::anyhow!("failed to spawn config save thread: {e}"))?
+                .join()
+                .map_err(|_| anyhow::anyhow!("config save thread panicked"))?;
+        }
+        self.save_inner()
+    }
+
+    fn save_inner(&self) -> Result<()> {
         let content = toml::to_string_pretty(self)
             .context("Failed to serialize config to TOML")?;
 
@@ -143,11 +159,14 @@ impl Config {
             .config_path
             .parent()
             .unwrap_or(&self.config_path)
-            .to_string_lossy();
+            .to_string_lossy()
+            .to_string();
 
+        let mut table = toml::Table::new();
+        table.insert("config_dir".to_string(), toml::Value::String(dir_str));
+        let body = toml::to_string(&table).context("Failed to serialize active workspace pointer")?;
         let content = format!(
-            "# Auto-generated – points to the active OmniNova workspace\nconfig_dir = \"{}\"\n",
-            dir_str
+            "# Auto-generated – points to the active OmniNova workspace\n{body}\n"
         );
         std::fs::write(&active_path, content)?;
         Ok(())
