@@ -1251,8 +1251,27 @@ fn display_provider_name(id: &str) -> String {
     }
 }
 
+/// Worker-thread stack size for the async runtime that backs Tauri commands.
+///
+/// The `Config` struct is large (~8.7 KiB) and very deeply nested, so serde
+/// (de)serialization to/from TOML/JSON consumes a lot of stack. On Windows the
+/// default worker-thread stack (~1 MiB) overflows during config save, crashing
+/// the process with `0xC00000FD` (STATUS_STACK_OVERFLOW). An 8 MiB stack keeps
+/// every command handler (which may (de)serialize `Config`) well within bounds.
+const ASYNC_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install a tokio runtime with larger worker stacks *before* anything uses
+    // the async runtime, so all Tauri command handlers run with enough stack.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(ASYNC_RUNTIME_STACK_BYTES)
+        .build()
+        .expect("Failed to build async runtime");
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+    tauri::async_runtime::set(runtime.handle().clone());
+
     omninova_core::init().expect("Failed to initialize core");
 
     let config = Config::load_or_init().expect("Failed to load config");
