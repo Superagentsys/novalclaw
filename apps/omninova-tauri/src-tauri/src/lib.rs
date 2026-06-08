@@ -373,9 +373,7 @@ async fn save_setup_config(
     let mut next = setup_config_to_core(current, config)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
 
-    if let Err(error) = save_config_with_fallback(&mut next) {
-        eprintln!("[config warning] {error}");
-    }
+    save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
     if current_gateway_url != next_gateway_url {
@@ -1177,15 +1175,19 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
 fn expand_tilde_path(value: &str) -> PathBuf {
     if value == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(value));
+        return user_home_dir().unwrap_or_else(|| PathBuf::from(value));
     }
 
     if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = user_home_dir() {
             return home.join(rest);
         }
     }
