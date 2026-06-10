@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OmniNova Phone Call Conversation Log",
+  "description": "与 iOS OmniNovaPhoneAgent 的 ConversationModels.swift 对齐的通话记录格式",
+  "type": "object",
+  "required": ["schema_version", "session_id", "channel", "started_at_utc", "turns"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "全局唯一的会话 ID（UUID）"
+    },
+    "channel": {
+      "type": "string",
+      "enum": ["voip_callkit", "in_app_voice", "simulated", "unknown"],
+      "description": "来电渠道"
+    },
+    "started_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "会话开始时间 (ISO 8601 UTC)"
+    },
+    "ended_at_utc": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "会话结束时间 (ISO 8601 UTC)；进行中为 null"
+    },
+    "locale": {
+      "type": ["string", "null"],
+      "description": "语音识别语言区域（如 zh-CN、en-US）"
+    },
+    "turns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["t", "role", "text"],
+        "properties": {
+          "t": {
+            "type": "string",
+            "format": "date-time",
+            "description": "该轮时间戳 (ISO 8601)"
+          },
+          "role": {
+            "type": "string",
+            "enum": ["caller", "agent", "system"],
+            "description": "说话者角色"
+          },
+          "text": {
+            "type": "string",
+            "description": "转写或回复内容"
+          },
+          "confidence": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1,
+            "description": "语音转写置信度 (0-1)；Agent 回复为 1.0"
+          },
+          "raw_note": {
+            "type": ["string", "null"],
+            "description": "附加说明（如 [REDACTED]、转人工等标记）"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": ["object", "null"],
+      "description": "扩展元数据（设备名、App 版本等）",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

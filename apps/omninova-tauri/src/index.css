@@ -1,0 +1,74 @@
+:root {
+  /* ClawX-inspired warm neutrals */
+  --surface-cream: #f3f0e8;
+  --surface-panel: #ebe6dc;
+  --surface-elevated: #faf8f3;
+  --border-soft: rgba(55, 48, 40, 0.08);
+  --text-primary: #2c2824;
+  --text-muted: rgba(44, 40, 36, 0.55);
+  --accent-blue: #2563eb;
+  --accent-blue-soft: rgba(37, 99, 235, 0.12);
+  --sidebar-w: 240px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+  --font-ui: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: "Iowan Old Style", "Palatino Linotype", "Songti SC", "Noto Serif SC", Georgia, serif;
+
+  font-family: var(--font-ui);
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light;
+  color: var(--text-primary);
+  background-color: var(--surface-cream);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  font-weight: 500;
+  color: #4a62c8;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #6a82df;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  height: 100vh;
+  background-color: var(--surface-cream);
+  overflow: hidden;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #ffffff;
+  color: #1a1a2e;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: #c0c8e0;
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}

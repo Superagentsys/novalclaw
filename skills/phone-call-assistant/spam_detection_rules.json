@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "1.0",
+  "description": "OmniNova Phone Agent 骚扰/营销/诈骗电话识别规则。客户端（iOS/Android）在来电 screening 阶段加载执行；网关侧可下发最新版本覆盖本地。",
+  "severity_levels": {
+    "block": "直接拒接，不振铃",
+    "silence": "静音接入，交由 Agent 自动应答",
+    "allow": "正常放行给用户"
+  },
+  "rules": [
+    {
+      "id": "prefix-overseas-00",
+      "severity": "silence",
+      "reason": "境外回拨常见前缀，交由 Agent 甄别",
+      "match": {
+        "type": "prefix",
+        "values": ["00", "+0"]
+      }
+    },
+    {
+      "id": "prefix-cn-marketing-95-96-400",
+      "severity": "silence",
+      "reason": "95/96/400 常见客服与营销号段",
+      "match": {
+        "type": "prefix",
+        "values": ["95", "96", "400", "+86400", "+8695", "+8696"]
+      }
+    },
+    {
+      "id": "pattern-loan-ads",
+      "severity": "block",
+      "reason": "贷款、办卡等高风险营销",
+      "match": {
+        "type": "keyword",
+        "values": [
+          "贷款",
+          "额度",
+          "分期",
+          "下款",
+          "办卡",
+          "POS 机",
+          "走流水"
+        ],
+        "applies_to": "caller_text_first_turn"
+      }
+    },
+    {
+      "id": "pattern-fraud",
+      "severity": "block",
+      "reason": "常见电信诈骗话术",
+      "match": {
+        "type": "keyword",
+        "values": [
+          "公安局",
+          "检察院",
+          "涉嫌洗钱",
+          "账户异常",
+          "快递丢失",
+          "退款",
+          "冻结",
+          "安全账户"
+        ],
+        "applies_to": "caller_text_first_turn"
+      }
+    },
+    {
+      "id": "pattern-insurance-sales",
+      "severity": "silence",
+      "reason": "保险销售",
+      "match": {
+        "type": "keyword",
+        "values": ["保险", "车险", "重疾", "续保", "保单"],
+        "applies_to": "caller_text_first_turn"
+      }
+    },
+    {
+      "id": "rate-limit-unknown",
+      "severity": "silence",
+      "reason": "陌生号码短时间高频来电",
+      "match": {
+        "type": "rate_limit",
+        "window_seconds": 3600,
+        "threshold": 3,
+        "scope": "not_in_contacts"
+      }
+    },
+    {
+      "id": "time-night",
+      "severity": "silence",
+      "reason": "夜间陌生来电统一由 Agent 接管",
+      "match": {
+        "type": "time_window",
+        "start_local": "22:30",
+        "end_local": "07:30",
+        "scope": "not_in_contacts"
+      }
+    }
+  ],
+  "number_blocklist": [],
+  "number_allowlist": [],
+  "remote_sync": {
+    "enabled": true,
+    "endpoint": "/api/skill/phone-call-assistant/rules",
+    "poll_interval_seconds": 3600
+  }
+}

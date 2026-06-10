@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>OmniNova Claw 需要访问摄像头以在对话界面中预览与视频交互。</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>OmniNova Claw 需要访问麦克风以进行语音输入与音量指示。</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>OmniNova Claw 需要屏幕录制权限，以便在开启「桌面视觉监控」时将当前桌面画面发送给支持视觉的多模态模型。</string>
+</dict>
+</plist>
