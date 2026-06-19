@@ -4,13 +4,31 @@
   --surface-panel: #ebe6dc;
   --surface-elevated: #faf8f3;
   --border-soft: rgba(55, 48, 40, 0.08);
+  --border-strong: rgba(55, 48, 40, 0.14);
   --text-primary: #2c2824;
   --text-muted: rgba(44, 40, 36, 0.55);
   --accent-blue: #2563eb;
+  --accent-blue-strong: #1d4ed8;
   --accent-blue-soft: rgba(37, 99, 235, 0.12);
+  --accent-gradient: linear-gradient(135deg, #3b6ef0 0%, #2563eb 100%);
   --sidebar-w: 240px;
+  --radius-sm: 10px;
+  --radius-md: 12px;
   --radius-lg: 16px;
+  --radius-xl: 22px;
   --radius-pill: 999px;
+
+  /* Layered elevation scale (warm-tinted shadows) */
+  --shadow-xs: 0 1px 2px rgba(44, 40, 36, 0.05);
+  --shadow-sm: 0 2px 8px rgba(44, 40, 36, 0.07);
+  --shadow-md: 0 6px 20px rgba(44, 40, 36, 0.09);
+  --shadow-lg: 0 16px 40px rgba(44, 40, 36, 0.12);
+  --shadow-accent: 0 6px 18px rgba(37, 99, 235, 0.30);
+
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --transition-fast: 0.16s var(--ease-out);
+  --transition-med: 0.26s var(--ease-out);
+
   --font-ui: "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   --font-display: "Iowan Old Style", "Palatino Linotype", "Songti SC", "Noto Serif SC", Georgia, serif;
 
@@ -25,6 +43,25 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Refined custom scrollbars (WebKit) for a calmer, more polished feel */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(55, 48, 40, 0.16);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(55, 48, 40, 0.30);
+  background-clip: padding-box;
 }
 
 a {
