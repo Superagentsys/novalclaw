@@ -93,6 +93,42 @@ impl Agent {
         }
     }
 
+    /// Streaming variant of [`process_message`]: drives the budget-aware tool
+    /// loop while forwarding token deltas and tool steps over `events`. Uses the
+    /// plain streaming ReAct path (Plan-Execute-Reflect is not streamed).
+    pub async fn process_message_streaming(
+        &mut self,
+        message: &str,
+        events: &tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
+    ) -> Result<String> {
+        if self.messages.is_empty() {
+            self.messages.extend(bootstrap_system_messages(&self.config));
+        }
+
+        let _ = self
+            .memory
+            .store(
+                &format!("conversation/{}", uuid::Uuid::new_v4()),
+                message,
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+
+        self.messages.push(ChatMessage::user(message));
+
+        let budget = BudgetTracker::new(self.config.budget.clone());
+        let dispatcher = AgentDispatcher::new(
+            self.provider.as_ref(),
+            &self.tools,
+            &self.tool_specs,
+            self.config.max_tool_iterations,
+            &self.security,
+            &budget,
+        );
+        dispatcher.run_streaming(&mut self.messages, events).await
+    }
+
     /// Plan-Execute-Reflect loop: a planner decomposes the task, the executor
     /// (ReAct tool loop) runs one step at a time, and an isolated reflector
     /// judges progress after each step, optionally triggering a replan.

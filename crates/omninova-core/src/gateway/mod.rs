@@ -151,6 +151,48 @@ impl GatewayRuntime {
         agent.process_message(message).await
     }
 
+    /// Build a ready-to-use in-process `Agent` (provider + tools + skills +
+    /// security), for interactive front-ends like the terminal UI that drive
+    /// multi-turn streaming conversations and keep history in-memory.
+    pub async fn build_interactive_agent(&self) -> Agent {
+        let cfg = self.config.read().await.clone();
+        let route_agent_name = cfg.agent.name.clone();
+        let provider = build_provider_from_config(&cfg);
+        let mut tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
+        // Give the interactive agent the delegate tool so it can hand subtasks
+        // to other configured agents (multi-agent), matching `chat()`.
+        attach_delegate_tool(
+            &cfg,
+            self,
+            &route_agent_name,
+            None,
+            &ChannelKind::Web,
+            0,
+            &mut tools,
+        );
+        let mut agent_cfg = cfg.agent.clone();
+        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
+
+        if cfg.skills.open_skills_enabled {
+            let skills_dir = cfg
+                .skills
+                .open_skills_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
+                let prompt = format_skills_prompt(&skills);
+                if !prompt.is_empty() {
+                    let current = agent_cfg.system_prompt.unwrap_or_default();
+                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
+                }
+            }
+        }
+
+        let security = SecurityContext::from_config(&cfg);
+        Agent::new(provider, tools, self.memory.clone(), agent_cfg, security)
+    }
+
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
         let cfg = self.config.read().await.clone();
         resolve_agent_route(&cfg, inbound)
