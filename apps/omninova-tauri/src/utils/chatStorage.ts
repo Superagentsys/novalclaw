@@ -20,6 +20,8 @@ export interface ChatStorageSnapshot {
   avatars: StoredAvatarSession[];
   activeAvatarId: string;
   messagesBySession: Record<string, StoredChatMessage[]>;
+  /** 已删除会话的 sessionId（墓碑），防止被网关同步重新合并回来 */
+  deletedSessionIds: string[];
 }
 
 export interface GatewayChatHistoryMessage {
@@ -60,7 +62,7 @@ export function formatTimeFromUnix(ts: number): string {
 export function sessionDisplayName(sessionId: string): string {
   if (sessionId === "omninova-chat-session") return "Main";
   const short = sessionId.replace(/^session-/, "").slice(0, 8);
-  return short ? `对话 ${short}` : sessionId.slice(0, 12);
+  return short ? `智能体 ${short}` : sessionId.slice(0, 12);
 }
 
 export function loadChatStorage(): ChatStorageSnapshot {
@@ -71,6 +73,7 @@ export function loadChatStorage(): ChatStorageSnapshot {
         avatars: DEFAULT_AVATARS,
         activeAvatarId: "main",
         messagesBySession: { main: [] },
+        deletedSessionIds: [],
       };
     }
     const parsed = JSON.parse(raw) as Partial<ChatStorageSnapshot>;
@@ -86,12 +89,16 @@ export function loadChatStorage(): ChatStorageSnapshot {
       avatars,
       activeAvatarId,
       messagesBySession: parsed.messagesBySession ?? {},
+      deletedSessionIds: Array.isArray(parsed.deletedSessionIds)
+        ? parsed.deletedSessionIds
+        : [],
     };
   } catch {
     return {
       avatars: DEFAULT_AVATARS,
       activeAvatarId: "main",
       messagesBySession: { main: [] },
+      deletedSessionIds: [],
     };
   }
 }

@@ -242,21 +242,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>(
     initialStorage.messagesBySession
   );
+  // 已删除会话墓碑：防止网关同步把删掉的会话重新合并回列表。
+  const [deletedSessionIds, setDeletedSessionIds] = useState<string[]>(
+    initialStorage.deletedSessionIds ?? []
+  );
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const [elapsedSec, setElapsedSec] = useState(0);
+  // 输入草稿与运行状态按会话隔离，避免一个会话影响其它会话。
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [runs, setRuns] = useState<
+    Record<string, { elapsedSec: number; steps: ExecutionStep[] }>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
   const [availableModels] = useState<string[]>(["auto", "openai", "anthropic", "gemini", "ollama"]);
   const [selectedModel, setSelectedModel] = useState("auto");
-  const [activeSteps, setActiveSteps] = useState<ExecutionStep[]>([]);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const historyLoadGenRef = useRef(0);
-  const cancelledRef = useRef(false);
-  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 每个会话独立的取消标志与计时器。
+  const cancelledRef = useRef<Record<string, boolean>>({});
+  const elapsedTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [desktopVisionMaster, setDesktopVisionMaster] = useState(false);
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
@@ -267,6 +273,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const messages = useMemo(
     () => messagesBySession[activeAvatarId] ?? [],
     [messagesBySession, activeAvatarId]
+  );
+
+  // 仅反映「当前查看的会话」的运行/输入状态。
+  const activeRun = runs[activeAvatarId];
+  const sending = Boolean(activeRun);
+  const elapsedSec = activeRun?.elapsedSec ?? 0;
+  const activeSteps = activeRun?.steps ?? [];
+  const input = inputs[activeAvatarId] ?? "";
+
+  const setActiveInput = useCallback(
+    (value: string) =>
+      setInputs((prev) => ({ ...prev, [activeAvatarId]: value })),
+    [activeAvatarId]
+  );
+  const appendActiveInput = useCallback(
+    (updater: (prev: string) => string) =>
+      setInputs((prev) => ({
+        ...prev,
+        [activeAvatarId]: updater(prev[activeAvatarId] ?? ""),
+      })),
+    [activeAvatarId]
   );
 
   useEffect(() => {
@@ -312,7 +339,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
 
   const syncChatSessions = useCallback(async () => {
     try {
-      const remote = await fetchWebSessionsFromGateway();
+      const remoteAll = await fetchWebSessionsFromGateway();
+      // 过滤掉已被用户删除的会话，避免「删了又回来」。
+      const tombstoned = new Set(deletedSessionIds);
+      const remote = remoteAll.filter((s) => !tombstoned.has(s.sessionId));
       setAvatars((prev) => {
         const merged = mergeAvatarSessions(prev, remote);
         if (
@@ -332,15 +362,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     } catch {
       // 网关未就绪时仅使用本地会话列表
     }
-  }, []);
+  }, [deletedSessionIds]);
 
   useEffect(() => {
     saveChatStorage({
       avatars,
       activeAvatarId,
       messagesBySession,
+      deletedSessionIds,
     });
-  }, [avatars, activeAvatarId, messagesBySession]);
+  }, [avatars, activeAvatarId, messagesBySession, deletedSessionIds]);
 
   useEffect(() => {
     void refreshGatewayStatus();
@@ -393,8 +424,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, [messages, sending, activeSteps, elapsedSec, scrollMessagesToEnd]);
 
   useEffect(() => {
+    const timers = elapsedTimersRef.current;
     return () => {
-      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+      Object.values(timers).forEach((timer) => clearInterval(timer));
     };
   }, []);
 
@@ -412,13 +444,82 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const handleAddAvatar = () => {
     const id = `avatar-${Date.now()}`;
     const sessionId = `session-${id}`;
-    const name = `对话 ${avatars.length}`;
+    const name = `智能体 ${avatars.length}`;
     setAvatars((prev) => [
       { id, name, sessionId, lastAt: formatTime(new Date()) },
       ...prev,
     ]);
     setMessagesBySession((prev) => ({ ...prev, [id]: [] }));
     setActiveAvatarId(id);
+  };
+
+  const handleDeleteAvatar = (id: string) => {
+    // 终止该会话可能正在进行的任务，并清理其计时器/运行态。
+    cancelledRef.current[id] = true;
+    const timer = elapsedTimersRef.current[id];
+    if (timer) {
+      clearInterval(timer);
+      delete elapsedTimersRef.current[id];
+    }
+    setRuns((prev) => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    // 记录墓碑并在网关侧删除，避免被会话同步重新合并回来。
+    const target = avatars.find((a) => a.id === id);
+    if (target) {
+      setDeletedSessionIds((prev) =>
+        prev.includes(target.sessionId) ? prev : [...prev, target.sessionId]
+      );
+      void invokeTauri<boolean>("delete_chat_session", {
+        query: { sessionId: target.sessionId, channel: "web" },
+      }).catch(() => {
+        // 网关未连接时忽略：墓碑已能阻止其在本地重新出现。
+      });
+    }
+
+    const remaining = avatars.filter((a) => a.id !== id);
+
+    const dropMaps = (alsoSeed?: string) => {
+      setMessagesBySession((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        if (alsoSeed) next[alsoSeed] = [];
+        return next;
+      });
+      setInputs((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    };
+
+    // 始终保留至少一个会话：删光时重建一个空的 Main。
+    if (remaining.length === 0) {
+      const fresh = {
+        id: "main",
+        name: "Main",
+        sessionId: "omninova-chat-session",
+        lastAt: formatTime(new Date()),
+      };
+      setAvatars([fresh]);
+      dropMaps(fresh.id);
+      // 重建的 Main 复用默认 sessionId，需从墓碑移除以恢复其同步。
+      setDeletedSessionIds((prev) =>
+        prev.filter((sid) => sid !== fresh.sessionId)
+      );
+      setActiveAvatarId(fresh.id);
+      return;
+    }
+
+    setAvatars(remaining);
+    dropMaps();
+    if (id === activeAvatarId) {
+      setActiveAvatarId(remaining[0].id);
+    }
   };
 
   const handleRefreshHistory = useCallback(() => {
@@ -478,50 +579,91 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   };
 
   const handleCancel = useCallback(() => {
-    cancelledRef.current = true;
-  }, []);
-
-  const updateStep = useCallback((title: string, status: ExecutionStep["status"], detail?: string) => {
-    setActiveSteps((prev) => {
-      const existingIndex = prev.findIndex((step) => step.title === title);
-      const nextStep: ExecutionStep = { title, status, detail };
-      if (existingIndex < 0) return [...prev, nextStep];
-      return prev.map((step, index) => (index === existingIndex ? nextStep : step));
-    });
-  }, []);
+    // 仅取消当前查看的会话。
+    cancelledRef.current[activeAvatarId] = true;
+  }, [activeAvatarId]);
 
   const handleSend = async () => {
+    // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
+    // 即使用户中途切换到其它会话也互不影响。
+    const avatarId = activeAvatarId;
+    const targetSessionId = sessionId;
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || runs[avatarId]) return;
 
     if (gatewayStatus !== "connected") {
       setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
       return;
     }
 
-    setInput("");
-    setError(null);
-    cancelledRef.current = false;
-    setElapsedSec(0);
-    setActiveSteps([
-      { title: "准备请求", status: "done", detail: `会话：${sessionId}` },
+    // 本地维护该会话的步骤列表，避免依赖共享状态。
+    let localSteps: ExecutionStep[] = [
+      { title: "准备请求", status: "done", detail: `会话：${targetSessionId}` },
       { title: "路由选择", status: "running", detail: "正在选择 Agent / Provider / Model" },
-    ]);
+    ];
+    const writeSteps = (steps: ExecutionStep[]) => {
+      localSteps = steps;
+      setRuns((prev) =>
+        prev[avatarId]
+          ? { ...prev, [avatarId]: { ...prev[avatarId], steps } }
+          : prev
+      );
+    };
+    const updateStep = (
+      title: string,
+      status: ExecutionStep["status"],
+      detail?: string
+    ) => {
+      const idx = localSteps.findIndex((step) => step.title === title);
+      const nextStep: ExecutionStep = { title, status, detail };
+      writeSteps(
+        idx < 0
+          ? [...localSteps, nextStep]
+          : localSteps.map((step, i) => (i === idx ? nextStep : step))
+      );
+    };
+    const finishRun = () => {
+      const timer = elapsedTimersRef.current[avatarId];
+      if (timer) {
+        clearInterval(timer);
+        delete elapsedTimersRef.current[avatarId];
+      }
+      setRuns((prev) => {
+        if (!prev[avatarId]) return prev;
+        const next = { ...prev };
+        delete next[avatarId];
+        return next;
+      });
+    };
+
+    setActiveInput("");
+    setError(null);
+    cancelledRef.current[avatarId] = false;
+    setRuns((prev) => ({ ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps } }));
 
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
       ...prev,
-      [activeAvatarId]: [...(prev[activeAvatarId] ?? []), { role: "user", content: text }],
+      [avatarId]: [...(prev[avatarId] ?? []), { role: "user", content: text }],
     }));
     setAvatars((prev) =>
       prev.map((a) =>
-        a.id === activeAvatarId ? { ...a, lastAt: formatTime(new Date()) } : a
+        a.id === avatarId ? { ...a, lastAt: formatTime(new Date()) } : a
       )
     );
-    setSending(true);
 
-    elapsedTimerRef.current = setInterval(() => {
-      setElapsedSec((s) => s + 1);
+    elapsedTimersRef.current[avatarId] = setInterval(() => {
+      setRuns((prev) =>
+        prev[avatarId]
+          ? {
+              ...prev,
+              [avatarId]: {
+                ...prev[avatarId],
+                elapsedSec: prev[avatarId].elapsedSec + 1,
+              },
+            }
+          : prev
+      );
     }, 1000);
 
     let route: RouteDecision | null = null;
@@ -547,16 +689,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           const msg = err instanceof Error ? err.message : String(err);
           updateStep("桌面视觉", "error", msg);
           setError(`桌面截图失败：${msg}`);
-          setSending(false);
-          if (elapsedTimerRef.current) {
-            clearInterval(elapsedTimerRef.current);
-            elapsedTimerRef.current = null;
-          }
+          finishRun();
           setMessagesBySession((prev) => ({
             ...prev,
-            [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+            [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
           }));
-          setInput(text);
+          setInputs((prev) => ({ ...prev, [avatarId]: text }));
           return;
         }
       }
@@ -564,7 +702,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       const payload = {
         channel: "web" as const,
         text,
-        sessionId,
+        sessionId: targetSessionId,
         userId: USER_ID,
         metadata,
       };
@@ -585,22 +723,21 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         payload,
       });
 
-      if (cancelledRef.current) {
+      if (cancelledRef.current[avatarId]) {
         setMessagesBySession((prev) => ({
           ...prev,
-          [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
         }));
-        setInput(text);
+        setInputs((prev) => ({ ...prev, [avatarId]: text }));
         return;
       }
 
       const replyText = result?.reply || "(空回复)";
-      const steps = result?.steps?.length ? result.steps : activeSteps;
-      setActiveSteps(steps);
+      const steps = result?.steps?.length ? result.steps : localSteps;
       setMessagesBySession((prev) => ({
         ...prev,
-        [activeAvatarId]: [
-          ...(prev[activeAvatarId] ?? []),
+        [avatarId]: [
+          ...(prev[avatarId] ?? []),
           {
             role: "assistant",
             content: replyText,
@@ -610,12 +747,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         ],
       }));
     } catch (e) {
-      if (cancelledRef.current) {
+      if (cancelledRef.current[avatarId]) {
         setMessagesBySession((prev) => ({
           ...prev,
-          [activeAvatarId]: (prev[activeAvatarId] ?? []).slice(0, -1),
+          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
         }));
-        setInput(text);
+        setInputs((prev) => ({ ...prev, [avatarId]: text }));
         return;
       }
 
@@ -625,19 +762,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       setError(errorContent);
       setMessagesBySession((prev) => ({
         ...prev,
-        [activeAvatarId]: [
-          ...(prev[activeAvatarId] ?? []),
+        [avatarId]: [
+          ...(prev[avatarId] ?? []),
           { role: "error", content: errorContent },
         ],
       }));
     } finally {
-      setSending(false);
-      setElapsedSec(0);
-      setActiveSteps([]);
-      if (elapsedTimerRef.current) {
-        clearInterval(elapsedTimerRef.current);
-        elapsedTimerRef.current = null;
-      }
+      finishRun();
     }
   };
 
@@ -648,15 +779,21 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     }
   };
 
-  const appendVoiceTranscript = useCallback((text: string) => {
-    setInput((prev) => (prev.trim() ? `${prev} ${text}` : text));
-  }, []);
+  const appendVoiceTranscript = useCallback(
+    (text: string) => {
+      appendActiveInput((prev) => (prev.trim() ? `${prev} ${text}` : text));
+    },
+    [appendActiveInput]
+  );
 
-  const appendAttachmentContent = useCallback((insert: string) => {
-    const trimmed = insert.trim();
-    if (!trimmed) return;
-    setInput((prev) => (prev.trim() ? `${prev}\n${trimmed}` : trimmed));
-  }, []);
+  const appendAttachmentContent = useCallback(
+    (insert: string) => {
+      const trimmed = insert.trim();
+      if (!trimmed) return;
+      appendActiveInput((prev) => (prev.trim() ? `${prev}\n${trimmed}` : trimmed));
+    },
+    [appendActiveInput]
+  );
 
   const mergePathsIntoInput = useCallback(
     async (paths: string[]) => {
@@ -812,13 +949,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             className="chat-new-chat-pill"
             onClick={handleAddAvatar}
           >
-            + 新对话
+            + 新智能体
           </button>
           <section className="chat-sidebar-section">
-            <h3 className="chat-sidebar-heading">会话</h3>
+            <h3 className="chat-sidebar-heading">智能体</h3>
             <ul className="chat-avatar-list">
               {avatars.map((a) => (
-                <li key={a.id}>
+                <li
+                  key={a.id}
+                  className={`chat-avatar-row ${a.id === activeAvatarId ? "is-active" : ""}`}
+                >
                   <button
                     type="button"
                     className={`chat-avatar-item ${a.id === activeAvatarId ? "is-active" : ""}`}
@@ -826,7 +966,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   >
                     <span className="chat-avatar-icon">◇</span>
                     <span className="chat-avatar-name">{a.name}</span>
-                    <span className="chat-avatar-time">{a.lastAt}</span>
+                    {runs[a.id] ? (
+                      <span
+                        className="chat-avatar-running"
+                        title="该会话正在运行"
+                        aria-label="运行中"
+                      />
+                    ) : (
+                      <span className="chat-avatar-time">{a.lastAt}</span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-avatar-delete"
+                    title="删除智能体"
+                    aria-label={`删除智能体 ${a.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteAvatar(a.id);
+                    }}
+                  >
+                    ✕
                   </button>
                 </li>
               ))}
@@ -940,7 +1100,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                 <img src={omninovalLogo} alt="" />
               </span>
               <span className="chat-target-pill-text">
-                当前对话对象：{activeSession?.name ?? "Main"}
+                当前智能体：{activeSession?.name ?? "Main"}
               </span>
             </div>
             <div className="chat-main-toolbar-actions">
@@ -994,7 +1154,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               <div className="chat-hero">
                 <h1 className="chat-hero-title">我能为你做些什么？</h1>
                 <p className="chat-hero-sub">
-                  与 {activeSession?.name ?? "Main"} 对话；历史记录会保存在网关并在下次打开时恢复。
+                  与智能体 {activeSession?.name ?? "Main"} 对话；历史记录会保存在网关并在下次打开时恢复。
                 </p>
                 <div className="chat-quick-pills">
                   {quickPrompts.map((q) => (
@@ -1002,7 +1162,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                       key={q.label}
                       type="button"
                       className="chat-quick-pill"
-                      onClick={() => setInput(q.text)}
+                      onClick={() => setActiveInput(q.text)}
                     >
                       {q.label}
                     </button>
@@ -1098,7 +1258,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               <textarea
                 className="chat-input"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => setActiveInput(e.target.value)}
                 onKeyDown={handleKeyDown}
                 onDragOver={handleComposerDragOverFiles}
                 onDrop={handleComposerDropFiles}

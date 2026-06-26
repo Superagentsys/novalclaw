@@ -1,12 +1,11 @@
+use crate::agent::budget::BudgetTracker;
 use crate::agent::history::sanitize_messages_for_provider;
-use crate::providers::{ChatMessage, ChatRequest, Provider, ToolCall};
+use crate::agent::AgentEvent;
+use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
-use std::collections::HashMap;
-
-const SAME_TOOL_CALL_LIMIT: u32 = 3;
-const WRAP_UP_FRACTION: f64 = 0.7;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Stateless dispatcher for one agent turn:
 /// model response -> tool call(s) -> tool result message(s) -> next model response.
@@ -16,6 +15,7 @@ pub struct AgentDispatcher<'a> {
     tool_specs: &'a [ToolSpec],
     max_tool_iterations: usize,
     security: &'a SecurityContext,
+    budget: &'a BudgetTracker,
 }
 
 impl<'a> AgentDispatcher<'a> {
@@ -25,6 +25,7 @@ impl<'a> AgentDispatcher<'a> {
         tool_specs: &'a [ToolSpec],
         max_tool_iterations: usize,
         security: &'a SecurityContext,
+        budget: &'a BudgetTracker,
     ) -> Self {
         Self {
             provider,
@@ -32,6 +33,7 @@ impl<'a> AgentDispatcher<'a> {
             tool_specs,
             max_tool_iterations,
             security,
+            budget,
         }
     }
 
@@ -39,11 +41,26 @@ impl<'a> AgentDispatcher<'a> {
     pub async fn run(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
         *messages = sanitize_messages_for_provider(std::mem::take(messages));
         let iteration_cap = self.max_tool_iterations.max(1);
-        let mut call_counts: HashMap<String, u32> = HashMap::new();
-        let wrap_up_at = ((iteration_cap as f64) * WRAP_UP_FRACTION).floor() as usize;
-        let mut wrap_up_hinted = false;
 
         for iteration in 0..iteration_cap {
+            if let Some(reason) = self.budget.check() {
+                let text = format!(
+                    "[budget exceeded] {reason}. Stopping here ({}).",
+                    self.budget.summary()
+                );
+                self.security
+                    .audit()
+                    .record_event(
+                        "budget_exceeded",
+                        false,
+                        &reason,
+                        serde_json::json!({ "stage": "dispatcher", "iteration": iteration }),
+                    )
+                    .await;
+                messages.push(ChatMessage::assistant(&text));
+                return Ok(text);
+            }
+
             let provider_name = self
                 .security
                 .audit()
@@ -63,6 +80,10 @@ impl<'a> AgentDispatcher<'a> {
                     },
                 })
                 .await;
+
+            if let Ok(response) = &chat_result {
+                self.budget.record_call(response.usage.as_ref());
+            }
 
             match &chat_result {
                 Ok(response) => {
@@ -100,59 +121,142 @@ impl<'a> AgentDispatcher<'a> {
             .to_string();
             messages.push(ChatMessage::assistant(assistant_payload));
 
-            let near_cap = !wrap_up_hinted && iteration >= wrap_up_at;
-            if near_cap {
-                wrap_up_hinted = true;
-            }
-
             for tool_call in response.tool_calls {
                 let tool_result = self.execute_tool_call(&tool_call).await?;
-
-                let fingerprint = format!("{}::{}", tool_call.name, tool_call.arguments);
-                let count = call_counts.entry(fingerprint).or_insert(0);
-                *count += 1;
-
-                let mut content = tool_result;
-                if *count >= SAME_TOOL_CALL_LIMIT {
-                    content.push_str(&format!(
-                        "\n\n<mentor_analysis>You have called this exact tool {} times with no new progress. \
-                         Stop repeating it — change your approach or produce your final answer now.</mentor_analysis>",
-                        *count
-                    ));
-                }
-                if near_cap {
-                    content.push_str(
-                        "\n\n<mentor_analysis>You are approaching the action limit. \
-                         Stop exploring and write your final answer/report based on real results gathered so far.</mentor_analysis>",
-                    );
-                }
-
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
-                    "content": content,
+                    "content": tool_result,
                 })
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
             }
         }
 
-        // Hard cap: ask model once more without tools to summarize what it found.
-        messages.push(ChatMessage::system(
-            "Action limit reached. Do not call any more tools. \
-             Write your final answer/report based on the real results gathered so far.",
-        ));
-        match self.provider.chat(ChatRequest { messages, tools: None }).await {
-            Ok(resp) => {
-                let text = resp.text.unwrap_or_default();
-                if text.trim().is_empty() {
-                    Ok("tool call loop limit reached".to_string())
-                } else {
-                    messages.push(ChatMessage::assistant(&text));
-                    Ok(text)
+        Ok("tool call loop limit reached".to_string())
+    }
+
+    /// One streamed model call: forwards text deltas to `events` as
+    /// [`AgentEvent::Token`] and returns the assembled response.
+    async fn stream_once(
+        &self,
+        messages: &[ChatMessage],
+        with_tools: bool,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Result<ChatResponse> {
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ev = events.clone();
+        let fwd = tokio::spawn(async move {
+            while let Some(t) = tok_rx.recv().await {
+                let _ = ev.send(AgentEvent::Token(t));
+            }
+        });
+        let request = ChatRequest {
+            messages,
+            tools: if with_tools && !self.tool_specs.is_empty() {
+                Some(self.tool_specs)
+            } else {
+                None
+            },
+        };
+        let result = self.provider.chat_stream(request, tok_tx).await;
+        let _ = fwd.await;
+        result
+    }
+
+    /// Streaming variant of [`run`]: emits token deltas and tool steps over
+    /// `events` while driving the same budget-aware tool-calling loop.
+    pub async fn run_streaming(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Result<String> {
+        *messages = sanitize_messages_for_provider(std::mem::take(messages));
+        let iteration_cap = self.max_tool_iterations.max(1);
+
+        for iteration in 0..iteration_cap {
+            if let Some(reason) = self.budget.check() {
+                let text = format!(
+                    "[budget exceeded] {reason}. Stopping here ({}).",
+                    self.budget.summary()
+                );
+                self.security
+                    .audit()
+                    .record_event(
+                        "budget_exceeded",
+                        false,
+                        &reason,
+                        serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
+                    )
+                    .await;
+                messages.push(ChatMessage::assistant(&text));
+                let _ = events.send(AgentEvent::Done(text.clone()));
+                return Ok(text);
+            }
+
+            let provider_name = self
+                .security
+                .audit()
+                .context()
+                .provider
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+
+            let chat_result = self.stream_once(messages, true, events).await;
+            if let Ok(response) = &chat_result {
+                self.budget.record_call(response.usage.as_ref());
+            }
+            match &chat_result {
+                Ok(response) => {
+                    crate::observability::record_provider_call(&provider_name, "ok");
+                    self.security
+                        .audit_provider_call(
+                            iteration,
+                            response.tool_calls.len(),
+                            true,
+                            "provider returned response",
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    crate::observability::record_provider_call(&provider_name, "error");
+                    self.security
+                        .audit_provider_call(iteration, 0, false, &err.to_string())
+                        .await;
+                    let _ = events.send(AgentEvent::Error(err.to_string()));
                 }
             }
-            Err(_) => Ok("tool call loop limit reached".to_string()),
+            let response = chat_result?;
+
+            if response.tool_calls.is_empty() {
+                let text = response.text.unwrap_or_default();
+                messages.push(ChatMessage::assistant(&text));
+                let _ = events.send(AgentEvent::Done(text.clone()));
+                return Ok(text);
+            }
+
+            let assistant_payload = serde_json::json!({
+                "content": response.text,
+                "reasoning_content": response.reasoning_content,
+                "tool_calls": response.tool_calls,
+            })
+            .to_string();
+            messages.push(ChatMessage::assistant(assistant_payload));
+
+            for tool_call in response.tool_calls {
+                let _ = events.send(AgentEvent::Step(format!("调用工具 {}", tool_call.name)));
+                let tool_result = self.execute_tool_call(&tool_call).await?;
+                let _ = events.send(AgentEvent::Step(format!("完成 {}", tool_call.name)));
+                let tool_payload = serde_json::json!({
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                })
+                .to_string();
+                messages.push(ChatMessage::tool(tool_payload));
+            }
         }
+
+        let _ = events.send(AgentEvent::Done(String::new()));
+        Ok("tool call loop limit reached".to_string())
     }
 
     async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {

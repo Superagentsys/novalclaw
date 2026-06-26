@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod content_search;
+pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -16,6 +17,7 @@ pub mod web_search;
 
 pub use browser::BrowserTool;
 pub use content_search::ContentSearchTool;
+pub use delegate::{AgentInvoker, DelegateRequest, DelegateTool};
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;

@@ -373,9 +373,7 @@ async fn save_setup_config(
     let mut next = setup_config_to_core(current, config)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
 
-    if let Err(error) = save_config_with_fallback(&mut next) {
-        eprintln!("[config warning] {error}");
-    }
+    save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
     if current_gateway_url != next_gateway_url {
@@ -526,6 +524,22 @@ async fn get_chat_session_history(
     Ok(runtime
         .get_session_history(&channel, &query.session_id)
         .await)
+}
+
+#[tauri::command]
+async fn delete_chat_session(
+    query: UiSessionHistoryQuery,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let channel = query.channel.unwrap_or(ChannelKind::Web);
+    runtime
+        .delete_session(&channel, &query.session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1177,15 +1191,19 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
 fn expand_tilde_path(value: &str) -> PathBuf {
     if value == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(value));
+        return user_home_dir().unwrap_or_else(|| PathBuf::from(value));
     }
 
     if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = user_home_dir() {
             return home.join(rest);
         }
     }
@@ -1249,8 +1267,27 @@ fn display_provider_name(id: &str) -> String {
     }
 }
 
+/// Worker-thread stack size for the async runtime that backs Tauri commands.
+///
+/// The `Config` struct is large (~8.7 KiB) and very deeply nested, so serde
+/// (de)serialization to/from TOML/JSON consumes a lot of stack. On Windows the
+/// default worker-thread stack (~1 MiB) overflows during config save, crashing
+/// the process with `0xC00000FD` (STATUS_STACK_OVERFLOW). An 8 MiB stack keeps
+/// every command handler (which may (de)serialize `Config`) well within bounds.
+const ASYNC_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install a tokio runtime with larger worker stacks *before* anything uses
+    // the async runtime, so all Tauri command handlers run with enough stack.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(ASYNC_RUNTIME_STACK_BYTES)
+        .build()
+        .expect("Failed to build async runtime");
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+    tauri::async_runtime::set(runtime.handle().clone());
+
     omninova_core::init().expect("Failed to initialize core");
 
     let config = Config::load_or_init().expect("Failed to load config");
@@ -1287,6 +1324,7 @@ pub fn run() {
             route_inbound_message,
             process_inbound_message,
             get_chat_session_history,
+            delete_chat_session,
             session_tree_snapshot,
             check_browser_dep,
             install_browser_dep,

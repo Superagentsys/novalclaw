@@ -1,6 +1,21 @@
 fn main() {
     tauri_build::build();
 
+    // Windows: raise the executable's default thread stack reserve to 8 MiB.
+    //
+    // The `Config` struct is large and deeply nested, so serde (de)serialization
+    // to/from JSON/TOML is stack-hungry. Tauri deserializes command arguments and
+    // serializes results on its IPC/main threads — created with the OS default
+    // stack size (PE `SizeOfStackReserve`, ~1 MiB by default on MSVC). That caused
+    // a `0xC00000FD` (STATUS_STACK_OVERFLOW) crash when saving the model config.
+    // Threads created with stack size 0 inherit this reserve, so this covers the
+    // main thread, Tauri/wry internal threads and the IPC response path.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
+
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.join("../../..");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());

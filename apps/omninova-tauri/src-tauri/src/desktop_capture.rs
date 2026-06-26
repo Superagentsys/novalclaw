@@ -29,8 +29,10 @@ fn resize_max_dimension(image: DynamicImage, max_dimension_px: u32) -> DynamicIm
 }
 
 fn encode_jpeg_data_url(image: DynamicImage) -> Result<String, String> {
+    // JPEG 不支持 alpha 通道；屏幕截图常为 RGBA8，需先丢弃 alpha 转 RGB8。
+    let rgb = DynamicImage::ImageRgb8(image.to_rgb8());
     let mut buffer = Vec::new();
-    image
+    rgb
         .write_to(&mut Cursor::new(&mut buffer), ImageFormat::Jpeg)
         .map_err(|e| format!("JPEG 编码失败: {e}"))?;
     Ok(format!(

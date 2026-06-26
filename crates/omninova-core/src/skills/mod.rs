@@ -75,66 +75,24 @@ pub fn load_skills_from_dir(dir: &Path) -> Result<Vec<Skill>> {
             Err(e) => warn!("Failed to load skill from {:?}: {}", skill_file, e),
         }
     }
-
+    
     skills.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     Ok(skills)
 }
 
-/// Controls how much of each skill is injected into the system prompt.
-///
-/// For large skill packs (e.g. hundreds of cybersecurity skills) `Full` would
-/// overflow the context window, so `Summary` injects only a lightweight catalog
-/// (name + description) and the agent reads full `SKILL.md` files on demand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkillPromptMode {
-    Full,
-    Summary,
-    Disabled,
-}
-
-impl SkillPromptMode {
-    pub fn from_config(value: Option<&str>) -> Self {
-        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            Some("summary") => SkillPromptMode::Summary,
-            Some("disabled") | Some("off") | Some("none") => SkillPromptMode::Disabled,
-            _ => SkillPromptMode::Full,
-        }
-    }
-}
-
 pub fn format_skills_prompt(skills: &[Skill]) -> String {
-    format_skills_prompt_with_mode(skills, SkillPromptMode::Full)
-}
-
-pub fn format_skills_prompt_with_mode(skills: &[Skill], mode: SkillPromptMode) -> String {
-    if skills.is_empty() || mode == SkillPromptMode::Disabled {
+    if skills.is_empty() {
         return String::new();
     }
-
-    match mode {
-        SkillPromptMode::Disabled => String::new(),
-        SkillPromptMode::Summary => {
-            let mut prompt = String::from(
-                "\n\n## Available Skills (catalog)\n\nThe following skills are available. Only names and short descriptions are listed to save context. When a skill is relevant, read its full `SKILL.md` (under the skills directory) before acting.\n\n",
-            );
-            for skill in skills {
-                prompt.push_str(&format!(
-                    "- **{}**: {}\n",
-                    skill.metadata.name,
-                    skill.metadata.description.replace('\n', " ").trim()
-                ));
-            }
-            prompt
-        }
-        SkillPromptMode::Full => {
-            let mut prompt = String::from("\n\n## Available Skills\n\nThe following skills are available to you. Each skill provides specific commands and usage instructions.\n\n");
-            for skill in skills {
-                prompt.push_str(&skill.to_prompt_section());
-                prompt.push_str("\n\n---\n\n");
-            }
-            prompt
-        }
+    
+    let mut prompt = String::from("\n\n## Available Skills\n\nThe following skills are available to you. Each skill provides specific commands and usage instructions.\n\n");
+    
+    for skill in skills {
+        prompt.push_str(&skill.to_prompt_section());
+        prompt.push_str("\n\n---\n\n");
     }
+    
+    prompt
 }
 
 pub fn import_skills_from_dir(source_dir: &Path, target_dir: &Path, overwrite: bool) -> Result<usize> {

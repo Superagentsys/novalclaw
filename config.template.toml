@@ -71,22 +71,39 @@
 # max_history_messages = 50
 # parallel_tools = false
 
+# Plan-Execute-Reflect loop (off by default; plain ReAct otherwise).
+# A planner decomposes the task, the executor runs each step with tools,
+# and an isolated reflector judges progress and may trigger a replan.
+# [agent.planning]
+# enabled = false
+# max_plan_steps = 8
+# max_replans = 2
+
+# Hard per-request budgets spanning plan/execute/reflect. Unset = unlimited.
+# [agent.budget]
+# max_total_tokens = 200000
+# max_wall_time_secs = 600
+# max_provider_calls = 50
+
 # --- Delegate Agents ---
+# When at least one [agents.*] entry exists, agents gain a `delegate` tool to
+# hand subtasks to each other at runtime (Orchestrator-Workers). Spawn depth
+# and child concurrency follow [agents.defaults.subagents] limits; agents with
+# an `allowed_tools` list must include "delegate" to use it.
 # [agents.researcher]
 # provider = "openrouter"
 # model = "anthropic/claude-sonnet-4-20250514"
 # system_prompt = "You are a research assistant."
 # max_depth = 2
 # agentic = true
-# allowed_tools = ["web_search", "http_request", "file_read"]
+# allowed_tools = ["web_search", "http_request", "file_read", "delegate"]
 # max_iterations = 8
 
 # --- Skills ---
 # [skills]
 # open_skills_enabled = true
 # open_skills_dir = "~/.omninova/skills"
-# prompt_injection_mode = "full"   # full | summary | disabled
-# Use "summary" when loading skills/cybersecurity (754 skills) to avoid context overflow.
+# prompt_injection_mode = "full"
 
 # --- Autonomy ---
 # [autonomy]

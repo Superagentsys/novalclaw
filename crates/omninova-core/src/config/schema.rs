@@ -361,6 +361,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub parallel_tools: bool,
     pub tool_dispatcher: Option<String>,
+    #[serde(default)]
+    pub planning: PlanningConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 fn default_true() -> bool {
@@ -384,8 +388,56 @@ impl Default for AgentConfig {
             max_history_messages: 50,
             parallel_tools: false,
             tool_dispatcher: None,
+            planning: PlanningConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
+}
+
+/// Plan-Execute-Reflect loop configuration (off by default; the agent then
+/// runs the plain ReAct tool loop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanningConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of steps the planner may emit per plan.
+    #[serde(default = "default_max_plan_steps")]
+    pub max_plan_steps: usize,
+    /// Maximum number of replans triggered by the reflector.
+    #[serde(default = "default_max_replans")]
+    pub max_replans: usize,
+}
+
+fn default_max_plan_steps() -> usize {
+    8
+}
+fn default_max_replans() -> usize {
+    2
+}
+
+impl Default for PlanningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_plan_steps: default_max_plan_steps(),
+            max_replans: default_max_replans(),
+        }
+    }
+}
+
+/// Hard run budgets. `None` disables a given cap; `max_tool_iterations`
+/// remains the per-turn step cap.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BudgetConfig {
+    /// Total tokens (input+output as reported by providers) per request.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Wall-clock seconds per request.
+    #[serde(default)]
+    pub max_wall_time_secs: Option<u64>,
+    /// Total provider calls per request (spans plan/execute/reflect).
+    #[serde(default)]
+    pub max_provider_calls: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------

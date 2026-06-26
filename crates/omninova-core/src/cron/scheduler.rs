@@ -105,25 +105,18 @@ fn format_timestamp(dt: time::OffsetDateTime) -> String {
 }
 
 async fn execute_shell_job(command: &str) -> anyhow::Result<String> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-lc")
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // On Windows, ensure the Git tool directories are on PATH so cron jobs that
-    // invoke curl/grep/etc behave the same as ShellTool, regardless of launcher.
-    #[cfg(windows)]
-    {
-        if let Some(new_path) = crate::tools::shell::windows_augmented_path() {
-            cmd.env("PATH", new_path);
-        }
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(300), cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("job timed out after 300s"))?
-        .map_err(|e| anyhow::anyhow!("failed to execute: {e}"))?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(300),
+        Command::new("sh")
+            .arg("-lc")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("job timed out after 300s"))?
+    .map_err(|e| anyhow::anyhow!("failed to execute: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

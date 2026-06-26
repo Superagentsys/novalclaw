@@ -76,6 +76,30 @@ impl Config {
             );
         }
 
+        if self.agent.budget.max_total_tokens == Some(0) {
+            report.warnings.push(
+                "agent.budget.max_total_tokens is 0 – every request will be budget-blocked."
+                    .into(),
+            );
+        }
+        if self.agent.budget.max_wall_time_secs == Some(0) {
+            report.warnings.push(
+                "agent.budget.max_wall_time_secs is 0 – every request will be budget-blocked."
+                    .into(),
+            );
+        }
+        if self.agent.budget.max_provider_calls == Some(0) {
+            report.warnings.push(
+                "agent.budget.max_provider_calls is 0 – every request will be budget-blocked."
+                    .into(),
+            );
+        }
+        if self.agent.planning.enabled && self.agent.planning.max_plan_steps == 0 {
+            report
+                .errors
+                .push("agent.planning.max_plan_steps must be > 0 when planning is enabled".into());
+        }
+
         if self.cost.max_daily_cents == Some(0) {
             report.warnings.push(
                 "cost.max_daily_cents is 0 – the agent will not be able to make API calls.".into(),

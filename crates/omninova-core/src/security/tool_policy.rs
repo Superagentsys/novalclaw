@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::security::dangerous_tools::is_dangerous_shell_command;
 use crate::security::sandbox::path_hits_forbidden;
-use crate::tools::shell::extract_command_names;
 use serde::{Deserialize, Serialize};
 
 const MEDIUM_RISK_COMMANDS: &[&str] = &[
@@ -113,19 +112,17 @@ pub fn evaluate_tool_call(
 
     if tool_name == "shell" {
         if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
-            let names = extract_command_names(cmd);
+            let first = cmd.split_whitespace().next().unwrap_or("");
+            if config.autonomy.block_high_risk_commands && is_dangerous_shell_command(first) {
+                return ToolPolicyDecision::Deny {
+                    reason: format!("shell command '{first}' is blocked as high-risk"),
+                };
+            }
             let allowlist = resolve_shell_allowlist(config);
-            for name in &names {
-                if config.autonomy.block_high_risk_commands && is_dangerous_shell_command(name) {
-                    return ToolPolicyDecision::Deny {
-                        reason: format!("shell command '{name}' is blocked as high-risk"),
-                    };
-                }
-                if !allowlist.iter().any(|c| c == name) {
-                    return ToolPolicyDecision::Deny {
-                        reason: format!("shell command '{name}' is not in allowlist"),
-                    };
-                }
+            if !allowlist.iter().any(|c| c == first) {
+                return ToolPolicyDecision::Deny {
+                    reason: format!("shell command '{first}' is not in allowlist"),
+                };
             }
         }
     }

@@ -27,6 +27,51 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+}
+
+// --- Streaming (SSE) chunk shapes ---
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFuncDelta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamFuncDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,6 +382,7 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            stream: None,
         };
 
         let response = self
@@ -380,6 +426,149 @@ impl Provider for OpenAiProvider {
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ProviderChatRequest<'_>,
+        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        use futures_util::StreamExt;
+
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or configure api_key.")
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: self.model.clone(),
+            messages: Self::convert_messages(request.messages),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            stream: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&native_request)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("流式请求失败：{e}"))?;
+
+        if !response.status().is_success() {
+            return Err(api_error("OpenAI", response).await);
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        // (id, name, arguments) accumulated per tool-call index.
+        let mut tool_accum: Vec<(String, String, String)> = Vec::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut done = false;
+
+        while let Some(item) = stream.next().await {
+            let bytes = item.map_err(|e| anyhow::anyhow!("流式读取失败：{e}"))?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim_end_matches('\r').trim().to_string();
+                buf.drain(..=pos);
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+                    continue;
+                };
+                if let Some(u) = chunk.usage {
+                    usage = Some(TokenUsage {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                    });
+                }
+                if let Some(choice) = chunk.choices.into_iter().next() {
+                    if let Some(c) = choice.delta.content {
+                        if !c.is_empty() {
+                            text.push_str(&c);
+                            let _ = token_tx.send(c);
+                        }
+                    }
+                    if let Some(r) = choice.delta.reasoning_content {
+                        reasoning.push_str(&r);
+                    }
+                    if let Some(tcs) = choice.delta.tool_calls {
+                        for tc in tcs {
+                            let idx = tc.index.unwrap_or(0);
+                            while tool_accum.len() <= idx {
+                                tool_accum.push((String::new(), String::new(), String::new()));
+                            }
+                            let slot = &mut tool_accum[idx];
+                            if let Some(id) = tc.id {
+                                if !id.is_empty() {
+                                    slot.0 = id;
+                                }
+                            }
+                            if let Some(f) = tc.function {
+                                if let Some(n) = f.name {
+                                    if !n.is_empty() {
+                                        slot.1 = n;
+                                    }
+                                }
+                                if let Some(a) = f.arguments {
+                                    slot.2.push_str(&a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+
+        let tool_calls = tool_accum
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| ProviderToolCall {
+                id: if id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    id
+                },
+                name,
+                arguments,
+            })
+            .collect::<Vec<_>>();
+
+        let final_text = if text.is_empty() && !reasoning.is_empty() {
+            Some(reasoning.clone())
+        } else if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+
+        Ok(ProviderChatResponse {
+            text: final_text,
+            tool_calls,
+            usage,
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
+        })
     }
 
     async fn health_check(&self) -> bool {
