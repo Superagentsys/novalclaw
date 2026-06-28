@@ -29,6 +29,7 @@ import type {
   RouteDecision,
   WorkspaceStatus,
 } from "../../types/config";
+import { AgentRunTimeline } from "../AgentRun/AgentRunTimeline";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -1693,6 +1694,15 @@ function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
             <span className="chat-execution-step-title">{step.title}</span>
             <span className="chat-execution-step-status">{statusLabel(step.status)}</span>
             {step.detail ? <div className="chat-execution-step-detail">{step.detail}</div> : null}
+            {step.run_events && step.run_events.length > 0 && (
+              <div className="mt-1">
+                <AgentRunTimeline
+                  events={step.run_events}
+                  isRunning={step.status === "running"}
+                  defaultCollapsed={true}
+                />
+              </div>
+            )}
           </li>
         ))}
       </ol>

@@ -1,10 +1,11 @@
-use crate::agent::budget::BudgetTracker;
+﻿use crate::agent::budget::BudgetTracker;
 use crate::agent::history::sanitize_messages_for_provider;
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, FileDiffStats, ToolExecutionEvent};
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Stateless dispatcher for one agent turn:
@@ -122,7 +123,7 @@ impl<'a> AgentDispatcher<'a> {
             messages.push(ChatMessage::assistant(assistant_payload));
 
             for tool_call in response.tool_calls {
-                let tool_result = self.execute_tool_call(&tool_call).await?;
+                let (tool_result, _exec_event) = self.execute_tool_call(&tool_call).await?;
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
                     "content": tool_result,
@@ -243,9 +244,20 @@ impl<'a> AgentDispatcher<'a> {
             messages.push(ChatMessage::assistant(assistant_payload));
 
             for tool_call in response.tool_calls {
-                let _ = events.send(AgentEvent::Step(format!("调用工具 {}", tool_call.name)));
-                let tool_result = self.execute_tool_call(&tool_call).await?;
-                let _ = events.send(AgentEvent::Step(format!("完成 {}", tool_call.name)));
+                let tool_args: Option<serde_json::Value> =
+                    serde_json::from_str(&tool_call.arguments).ok();
+                let summary = tool_args
+                    .as_ref()
+                    .map(|a| build_tool_summary(&tool_call.name, a))
+                    .unwrap_or_else(|| format!("正在执行工具：{}", tool_call.name));
+                let _ = events.send(AgentEvent::ToolExecution(ToolExecutionEvent::Started {
+                    tool_name: tool_call.name.clone(),
+                    summary,
+                }));
+                let (tool_result, exec_event) = self.execute_tool_call(&tool_call).await?;
+                if let Some(evt) = exec_event {
+                    let _ = events.send(AgentEvent::ToolExecution(evt));
+                }
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
                     "content": tool_result,
@@ -259,7 +271,41 @@ impl<'a> AgentDispatcher<'a> {
         Ok("tool call loop limit reached".to_string())
     }
 
-    async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {
+    /// Like `run_streaming` but also collects `ToolExecutionEvent`s.
+    /// Returns `(reply_text, collected_events)`.
+    pub async fn run_with_events(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+    ) -> Result<(String, Vec<ToolExecutionEvent>)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
+        let handle = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    AgentEvent::ToolExecution(te) => events.push(te),
+                    AgentEvent::Done(_) => break,
+                    _ => {}
+                }
+            }
+            events
+        });
+
+        let reply = self.run_streaming(messages, &tx).await;
+        let events = handle.await.unwrap_or_default();
+
+        let reply_text = match reply {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+
+        Ok((reply_text, events))
+    }
+
+    async fn execute_tool_call(
+        &self,
+        tool_call: &ToolCall,
+    ) -> Result<(String, Option<ToolExecutionEvent>)> {
         let tool = self
             .tools
             .iter()
@@ -275,20 +321,43 @@ impl<'a> AgentDispatcher<'a> {
             .await?
         {
             crate::security::ToolExecutionGate::Blocked { reason } => {
-                return Ok(format!("tool blocked by security policy: {reason}"));
+                let msg = format!("tool blocked by security policy: {reason}");
+                return Ok((
+                    msg.clone(),
+                    Some(ToolExecutionEvent::Completed {
+                        tool_name: tool_call.name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        result_summary: msg,
+                        diff_stats: None,
+                    }),
+                ));
             }
             crate::security::ToolExecutionGate::ApprovalRequired { pending } => {
-                return Ok(format!(
+                let msg = format!(
                     "tool execution requires approval (id={}, tool={}, reason={}). \
                      Approve with: omninova approvals approve {}",
                     pending.id, pending.tool_name, pending.reason, pending.id
+                );
+                return Ok((
+                    msg.clone(),
+                    Some(ToolExecutionEvent::Completed {
+                        tool_name: tool_call.name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        result_summary: msg,
+                        diff_stats: None,
+                    }),
                 ));
             }
             crate::security::ToolExecutionGate::Proceed { .. } => {}
         }
 
+        let started = Instant::now();
         let result = tool.execute(args.clone()).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let success = result.success;
+
         let output = if success {
             result.output
         } else {
@@ -297,6 +366,7 @@ impl<'a> AgentDispatcher<'a> {
                 .clone()
                 .unwrap_or_else(|| "tool execution failed".to_string())
         };
+
         self.security
             .audit_tool_call(
                 tool_call.name.as_str(),
@@ -305,6 +375,134 @@ impl<'a> AgentDispatcher<'a> {
                 if success { "ok" } else { output.as_str() },
             )
             .await;
-        Ok(output)
+
+        let result_summary = if success {
+            truncate_for_display(&output, 300)
+        } else {
+            truncate_for_display(&output, 200)
+        };
+
+        let diff_stats = if success {
+            extract_diff_stats(&tool_call.name, &args, &output)
+        } else {
+            None
+        };
+
+        let event = Some(ToolExecutionEvent::Completed {
+            tool_name: tool_call.name.clone(),
+            success,
+            duration_ms: elapsed_ms,
+            result_summary,
+            diff_stats,
+        });
+
+        Ok((output, event))
+    }
+}
+
+/// Build a short human-readable summary of what a tool is doing.
+fn build_tool_summary(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "file_read" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("正在读取文件：{}", p))
+            .unwrap_or_else(|| "正在读取文件".to_string()),
+        "file_write" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("正在写入文件：{}", p))
+            .unwrap_or_else(|| "正在写入文件".to_string()),
+        "file_edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("正在修改文件：{}", p))
+            .unwrap_or_else(|| "正在修改文件".to_string()),
+        "file_list" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("正在列出目录：{}", p))
+            .unwrap_or_else(|| "正在列出目录".to_string()),
+        "glob_search" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("正在搜索文件：{}", p))
+            .unwrap_or_else(|| "正在搜索文件".to_string()),
+        "content_search" => args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| format!("正在搜索内容：{}", q))
+            .unwrap_or_else(|| "正在搜索内容".to_string()),
+        "shell" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| {
+                let preview = if c.len() > 60 {
+                    format!("{}...", &c[..60])
+                } else {
+                    c.to_string()
+                };
+                format!("正在执行命令：{}", preview)
+            })
+            .unwrap_or_else(|| "正在执行命令".to_string()),
+        "git_operations" => args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .map(|op| format!("正在执行 Git 操作：{}", op))
+            .unwrap_or_else(|| "正在执行 Git 操作".to_string()),
+        "delegate" => args
+            .get("task")
+            .and_then(|v| v.as_str())
+            .map(|t| format!("正在委托子任务：{}", t))
+            .unwrap_or_else(|| "正在委托子任务".to_string()),
+        _ => format!("正在执行工具：{}", tool_name),
+    }
+}
+
+/// Truncate a tool output for UI display.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}...\n[输出已截断]", &s[..max_chars])
+    }
+}
+
+/// Attempt to extract git diff stats from a file write/edit result.
+fn extract_diff_stats(
+    tool_name: &str,
+    args: &serde_json::Value,
+    output: &str,
+) -> Option<FileDiffStats> {
+    match tool_name {
+        "file_write" | "file_edit" => {
+            if output.contains("is not a git repository")
+                || output.contains("fatal: not a git repository")
+            {
+                return None;
+            }
+            let mut additions = 0i32;
+            let mut deletions = 0i32;
+            for line in output.lines() {
+                if let Some(rest) = line.strip_prefix('\t') {
+                    let parts: Vec<&str> = rest.split('\t').collect();
+                    if parts.len() >= 2 {
+                        if let (Ok(a), Ok(d)) = (
+                            parts[0].parse::<i32>(),
+                            parts[1].parse::<i32>(),
+                        ) {
+                            additions += a;
+                            deletions += d;
+                        }
+                    }
+                }
+            }
+            if additions > 0 || deletions > 0 {
+                Some(FileDiffStats { additions, deletions })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

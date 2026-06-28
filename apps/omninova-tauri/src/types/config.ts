@@ -357,6 +357,8 @@ export interface ExecutionStep {
   title: string;
   status?: "pending" | "running" | "done" | "error";
   detail?: string | null;
+  /** Rich run events produced during the tool call loop (from AgentRun feature). */
+  run_events?: import("../components/AgentRun/types").RunEvent[];
 }
 
 export interface GatewayHealth {

@@ -28,6 +28,7 @@ use crate::tools::{
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::agent::sanitize_messages_for_provider;
+use crate::agent::ToolExecutionEvent;
 use crate::Agent;
 use std::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
@@ -427,14 +428,18 @@ impl GatewayRuntime {
         }
 
         steps.push(ExecutionStep::running("Agent 执行", "调用模型；如模型请求工具，将继续执行工具循环"));
-        let reply = if vision_images.is_empty() {
-            agent.process_message(&inbound.text).await?
+        let (reply, run_events) = if vision_images.is_empty() {
+            agent.process_message_with_events(&inbound.text).await?
         } else {
-            agent
-                .process_message_with_images(&inbound.text, &vision_images)
-                .await?
+            // Vision is not yet supported in process_message_with_events; degrade.
+            let reply = agent.process_message(&inbound.text).await?;
+            (reply, Vec::new())
         };
-        steps.push(ExecutionStep::done("Agent 执行", "模型返回最终回复"));
+        let run_events: Vec<RunEvent> = run_events.into_iter().map(RunEvent::from).collect();
+        steps.push(
+            ExecutionStep::done("Agent 执行", "模型返回最终回复")
+                .with_events(run_events)
+        );
         steps.extend(extract_tool_steps(&agent.export_messages()));
         if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
@@ -1344,6 +1349,51 @@ pub struct ExecutionStep {
     pub title: String,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_events: Vec<RunEvent>,
+}
+
+/// Enriched run events produced during a tool call loop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum RunEvent {
+    ToolStarted { tool_name: String, summary: String },
+    ToolCompleted {
+        tool_name: String,
+        success: bool,
+        duration_ms: u64,
+        result_summary: String,
+        diff_stats: Option<RunDiffStats>,
+    },
+    FileChanged { path: String, additions: i32, deletions: i32 },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunDiffStats {
+    pub additions: i32,
+    pub deletions: i32,
+}
+
+impl From<ToolExecutionEvent> for RunEvent {
+    fn from(evt: ToolExecutionEvent) -> Self {
+        match evt {
+            ToolExecutionEvent::Started { tool_name, summary } => {
+                RunEvent::ToolStarted { tool_name, summary }
+            }
+            ToolExecutionEvent::Completed { tool_name, success, duration_ms, result_summary, diff_stats } => {
+                RunEvent::ToolCompleted {
+                    tool_name,
+                    success,
+                    duration_ms,
+                    result_summary,
+                    diff_stats: diff_stats.map(|d| RunDiffStats { additions: d.additions, deletions: d.deletions }),
+                }
+            }
+            ToolExecutionEvent::FileChanged { path, additions, deletions } => {
+                RunEvent::FileChanged { path, additions, deletions }
+            }
+        }
+    }
 }
 
 impl ExecutionStep {
@@ -1352,6 +1402,7 @@ impl ExecutionStep {
             title: title.into(),
             status: "done".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
     }
 
@@ -1360,6 +1411,7 @@ impl ExecutionStep {
             title: title.into(),
             status: "running".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
     }
 
@@ -1368,7 +1420,13 @@ impl ExecutionStep {
             title: title.into(),
             status: "error".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
+    }
+
+    fn with_events(mut self, events: Vec<RunEvent>) -> Self {
+        self.run_events = events;
+        self
     }
 }
 

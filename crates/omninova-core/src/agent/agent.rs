@@ -2,6 +2,7 @@ use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::planner::{self, Reflection};
 use crate::agent::prompt::bootstrap_system_messages;
+use crate::agent::ToolExecutionEvent;
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
 use crate::providers::{ChatMessage, Provider};
@@ -91,6 +92,43 @@ impl Agent {
             );
             dispatcher.run(&mut self.messages).await
         }
+    }
+
+    /// Like `process_message` but also collects rich tool-execution events
+    /// for a live execution timeline. Returns `(reply_text, collected_events)`.
+    pub async fn process_message_with_events(
+        &mut self,
+        message: &str,
+    ) -> Result<(String, Vec<ToolExecutionEvent>)> {
+        if self.messages.is_empty() {
+            self.messages.extend(bootstrap_system_messages(&self.config));
+        }
+
+        let _ = self
+            .memory
+            .store(
+                &format!("conversation/{}", uuid::Uuid::new_v4()),
+                message,
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+
+        self.messages.push(ChatMessage::user(message));
+
+        let budget = BudgetTracker::new(self.config.budget.clone());
+        let dispatcher = AgentDispatcher::new(
+            self.provider.as_ref(),
+            &self.tools,
+            &self.tool_specs,
+            self.config.max_tool_iterations,
+            &self.security,
+            &budget,
+        );
+
+        let (reply, events) = dispatcher.run_with_events(&mut self.messages).await?;
+
+        Ok((reply, events))
     }
 
     /// Streaming variant of [`process_message`]: drives the budget-aware tool

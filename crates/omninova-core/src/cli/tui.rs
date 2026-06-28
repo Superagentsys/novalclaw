@@ -229,6 +229,43 @@ fn handle_agent_event(app: &mut App, ev: AgentEvent) {
             });
             app.busy = false;
         }
+        AgentEvent::ToolExecution(evt) => {
+            if app.show_steps {
+                match evt {
+                    crate::agent::ToolExecutionEvent::Started { tool_name, summary } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!("⚡ {}", summary),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::Completed {
+                        tool_name,
+                        success,
+                        duration_ms,
+                        result_summary,
+                        diff_stats,
+                    } => {
+                        let icon = if success { "✅" } else { "❌" };
+                        let stats = diff_stats
+                            .map(|d| format!(" +{} -{}", d.additions, d.deletions))
+                            .unwrap_or_default();
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!(
+                                "{} {} 完成 ({}ms){} — {}",
+                                icon, tool_name, duration_ms, stats, result_summary
+                            ),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::FileChanged { path, additions, deletions } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!("📝 {} (+{}/-{})", path, additions, deletions),
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
