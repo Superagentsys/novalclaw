@@ -149,6 +149,26 @@ pub trait Provider: Send + Sync {
     /// Send a chat request to the LLM
     async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse>;
 
+    /// Streaming variant: forwards text deltas over `token_tx` as they arrive
+    /// and returns the fully-assembled response (text + tool calls).
+    ///
+    /// The default implementation falls back to the non-streaming [`chat`] and
+    /// emits the whole text as a single delta, so providers without streaming
+    /// support still work transparently.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        let response = self.chat(request).await?;
+        if let Some(text) = response.text.as_deref() {
+            if !text.is_empty() {
+                let _ = token_tx.send(text.to_string());
+            }
+        }
+        Ok(response)
+    }
+
     /// Check if the provider is healthy
     async fn health_check(&self) -> bool;
 }

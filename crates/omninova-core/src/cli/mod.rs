@@ -1,3 +1,5 @@
+mod tui;
+
 use crate::config::Config;
 use crate::daemon::service::{
     GatewayServiceCheckLevel, GatewayServiceCheckReport, GatewayServiceOperation,
@@ -670,9 +672,7 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
         Commands::Security { command } => run_security(command, &config).await,
         Commands::Sessions { command } => run_sessions(command, &config).await,
         Commands::Status => run_status(&config).await,
-        Commands::Tui => {
-            Ok("tui: not yet implemented".to_string())
-        }
+        Commands::Tui => tui::run_tui(config).await,
         Commands::Dashboard => {
             let url = format!("http://{}:{}/dashboard", config.gateway.host, config.gateway.port);
             open_url(&url)?;
