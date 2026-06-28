@@ -1336,24 +1336,8 @@
   flex-shrink: 0;
 }
 
-/* Workspace 工具按钮：未设置时灰色；已设置时紫色高亮；hover 淡紫背景 */
 .chat-workspace-button {
   flex-shrink: 0;
-}
-
-.chat-workspace-button:hover:not(:disabled) {
-  background: rgba(124, 92, 220, 0.12);
-  color: #6b4cd1;
-}
-
-.chat-workspace-button.is-active {
-  border-color: rgba(124, 92, 220, 0.5);
-  background: rgba(124, 92, 220, 0.18);
-  color: #6b4cd1;
-}
-
-.chat-workspace-button.is-active:hover:not(:disabled) {
-  background: rgba(124, 92, 220, 0.26);
 }
 
 .chat-typing-badge {

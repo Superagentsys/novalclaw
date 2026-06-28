@@ -116,7 +116,7 @@ pub async fn run_tui(config: Config) -> Result<String> {
 
     // A single long-lived agent owns the conversation; a worker task drives it
     // sequentially so the UI loop never blocks on model calls.
-    let agent: Agent = runtime.build_interactive_agent().await;
+    let agent: Agent = runtime.build_interactive_agent().await?;
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
     tokio::spawn(async move {

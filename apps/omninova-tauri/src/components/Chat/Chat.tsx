@@ -1389,9 +1389,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               trailingActions={
                 <button
                   type="button"
-                  className={`chat-icon-btn chat-workspace-button${
-                    sessionWorkspaceDir || workspaceDir ? " is-active" : ""
-                  }`}
+                  className="chat-icon-btn chat-workspace-button"
                   title={
                     sessionWorkspaceDir
                       ? `会话临时 Workspace：${sessionWorkspaceDir}\n（Shift+点击 保存到该 Agent）`

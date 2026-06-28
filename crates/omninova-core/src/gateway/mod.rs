@@ -166,11 +166,23 @@ impl GatewayRuntime {
     /// Build a ready-to-use in-process `Agent` (provider + tools + skills +
     /// security), for interactive front-ends like the terminal UI that drive
     /// multi-turn streaming conversations and keep history in-memory.
-    pub async fn build_interactive_agent(&self) -> Agent {
+    pub async fn build_interactive_agent(&self) -> anyhow::Result<Agent> {
         let cfg = self.config.read().await.clone();
         let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let mut tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
+        let agent_delegate = cfg.agents.get(&route_agent_name);
+        let effective_workspace = resolve_effective_workspace_dir(
+            None,
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        )
+        .ok_or_else(|| anyhow::anyhow!("未设置 Workspace 目录，请点击 Workspace 按钮选择一个工作目录"))?;
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route_agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
         // Give the interactive agent the delegate tool so it can hand subtasks
         // to other configured agents (multi-agent), matching `chat()`.
         attach_delegate_tool(
@@ -191,7 +203,7 @@ impl GatewayRuntime {
                 .open_skills_dir
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+                .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
                 let prompt = format_skills_prompt(&skills);
                 if !prompt.is_empty() {
@@ -202,7 +214,7 @@ impl GatewayRuntime {
         }
 
         let security = SecurityContext::from_config(&cfg);
-        Agent::new(provider, tools, self.memory.clone(), agent_cfg, security)
+        Ok(Agent::new(provider, tools, self.memory.clone(), agent_cfg, security))
     }
 
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
