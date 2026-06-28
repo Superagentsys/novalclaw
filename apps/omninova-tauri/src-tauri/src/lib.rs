@@ -202,6 +202,7 @@ struct SetupAppConfig {
     api_url: Option<String>,
     default_provider: Option<String>,
     default_model: Option<String>,
+    #[serde(default)]
     workspace_dir: String,
     #[serde(default)]
     workspace_status: SetupWorkspaceStatus,
@@ -377,6 +378,46 @@ async fn get_setup_config(
 
     let cfg = runtime.get_config().await;
     Ok(setup_config_from_core(&cfg))
+}
+
+#[tauri::command]
+async fn open_workspace_dir(
+    path: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let fallback_workspace = {
+        let runtime = {
+            let app_state = state.lock().await;
+            app_state.runtime.clone()
+        };
+        runtime.get_config().await.workspace_dir
+    };
+
+    let target = normalize_optional_string(path)
+        .map(|path| expand_tilde_path(&path))
+        .unwrap_or(fallback_workspace);
+    if target.as_os_str().is_empty() {
+        return Err("请先选择 Workspace。".into());
+    }
+
+    if !target.exists() || !target.is_dir() {
+        return Err("Workspace 目录不存在，请重新选择 Workspace。".into());
+    }
+
+    let target = std::fs::canonicalize(&target)
+        .map_err(|_| "无法打开 Workspace 文件夹，请检查路径是否存在。".to_string())?;
+
+    let opened = if cfg!(target_os = "windows") {
+        StdCommand::new("explorer").arg(&target).spawn()
+    } else if cfg!(target_os = "macos") {
+        StdCommand::new("open").arg(&target).spawn()
+    } else {
+        StdCommand::new("xdg-open").arg(&target).spawn()
+    };
+
+    opened
+        .map(|_| ())
+        .map_err(|_| "无法打开 Workspace 文件夹，请检查路径是否存在。".to_string())
 }
 
 #[tauri::command]
@@ -903,7 +944,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         default_provider: config.default_provider.clone(),
         default_model: config.default_model.clone(),
         workspace_dir: config.workspace_dir.to_string_lossy().to_string(),
-        workspace_status: compute_workspace_status(&config.workspace_dir),
+        workspace_status: compute_effective_workspace_status(config),
         omninoval_gateway_url: Some(format!(
             "http://{}:{}",
             config.gateway.host, config.gateway.port
@@ -1029,9 +1070,9 @@ fn setup_config_to_core(
     current.default_provider = normalize_optional_string(setup.default_provider);
     current.default_model = normalize_optional_string(setup.default_model);
 
-    if !setup.workspace_dir.trim().is_empty() {
-        current.workspace_dir = expand_tilde_path(&setup.workspace_dir);
-    }
+    current.workspace_dir = normalize_optional_string(Some(setup.workspace_dir))
+        .map(|workspace_dir| expand_tilde_path(&workspace_dir))
+        .unwrap_or_default();
 
     if let Some(config_dir) = normalize_optional_string(setup.omninoval_config_dir) {
         current.config_path = expand_tilde_path(&config_dir).join("config.toml");
@@ -1124,10 +1165,12 @@ fn setup_config_to_core(
 
 fn config_fallback_candidates(config: &Config) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(parent) = config.workspace_dir.parent() {
-        candidates.push(parent.join(".omninova").join("config.toml"));
+    if !config.workspace_dir.as_os_str().is_empty() {
+        if let Some(parent) = config.workspace_dir.parent() {
+            candidates.push(parent.join(".omninova").join("config.toml"));
+        }
+        candidates.push(config.workspace_dir.join(".omninova").join("config.toml"));
     }
-    candidates.push(config.workspace_dir.join(".omninova").join("config.toml"));
     candidates
         .into_iter()
         .filter(|path| path != &config.config_path)
@@ -1375,7 +1418,7 @@ fn compute_workspace_status(workspace_dir: &std::path::Path) -> SetupWorkspaceSt
         return SetupWorkspaceStatus {
             state: "unselected".into(),
             path: None,
-            message: "请先点击 Workspace 按钮选择目录".into(),
+            message: "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。".into(),
         };
     }
     match std::fs::metadata(workspace_dir) {
@@ -1429,6 +1472,15 @@ fn compute_workspace_status(workspace_dir: &std::path::Path) -> SetupWorkspaceSt
     }
 }
 
+fn compute_effective_workspace_status(config: &Config) -> SetupWorkspaceStatus {
+    let agent_workspace = config
+        .agents
+        .get(&config.agent.name)
+        .and_then(|agent| agent.workspace_dir.as_deref());
+    let workspace = agent_workspace.unwrap_or(config.workspace_dir.as_path());
+    compute_workspace_status(workspace)
+}
+
 /// Worker-thread stack size for the async runtime that backs Tauri commands.
 ///
 /// The `Config` struct is large (~8.7 KiB) and very deeply nested, so serde
@@ -1479,6 +1531,7 @@ pub fn run() {
             save_config,
             reload_config,
             get_setup_config,
+            open_workspace_dir,
             save_setup_config,
             gateway_status,
             gateway_health,

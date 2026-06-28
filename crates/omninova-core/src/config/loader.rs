@@ -81,12 +81,11 @@ impl Config {
 
         cfg.config_path = path.to_path_buf();
 
-        // Resolve relative workspace_dir against the config directory.
-        if cfg.workspace_dir.as_os_str().is_empty() {
-            if let Some(parent) = path.parent() {
-                cfg.workspace_dir = parent.join("workspace");
-            }
-        } else if cfg.workspace_dir.is_relative() {
+        // Resolve relative workspace_dir against the config directory, but
+        // keep an empty workspace empty. An unset Workspace must be surfaced
+        // to the UI/agent instead of silently falling back to an internal
+        // directory.
+        if !cfg.workspace_dir.as_os_str().is_empty() && cfg.workspace_dir.is_relative() {
             if let Some(parent) = path.parent() {
                 cfg.workspace_dir = parent.join(&cfg.workspace_dir);
             }
@@ -329,7 +328,7 @@ http_proxy = "http://proxy:3128"
     }
 
     #[test]
-    fn test_workspace_dir_empty_falls_back_to_config_dir_workspace() {
+    fn test_workspace_dir_missing_stays_empty() {
         let _guard = test_env_lock().lock().unwrap();
         clear_common_env_overrides();
         let dir = tempdir();
@@ -337,7 +336,7 @@ http_proxy = "http://proxy:3128"
         std::fs::write(&config_path, "api_key = \"sk-test\"\n").unwrap();
 
         let cfg = Config::load_from(&config_path).unwrap();
-        assert_eq!(cfg.workspace_dir, dir.join("workspace"));
+        assert!(cfg.workspace_dir.as_os_str().is_empty());
     }
 
     fn tempdir() -> PathBuf {

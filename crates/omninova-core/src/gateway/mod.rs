@@ -41,6 +41,8 @@ use tracing::{info, warn};
 
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+const WORKSPACE_REQUIRED_MESSAGE: &str =
+    "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
 
 #[derive(Clone)]
 pub struct GatewayRuntime {
@@ -126,7 +128,7 @@ impl GatewayRuntime {
             agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
             &cfg.workspace_dir,
         )
-        .ok_or_else(|| anyhow::anyhow!("未设置 Workspace 目录，请点击 Workspace 按钮选择一个工作目录"))?;
+        .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
         let mut tools = create_tools_for_route(
             &cfg,
             &route_agent_name,
@@ -176,7 +178,7 @@ impl GatewayRuntime {
             agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
             &cfg.workspace_dir,
         )
-        .ok_or_else(|| anyhow::anyhow!("未设置 Workspace 目录，请点击 Workspace 按钮选择一个工作目录"))?;
+        .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
         let mut tools = create_tools_for_route(
             &cfg,
             &route_agent_name,
@@ -281,7 +283,7 @@ impl GatewayRuntime {
         let effective_workspace = match effective_workspace {
             Some(w) if !w.as_os_str().is_empty() => w,
             _ => {
-                let message = "未设置 Workspace 目录，请点击 Workspace 按钮选择一个工作目录";
+                let message = WORKSPACE_REQUIRED_MESSAGE;
                 steps.push(ExecutionStep::error(
                     "Workspace",
                     message,

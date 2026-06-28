@@ -363,7 +363,7 @@ export function Setup({
 
   const handleClearWorkspaceDir = () => {
     setConfig({ ...config, workspace_dir: undefined });
-    setActionMessage("Workspace 目录已清空，将使用默认目录。");
+    setActionMessage("Workspace 目录已清空。保存后 Agent 会要求先选择真实工作目录。");
   };
 
   const renderTabContent = () => {

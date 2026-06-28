@@ -178,7 +178,7 @@ impl Default for Config {
         let home = dirs_home();
         let omninova_dir = home.join(".omninova");
         Self {
-            workspace_dir: omninova_dir.join("workspace"),
+            workspace_dir: PathBuf::new(),
             config_path: omninova_dir.join("config.toml"),
             api_key: None,
             api_url: None,

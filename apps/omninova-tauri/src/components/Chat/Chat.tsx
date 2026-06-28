@@ -115,6 +115,19 @@ function fileExtensionLower(name: string): string {
   return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
+function workspaceBasename(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.at(-1) ?? path;
+}
+
+function summarizeWorkspacePath(path: string | null | undefined): string {
+  if (!path) return "选择 Workspace";
+  const name = workspaceBasename(path);
+  if (name.length <= 24) return name;
+  return `${name.slice(0, 10)}…${name.slice(-10)}`;
+}
+
 function isProbablyTextFile(file: File): boolean {
   const ext = fileExtensionLower(file.name);
   if (TEXT_FILE_EXTENSIONS.has(ext)) return true;
@@ -271,17 +284,30 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
   const [desktopVisionMaxPx, setDesktopVisionMaxPx] = useState(1280);
   const [workspaceDir, setWorkspaceDir] = useState<string | null>(null);
+  const [workspaceSource, setWorkspaceSource] = useState<"agent" | "global" | null>(null);
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
   /**
    * Session-level temporary workspace. Set by the chat-page Workspace button
    * without modifying the agent's default workspace. This takes the highest
    * priority when the Agent processes a message (higher than per-agent or
    * global workspace_dir).
    */
-  const [sessionWorkspaceDir, setSessionWorkspaceDir] = useState<string | null>(null);
+  const [sessionWorkspaceDirs, setSessionWorkspaceDirs] = useState<Record<string, string>>({});
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
+  const sessionWorkspaceDir = sessionWorkspaceDirs[activeAvatarId] ?? null;
+  const activeWorkspaceDir = sessionWorkspaceDir ?? workspaceDir;
+  const workspaceSummary = summarizeWorkspacePath(activeWorkspaceDir);
+  const workspaceLabel = sessionWorkspaceDir
+    ? "临时"
+    : workspaceSource === "agent"
+      ? "Agent"
+      : workspaceSource === "global"
+        ? "全局"
+        : "Workspace";
   const messages = useMemo(
     () => messagesBySession[activeAvatarId] ?? [],
     [messagesBySession, activeAvatarId]
@@ -402,15 +428,36 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, [activeAvatarId, sessionId, gatewayStatus, loadSessionHistory]);
 
   useEffect(() => {
+    if (!workspaceMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && workspaceMenuRef.current?.contains(target)) return;
+      setWorkspaceMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setWorkspaceMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [workspaceMenuOpen]);
+
+  useEffect(() => {
     void invokeTauri<Config>("get_setup_config")
       .then((cfg) => {
         const master = cfg.multimodal?.desktop_vision_enabled ?? false;
         const maxPx = cfg.multimodal?.desktop_vision_max_dimension_px ?? 1280;
         setDesktopVisionMaster(master);
         setDesktopVisionMaxPx(maxPx);
-        setWorkspaceDir(
-          cfg.agent?.workspace_dir ?? cfg.workspace_dir ?? null
-        );
+        const agentWorkspace = cfg.agent?.workspace_dir ?? null;
+        const globalWorkspace = cfg.workspace_dir ?? null;
+        setWorkspaceDir(agentWorkspace || globalWorkspace || null);
+        setWorkspaceSource(agentWorkspace ? "agent" : globalWorkspace ? "global" : null);
         setWorkspaceStatus(cfg.workspace_status ?? null);
         const stored = localStorage.getItem(DESKTOP_VISION_SESSION_KEY);
         if (stored === "1") setDesktopVisionOn(true);
@@ -583,6 +630,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         return next;
       });
       setInputs((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setSessionWorkspaceDirs((prev) => {
+        if (!prev[id]) return prev;
         const next = { ...prev };
         delete next[id];
         return next;
@@ -969,6 +1022,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
    */
   const handleChooseWorkspace = useCallback(async (event?: React.MouseEvent) => {
     const saveToAgent = event?.shiftKey ?? false;
+    setWorkspaceMenuOpen(false);
     try {
       const selected = await open({
         directory: true,
@@ -993,6 +1047,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           { config: next }
         );
         setWorkspaceDir(dir);
+        setWorkspaceSource("agent");
+        setSessionWorkspaceDirs((prev) => {
+          if (!prev[activeAvatarId]) return prev;
+          const next = { ...prev };
+          delete next[activeAvatarId];
+          return next;
+        });
         if (saveResult?.gateway_restarted) {
           await new Promise<void>((resolve) => setTimeout(resolve, 1000));
           const status = await invokeTauri<GatewayStatus>("gateway_status").catch(() => null);
@@ -1001,19 +1062,46 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           }
           const refreshed = await invokeTauri<Config>("get_setup_config").catch(() => null);
           if (refreshed) {
+            const agentWorkspace = refreshed.agent?.workspace_dir ?? null;
+            const globalWorkspace = refreshed.workspace_dir ?? null;
+            setWorkspaceDir(agentWorkspace || globalWorkspace || null);
+            setWorkspaceSource(agentWorkspace ? "agent" : globalWorkspace ? "global" : null);
             setWorkspaceStatus(refreshed.workspace_status ?? null);
           }
         }
       } else {
         // Session-scoped temporary workspace (no save, no gateway restart).
-        setSessionWorkspaceDir(dir);
+        setSessionWorkspaceDirs((prev) => ({ ...prev, [activeAvatarId]: dir }));
       }
     } catch (err) {
       setError(
         `选择 Workspace 失败：${err instanceof Error ? err.message : String(err)}`
       );
     }
-  }, []);
+  }, [activeAvatarId]);
+
+  const handleOpenWorkspace = useCallback(async () => {
+    setWorkspaceMenuOpen(false);
+    if (!activeWorkspaceDir) {
+      setError("请先选择 Workspace。");
+      return;
+    }
+    try {
+      await invokeTauri<void>("open_workspace_dir", { path: activeWorkspaceDir });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [activeWorkspaceDir]);
+
+  const handleClearSessionWorkspace = useCallback(() => {
+    setWorkspaceMenuOpen(false);
+    setSessionWorkspaceDirs((prev) => {
+      if (!prev[activeAvatarId]) return prev;
+      const next = { ...prev };
+      delete next[activeAvatarId];
+      return next;
+    });
+  }, [activeAvatarId]);
 
   const handleComposerDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -1293,7 +1381,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             </div>
           </div>
 
-          {workspaceStatus && workspaceStatus.state !== "ok" ? (
+          {workspaceStatus && workspaceStatus.state !== "ok" && !sessionWorkspaceDir ? (
             <div
               className={`chat-workspace-banner chat-workspace-banner--${workspaceStatus.state}`}
               role="status"
@@ -1387,30 +1475,67 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               appendTranscript={appendVoiceTranscript}
               disabled={sending || gatewayStatus !== "connected"}
               trailingActions={
-                <button
-                  type="button"
-                  className="chat-icon-btn chat-workspace-button"
-                  title={
-                    sessionWorkspaceDir
-                      ? `会话临时 Workspace：${sessionWorkspaceDir}\n（Shift+点击 保存到该 Agent）`
-                      : workspaceDir
-                        ? `Agent Workspace：${workspaceDir}\n（普通点击 = 临时会话，Shift+点击 = 保存到该 Agent）`
-                        : "设置 Workspace（Shift+点击 保存到该 Agent）"
-                  }
-                  aria-label={
-                    sessionWorkspaceDir
-                      ? `会话临时 Workspace：${sessionWorkspaceDir}`
-                      : workspaceDir
-                        ? `Agent Workspace：${workspaceDir}`
-                        : "设置 Workspace"
-                  }
-                  onClick={(e) =>
-                    void handleChooseWorkspace(e)
-                  }
-                  disabled={sending}
+                <div
+                  ref={workspaceMenuRef}
+                  className={`chat-workspace-actions${
+                    sessionWorkspaceDir ? " chat-workspace-actions--temporary" : ""
+                  }`}
                 >
-                  <span aria-hidden>📁</span>
-                </button>
+                  <button
+                    type="button"
+                    className="chat-workspace-pill"
+                    title={
+                      activeWorkspaceDir
+                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}\n普通点击 = 重新选择临时 Workspace；Shift+点击 = 保存到该 Agent；右键 = 更多操作`
+                        : "选择 Workspace（普通点击 = 当前会话临时 Workspace；Shift+点击 = 保存到该 Agent）"
+                    }
+                    aria-label={
+                      activeWorkspaceDir
+                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}`
+                        : "选择 Workspace"
+                    }
+                    onClick={(e) => void handleChooseWorkspace(e)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      if (!sending) setWorkspaceMenuOpen((open) => !open);
+                    }}
+                    disabled={sending}
+                  >
+                    <span aria-hidden>📁</span>
+                    {activeWorkspaceDir ? (
+                      <span className="chat-workspace-pill-scope">{workspaceLabel}</span>
+                    ) : null}
+                    <span className="chat-workspace-pill-path">{workspaceSummary}</span>
+                  </button>
+                  {workspaceMenuOpen ? (
+                    <div className="chat-workspace-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={(e) => void handleChooseWorkspace(e)}
+                      >
+                        重新选择 Workspace
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void handleOpenWorkspace()}
+                        disabled={!activeWorkspaceDir}
+                      >
+                        打开当前 Workspace 文件夹
+                      </button>
+                      {sessionWorkspaceDir ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={handleClearSessionWorkspace}
+                        >
+                          清除当前会话临时 Workspace
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
               }
             />
 

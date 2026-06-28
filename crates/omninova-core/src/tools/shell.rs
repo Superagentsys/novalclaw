@@ -82,6 +82,61 @@ impl ShellTool {
         }
     }
 
+    fn is_remove_command(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+        lower.split_whitespace().any(|token| {
+            matches!(
+                token.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == ';'),
+                "rm" | "rmdir" | "rd" | "remove-item" | "del"
+            )
+        })
+    }
+
+    fn normalize_command_path_token(token: &str) -> String {
+        let trimmed = token
+            .trim_matches(|c| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']'
+                )
+            })
+            .trim_end_matches(['\\', '/'])
+            .to_ascii_lowercase();
+        trimmed
+            .strip_prefix("-path=")
+            .or_else(|| trimmed.strip_prefix("-literalpath="))
+            .unwrap_or(&trimmed)
+            .to_string()
+    }
+
+    fn command_targets_workspace_root(
+        &self,
+        command: &str,
+        cwd: &Path,
+        workspace: &Path,
+    ) -> bool {
+        if !Self::is_remove_command(command) {
+            return false;
+        }
+
+        let cwd_is_workspace = cwd == workspace;
+        let workspace_str = workspace
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_ascii_lowercase();
+
+        command.split_whitespace().any(|raw| {
+            let token = Self::normalize_command_path_token(raw);
+            if token.is_empty() || token.contains('*') {
+                return false;
+            }
+            if cwd_is_workspace && matches!(token.as_str(), "." | "./" | ".\\") {
+                return true;
+            }
+            token == workspace_str
+        })
+    }
+
     fn truncate_output(s: String) -> String {
         if s.len() <= MAX_OUTPUT_BYTES {
             return s;
@@ -144,6 +199,25 @@ impl Tool for ShellTool {
                 });
             }
         };
+        let workspace = match tokio::fs::canonicalize(&self.workspace_dir).await {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("failed to resolve workspace dir: {e}")),
+                });
+            }
+        };
+        if self.command_targets_workspace_root(command, &cwd, &workspace) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Refusing to delete the Workspace root directory. Delete files inside the Workspace instead.".to_string(),
+                ),
+            });
+        }
 
         if sandbox_enabled(&self.config) {
             if let Err(e) = ensure_sandbox_home(&self.config).await {
