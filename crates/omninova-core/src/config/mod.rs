@@ -20,5 +20,6 @@ pub use schema::{
     WebSearchConfig,
 };
 
+pub use schema::resolve_effective_workspace_dir;
 pub use loader::resolve_config_path;
 pub use validation::ValidationReport;

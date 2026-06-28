@@ -1,7 +1,8 @@
+use crate::security::sandbox::resolve_workspace_relative;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -14,20 +15,6 @@ impl FileReadTool {
         Self {
             workspace_dir: workspace_dir.into(),
         }
-    }
-
-    async fn resolve_allowed_path(&self, relative: &str) -> anyhow::Result<PathBuf> {
-        let rel = Path::new(relative);
-        if rel.is_absolute() {
-            anyhow::bail!("absolute paths are not allowed");
-        }
-        let full_path = self.workspace_dir.join(rel);
-        let resolved = tokio::fs::canonicalize(&full_path).await?;
-        let workspace = tokio::fs::canonicalize(&self.workspace_dir).await?;
-        if !resolved.starts_with(&workspace) {
-            anyhow::bail!("path escapes workspace");
-        }
-        Ok(resolved)
     }
 }
 
@@ -59,7 +46,7 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        let resolved = match self.resolve_allowed_path(path).await {
+        let resolved = match resolve_workspace_relative(&self.workspace_dir, path).await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {

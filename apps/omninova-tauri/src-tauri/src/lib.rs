@@ -189,6 +189,13 @@ struct SetupAuditConfig {
     record_arguments: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SetupWorkspaceStatus {
+    state: String, // "unselected" | "missing" | "inaccessible" | "ok"
+    path: Option<String>,
+    message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetupAppConfig {
     api_key: Option<String>,
@@ -196,6 +203,8 @@ struct SetupAppConfig {
     default_provider: Option<String>,
     default_model: Option<String>,
     workspace_dir: String,
+    #[serde(default)]
+    workspace_status: SetupWorkspaceStatus,
     omninoval_gateway_url: Option<String>,
     omninoval_config_dir: Option<String>,
     robot: Option<RobotConfig>,
@@ -209,6 +218,21 @@ struct SetupAppConfig {
     observability: SetupObservabilityConfig,
     #[serde(default)]
     audit: SetupAuditConfig,
+    /// Per-agent settings (workspace_dir, system_prompt, etc.) from the Agent tab.
+    #[serde(default)]
+    agent: Option<AgentPersonaSetup>,
+}
+
+/// Corresponds to the frontend `AgentPersonaConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AgentPersonaSetup {
+    name: String,
+    workspace_dir: Option<String>,
+    system_prompt: Option<String>,
+    compact_context: Option<bool>,
+    max_tool_iterations: Option<usize>,
+    max_history_messages: Option<usize>,
+    mbti_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,7 +383,7 @@ async fn get_setup_config(
 async fn save_setup_config(
     config: SetupAppConfig,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+) -> Result<SaveSetupResult, String> {
     let state_ref = state.inner().clone();
     sync_gateway_task_state(&state_ref).await;
 
@@ -370,17 +394,33 @@ async fn save_setup_config(
 
     let current = runtime.get_config().await;
     let current_gateway_url = format!("http://{}:{}", current.gateway.host, current.gateway.port);
+    let current_workspace_dir = current.workspace_dir.clone();
     let mut next = setup_config_to_core(current, config)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
+    let workspace_changed = current_workspace_dir != next.workspace_dir;
 
     save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
-    if current_gateway_url != next_gateway_url {
+    let mut restarted = false;
+    if current_gateway_url != next_gateway_url || workspace_changed {
+        // Restart gateway so new workspace_dir takes effect and tools are recreated.
         stop_gateway_inner(&state_ref).await;
+        sleep(Duration::from_millis(200)).await;
+        if let Err(e) = start_gateway_inner(state_ref.clone()).await {
+            return Err(format!("配置已保存但网关重启失败: {e}"));
+        }
+        restarted = true;
     }
 
-    Ok(())
+    Ok(SaveSetupResult {
+        gateway_restarted: restarted,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SaveSetupResult {
+    gateway_restarted: bool,
 }
 
 #[tauri::command]
@@ -863,6 +903,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         default_provider: config.default_provider.clone(),
         default_model: config.default_model.clone(),
         workspace_dir: config.workspace_dir.to_string_lossy().to_string(),
+        workspace_status: compute_workspace_status(&config.workspace_dir),
         omninoval_gateway_url: Some(format!(
             "http://{}:{}",
             config.gateway.host, config.gateway.port
@@ -886,6 +927,19 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             enabled: config.security.audit.enabled,
             record_arguments: config.security.audit.record_arguments,
         },
+        agent: Some(AgentPersonaSetup {
+            name: config.agent.name.clone(),
+            workspace_dir: config
+                .agents
+                .get(&config.agent.name)
+                .and_then(|a| a.workspace_dir.clone())
+                .map(|p| p.to_string_lossy().to_string()),
+            system_prompt: config.agent.system_prompt.clone(),
+            compact_context: Some(config.agent.compact_context),
+            max_tool_iterations: Some(config.agent.max_tool_iterations),
+            max_history_messages: Some(config.agent.max_history_messages),
+            mbti_type: None,
+        }),
     }
 }
 
@@ -1033,6 +1087,25 @@ fn setup_config_to_core(
         current.channels_config = channels_to_core(channels);
     }
 
+    // Persist per-agent workspace_dir to the agents HashMap.
+    if let Some(agent_setup) = setup.agent {
+        current.agent.name = agent_setup.name.clone();
+        current.agent.system_prompt = agent_setup.system_prompt.clone();
+        current.agent.compact_context = agent_setup.compact_context.unwrap_or(true);
+        current.agent.max_tool_iterations = agent_setup.max_tool_iterations.unwrap_or(20);
+        current.agent.max_history_messages = agent_setup.max_history_messages.unwrap_or(50);
+
+        let agent_name = agent_setup.name.clone();
+        let delegate = current.agents.entry(agent_name.clone()).or_default();
+        if let Some(ws) = agent_setup.workspace_dir {
+            if !ws.trim().is_empty() {
+                delegate.workspace_dir = Some(expand_tilde_path(&ws));
+            } else {
+                delegate.workspace_dir = None;
+            }
+        }
+    }
+
     current.multimodal.desktop_vision_enabled = setup.multimodal.desktop_vision_enabled;
     current.multimodal.desktop_vision_max_dimension_px = setup
         .multimodal
@@ -1132,7 +1205,15 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
         changed = true;
     }
 
-    let auto_approved_tools = ["browser", "shell", "file_read", "file_write", "file_edit"];
+    let auto_approved_tools = [
+        "browser",
+        "shell",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "file_list",
+        "git_operations",
+    ];
     for tool in auto_approved_tools {
         if !config
             .autonomy
@@ -1141,6 +1222,24 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
             .any(|existing| existing.eq_ignore_ascii_case(tool))
         {
             config.autonomy.auto_approve.push(tool.to_string());
+            changed = true;
+        }
+    }
+
+    // Make sure common read-only / workspace-safe Git operations are in
+    // the shell allowlist so the model can answer "what changed in this
+    // repo?" without prompting. The shell tool additionally constrains
+    // commands via the high-risk deny list, so this only widens access to
+    // safe commands (status, diff, log, branch, add, commit, checkout, stash).
+    let safe_git_commands = ["git"];
+    for command in safe_git_commands {
+        if !config
+            .autonomy
+            .allowed_commands
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(command))
+        {
+            config.autonomy.allowed_commands.push(command.to_string());
             changed = true;
         }
     }
@@ -1264,6 +1363,69 @@ fn display_provider_name(id: &str) -> String {
         "xai" => "xAI".to_string(),
         "mistral" => "Mistral".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Inspect the configured workspace directory and classify its state for
+/// the frontend so the chat UI can surface actionable messages instead of
+/// letting the model fail tool calls with permission errors.
+fn compute_workspace_status(workspace_dir: &std::path::Path) -> SetupWorkspaceStatus {
+    let path_str = workspace_dir.to_string_lossy().to_string();
+    if workspace_dir.as_os_str().is_empty() {
+        return SetupWorkspaceStatus {
+            state: "unselected".into(),
+            path: None,
+            message: "请先点击 Workspace 按钮选择目录".into(),
+        };
+    }
+    match std::fs::metadata(workspace_dir) {
+        Ok(meta) if meta.is_dir() => {
+            // Touch the directory to confirm write access; if even read
+            // works but write fails (e.g. read-only mount) we still
+            // consider it inaccessible.
+            let probe = workspace_dir.join(".omninova-write-probe");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    SetupWorkspaceStatus {
+                        state: "ok".into(),
+                        path: Some(path_str),
+                        message: "Workspace 可访问".into(),
+                    }
+                }
+                Err(_) => SetupWorkspaceStatus {
+                    state: "inaccessible".into(),
+                    path: Some(path_str),
+                    message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+                },
+            }
+        }
+        Ok(_) => SetupWorkspaceStatus {
+            state: "inaccessible".into(),
+            path: Some(path_str),
+            message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+        },
+        Err(_) => {
+            // Try to create the directory; if creation succeeds the
+            // workspace is reachable. Otherwise mark it inaccessible.
+            match std::fs::create_dir_all(workspace_dir) {
+                Ok(()) => SetupWorkspaceStatus {
+                    state: "ok".into(),
+                    path: Some(path_str),
+                    message: "Workspace 已自动创建，可访问".into(),
+                },
+                Err(_) => SetupWorkspaceStatus {
+                    state: "missing".into(),
+                    path: Some(path_str),
+                    message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+                },
+            }
+        }
     }
 }
 

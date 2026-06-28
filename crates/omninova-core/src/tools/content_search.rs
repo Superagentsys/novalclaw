@@ -1,3 +1,4 @@
+use crate::security::sandbox::resolve_workspace_relative;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -67,15 +68,19 @@ impl Tool for ContentSearchTool {
         let context_before = args.get("context_before").and_then(|v| v.as_u64()).unwrap_or(0);
         let context_after = args.get("context_after").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        if sub_path.contains("..") || sub_path.starts_with('/') {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Path must be relative and not contain '..'".to_string()),
-            });
-        }
+        // Use resolve_workspace_relative so "." resolves to workspace_dir and
+        // paths with .. are rejected, preventing escape via "foo/../bar".
+        let search_dir = match resolve_workspace_relative(&self.workspace_dir, sub_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
 
-        let search_dir = self.workspace_dir.join(sub_path);
         let has_rg = Command::new("rg")
             .arg("--version")
             .stdout(Stdio::null())

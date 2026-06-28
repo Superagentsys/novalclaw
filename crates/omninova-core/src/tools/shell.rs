@@ -10,7 +10,6 @@ use tokio::time::{timeout, Duration};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
-
 pub struct ShellTool {
     workspace_dir: PathBuf,
     allowed_commands: Vec<String>,
@@ -40,9 +39,25 @@ impl ShellTool {
                 if rel.is_absolute() {
                     anyhow::bail!("absolute working_directory is not allowed");
                 }
-                self.workspace_dir.join(rel)
+                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    anyhow::bail!("path traversal is not allowed");
+                }
+                if !self.workspace_dir.exists() {
+                    tokio::fs::create_dir_all(&self.workspace_dir).await.map_err(|e| {
+                        anyhow::anyhow!("workspace dir does not exist and could not be created: {e}")
+                    })?;
+                }
+                let workspace_canon = tokio::fs::canonicalize(&self.workspace_dir).await?;
+                workspace_canon.join(rel)
             }
-            _ => self.workspace_dir.clone(),
+            _ => {
+                if !self.workspace_dir.exists() {
+                    tokio::fs::create_dir_all(&self.workspace_dir).await.map_err(|e| {
+                        anyhow::anyhow!("workspace dir does not exist and could not be created: {e}")
+                    })?;
+                }
+                tokio::fs::canonicalize(&self.workspace_dir).await?
+            }
         };
 
         let resolved = tokio::fs::canonicalize(&wd)
@@ -140,10 +155,19 @@ impl Tool for ShellTool {
             }
         }
 
-        let mut child = Command::new("sh");
+        // On Windows there is no `sh -lc`; route the command through PowerShell
+        // so default allow-listed commands like `pwd`, `ls`, `cat`, `git`
+        // continue to work without each caller having to know the platform.
+        let mut child = if cfg!(target_os = "windows") {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-lc").arg(command);
+            c
+        };
         child
-            .arg("-lc")
-            .arg(command)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

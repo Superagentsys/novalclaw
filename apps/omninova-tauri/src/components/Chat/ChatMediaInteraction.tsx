@@ -38,11 +38,14 @@ interface ChatMediaInteractionProps {
   appendTranscript: (text: string) => void;
   /** 禁用媒体按钮（例如正在发送消息时） */
   disabled?: boolean;
+  /** 追加在媒体按钮组末尾的额外操作（如 Workspace 按钮），与现有图标按钮同一排 */
+  trailingActions?: React.ReactNode;
 }
 
 export function ChatMediaInteraction({
   appendTranscript,
   disabled = false,
+  trailingActions,
 }: ChatMediaInteractionProps) {
   const [videoOn, setVideoOn] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
@@ -306,6 +309,7 @@ export function ChatMediaInteraction({
         >
           <span aria-hidden>🗣</span>
         </button>
+        {trailingActions}
       </div>
     </div>
   );

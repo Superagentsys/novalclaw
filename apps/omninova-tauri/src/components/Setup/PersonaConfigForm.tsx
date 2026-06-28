@@ -1,4 +1,5 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useCallback } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { type AgentPersonaConfig, MBTI_TYPES } from "../../types/config";
 
 interface Props {
@@ -12,6 +13,25 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
       ? MBTI_TYPES[config.mbti_type]
       : null;
   }, [config.mbti_type]);
+
+  const handlePickWorkspaceDir = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "选择该 Agent 的 Workspace",
+      });
+      if (selected != null) {
+        onChange({ ...config, workspace_dir: selected as string });
+      }
+    } catch (error) {
+      console.error("选择目录失败:", error);
+    }
+  }, [config, onChange]);
+
+  const handleClearWorkspaceDir = useCallback(() => {
+    onChange({ ...config, workspace_dir: undefined });
+  }, [config, onChange]);
 
   const handleMBTIChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const code = e.target.value;
@@ -68,6 +88,40 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
             className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50"
           />
         </div>
+      </div>
+
+      {/* Per-Agent Workspace */}
+      <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-4">
+        <h4 className="text-white font-medium flex items-center gap-2">
+          <span>📁</span> Workspace 目录
+        </h4>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={config.workspace_dir ?? ""}
+            onChange={(e) => onChange({ ...config, workspace_dir: e.target.value || undefined })}
+            placeholder="未设置，使用全局 Workspace"
+            className="flex-1 bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 text-sm focus:outline-none focus:border-blue-500/50"
+          />
+          <button
+            type="button"
+            onClick={() => void handlePickWorkspaceDir()}
+            className="setup-btn setup-btn--secondary whitespace-nowrap"
+          >
+            选择目录
+          </button>
+          <button
+            type="button"
+            onClick={handleClearWorkspaceDir}
+            disabled={!config.workspace_dir}
+            className="setup-btn setup-btn--ghost whitespace-nowrap disabled:opacity-30"
+          >
+            清空
+          </button>
+        </div>
+        <p className="text-white/30 text-xs">
+          未设置时，该 Agent 使用全局 Workspace 目录。设置后可让不同 Agent 操作不同目录。
+        </p>
       </div>
 
       {/* MBTI Selection */}

@@ -80,14 +80,13 @@ impl Config {
             .with_context(|| format!("Failed to parse config from {}", path.display()))?;
 
         cfg.config_path = path.to_path_buf();
-        if let Some(parent) = path.parent() {
-            if cfg.workspace_dir.as_os_str().is_empty() {
+
+        // Resolve relative workspace_dir against the config directory.
+        if cfg.workspace_dir.as_os_str().is_empty() {
+            if let Some(parent) = path.parent() {
                 cfg.workspace_dir = parent.join("workspace");
             }
-        }
-
-        // Resolve relative workspace_dir against config dir
-        if cfg.workspace_dir.is_relative() {
+        } else if cfg.workspace_dir.is_relative() {
             if let Some(parent) = path.parent() {
                 cfg.workspace_dir = parent.join(&cfg.workspace_dir);
             }
@@ -96,7 +95,11 @@ impl Config {
         super::env::apply_env_overrides(&mut cfg);
         cfg.ensure_dirs()?;
 
-        info!("Config loaded from {}", path.display());
+        info!(
+            "Config loaded from {} (workspace_dir={})",
+            path.display(),
+            cfg.workspace_dir.display()
+        );
         Ok(cfg)
     }
 
@@ -297,5 +300,56 @@ http_proxy = "http://proxy:3128"
         assert!(cfg.runtime.reasoning_enabled);
         assert_eq!(cfg.runtime.wasm.fuel_limit, 500000);
         assert!(cfg.proxy.enabled);
+    }
+
+    #[test]
+    fn test_workspace_dir_round_trip() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
+        let dir = tempdir();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "api_key = \"sk-test\"\nworkspace_dir = 'E:\\novalclaw'\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&config_path).unwrap();
+        assert_eq!(cfg.workspace_dir, PathBuf::from(r"E:\novalclaw"));
+
+        cfg.save().unwrap();
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("workspace_dir"),
+            "workspace_dir must be persisted on save: {on_disk}"
+        );
+
+        let reloaded = Config::load_from(&config_path).unwrap();
+        assert_eq!(reloaded.workspace_dir, PathBuf::from(r"E:\novalclaw"));
+    }
+
+    #[test]
+    fn test_workspace_dir_empty_falls_back_to_config_dir_workspace() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
+        let dir = tempdir();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "api_key = \"sk-test\"\n").unwrap();
+
+        let cfg = Config::load_from(&config_path).unwrap();
+        assert_eq!(cfg.workspace_dir, dir.join("workspace"));
+    }
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "omninova-cfg-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 }

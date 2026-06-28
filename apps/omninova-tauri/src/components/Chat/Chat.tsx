@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { invokeTauri } from "../../utils/tauri";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   isTauriEnvironment,
   pickComposerAttachmentPaths,
@@ -18,6 +19,7 @@ import {
   type StoredChatMessage,
 } from "../../utils/chatStorage";
 import type {
+  AgentPersonaConfig,
   Config,
   GatewayHealth,
   GatewayInboundResponse,
@@ -25,6 +27,7 @@ import type {
   ProviderHealthSummary,
   ExecutionStep,
   RouteDecision,
+  WorkspaceStatus,
 } from "../../types/config";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
@@ -267,6 +270,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [desktopVisionMaster, setDesktopVisionMaster] = useState(false);
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
   const [desktopVisionMaxPx, setDesktopVisionMaxPx] = useState(1280);
+  const [workspaceDir, setWorkspaceDir] = useState<string | null>(null);
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
+  /**
+   * Session-level temporary workspace. Set by the chat-page Workspace button
+   * without modifying the agent's default workspace. This takes the highest
+   * priority when the Agent processes a message (higher than per-agent or
+   * global workspace_dir).
+   */
+  const [sessionWorkspaceDir, setSessionWorkspaceDir] = useState<string | null>(null);
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
@@ -396,6 +408,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         const maxPx = cfg.multimodal?.desktop_vision_max_dimension_px ?? 1280;
         setDesktopVisionMaster(master);
         setDesktopVisionMaxPx(maxPx);
+        setWorkspaceDir(
+          cfg.agent?.workspace_dir ?? cfg.workspace_dir ?? null
+        );
+        setWorkspaceStatus(cfg.workspace_status ?? null);
         const stored = localStorage.getItem(DESKTOP_VISION_SESSION_KEY);
         if (stored === "1") setDesktopVisionOn(true);
         else if (stored === "0") setDesktopVisionOn(false);
@@ -419,9 +435,85 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, []);
 
   useEffect(() => {
-    if (!stickToBottomRef.current && !sending) return;
+    if (!stickToBottomRef.current) return;
     scrollMessagesToEnd("auto");
   }, [messages, sending, activeSteps, elapsedSec, scrollMessagesToEnd]);
+
+  // 窗口缩放导致消息重新换行时，保持视口顶部正在浏览的消息位置不变。
+  useEffect(() => {
+    const container = messagesScrollRef.current;
+    if (!container) return;
+
+    type ScrollAnchor = {
+      element: HTMLElement;
+      offsetTop: number;
+    };
+
+    let anchor: ScrollAnchor | null = null;
+    let adjusting = false;
+
+    const captureAnchor = () => {
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (distanceFromBottom < 80) {
+        anchor = null;
+        return;
+      }
+
+      const containerTop = container.getBoundingClientRect().top;
+      const bubbles = container.querySelectorAll<HTMLElement>(".chat-bubble");
+      let firstVisible: HTMLElement | null = null;
+      let low = 0;
+      let high = bubbles.length - 1;
+
+      while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        const bubble = bubbles.item(middle);
+        if (bubble.getBoundingClientRect().bottom > containerTop) {
+          firstVisible = bubble;
+          high = middle - 1;
+        } else {
+          low = middle + 1;
+        }
+      }
+
+      anchor = firstVisible
+        ? {
+            element: firstVisible,
+            offsetTop: firstVisible.getBoundingClientRect().top - containerTop,
+          }
+        : null;
+    };
+
+    const handleScroll = () => {
+      if (!adjusting) captureAnchor();
+    };
+
+    captureAnchor();
+    container.addEventListener("scroll", handleScroll, { passive: true });
+
+    const ro = new ResizeObserver(() => {
+      adjusting = true;
+
+      if (stickToBottomRef.current) {
+        container.scrollTop = container.scrollHeight;
+      } else if (anchor?.element.isConnected) {
+        const currentOffsetTop =
+          anchor.element.getBoundingClientRect().top -
+          container.getBoundingClientRect().top;
+        container.scrollTop += currentOffsetTop - anchor.offsetTop;
+      }
+
+      captureAnchor();
+      adjusting = false;
+    });
+
+    ro.observe(container);
+    return () => {
+      ro.disconnect();
+      container.removeEventListener("scroll", handleScroll);
+    };
+  }, []);
 
   useEffect(() => {
     const timers = elapsedTimersRef.current;
@@ -670,6 +762,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     try {
       const metadata: Record<string, unknown> = {
         preferred_provider: selectedModel === "auto" ? undefined : selectedModel,
+        // Session-scoped temporary workspace (takes highest priority in the backend).
+        // Clears when the user closes the app or starts a new session.
+        ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
       };
 
       if (desktopVisionOn && desktopVisionMaster && isTauriEnvironment()) {
@@ -862,6 +957,63 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, [mergePathsIntoInput]);
+
+  /**
+   * Chat-page Workspace button — two modes:
+   * 1. Shift+click  → save to agent config (persistent, survives session)
+   * 2. plain click  → session-scoped temporary workspace (highest priority,
+   *                    resets on app restart / new chat session)
+   *
+   * Requirement #11: "聊天页点 Workspace 按钮选目录，只作为当前会话临时
+   * workspace，不要强制覆盖 Agent 默认 workspace，除非用户点击'保存到该 Agent'。"
+   */
+  const handleChooseWorkspace = useCallback(async (event?: React.MouseEvent) => {
+    const saveToAgent = event?.shiftKey ?? false;
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: saveToAgent ? "选择该 Agent 的 Workspace 目录" : "选择临时 Workspace 目录",
+      });
+      if (selected == null) return;
+      const dir = selected as string;
+
+      if (saveToAgent) {
+        // Save to the agent config (persistent).
+        const current = await invokeTauri<Config>("get_setup_config").catch(() => null);
+        const next: Config = {
+          ...(current ?? ({} as Config)),
+          agent: {
+            ...(current?.agent ?? {}),
+            workspace_dir: dir,
+          } as AgentPersonaConfig,
+        };
+        const saveResult = await invokeTauri<{ gateway_restarted: boolean }>(
+          "save_setup_config",
+          { config: next }
+        );
+        setWorkspaceDir(dir);
+        if (saveResult?.gateway_restarted) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+          const status = await invokeTauri<GatewayStatus>("gateway_status").catch(() => null);
+          if (status) {
+            setGatewayStatus(status.running ? "connected" : "disconnected");
+          }
+          const refreshed = await invokeTauri<Config>("get_setup_config").catch(() => null);
+          if (refreshed) {
+            setWorkspaceStatus(refreshed.workspace_status ?? null);
+          }
+        }
+      } else {
+        // Session-scoped temporary workspace (no save, no gateway restart).
+        setSessionWorkspaceDir(dir);
+      }
+    } catch (err) {
+      setError(
+        `选择 Workspace 失败：${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }, []);
 
   const handleComposerDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -1141,6 +1293,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             </div>
           </div>
 
+          {workspaceStatus && workspaceStatus.state !== "ok" ? (
+            <div
+              className={`chat-workspace-banner chat-workspace-banner--${workspaceStatus.state}`}
+              role="status"
+            >
+              <strong>Workspace 未就绪：</strong>
+              {workspaceStatus.message}
+              {workspaceStatus.path ? (
+                <code className="chat-workspace-banner-path">{workspaceStatus.path}</code>
+              ) : null}
+              <button
+                type="button"
+                className="chat-workspace-banner-action"
+                onClick={() => void handleChooseWorkspace()}
+                disabled={sending}
+              >
+                {workspaceStatus.state === "unselected" ? "选择目录" : "重新选择"}
+              </button>
+            </div>
+          ) : null}
+
           <div
             ref={messagesScrollRef}
             className="chat-messages"
@@ -1213,6 +1386,34 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             <ChatMediaInteraction
               appendTranscript={appendVoiceTranscript}
               disabled={sending || gatewayStatus !== "connected"}
+              trailingActions={
+                <button
+                  type="button"
+                  className={`chat-icon-btn chat-workspace-button${
+                    sessionWorkspaceDir || workspaceDir ? " is-active" : ""
+                  }`}
+                  title={
+                    sessionWorkspaceDir
+                      ? `会话临时 Workspace：${sessionWorkspaceDir}\n（Shift+点击 保存到该 Agent）`
+                      : workspaceDir
+                        ? `Agent Workspace：${workspaceDir}\n（普通点击 = 临时会话，Shift+点击 = 保存到该 Agent）`
+                        : "设置 Workspace（Shift+点击 保存到该 Agent）"
+                  }
+                  aria-label={
+                    sessionWorkspaceDir
+                      ? `会话临时 Workspace：${sessionWorkspaceDir}`
+                      : workspaceDir
+                        ? `Agent Workspace：${workspaceDir}`
+                        : "设置 Workspace"
+                  }
+                  onClick={(e) =>
+                    void handleChooseWorkspace(e)
+                  }
+                  disabled={sending}
+                >
+                  <span aria-hidden>📁</span>
+                </button>
+              }
             />
 
             <input

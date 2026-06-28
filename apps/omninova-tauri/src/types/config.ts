@@ -243,6 +243,8 @@ export interface AgentPersonaConfig {
   max_tool_iterations?: number;
   max_history_messages?: number;
   mbti_type?: string;
+  /** Per-agent workspace root. Takes precedence over the global Config.workspace_dir. */
+  workspace_dir?: string;
 }
 
 export interface MultimodalConfig {
@@ -261,6 +263,12 @@ export interface AuditConfig {
 }
 
 // Main configuration interface
+export interface WorkspaceStatus {
+  state: "unselected" | "missing" | "inaccessible" | "ok";
+  path?: string | null;
+  message: string;
+}
+
 export interface Config {
   api_key?: string;
   api_url?: string;
@@ -268,6 +276,7 @@ export interface Config {
   default_model?: string;
   default_temperature?: number;
   workspace_dir?: string;
+  workspace_status?: WorkspaceStatus;
   omninoval_gateway_url?: string;
   omninoval_config_dir?: string;
   provider_api?: string;
