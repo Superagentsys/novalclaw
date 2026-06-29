@@ -340,10 +340,10 @@ impl GatewayRuntime {
             lineage.spawn_depth,
             &mut tools,
         ) {
-            steps.push(ExecutionStep::done("子代理委派", "已启用 delegate 工具"));
+            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
         }
         steps.push(ExecutionStep::done(
-            "准备工具",
+            "加载工具",
             format!("可用工具数：{}", tools.len()),
         ));
 
@@ -499,6 +499,286 @@ impl GatewayRuntime {
             }
         }
         result
+    }
+
+    /// Streaming variant of [`process_inbound`]: emits [`AgentRunEvent`]s via `events_tx`
+    /// in real-time so the frontend can display a live execution timeline.
+    pub async fn process_inbound_streaming(
+        &self,
+        inbound: &InboundMessage,
+        events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> anyhow::Result<GatewayInboundResponse> {
+        let started = std::time::Instant::now();
+        let cfg = self.config.read().await.clone();
+        let route = resolve_agent_route(&cfg, inbound);
+        let security = SecurityContext::for_inbound(&cfg, inbound, &route);
+        let channel_label = security.audit().context().channel.clone();
+        crate::observability::record_inbound_request(&channel_label);
+        security.audit_inbound_start(inbound.text.chars().count()).await;
+
+        let mut steps = vec![ExecutionStep::done(
+            "接收请求",
+            format!(
+                "channel={:?}, session={}, trace={}",
+                inbound.channel,
+                inbound.session_id.as_deref().unwrap_or("-"),
+                security.trace_id()
+            ),
+        )];
+
+        let _slot = acquire_inbound_slot(&cfg, &self.active_inbound)?;
+        let _child_slot =
+            acquire_subagent_guard(&cfg, inbound, &self.active_children_by_parent).await?;
+        steps.push(ExecutionStep::done(
+            "路由选择",
+            format!(
+                "Agent: {}{}{}",
+                route.agent_name,
+                route.provider.as_ref().map(|p| format!(", Provider: {p}")).unwrap_or_default(),
+                route.model.as_ref().map(|m| format!(", Model: {m}")).unwrap_or_default()
+            ),
+        ));
+        security
+            .audit_route(&format!(
+                "agent={} provider={:?} model={:?}",
+                route.agent_name, route.provider, route.model
+            ))
+            .await;
+
+        let agent_delegate = cfg.agents.get(&route.agent_name);
+        let session_workspace_path: Option<std::path::PathBuf> = inbound
+            .metadata
+            .get("workspace_dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let effective_workspace = resolve_effective_workspace_dir(
+            session_workspace_path.as_deref(),
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        );
+        let effective_workspace = match effective_workspace {
+            Some(w) if !w.as_os_str().is_empty() => w,
+            _ => {
+                let message = WORKSPACE_REQUIRED_MESSAGE;
+                steps.push(ExecutionStep::error("Workspace", message));
+                anyhow::bail!(message);
+            }
+        };
+        steps.push(ExecutionStep::done("Workspace", format!("{}", effective_workspace.display())));
+        security
+            .audit_route(&format!(
+                "agent={} workspace={}",
+                route.agent_name,
+                effective_workspace.display()
+            ))
+            .await;
+
+        let lineage = self
+            .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
+            .await?;
+
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route.agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
+
+        if attach_delegate_tool(
+            &cfg,
+            self,
+            &route.agent_name,
+            inbound.session_id.as_deref(),
+            &inbound.channel,
+            lineage.spawn_depth,
+            &mut tools,
+        ) {
+            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
+        }
+        steps.push(ExecutionStep::done(
+            "加载工具",
+            format!("可用工具数：{}", tools.len()),
+        ));
+
+        let mut agent_cfg = cfg.agent.clone();
+        if let Some(delegate) = cfg.agents.get(&route.agent_name) {
+            if let Some(prompt) = &delegate.system_prompt {
+                agent_cfg.system_prompt = Some(prompt.clone());
+            }
+        }
+        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
+
+        {
+            let workspace_note = format!(
+                "\n[环境信息] 当前 Workspace 目录是：{}。\n",
+                effective_workspace.display()
+            );
+            let current = agent_cfg.system_prompt.unwrap_or_default();
+            agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
+        }
+
+        if cfg.skills.open_skills_enabled {
+            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| effective_workspace.join("skills"));
+            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
+                let prompt = format_skills_prompt(&skills);
+                if !prompt.is_empty() {
+                    let current = agent_cfg.system_prompt.unwrap_or_default();
+                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
+                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
+                }
+            }
+        }
+
+        let agent_security = security.clone();
+        let mut agent = Agent::new(
+            build_provider_from_config(&cfg),
+            tools,
+            self.memory.clone(),
+            agent_cfg.clone(),
+            agent_security.clone(),
+        );
+
+        if let Some(session_id) = inbound.session_id.as_deref() {
+            let _guard = self.session_store_guard.lock().await;
+            match load_session_history(&cfg, &inbound.channel, session_id).await {
+                Ok(history) if !history.is_empty() => {
+                    let sanitized = sanitize_messages_for_provider(history);
+                    steps.push(ExecutionStep::done(
+                        "加载会话历史",
+                        format!("历史消息数：{}", sanitized.len()),
+                    ));
+                    agent.import_messages(sanitized);
+                }
+                Ok(_) => steps.push(ExecutionStep::done("加载会话历史", "无历史消息")),
+                Err(e) => {
+                    steps.push(ExecutionStep::error("加载会话历史", e.to_string()));
+                    warn!("failed to load session history for {}: {}", session_id, e);
+                }
+            }
+        }
+
+        // Use the frontend-provided run_id if available, otherwise generate a new one.
+        let run_id = metadata_str(inbound, &["run_id"])
+            .map(String::from)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        macro_rules! emit_event {
+            ($tx:expr, $ev:expr) => {
+                if let Ok(v) = serde_json::to_value($ev) {
+                    let _ = $tx.send(v);
+                }
+            };
+        }
+
+        emit_event!(events_tx, AgentRunEvent::RunStarted {
+            run_id: run_id.clone(),
+            agent_name: route.agent_name.clone(),
+            session_id: inbound.session_id.clone(),
+        });
+
+        let events_tx_inner = events_tx.clone();
+        let run_id_inner = run_id.clone();
+
+        let forwarder: Box<dyn Fn(crate::agent::ToolExecutionEvent) + Send + Sync + 'static> =
+            Box::new(move |te: crate::agent::ToolExecutionEvent| {
+                match te {
+                    crate::agent::ToolExecutionEvent::Started { tool_call_id, tool_name, summary } => {
+                        emit_event!(events_tx_inner, AgentRunEvent::ToolStarted {
+                            run_id: run_id_inner.clone(),
+                            tool_call_id,
+                            tool_name,
+                            summary,
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::Completed {
+                        tool_call_id,
+                        tool_name,
+                        success,
+                        duration_ms,
+                        result_summary,
+                        diff_stats,
+                    } => {
+                        emit_event!(events_tx_inner, AgentRunEvent::ToolCompleted {
+                            run_id: run_id_inner.clone(),
+                            tool_call_id,
+                            tool_name,
+                            success,
+                            duration_ms,
+                            result_summary,
+                            diff_stats: diff_stats.map(|d| RunDiffStats {
+                                additions: d.additions,
+                                deletions: d.deletions,
+                            }),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::CommandOutput {
+                        tool_call_id,
+                        tool_name,
+                        output,
+                        is_final,
+                    } => {
+                        emit_event!(events_tx_inner, AgentRunEvent::CommandOutput {
+                            run_id: run_id_inner.clone(),
+                            tool_call_id,
+                            tool_name,
+                            output,
+                            is_final,
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::FileChanged { path, additions, deletions } => {
+                        emit_event!(events_tx_inner, AgentRunEvent::FileChanged {
+                            run_id: run_id_inner.clone(),
+                            path,
+                            additions,
+                            deletions,
+                        });
+                    }
+                }
+            });
+
+        let result = agent
+            .process_message_with_events_streaming(&inbound.text, forwarder)
+            .await;
+
+        let reply_text = match &result {
+            Ok((reply, _)) => {
+                security
+                    .audit_inbound_complete(true, &format!("reply_len={}", reply.len()))
+                    .await;
+                crate::observability::record_inbound_duration(
+                    &channel_label, "ok", started.elapsed().as_secs_f64(),
+                );
+                emit_event!(events_tx, AgentRunEvent::RunCompleted {
+                    run_id: run_id.clone(),
+                    success: true,
+                    reply_preview: if reply.len() > 200 {
+                        format!("{}...", &reply[..200])
+                    } else {
+                        reply.clone()
+                    },
+                });
+                reply.clone()
+            }
+            Err(err) => {
+                crate::observability::record_inbound_error("process_inbound_streaming");
+                security
+                    .audit_inbound_complete(false, &err.to_string())
+                    .await;
+                crate::observability::record_inbound_duration(
+                    &channel_label, "error", started.elapsed().as_secs_f64(),
+                );
+                emit_event!(events_tx, AgentRunEvent::Error {
+                    run_id: run_id.clone(),
+                    message: err.to_string(),
+                });
+                return Err(anyhow::anyhow!(err.to_string()));
+            }
+        };
+
+        Ok(GatewayInboundResponse { route, reply: reply_text, steps })
     }
 
     async fn validate_and_resolve_session_lineage(
@@ -719,7 +999,7 @@ impl GatewayRuntime {
             .await
     }
 
-    /// 供桌面聊天 UI 展示的会话历史（过滤 system/tool 与纯工具调用轮次）。
+    /// ????? UI ?????????? system/tool ??????????
     pub async fn get_session_history(
         &self,
         channel: &ChannelKind,
@@ -742,8 +1022,8 @@ impl GatewayRuntime {
         }
     }
 
-    /// 删除某个会话：从内存血缘树与持久化会话存储中移除其记录。
-    /// 返回是否确有记录被删除。
+    /// ????????????????????????????
+    /// ????????????
     pub async fn delete_session(
         &self,
         channel: &ChannelKind,
@@ -752,13 +1032,13 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let key = session_key(channel, session_id);
 
-        // 内存血缘树
+        // ?????
         {
             let mut tree = self.session_tree.write().await;
             tree.remove(&key);
         }
 
-        // 持久化存储
+        // ?????
         let path = session_store_path(&cfg);
         let mut store = load_session_store(&path).await?;
         let removed = store.sessions.remove(&key).is_some();
@@ -1291,7 +1571,7 @@ fn truncate_for_step(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in trimmed.chars().enumerate() {
         if idx >= max_chars {
-            out.push('…');
+            out.push('?');
             return out;
         }
         out.push(ch);
@@ -1357,14 +1637,16 @@ pub struct ExecutionStep {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RunEvent {
-    ToolStarted { tool_name: String, summary: String },
+    ToolStarted { tool_call_id: String, tool_name: String, summary: String },
     ToolCompleted {
+        tool_call_id: String,
         tool_name: String,
         success: bool,
         duration_ms: u64,
         result_summary: String,
         diff_stats: Option<RunDiffStats>,
     },
+    CommandOutput { tool_call_id: String, tool_name: String, output: String, is_final: bool },
     FileChanged { path: String, additions: i32, deletions: i32 },
 }
 
@@ -1377,17 +1659,21 @@ pub struct RunDiffStats {
 impl From<ToolExecutionEvent> for RunEvent {
     fn from(evt: ToolExecutionEvent) -> Self {
         match evt {
-            ToolExecutionEvent::Started { tool_name, summary } => {
-                RunEvent::ToolStarted { tool_name, summary }
+            ToolExecutionEvent::Started { tool_call_id, tool_name, summary } => {
+                RunEvent::ToolStarted { tool_call_id, tool_name, summary }
             }
-            ToolExecutionEvent::Completed { tool_name, success, duration_ms, result_summary, diff_stats } => {
+            ToolExecutionEvent::Completed { tool_call_id, tool_name, success, duration_ms, result_summary, diff_stats } => {
                 RunEvent::ToolCompleted {
+                    tool_call_id,
                     tool_name,
                     success,
                     duration_ms,
                     result_summary,
                     diff_stats: diff_stats.map(|d| RunDiffStats { additions: d.additions, deletions: d.deletions }),
                 }
+            }
+            ToolExecutionEvent::CommandOutput { tool_call_id, tool_name, output, is_final } => {
+                RunEvent::CommandOutput { tool_call_id, tool_name, output, is_final }
             }
             ToolExecutionEvent::FileChanged { path, additions, deletions } => {
                 RunEvent::FileChanged { path, additions, deletions }
@@ -1428,6 +1714,27 @@ impl ExecutionStep {
         self.run_events = events;
         self
     }
+}
+
+/// Live execution event sent to the frontend via Tauri emit.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentRunEvent {
+    RunStarted { run_id: String, agent_name: String, session_id: Option<String> },
+    ToolStarted { run_id: String, tool_call_id: String, tool_name: String, summary: String },
+    ToolCompleted {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        success: bool,
+        duration_ms: u64,
+        result_summary: String,
+        diff_stats: Option<RunDiffStats>,
+    },
+    CommandOutput { run_id: String, tool_call_id: String, tool_name: String, output: String, is_final: bool },
+    FileChanged { run_id: String, path: String, additions: i32, deletions: i32 },
+    RunCompleted { run_id: String, success: bool, reply_preview: String },
+    Error { run_id: String, message: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1490,7 +1797,7 @@ pub struct GatewaySessionTreeQuery {
     pub sort_order: Option<String>,
 }
 
-/// 聊天界面可展示的一条历史消息。
+/// ???????????????
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayChatMessage {
     pub role: String,
@@ -2116,7 +2423,7 @@ fn channel_label(channel: &ChannelKind) -> String {
     }
 }
 
-/// 将网关持久化的 `ChatMessage` 转为 UI 气泡列表。
+/// ??????? `ChatMessage` ?? UI ?????
 fn messages_for_chat_ui(messages: &[ChatMessage]) -> Vec<GatewayChatMessage> {
     let mut out = Vec::new();
     for msg in messages {

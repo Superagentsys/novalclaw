@@ -19,12 +19,62 @@ use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::AppHandle;
-use tauri::Manager;
-use tauri::WindowEvent;
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+
+/// Live execution event sent from backend to frontend via Tauri emit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum AgentRunEvent {
+    RunStarted {
+        run_id: String,
+        agent_name: String,
+        session_id: Option<String>,
+    },
+    ToolStarted {
+        run_id: String,
+        tool_name: String,
+        summary: String,
+    },
+    ToolCompleted {
+        run_id: String,
+        tool_name: String,
+        success: bool,
+        duration_ms: u64,
+        result_summary: String,
+        diff_stats: Option<RunDiffStats>,
+    },
+    CommandOutput {
+        run_id: String,
+        tool_name: String,
+        output: String,
+        is_final: bool,
+    },
+    FileChanged {
+        run_id: String,
+        path: String,
+        additions: i32,
+        deletions: i32,
+    },
+    RunCompleted {
+        run_id: String,
+        success: bool,
+        reply_preview: String,
+    },
+    RunError {
+        run_id: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunDiffStats {
+    pub additions: i32,
+    pub deletions: i32,
+}
 
 struct AppState {
     runtime: GatewayRuntime,
@@ -582,6 +632,45 @@ async fn process_inbound_message(
         .process_inbound(&inbound)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Starts an agent run with real-time event emission to the frontend.
+/// The caller should listen for "agent-run-event" on the window to receive live updates.
+#[tauri::command]
+async fn process_inbound_message_streaming(
+    app_handle: AppHandle,
+    payload: UiInboundPayload,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayInboundResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let inbound = inbound_from_payload(payload);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Spawn a background task that forwards events to the Tauri frontend.
+    let handle = tokio::spawn({
+        let app = app_handle.clone();
+        let mut rx = rx;
+        async move {
+            while let Some(evt) = rx.recv().await {
+                if app.emit("agent-run-event", evt).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = runtime
+        .process_inbound_streaming(&inbound, tx)
+        .await;
+
+    // The spawned task drains the channel and emits all events.
+    let _ = handle.await;
+
+    result.map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1538,6 +1627,7 @@ pub fn run() {
             provider_health_overview,
             route_inbound_message,
             process_inbound_message,
+            process_inbound_message_streaming,
             get_chat_session_history,
             delete_chat_session,
             session_tree_snapshot,

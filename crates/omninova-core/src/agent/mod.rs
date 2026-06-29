@@ -14,11 +14,13 @@ pub use history::sanitize_messages_for_provider;
 pub enum ToolExecutionEvent {
     /// Tool execution started.
     Started {
+        tool_call_id: String,
         tool_name: String,
         summary: String,
     },
     /// Tool execution completed.
     Completed {
+        tool_call_id: String,
         tool_name: String,
         success: bool,
         duration_ms: u64,
@@ -26,6 +28,13 @@ pub enum ToolExecutionEvent {
         result_summary: String,
         /// For file write/edit: diff stats if git is available.
         diff_stats: Option<FileDiffStats>,
+    },
+    /// Output produced by a command-style tool such as shell or git.
+    CommandOutput {
+        tool_call_id: String,
+        tool_name: String,
+        output: String,
+        is_final: bool,
     },
     /// A file was modified (write / edit).
     FileChanged {

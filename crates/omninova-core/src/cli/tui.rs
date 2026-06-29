@@ -232,7 +232,7 @@ fn handle_agent_event(app: &mut App, ev: AgentEvent) {
         AgentEvent::ToolExecution(evt) => {
             if app.show_steps {
                 match evt {
-                    crate::agent::ToolExecutionEvent::Started { tool_name, summary } => {
+                    crate::agent::ToolExecutionEvent::Started { summary, .. } => {
                         app.transcript.push(Msg {
                             role: Role::Tool,
                             text: format!("⚡ {}", summary),
@@ -244,6 +244,7 @@ fn handle_agent_event(app: &mut App, ev: AgentEvent) {
                         duration_ms,
                         result_summary,
                         diff_stats,
+                        ..
                     } => {
                         let icon = if success { "✅" } else { "❌" };
                         let stats = diff_stats
@@ -255,6 +256,12 @@ fn handle_agent_event(app: &mut App, ev: AgentEvent) {
                                 "{} {} 完成 ({}ms){} — {}",
                                 icon, tool_name, duration_ms, stats, result_summary
                             ),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::CommandOutput { output, .. } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: output,
                         });
                     }
                     crate::agent::ToolExecutionEvent::FileChanged { path, additions, deletions } => {

@@ -1,0 +1,18 @@
+{
+  "items": [
+    {
+      "id": "appr-d67f4c37-5c9e-4ecb-a7c1-61ab80768947",
+      "tool_name": "glob_search",
+      "arguments": {
+        "pattern": ".git/**"
+      },
+      "args_hash": "a9151d9afe38cd09be88ccf9d0151a225dca7556509164338fc4359671b52eb3",
+      "reason": "tool 'glob_search' requires approval under supervised autonomy",
+      "status": "pending",
+      "created_at": "2026-06-29T14:17:29.4862551Z",
+      "updated_at": "2026-06-29T14:17:29.4862551Z",
+      "approved_by": null,
+      "reject_reason": null
+    }
+  ]
+}

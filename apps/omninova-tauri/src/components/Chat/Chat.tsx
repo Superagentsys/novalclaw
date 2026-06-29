@@ -267,7 +267,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 输入草稿与运行状态按会话隔离，避免一个会话影响其它会话。
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [runs, setRuns] = useState<
-    Record<string, { elapsedSec: number; steps: ExecutionStep[] }>
+    Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string }>
   >({});
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
@@ -319,6 +319,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const sending = Boolean(activeRun);
   const elapsedSec = activeRun?.elapsedSec ?? 0;
   const activeSteps = activeRun?.steps ?? [];
+  const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
 
   const setActiveInput = useCallback(
@@ -736,6 +737,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     const targetSessionId = sessionId;
     const text = input.trim();
     if (!text || runs[avatarId]) return;
+    // Generate a run_id for real-time event correlation.
+    const runId = crypto.randomUUID();
+    console.log("[agent-run-id]", runId);
 
     if (gatewayStatus !== "connected") {
       setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
@@ -785,7 +789,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     setActiveInput("");
     setError(null);
     cancelledRef.current[avatarId] = false;
-    setRuns((prev) => ({ ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps } }));
+    setRuns((prev) => ({ ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps, runId } }));
 
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
@@ -813,12 +817,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     }, 1000);
 
     let route: RouteDecision | null = null;
+
     try {
       const metadata: Record<string, unknown> = {
         preferred_provider: selectedModel === "auto" ? undefined : selectedModel,
         // Session-scoped temporary workspace (takes highest priority in the backend).
         // Clears when the user closes the app or starts a new session.
         ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
+        // Run ID for real-time event correlation between frontend and backend.
+        run_id: runId,
       };
 
       if (desktopVisionOn && desktopVisionMaster && isTauriEnvironment()) {
@@ -868,9 +875,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         updateStep("路由选择", "done", "路由预览不可用，交由网关处理");
       }
       updateStep("Agent 执行", "running", "正在调用模型和工具；界面不设置超时，会持续等待后端完成");
-      const result = await invokeTauri<GatewayInboundResponse>("process_inbound_message", {
+      // Use the streaming command for real-time event emission.
+      console.log("[handleSend] Calling process_inbound_message_streaming with run_id:", runId);
+      const result = await invokeTauri<GatewayInboundResponse>("process_inbound_message_streaming", {
         payload,
       });
+      console.log("[handleSend] process_inbound_message_streaming returned for run_id:", runId);
 
       if (cancelledRef.current[avatarId]) {
         setMessagesBySession((prev) => ({
@@ -1453,7 +1463,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   <span className="typing-dot" />
                   <span className="typing-elapsed">{elapsedSec}s</span>
                 </div>
-                {activeSteps.length ? <ExecutionSteps steps={activeSteps} /> : null}
+                {activeSteps.length > 0 || activeRunId ? (
+                  <ExecutionSteps steps={activeSteps} liveSessionId={activeRunId} />
+                ) : null}
               </div>
             )}
           </div>
@@ -1669,8 +1681,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   );
 }
 
-function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
+function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; liveSessionId?: string | null }) {
   const statusLabel = (status?: ExecutionStep["status"]) => {
+    const labels: Record<string, string> = {
+      running: "进行中",
+      done: "完成",
+      error: "失败",
+      pending: "等待",
+    };
+    return labels[status ?? ""] ?? "记录";
+
     switch (status) {
       case "running":
         return "进行中";
@@ -1688,13 +1708,23 @@ function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
   return (
     <div className="chat-execution-steps">
       <div className="chat-execution-title">执行步骤</div>
+      {liveSessionId ? (
+        <div className="mt-1">
+          <AgentRunTimeline
+            events={[]}
+            isRunning={true}
+            defaultCollapsed={false}
+            liveSessionId={liveSessionId}
+          />
+        </div>
+      ) : null}
       <ol>
         {steps.map((step, index) => (
           <li key={`${step.title}-${index}`} className={`chat-execution-step chat-execution-step--${step.status ?? "info"}`}>
             <span className="chat-execution-step-title">{step.title}</span>
             <span className="chat-execution-step-status">{statusLabel(step.status)}</span>
             {step.detail ? <div className="chat-execution-step-detail">{step.detail}</div> : null}
-            {step.run_events && step.run_events.length > 0 && (
+            {!liveSessionId && step.run_events && step.run_events.length > 0 && (
               <div className="mt-1">
                 <AgentRunTimeline
                   events={step.run_events}
