@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import type { SkillsConfig } from "../../types/config";
 import { invokeTauri } from "../../utils/tauri";
 
@@ -7,10 +7,51 @@ interface Props {
   onChange: (config: SkillsConfig) => void;
 }
 
+interface SkillItem {
+  name: string;
+  description: string;
+  subdomain?: string | null;
+}
+
 interface SkillsPackageSummary {
   dir: string;
   total: number;
   names: string[];
+  items?: SkillItem[];
+}
+
+/** Max cards rendered at once (the library can hold 10k+ skills). */
+const RENDER_CAP = 120;
+
+/** Prettify a kebab-case skill id into a readable title. */
+function prettyName(name: string): string {
+  return name.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Pick an emoji for a skill based on its subdomain / keywords. */
+function iconFor(item: SkillItem): string {
+  const hay = `${item.subdomain ?? ""} ${item.name}`.toLowerCase();
+  const table: [RegExp, string][] = [
+    [/forensic|incident|dfir|memory|disk/, "🔬"],
+    [/malware|reverse|rootkit|ransom/, "🦠"],
+    [/network|packet|dns|traffic|firewall/, "🌐"],
+    [/web|api|http|sql|xss|ssrf/, "🕸️"],
+    [/cloud|aws|azure|gcp|kubernetes|container/, "☁️"],
+    [/threat|hunt|intel|siem|detection|log/, "🛰️"],
+    [/identity|iam|auth|kerberos|credential|password/, "🔑"],
+    [/recon|osint|enumerat|scan/, "🔎"],
+    [/exploit|payload|pentest|red.?team|privilege/, "💥"],
+    [/phish|email|social/, "🎣"],
+    [/crypto|tls|cert|encrypt/, "🔐"],
+    [/mobile|android|ios/, "📱"],
+    [/report|compliance|govern|stig|audit/, "📋"],
+    [/image|vision|photo/, "🖼️"],
+    [/paper|research|citation|academic|nature/, "📄"],
+  ];
+  for (const [re, emoji] of table) {
+    if (re.test(hay)) return emoji;
+  }
+  return "🧩";
 }
 
 export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
@@ -20,6 +61,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const [summary, setSummary] = useState<SkillsPackageSummary | null>(null);
   const [isLoadingSummary, setIsLoadingSummary] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const refreshSummary = useCallback(async () => {
     if (!config.open_skills_enabled) {
@@ -43,145 +85,203 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     void refreshSummary();
   }, [refreshSummary, config.open_skills_dir]);
 
+  const allItems: SkillItem[] = useMemo(() => {
+    if (summary?.items?.length) return summary.items;
+    // Fallback for older backends that only return names.
+    return (summary?.names ?? []).map((name) => ({ name, description: "" }));
+  }, [summary]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allItems;
+    return allItems.filter(
+      (s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.description.toLowerCase().includes(q) ||
+        (s.subdomain ?? "").toLowerCase().includes(q)
+    );
+  }, [allItems, query]);
+
+  const visible = filtered.slice(0, RENDER_CAP);
+
   const handleImport = async () => {
     if (!importPath) return;
     setIsImporting(true);
     setImportStatus(null);
     try {
       const result = await invokeTauri<string>("import_skills", { sourceDir: importPath });
-      setImportStatus(`✅ ${result}`);
+      setImportStatus(`✓ ${result}`);
       await refreshSummary();
     } catch (e) {
-      setImportStatus(`❌ 导入失败: ${String(e)}`);
+      setImportStatus(`✗ 导入失败: ${String(e)}`);
     } finally {
       setIsImporting(false);
     }
   };
 
   return (
-    <div className="space-y-8">
-      {/* Enable Toggle */}
-      <div className="flex items-center justify-between p-4 bg-white/5 rounded-lg border border-white/10">
-        <div>
-          <h4 className="text-white font-medium">启用 Open Skills</h4>
-          <p className="text-white/50 text-sm">允许 Agent 加载并使用外部技能（SKILL.md 格式）</p>
-        </div>
-        <button
-          onClick={() => onChange({ ...config, open_skills_enabled: !config.open_skills_enabled })}
-          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
-            config.open_skills_enabled ? "bg-blue-600" : "bg-white/10"
-          }`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-              config.open_skills_enabled ? "translate-x-6" : "translate-x-1"
-            }`}
-          />
-        </button>
-      </div>
-
-      {config.open_skills_enabled && (
-        <div className="space-y-6 animate-in fade-in slide-in-from-top-2 duration-300">
-          
-          {/* Config Section */}
-          <div className="space-y-4 p-4 bg-white/5 rounded-lg border border-white/10">
-            <h4 className="text-white font-medium text-sm uppercase tracking-wider opacity-70">基础配置</h4>
-            
-            <div>
-              <label className="block text-white/70 text-sm font-medium mb-2">
-                Skills 目录路径
-              </label>
-              <input
-                type="text"
-                value={config.open_skills_dir || ""}
-                onChange={(e) => onChange({ ...config, open_skills_dir: e.target.value })}
-                placeholder="~/.omninova/skills"
-                className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50"
-              />
-              <p className="mt-1 text-white/30 text-xs">
-                Agent 将从该目录及其子目录中扫描包含 SKILL.md 的文件夹
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-white/70 text-sm font-medium mb-2">
-                提示词注入模式
-              </label>
-              <select
-                value={config.prompt_injection_mode || "full"}
-                onChange={(e) => onChange({ ...config, prompt_injection_mode: e.target.value })}
-                className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white focus:outline-none focus:border-blue-500/50"
-              >
-                <option value="full">全量注入 (推荐)</option>
-                <option value="summary">仅注入摘要</option>
-                <option value="disabled">不注入</option>
-              </select>
-            </div>
-
-            <div className="p-3 rounded-md border border-indigo-300/20 bg-indigo-500/10 space-y-2">
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-indigo-100 text-sm font-medium">技能包概览</span>
-                <span className="px-2 py-1 rounded-full text-xs font-semibold bg-indigo-400/20 text-indigo-100 border border-indigo-300/30">
-                  {isLoadingSummary ? "读取中..." : `共 ${summary?.total ?? 0} 个`}
-                </span>
-              </div>
-              <div className="text-xs text-indigo-100/80 break-all">
-                目录：{summary?.dir || config.open_skills_dir || "~/.omninova/skills"}
-              </div>
-              {summaryError ? (
-                <div className="text-xs text-red-200">读取失败：{summaryError}</div>
-              ) : summary && summary.names.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {summary.names.slice(0, 8).map((name) => (
-                    <span
-                      key={name}
-                      className="px-2 py-1 rounded-md text-xs bg-white/10 text-white/90 border border-white/15"
-                    >
-                      {name}
-                    </span>
-                  ))}
-                  {summary.names.length > 8 ? (
-                    <span className="px-2 py-1 rounded-md text-xs bg-white/10 text-white/70 border border-white/15">
-                      +{summary.names.length - 8} 更多
-                    </span>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="text-xs text-white/60">当前未发现可用技能包（包含 SKILL.md 的文件夹）。</div>
-              )}
+    <div className="setup-stack">
+      {/* Enable toggle */}
+      <section className="setup-section">
+        <div className="section-heading">
+          <div>
+            <h2>技能扩展</h2>
+            <div className="section-subtitle">
+              允许 Agent 加载并使用外部技能（SKILL.md 格式）
             </div>
           </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={config.open_skills_enabled}
+            className={`skill-switch ${config.open_skills_enabled ? "is-on" : ""}`}
+            onClick={() =>
+              onChange({ ...config, open_skills_enabled: !config.open_skills_enabled })
+            }
+          >
+            <span className="skill-switch-knob" />
+          </button>
+        </div>
+      </section>
 
-          {/* Import Section */}
-          <div className="space-y-4 p-4 bg-white/5 rounded-lg border border-white/10">
-            <h4 className="text-white font-medium text-sm uppercase tracking-wider opacity-70">从 OpenClaw 导入</h4>
-            <p className="text-white/50 text-sm">将 OpenClaw 格式的 skills 目录导入到当前工作区</p>
-            
-            <div className="flex gap-2">
-              <input 
-                type="text" 
+      {config.open_skills_enabled && (
+        <>
+          {/* Basic config */}
+          <section className="setup-section">
+            <h3>基础配置</h3>
+            <div className="setup-grid">
+              <label>
+                Skills 目录路径
+                <input
+                  type="text"
+                  value={config.open_skills_dir || ""}
+                  onChange={(e) => onChange({ ...config, open_skills_dir: e.target.value })}
+                  placeholder="~/.omninova/skills"
+                />
+              </label>
+              <label>
+                提示词注入模式
+                <select
+                  value={config.prompt_injection_mode || "full"}
+                  onChange={(e) =>
+                    onChange({ ...config, prompt_injection_mode: e.target.value })
+                  }
+                >
+                  <option value="full">全量注入 (推荐)</option>
+                  <option value="summary">仅注入摘要</option>
+                  <option value="disabled">不注入</option>
+                </select>
+              </label>
+            </div>
+            <div className="skill-dir-hint">
+              扫描目录：<code>{summary?.dir || config.open_skills_dir || "~/.omninova/skills"}</code>
+            </div>
+          </section>
+
+          {/* Skill gallery */}
+          <section className="setup-section">
+            <div className="skill-gallery-head">
+              <div>
+                <h3>技能包</h3>
+                <div className="section-subtitle">
+                  {isLoadingSummary ? "读取中…" : `共 ${summary?.total ?? 0} 个技能`}
+                </div>
+              </div>
+              <div className="skill-gallery-actions">
+                <input
+                  type="search"
+                  className="skill-search"
+                  placeholder="搜索技能名称 / 描述 / 分类…"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  disabled={isLoadingSummary || !!summaryError}
+                />
+                <button
+                  type="button"
+                  className="setup-btn setup-btn--secondary"
+                  onClick={() => void refreshSummary()}
+                  disabled={isLoadingSummary}
+                >
+                  {isLoadingSummary ? "刷新中…" : "刷新"}
+                </button>
+              </div>
+            </div>
+
+            {summaryError ? (
+              <div className="skill-empty skill-empty--error">读取失败：{summaryError}</div>
+            ) : isLoadingSummary ? (
+              <div className="skill-empty">正在扫描技能目录…</div>
+            ) : allItems.length === 0 ? (
+              <div className="skill-empty">
+                当前未发现可用技能包（包含 SKILL.md 的文件夹）。可在下方从 OpenClaw 导入。
+              </div>
+            ) : (
+              <>
+                <div className="skill-grid">
+                  {visible.map((s) => (
+                    <div className="skill-card" key={s.name} title={s.name}>
+                      <div className="skill-card-icon" aria-hidden>
+                        {iconFor(s)}
+                      </div>
+                      <div className="skill-card-body">
+                        <div className="skill-card-name">{prettyName(s.name)}</div>
+                        <div className="skill-card-desc">
+                          {s.description || "（该技能未提供描述）"}
+                        </div>
+                        {s.subdomain ? (
+                          <span className="skill-card-tag">{s.subdomain}</span>
+                        ) : null}
+                      </div>
+                      <span className="skill-card-check" title="已启用">
+                        ✓
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {filtered.length > visible.length ? (
+                  <div className="skill-more">
+                    显示前 {visible.length} / 共 {filtered.length} 个匹配，输入关键词以缩小范围
+                  </div>
+                ) : query ? (
+                  <div className="skill-more">{filtered.length} 个匹配</div>
+                ) : null}
+              </>
+            )}
+          </section>
+
+          {/* Import */}
+          <section className="setup-section">
+            <h3>从 OpenClaw 导入</h3>
+            <div className="section-subtitle">
+              将 OpenClaw 格式的 skills 目录导入到当前工作区
+            </div>
+            <div className="skill-import-row">
+              <input
+                type="text"
                 value={importPath}
                 onChange={(e) => setImportPath(e.target.value)}
                 placeholder="/path/to/openclaw/skills"
-                className="flex-1 bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50"
               />
               <button
+                type="button"
+                className="setup-btn setup-btn--primary"
                 onClick={handleImport}
                 disabled={isImporting || !importPath}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-white/10 disabled:text-white/30 text-white rounded-md transition-colors whitespace-nowrap cursor-pointer"
               >
-                {isImporting ? "导入中..." : "开始导入"}
+                {isImporting ? "导入中…" : "开始导入"}
               </button>
             </div>
-            
             {importStatus && (
-              <div className={`mt-2 p-3 rounded text-sm ${importStatus.includes("❌") ? "bg-red-500/20 text-red-200" : "bg-green-500/20 text-green-200"}`}>
+              <div
+                className={`skill-import-status ${
+                  importStatus.includes("✗") ? "is-error" : "is-ok"
+                }`}
+              >
                 {importStatus}
               </div>
             )}
-          </div>
-
-        </div>
+          </section>
+        </>
       )}
     </div>
   );
