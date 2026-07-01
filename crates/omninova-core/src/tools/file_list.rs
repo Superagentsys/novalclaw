@@ -62,7 +62,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories inside the workspace. By default lists the workspace root recursively."
+        "List files and directories inside the workspace. Path must be workspace-relative; use '.' for the workspace root, never an absolute path like D:\\project."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -71,7 +71,7 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Optional relative subdirectory inside workspace; default is the workspace root."
+                    "description": "Optional workspace-relative subdirectory; use \".\" for the workspace root, not D:\\\\workspace."
                 }
             }
         })

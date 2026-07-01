@@ -1,42 +1,44 @@
 pub mod agent;
+pub mod agent_event;
 pub mod budget;
 pub mod dispatcher;
+pub mod event_bus;
 pub mod history;
 pub mod planner;
 pub mod prompt;
+pub mod run_control;
+pub mod tool_runner;
 
 pub use agent::Agent;
+pub use agent_event::{AgentRunEvent, DiffStats, StepStatus, ChangeType};
 pub use budget::BudgetTracker;
+pub use event_bus::{EventBus, EventBusDrainHandle, build_tool_summary, build_tool_prepare_summary, build_tool_start_summary, truncate_for_display, extract_diff_stats, compute_content_diff, TimedBlock};
 pub use history::sanitize_messages_for_provider;
+pub use run_control::AgentCancellationToken;
 
-/// Detailed event emitted during tool execution, forwarded to the UI timeline.
+/// Legacy event type — kept for internal dispatcher use.
+/// Prefer `AgentRunEvent` from `agent_event` for new code.
 #[derive(Debug, Clone)]
 pub enum ToolExecutionEvent {
-    /// Tool execution started.
     Started {
         tool_call_id: String,
         tool_name: String,
         summary: String,
     },
-    /// Tool execution completed.
     Completed {
         tool_call_id: String,
         tool_name: String,
         success: bool,
         duration_ms: u64,
-        /// Short result summary for display (may be truncated).
         result_summary: String,
-        /// For file write/edit: diff stats if git is available.
         diff_stats: Option<FileDiffStats>,
     },
-    /// Output produced by a command-style tool such as shell or git.
     CommandOutput {
         tool_call_id: String,
         tool_name: String,
         output: String,
-        is_final: bool,
+        is_stderr: bool,
     },
-    /// A file was modified (write / edit).
     FileChanged {
         path: String,
         additions: i32,
@@ -44,7 +46,6 @@ pub enum ToolExecutionEvent {
     },
 }
 
-/// Diff statistics for a modified file.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileDiffStats {
     pub additions: i32,

@@ -23,14 +23,14 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Write file content. Supports overwrite or append modes."
+        "Write file content. Supports overwrite or append modes. Path must be workspace-relative; use file_patch for local edits to existing files."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Workspace-relative path. Use \"index.html\", not D:\\\\workspace\\\\index.html." },
                 "content": { "type": "string" },
                 "mode": { "type": "string", "enum": ["overwrite", "append"] }
             },

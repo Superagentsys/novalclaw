@@ -25,14 +25,14 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit."
+        "Read file contents with line numbers. Path must be workspace-relative; use '.' for the workspace root and never pass an absolute path like D:\\project."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Workspace-relative file path. Use \"index.html\", not D:\\\\workspace\\\\index.html." },
                 "offset": { "type": "integer" },
                 "limit": { "type": "integer" }
             },

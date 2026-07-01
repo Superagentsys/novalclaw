@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { invokeTauri } from "../../utils/tauri";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   isTauriEnvironment,
@@ -19,12 +20,13 @@ import {
   type StoredChatMessage,
 } from "../../utils/chatStorage";
 import type {
+  AgentRunEvent,
+} from "../AgentRun/types";
+import type {
   AgentPersonaConfig,
   Config,
-  GatewayHealth,
   GatewayInboundResponse,
   GatewayStatus,
-  ProviderHealthSummary,
   ExecutionStep,
   RouteDecision,
   WorkspaceStatus,
@@ -267,7 +269,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 输入草稿与运行状态按会话隔离，避免一个会话影响其它会话。
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [runs, setRuns] = useState<
-    Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string }>
+    Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string; longRunning?: boolean }>
   >({});
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
@@ -280,6 +282,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 每个会话独立的取消标志与计时器。
   const cancelledRef = useRef<Record<string, boolean>>({});
   const elapsedTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+  const safetyTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const runAvatarIdsRef = useRef<Record<string, string>>({});
+  const activeRunIdRef = useRef<string | null>(null);
+  const terminalRunIdsRef = useRef<Set<string>>(new Set());
+  const completedRunIdsRef = useRef<Set<string>>(new Set());
+  const insertedReplyRunIdsRef = useRef<Set<string>>(new Set());
+  const runsRef = useRef(runs);
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [desktopVisionMaster, setDesktopVisionMaster] = useState(false);
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
@@ -321,6 +330,90 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const activeSteps = activeRun?.steps ?? [];
   const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
+
+  useEffect(() => {
+    runsRef.current = runs;
+  }, [runs]);
+
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
+
+  const findAvatarIdByRunId = useCallback((runId: string): string | null => {
+    const mapped = runAvatarIdsRef.current[runId];
+    if (mapped) return mapped;
+    const entry = Object.entries(runsRef.current).find(([, run]) => run.runId === runId);
+    return entry?.[0] ?? null;
+  }, []);
+
+  const finishRun = useCallback(
+    (runId: string) => {
+      const avatarId = findAvatarIdByRunId(runId);
+      terminalRunIdsRef.current.add(runId);
+
+      const safetyTimer = safetyTimersRef.current[runId];
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        delete safetyTimersRef.current[runId];
+      }
+
+      if (avatarId) {
+        const elapsedTimer = elapsedTimersRef.current[avatarId];
+        if (elapsedTimer) {
+          clearInterval(elapsedTimer);
+          delete elapsedTimersRef.current[avatarId];
+        }
+      }
+
+      setRuns((prev) => {
+        const targetAvatarId =
+          avatarId ??
+          Object.entries(prev).find(([, run]) => run.runId === runId)?.[0] ??
+          null;
+        if (!targetAvatarId) return prev;
+        const currentRun = prev[targetAvatarId];
+        if (!currentRun || currentRun.runId !== runId) return prev;
+        const next = { ...prev };
+        delete next[targetAvatarId];
+        runsRef.current = next;
+        return next;
+      });
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+      }
+      if (avatarId) {
+        cancelledRef.current[avatarId] = false;
+      }
+      delete runAvatarIdsRef.current[runId];
+    },
+    [findAvatarIdByRunId]
+  );
+
+  const appendAssistantMessageOnce = useCallback(
+    (runId: string, content: string, avatarId: string) => {
+      const reply = content.trim();
+      if (!reply || insertedReplyRunIdsRef.current.has(runId)) return false;
+      insertedReplyRunIdsRef.current.add(runId);
+
+      setMessagesBySession((prev) => ({
+        ...prev,
+        [avatarId]: [
+          ...(prev[avatarId] ?? []),
+          {
+            role: "assistant",
+            content: reply,
+          },
+        ],
+      }));
+      setAvatars((prev) =>
+        prev.map((a) =>
+          a.id === avatarId ? { ...a, lastAt: formatTime(new Date()) } : a
+        )
+      );
+      return true;
+    },
+    []
+  );
 
   const setActiveInput = useCallback(
     (value: string) =>
@@ -568,8 +661,105 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     const timers = elapsedTimersRef.current;
     return () => {
       Object.values(timers).forEach((timer) => clearInterval(timer));
+      Object.values(safetyTimersRef.current).forEach((timer) => clearTimeout(timer));
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listen<AgentRunEvent | Record<string, unknown>>("agent-run-event", (event) => {
+      const payload = event.payload as AgentRunEvent & {
+        type?: string;
+        run_id?: string;
+        reply?: string;
+        reply_preview?: string;
+        error?: string;
+        message?: string;
+      };
+      const runId = payload.run_id;
+      if (import.meta.env.DEV && payload.type !== "model_delta") {
+        console.log("[chat-agent-run-event payload]", payload);
+      }
+      if (disposed || !runId) return;
+
+      const eventType = payload.type;
+      const isTerminalEvent =
+        eventType === "run_completed" ||
+        eventType === "run_failed" ||
+        eventType === "run_cancelled" ||
+        eventType === "error";
+      if (terminalRunIdsRef.current.has(runId) && !isTerminalEvent) {
+        if (import.meta.env.DEV && payload.type !== "model_delta") {
+          console.debug("[chat-agent-run-event ignored after terminal]", payload);
+        }
+        return;
+      }
+      if (
+        !isTerminalEvent
+      ) {
+        return;
+      }
+
+      const avatarId = findAvatarIdByRunId(runId);
+      if (!avatarId) {
+        finishRun(runId);
+        return;
+      }
+      terminalRunIdsRef.current.add(runId);
+
+      if (eventType === "run_completed") {
+        if (!completedRunIdsRef.current.has(runId)) {
+          completedRunIdsRef.current.add(runId);
+          const finalReply = payload.reply || payload.reply_preview || "";
+          if (import.meta.env.DEV) {
+            console.log("[appendAssistantMessageOnce] run_id=" + runId + " reply_len=" + finalReply.length);
+          }
+          if (!cancelledRef.current[avatarId]) {
+            appendAssistantMessageOnce(runId, finalReply, avatarId);
+          }
+        }
+        if (import.meta.env.DEV) {
+          console.log("[finishRun] run_id=" + runId);
+        }
+        finishRun(runId);
+        return;
+      }
+
+      if (eventType === "run_cancelled") {
+        if (!completedRunIdsRef.current.has(runId)) {
+          completedRunIdsRef.current.add(runId);
+          appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
+        }
+        finishRun(runId);
+        return;
+      }
+
+      if (!completedRunIdsRef.current.has(runId)) {
+        completedRunIdsRef.current.add(runId);
+        const rawError = payload.error || payload.message || "Agent run failed";
+        setError(rawError);
+        if (!cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
+        }
+      }
+      finishRun(runId);
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [appendAssistantMessageOnce, findAvatarIdByRunId, finishRun]);
 
   const refreshGatewayStatus = async () => {
     try {
@@ -726,9 +916,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   };
 
   const handleCancel = useCallback(() => {
-    // 仅取消当前查看的会话。
+    if (!activeRunId) return;
     cancelledRef.current[activeAvatarId] = true;
-  }, [activeAvatarId]);
+    void invokeTauri<void>("cancel_agent_run", { runId: activeRunId }).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(`取消失败：${message}`);
+    });
+  }, [activeAvatarId, activeRunId]);
 
   const handleSend = async () => {
     // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
@@ -736,10 +930,20 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     const avatarId = activeAvatarId;
     const targetSessionId = sessionId;
     const text = input.trim();
-    if (!text || runs[avatarId]) return;
+    const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
+    if (active && terminalRunIdsRef.current.has(active)) {
+      finishRun(active);
+    } else if (active) {
+      setError("当前 Agent 仍在执行，请等待完成或取消。");
+      return;
+    }
+    if (!text) return;
     // Generate a run_id for real-time event correlation.
     const runId = crypto.randomUUID();
-    console.log("[agent-run-id]", runId);
+    runAvatarIdsRef.current[runId] = avatarId;
+    if (import.meta.env.DEV) {
+      console.log("[agent-run-id]", runId);
+    }
 
     if (gatewayStatus !== "connected") {
       setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
@@ -753,11 +957,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     ];
     const writeSteps = (steps: ExecutionStep[]) => {
       localSteps = steps;
-      setRuns((prev) =>
-        prev[avatarId]
+      setRuns((prev) => {
+        const next = prev[avatarId]
           ? { ...prev, [avatarId]: { ...prev[avatarId], steps } }
-          : prev
-      );
+          : prev;
+        runsRef.current = next;
+        return next;
+      });
     };
     const updateStep = (
       title: string,
@@ -772,24 +978,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           : localSteps.map((step, i) => (i === idx ? nextStep : step))
       );
     };
-    const finishRun = () => {
-      const timer = elapsedTimersRef.current[avatarId];
-      if (timer) {
-        clearInterval(timer);
-        delete elapsedTimersRef.current[avatarId];
-      }
-      setRuns((prev) => {
-        if (!prev[avatarId]) return prev;
-        const next = { ...prev };
-        delete next[avatarId];
-        return next;
-      });
-    };
-
     setActiveInput("");
     setError(null);
     cancelledRef.current[avatarId] = false;
-    setRuns((prev) => ({ ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps, runId } }));
+    activeRunIdRef.current = runId;
+    setRuns((prev) => {
+      const next = { ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps, runId } };
+      runsRef.current = next;
+      return next;
+    });
 
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
@@ -803,8 +1000,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     );
 
     elapsedTimersRef.current[avatarId] = setInterval(() => {
-      setRuns((prev) =>
-        prev[avatarId]
+      setRuns((prev) => {
+        const next = prev[avatarId]
           ? {
               ...prev,
               [avatarId]: {
@@ -812,8 +1009,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                 elapsedSec: prev[avatarId].elapsedSec + 1,
               },
             }
-          : prev
-      );
+          : prev;
+        runsRef.current = next;
+        return next;
+      });
     }, 1000);
 
     let route: RouteDecision | null = null;
@@ -845,7 +1044,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           const msg = err instanceof Error ? err.message : String(err);
           updateStep("桌面视觉", "error", msg);
           setError(`桌面截图失败：${msg}`);
-          finishRun();
+          finishRun(runId);
           setMessagesBySession((prev) => ({
             ...prev,
             [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
@@ -875,59 +1074,49 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         updateStep("路由选择", "done", "路由预览不可用，交由网关处理");
       }
       updateStep("Agent 执行", "running", "正在调用模型和工具；界面不设置超时，会持续等待后端完成");
-      // Use the streaming command for real-time event emission.
-      console.log("[handleSend] Calling process_inbound_message_streaming with run_id:", runId);
-      const result = await invokeTauri<GatewayInboundResponse>("process_inbound_message_streaming", {
-        payload,
-      });
-      console.log("[handleSend] process_inbound_message_streaming returned for run_id:", runId);
+      // Long-running notice only. This must not finish the run.
+      safetyTimersRef.current[runId] = setTimeout(() => {
+        if (import.meta.env.DEV) {
+          console.warn("[handleSend] LONG RUN still running run_id=" + runId);
+        }
+        setRuns((prev) => {
+          const current = prev[avatarId];
+          if (!current || current.runId !== runId) return prev;
+          const next = { ...prev, [avatarId]: { ...current, longRunning: true } };
+          runsRef.current = next;
+          return next;
+        });
+        updateStep("Agent 仍在执行", "running", "Agent 仍在生成页面代码，耗时较长，可继续等待或点击取消。");
+      }, 30_000);
+        if (import.meta.env.DEV) {
+          console.log("[handleSend] BEFORE_INVOKE run_id=" + runId + " ts=" + Date.now());
+        }
+        void invokeTauri<GatewayInboundResponse>("process_inbound_message_streaming", {
+          payload,
+        }).then((result) => {
+          if (import.meta.env.DEV) {
+            console.log("[handleSend] AFTER_INVOKE run_id=" + runId + " ts=" + Date.now());
+            console.log("[handleSend] resolved run_id=" + runId + " reply_len=" + (result?.reply?.length ?? -1));
+          }
 
-      if (cancelledRef.current[avatarId]) {
-        setMessagesBySession((prev) => ({
-          ...prev,
-          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
-        }));
-        setInputs((prev) => ({ ...prev, [avatarId]: text }));
-        return;
-      }
-
-      const replyText = result?.reply || "(空回复)";
-      const steps = result?.steps?.length ? result.steps : localSteps;
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [avatarId]: [
-          ...(prev[avatarId] ?? []),
-          {
-            role: "assistant",
-            content: replyText,
-            agent: result?.route?.agent_name,
-            steps,
-          },
-        ],
-      }));
+          // Normal completion is driven only by terminal agent-run-event payloads:
+          // run_completed / run_failed / run_cancelled. The invoke Promise may
+          // resolve late or never resolve, so it must not mutate chat completion state.
+        })
+        .catch((e) => {
+          if (import.meta.env.DEV) {
+            console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
+          }
+          // The Tauri command emits run_failed for backend errors when a run_id exists.
+          // Chat cleanup still happens only from that terminal event.
+        });
     } catch (e) {
-      if (cancelledRef.current[avatarId]) {
-        setMessagesBySession((prev) => ({
-          ...prev,
-          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
-        }));
-        setInputs((prev) => ({ ...prev, [avatarId]: text }));
-        return;
+      if (import.meta.env.DEV) {
+        console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
-
-      const msg = e instanceof Error ? e.message : String(e);
-      const errorDetail = await buildSendErrorMessage(msg, route);
-      const errorContent = `发送失败：${errorDetail}`;
-      setError(errorContent);
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [avatarId]: [
-          ...(prev[avatarId] ?? []),
-          { role: "error", content: errorContent },
-        ],
-      }));
+      finishRun(runId);
     } finally {
-      finishRun();
+      // outer finally (safety timer cleanup)
     }
   };
 
@@ -1461,7 +1650,11 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   <span className="typing-dot" />
                   <span className="typing-dot" />
                   <span className="typing-dot" />
-                  <span className="typing-elapsed">{elapsedSec}s</span>
+                  <span className="typing-elapsed">
+                    {activeRun?.longRunning
+                      ? `Agent 仍在执行，已运行 ${elapsedSec}s`
+                      : `${elapsedSec}s`}
+                  </span>
                 </div>
                 {activeSteps.length > 0 || activeRunId ? (
                   <ExecutionSteps steps={activeSteps} liveSessionId={activeRunId} />
@@ -1605,7 +1798,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     : "网关未连接…（仍可拖入文件编辑草稿）"
                 }
                 rows={1}
-                disabled={sending || gatewayStatus !== "connected"}
+                disabled={gatewayStatus !== "connected"}
               />
               {sending ? (
                 <button
@@ -1740,49 +1933,3 @@ function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; live
   );
 }
 
-async function buildSendErrorMessage(
-  rawMessage: string,
-  route: RouteDecision | null
-) {
-  const isConnectivityIssue =
-    rawMessage.includes("请求超时") ||
-    rawMessage.includes("连接失败") ||
-    rawMessage.includes("网络请求失败") ||
-    rawMessage.includes("timed out") ||
-    rawMessage.includes("timeout") ||
-    rawMessage.includes("connection refused") ||
-    rawMessage.includes("connect error");
-
-  if (!isConnectivityIssue) {
-    return rawMessage;
-  }
-
-  try {
-    const [gatewayHealth, providers] = await Promise.all([
-      invokeTauri<GatewayHealth>("gateway_health"),
-      invokeTauri<ProviderHealthSummary[]>("provider_health_overview"),
-    ]);
-
-    const routedProviderId =
-      route?.provider ?? providers.find((item) => item.is_default)?.id ?? gatewayHealth.provider;
-    const matchedProvider = providers.find((item) => item.id === routedProviderId);
-    const agentHint = route?.agent_name ? `，Agent 为 ${route.agent_name}` : "";
-    const providerHint = routedProviderId ? `，Provider 为 ${routedProviderId}` : "";
-
-    if (!gatewayHealth.provider_healthy) {
-      return `${rawMessage}。网关已响应，但当前 Provider 健康检查失败${providerHint}${agentHint}，请检查 API Key、Base URL、网络连通性或本地模型服务是否启动。`;
-    }
-
-    if (matchedProvider?.healthy === false) {
-      return `${rawMessage}。路由命中的 Provider 健康检查失败${providerHint}${agentHint}，请优先检查该模型服务是否可达。`;
-    }
-
-    if (matchedProvider?.enabled === false) {
-      return `${rawMessage}。当前路由命中的 Provider 未启用${providerHint}${agentHint}，请先在配置页启用并保存。`;
-    }
-
-    return `${rawMessage}。网关健康检查正常${providerHint}${agentHint}，更可能是模型推理耗时过长而不是网关断连。界面不会主动超时；如长期无响应，请检查上游模型服务状态。`;
-  } catch {
-    return `${rawMessage}。另外，超时后未能取得健康检查结果，请确认网关仍在运行，并检查上游模型服务是否可达。`;
-  }
-}

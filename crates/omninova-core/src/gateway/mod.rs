@@ -23,12 +23,12 @@ use crate::security::{
 use crate::skills::{format_skills_prompt, load_skills_from_dir};
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
-    FileListTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
+    FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
     MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::agent::sanitize_messages_for_provider;
-use crate::agent::ToolExecutionEvent;
+use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
 use crate::Agent;
 use std::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -44,6 +45,19 @@ static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 const WORKSPACE_REQUIRED_MESSAGE: &str =
     "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
+
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
 
 #[derive(Clone)]
 pub struct GatewayRuntime {
@@ -55,6 +69,107 @@ pub struct GatewayRuntime {
     active_inbound: Arc<AtomicUsize>,
     active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
     session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
+    run_registry: AgentRunRegistry,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentRunRegistry {
+    inner: Arc<RwLock<HashMap<String, ActiveAgentRun>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveAgentRun {
+    run_id: String,
+    session_id: String,
+    started_at: SystemTime,
+    cancel_token: AgentCancellationToken,
+}
+
+impl AgentRunRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn start_run(
+        &self,
+        run_id: String,
+        session_id: String,
+    ) -> anyhow::Result<AgentCancellationToken> {
+        let mut runs = self.inner.write().await;
+        if runs
+            .values()
+            .any(|run| run.session_id == session_id && !run.cancel_token.is_cancelled())
+        {
+            return Err(anyhow::anyhow!(
+                "当前会话已有任务正在运行，请等待完成或取消。"
+            ));
+        }
+        let token = AgentCancellationToken::new();
+        runs.insert(
+            run_id.clone(),
+            ActiveAgentRun {
+                run_id,
+                session_id,
+                started_at: SystemTime::now(),
+                cancel_token: token.clone(),
+            },
+        );
+        Ok(token)
+    }
+
+    async fn finish_run(&self, run_id: &str) {
+        self.inner.write().await.remove(run_id);
+    }
+
+    pub async fn cancel_run(&self, run_id: &str) -> anyhow::Result<()> {
+        let token = {
+            let runs = self.inner.read().await;
+            runs.get(run_id).map(|run| run.cancel_token.clone())
+        };
+        match token {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!("未找到正在运行的 Agent Run")),
+        }
+    }
+}
+
+struct ActiveRunGuard {
+    registry: AgentRunRegistry,
+    run_id: String,
+    finished: bool,
+}
+
+impl ActiveRunGuard {
+    fn new(registry: AgentRunRegistry, run_id: String) -> Self {
+        Self {
+            registry,
+            run_id,
+            finished: false,
+        }
+    }
+
+    async fn finish(mut self) {
+        self.registry.finish_run(&self.run_id).await;
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let registry = self.registry.clone();
+        let run_id = self.run_id.clone();
+        tokio::spawn(async move {
+            registry.finish_run(&run_id).await;
+        });
+    }
 }
 
 impl GatewayRuntime {
@@ -68,6 +183,7 @@ impl GatewayRuntime {
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            run_registry: AgentRunRegistry::new(),
         }
     }
 
@@ -81,6 +197,7 @@ impl GatewayRuntime {
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            run_registry: AgentRunRegistry::new(),
         }
     }
 
@@ -110,6 +227,10 @@ impl GatewayRuntime {
         config.config_path = lock.config_path.clone();
         *lock = config;
         Ok(())
+    }
+
+    pub async fn cancel_agent_run(&self, run_id: &str) -> anyhow::Result<()> {
+        self.run_registry.cancel_run(run_id).await
     }
 
     pub async fn refresh_memory_from_config(&mut self) -> anyhow::Result<()> {
@@ -361,7 +482,7 @@ impl GatewayRuntime {
         // never be used to answer that question.
         {
             let workspace_note = format!(
-                "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n",
+                "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
                 effective_workspace.display()
             );
             let current = agent_cfg.system_prompt.unwrap_or_default();
@@ -611,7 +732,7 @@ impl GatewayRuntime {
 
         {
             let workspace_note = format!(
-                "\n[环境信息] 当前 Workspace 目录是：{}。\n",
+                "\n[环境信息] 当前 Workspace 目录是：{}。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
                 effective_workspace.display()
             );
             let current = agent_cfg.system_prompt.unwrap_or_default();
@@ -664,84 +785,49 @@ impl GatewayRuntime {
         let run_id = metadata_str(inbound, &["run_id"])
             .map(String::from)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        macro_rules! emit_event {
-            ($tx:expr, $ev:expr) => {
-                if let Ok(v) = serde_json::to_value($ev) {
-                    let _ = $tx.send(v);
+        let session_key = inbound
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("{:?}:default", inbound.channel));
+        let cancel_token = match self
+            .run_registry
+            .start_run(run_id.clone(), session_key)
+            .await
+        {
+            Ok(token) => token,
+            Err(err) => {
+                if let Ok(v) = serde_json::to_value(&AgentRunEvent::run_failed {
+                    run_id: run_id.clone(),
+                    error: err.to_string(),
+                }) {
+                    let _ = events_tx.send(v);
                 }
-            };
-        }
-
-        emit_event!(events_tx, AgentRunEvent::RunStarted {
-            run_id: run_id.clone(),
-            agent_name: route.agent_name.clone(),
-            session_id: inbound.session_id.clone(),
-        });
+                return Err(err);
+            }
+        };
+        let run_guard = ActiveRunGuard::new(self.run_registry.clone(), run_id.clone());
 
         let events_tx_inner = events_tx.clone();
-        let run_id_inner = run_id.clone();
+        let emit_fn = move |evt: crate::agent::AgentRunEvent| {
+            if let Ok(v) = serde_json::to_value(&evt) {
+                let _ = events_tx_inner.send(v);
+            }
+        };
 
-        let forwarder: Box<dyn Fn(crate::agent::ToolExecutionEvent) + Send + Sync + 'static> =
-            Box::new(move |te: crate::agent::ToolExecutionEvent| {
-                match te {
-                    crate::agent::ToolExecutionEvent::Started { tool_call_id, tool_name, summary } => {
-                        emit_event!(events_tx_inner, AgentRunEvent::ToolStarted {
-                            run_id: run_id_inner.clone(),
-                            tool_call_id,
-                            tool_name,
-                            summary,
-                        });
-                    }
-                    crate::agent::ToolExecutionEvent::Completed {
-                        tool_call_id,
-                        tool_name,
-                        success,
-                        duration_ms,
-                        result_summary,
-                        diff_stats,
-                    } => {
-                        emit_event!(events_tx_inner, AgentRunEvent::ToolCompleted {
-                            run_id: run_id_inner.clone(),
-                            tool_call_id,
-                            tool_name,
-                            success,
-                            duration_ms,
-                            result_summary,
-                            diff_stats: diff_stats.map(|d| RunDiffStats {
-                                additions: d.additions,
-                                deletions: d.deletions,
-                            }),
-                        });
-                    }
-                    crate::agent::ToolExecutionEvent::CommandOutput {
-                        tool_call_id,
-                        tool_name,
-                        output,
-                        is_final,
-                    } => {
-                        emit_event!(events_tx_inner, AgentRunEvent::CommandOutput {
-                            run_id: run_id_inner.clone(),
-                            tool_call_id,
-                            tool_name,
-                            output,
-                            is_final,
-                        });
-                    }
-                    crate::agent::ToolExecutionEvent::FileChanged { path, additions, deletions } => {
-                        emit_event!(events_tx_inner, AgentRunEvent::FileChanged {
-                            run_id: run_id_inner.clone(),
-                            path,
-                            additions,
-                            deletions,
-                        });
-                    }
-                }
-            });
-
+        // Forward the frontend's run_id and session_id through to the agent.
+        let session_id = inbound.session_id.as_deref().map(String::from);
+        tracing::debug!(target: "e2e", "[e2e-gateway-agent-call] timestamp={} run_id={}", now_ts(), run_id);
         let result = agent
-            .process_message_with_events_streaming(&inbound.text, forwarder)
+            .process_message_with_events_streaming(
+                &inbound.text,
+                Box::new(emit_fn),
+                Some(run_id.clone()),
+                session_id,
+                cancel_token.clone(),
+            )
             .await;
+        tracing::debug!(target: "e2e", "[e2e-gateway-agent-return] timestamp={} run_id={}", now_ts(), run_id);
+        run_guard.finish().await;
 
         let reply_text = match &result {
             Ok((reply, _)) => {
@@ -751,15 +837,6 @@ impl GatewayRuntime {
                 crate::observability::record_inbound_duration(
                     &channel_label, "ok", started.elapsed().as_secs_f64(),
                 );
-                emit_event!(events_tx, AgentRunEvent::RunCompleted {
-                    run_id: run_id.clone(),
-                    success: true,
-                    reply_preview: if reply.len() > 200 {
-                        format!("{}...", &reply[..200])
-                    } else {
-                        reply.clone()
-                    },
-                });
                 reply.clone()
             }
             Err(err) => {
@@ -770,15 +847,142 @@ impl GatewayRuntime {
                 crate::observability::record_inbound_duration(
                     &channel_label, "error", started.elapsed().as_secs_f64(),
                 );
-                emit_event!(events_tx, AgentRunEvent::Error {
-                    run_id: run_id.clone(),
-                    message: err.to_string(),
-                });
                 return Err(anyhow::anyhow!(err.to_string()));
             }
         };
 
+        tracing::debug!(target: "e2e", "[e2e-gateway-return] timestamp={} run_id={} reply_len={}", now_ts(), run_id, reply_text.len());
         Ok(GatewayInboundResponse { route, reply: reply_text, steps })
+    }
+
+    /// Debug-only: directly executes a shell command and streams output as agent-run-events.
+    /// Does NOT go through LLM. Used to verify runtime streaming infrastructure.
+    pub async fn debug_shell_stream(
+        &self,
+        command: String,
+        run_id: String,
+        events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        use crate::agent::event_bus::EventBus;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use std::process::Stdio;
+
+        let events_tx_inner = events_tx.clone();
+        let emit_fn = move |evt: crate::agent::AgentRunEvent| {
+            if let Ok(v) = serde_json::to_value(&evt) {
+                let _ = events_tx_inner.send(v);
+            }
+        };
+
+        let (bus, drain_handle) = EventBus::new(run_id.clone(), emit_fn);
+
+        tokio::spawn(async move {
+            drain_handle.drain().await;
+        });
+
+        bus.run_started("debug-shell".to_string(), None, None);
+
+        // Resolve cwd: prefer workspace root, fallback to current_dir.
+        let cfg = self.config.read().await.clone();
+        let workspace = cfg.workspace_dir.clone();
+        drop(cfg);
+
+        let cwd = if workspace.exists() {
+            tracing::debug!(target: "e2e", "[e2e-debug-cwd] cwd={} exists=true", workspace.display());
+            workspace
+        } else {
+            let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            tracing::debug!(target: "e2e", "[e2e-debug-cwd] cwd={} exists={}", fallback.display(), fallback.exists());
+            if !fallback.exists() {
+                bus.run_failed(format!("debug_shell_stream cwd does not exist: {}", fallback.display()));
+                return Err(anyhow::anyhow!("cwd does not exist: {}", fallback.display()));
+            }
+            fallback
+        };
+
+        let step_id = bus.step_started("debug shell streaming".to_string(), None);
+        let tool_call_id = uuid::Uuid::new_v4().to_string();
+        bus.tool_started(
+            tool_call_id.clone(),
+            "shell".to_string(),
+            format!("执行: {}", truncate_for_step(&command, 50)),
+            None,
+        );
+
+        let preview_cmd = truncate_for_step(&command, 80);
+        tracing::debug!(target: "e2e", "[e2e-debug-spawn] program=cmd.exe arg0=/C command={} cwd={} exists={}",
+            preview_cmd, cwd.display(), cwd.exists());
+
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let step_id_out = step_id.clone();
+        let tool_call_id_out = tool_call_id.clone();
+        let bus_for_stdout = bus.clone();
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(out) = stdout {
+                let mut lines = BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    bus_for_stdout.command_output(
+                        step_id_out.clone(),
+                        tool_call_id_out.clone(),
+                        "shell".to_string(),
+                        line,
+                        false,
+                    );
+                }
+            }
+        });
+
+        let step_id_err = step_id.clone();
+        let tool_call_id_err = tool_call_id.clone();
+        let bus_for_stderr = bus.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(err) = stderr {
+                let mut lines = BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    bus_for_stderr.command_output(
+                        step_id_err.clone(),
+                        tool_call_id_err.clone(),
+                        "shell".to_string(),
+                        line,
+                        true,
+                    );
+                }
+            }
+        });
+
+        let status = child.wait().await.map_err(|e| anyhow::anyhow!("wait error: {}", e))?;
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+
+        let success = status.success();
+        bus.tool_completed(
+            step_id,
+            tool_call_id,
+            "shell".to_string(),
+            success,
+            0,
+            String::new(),
+            None,
+        );
+        let reply = if success {
+            "命令执行成功".to_string()
+        } else {
+            "命令执行失败".to_string()
+        };
+        bus.run_completed(reply.clone(), reply);
+
+        Ok(())
     }
 
     async fn validate_and_resolve_session_lineage(
@@ -1571,7 +1775,7 @@ fn truncate_for_step(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in trimmed.chars().enumerate() {
         if idx >= max_chars {
-            out.push('?');
+            out.push_str("...");
             return out;
         }
         out.push(ch);
@@ -1646,7 +1850,7 @@ pub enum RunEvent {
         result_summary: String,
         diff_stats: Option<RunDiffStats>,
     },
-    CommandOutput { tool_call_id: String, tool_name: String, output: String, is_final: bool },
+    CommandOutput { tool_call_id: String, tool_name: String, output: String, is_stderr: bool },
     FileChanged { path: String, additions: i32, deletions: i32 },
 }
 
@@ -1672,8 +1876,8 @@ impl From<ToolExecutionEvent> for RunEvent {
                     diff_stats: diff_stats.map(|d| RunDiffStats { additions: d.additions, deletions: d.deletions }),
                 }
             }
-            ToolExecutionEvent::CommandOutput { tool_call_id, tool_name, output, is_final } => {
-                RunEvent::CommandOutput { tool_call_id, tool_name, output, is_final }
+            ToolExecutionEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr } => {
+                RunEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr }
             }
             ToolExecutionEvent::FileChanged { path, additions, deletions } => {
                 RunEvent::FileChanged { path, additions, deletions }
@@ -1716,26 +1920,8 @@ impl ExecutionStep {
     }
 }
 
-/// Live execution event sent to the frontend via Tauri emit.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentRunEvent {
-    RunStarted { run_id: String, agent_name: String, session_id: Option<String> },
-    ToolStarted { run_id: String, tool_call_id: String, tool_name: String, summary: String },
-    ToolCompleted {
-        run_id: String,
-        tool_call_id: String,
-        tool_name: String,
-        success: bool,
-        duration_ms: u64,
-        result_summary: String,
-        diff_stats: Option<RunDiffStats>,
-    },
-    CommandOutput { run_id: String, tool_call_id: String, tool_name: String, output: String, is_final: bool },
-    FileChanged { run_id: String, path: String, additions: i32, deletions: i32 },
-    RunCompleted { run_id: String, success: bool, reply_preview: String },
-    Error { run_id: String, message: String },
-}
+// Re-exports for backward compatibility with external crate users.
+pub use crate::agent::AgentRunEvent;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewaySessionTreeResponse {
@@ -3020,6 +3206,7 @@ pub fn create_workspace_tools(
         Box::new(FileReadTool::new(workspace.clone())),
         Box::new(FileWriteTool::new(workspace.clone())),
         Box::new(FileEditTool::new(workspace.clone())),
+        Box::new(FilePatchTool::new(workspace.clone())),
         Box::new(FileListTool::new(workspace.clone())),
         Box::new(GlobSearchTool::new(workspace.clone())),
         Box::new(ContentSearchTool::new(workspace.clone())),

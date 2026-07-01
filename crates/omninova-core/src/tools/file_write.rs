@@ -23,14 +23,14 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file inside workspace. Creates parent directories if needed."
+        "Write content to a file inside workspace. Path must be workspace-relative; use \"index.html\" or \"sub/file.txt\", never an absolute path like D:\\project\\index.html. Prefer file_patch for existing files unless a full rewrite is explicitly requested."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Relative path within workspace" },
+                "path": { "type": "string", "description": "Workspace-relative path. Use \"index.html\", not D:\\\\workspace\\\\index.html." },
                 "content": { "type": "string", "description": "Content to write" }
             },
             "required": ["path", "content"]

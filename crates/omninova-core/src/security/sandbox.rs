@@ -147,17 +147,12 @@ pub async fn resolve_workspace_relative(
     workspace_dir: &Path,
     relative: &str,
 ) -> anyhow::Result<PathBuf> {
-    let trimmed = relative.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("path is empty");
-    }
+    let normalized = normalize_workspace_path(workspace_dir, relative).await?;
+    let trimmed = normalized.as_str();
     if trimmed.contains('\0') {
         anyhow::bail!("null bytes in path are not allowed");
     }
     let rel = Path::new(trimmed);
-    if rel.is_absolute() {
-        anyhow::bail!("absolute paths are not allowed");
-    }
     if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         anyhow::bail!("path traversal is not allowed");
     }
@@ -213,6 +208,76 @@ pub async fn resolve_workspace_relative(
     Ok(resolved)
 }
 
+/// Normalize a model-provided path into a workspace-relative path.
+///
+/// The jail remains strict: absolute paths outside the workspace are rejected.
+/// Absolute paths that point to the workspace root or a child of it are accepted
+/// and converted to the relative form tools expect. This prevents the common
+/// model mistake of passing `D:\project\index.html` after the prompt disclosed
+/// the active Workspace path.
+pub async fn normalize_workspace_path(
+    workspace_dir: &Path,
+    input_path: &str,
+) -> anyhow::Result<String> {
+    let trimmed = input_path.trim();
+    if trimmed.contains('\0') {
+        anyhow::bail!("null bytes in path are not allowed");
+    }
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(".".to_string());
+    }
+
+    if !workspace_dir.exists() {
+        tokio::fs::create_dir_all(workspace_dir).await.map_err(|e| {
+            anyhow::anyhow!(
+                "workspace dir does not exist and could not be created: {e}"
+            )
+        })?;
+    }
+    let workspace_canon = tokio::fs::canonicalize(workspace_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve workspace dir: {e}"))?;
+
+    let input = Path::new(trimmed);
+    if input.is_absolute() {
+        let resolved_input = match tokio::fs::metadata(input).await {
+            Ok(_) => tokio::fs::canonicalize(input)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to resolve {trimmed}: {e}"))?,
+            Err(_) => {
+                let parent = input
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("absolute path has no parent directory"))?;
+                let parent_canon = tokio::fs::canonicalize(parent)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("absolute path is outside workspace"))?;
+                let file_name = input
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("absolute path has no file name"))?;
+                parent_canon.join(file_name)
+            }
+        };
+
+        if !resolved_input.starts_with(&workspace_canon) {
+            anyhow::bail!("absolute path is outside workspace");
+        }
+
+        let rel = resolved_input
+            .strip_prefix(&workspace_canon)
+            .map_err(|_| anyhow::anyhow!("absolute path is outside workspace"))?;
+        if rel.as_os_str().is_empty() {
+            return Ok(".".to_string());
+        }
+        return Ok(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    if input.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        anyhow::bail!("path traversal is not allowed");
+    }
+
+    Ok(trimmed.replace('\\', "/"))
+}
+
 impl SandboxConfig {
     pub fn effective_workspace_jail(&self) -> bool {
         self.enabled && self.workspace_jail
@@ -221,7 +286,7 @@ impl SandboxConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_relative;
+    use super::{normalize_workspace_path, resolve_workspace_relative};
     use std::path::PathBuf;
 
     fn temp_workspace() -> PathBuf {
@@ -285,6 +350,39 @@ mod tests {
         let workspace = temp_workspace();
         let result = resolve_workspace_relative(&workspace, "/etc/passwd").await;
         assert!(result.is_err(), "absolute paths must be rejected");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn normalizes_workspace_root_absolute_path_to_dot() {
+        let workspace = temp_workspace();
+        let normalized = normalize_workspace_path(&workspace, &workspace.to_string_lossy())
+            .await
+            .expect("workspace root normalizes");
+        assert_eq!(normalized, ".");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn normalizes_workspace_child_absolute_path_to_relative_path() {
+        let workspace = temp_workspace();
+        let target = workspace.join("sub").join("file.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "hello").unwrap();
+        let normalized = normalize_workspace_path(&workspace, &target.to_string_lossy())
+            .await
+            .expect("workspace child normalizes");
+        assert_eq!(normalized, "sub/file.txt");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn normalizes_empty_path_to_dot() {
+        let workspace = temp_workspace();
+        let normalized = normalize_workspace_path(&workspace, "")
+            .await
+            .expect("empty path normalizes");
+        assert_eq!(normalized, ".");
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }

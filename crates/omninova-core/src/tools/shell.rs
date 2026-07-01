@@ -1,12 +1,29 @@
 use crate::config::Config;
-use crate::security::sandbox::{ensure_sandbox_home, sandbox_env, sandbox_enabled};
+use crate::agent::AgentCancellationToken;
+use crate::security::sandbox::{ensure_sandbox_home, normalize_workspace_path, sandbox_env, sandbox_enabled};
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use tracing::debug;
+
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
@@ -35,10 +52,8 @@ impl ShellTool {
     async fn resolve_working_directory(&self, relative: Option<&str>) -> anyhow::Result<PathBuf> {
         let wd = match relative {
             Some(p) if !p.trim().is_empty() => {
-                let rel = Path::new(p);
-                if rel.is_absolute() {
-                    anyhow::bail!("absolute working_directory is not allowed");
-                }
+                let normalized = normalize_workspace_path(&self.workspace_dir, p).await?;
+                let rel = Path::new(&normalized);
                 if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                     anyhow::bail!("path traversal is not allowed");
                 }
@@ -298,4 +313,250 @@ impl Tool for ShellTool {
             },
         })
     }
+
+    async fn execute_streaming_with_cancel(
+        &self,
+        args: serde_json::Value,
+        output_tx: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+        cancel_token: AgentCancellationToken,
+    ) -> anyhow::Result<ToolResult> {
+        cancel_token.check()?;
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?
+            .to_string();
+        self.execute_streaming_impl(command, output_tx, false, Some(cancel_token))
+            .await
+    }
+}
+
+/// Dev-only streaming execution that skips allowlist checks.
+/// Used exclusively by `debug_shell_stream` to test the full streaming pipeline.
+/// Panics if called from production code.
+impl ShellTool {
+    pub(crate) async fn execute_streaming_unchecked(
+        &self,
+        command: String,
+        output_tx: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    ) -> anyhow::Result<ToolResult> {
+        #[cfg(debug_assertions)]
+        {
+            self.execute_streaming_impl(command, output_tx, true, None).await
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (command, output_tx);
+            panic!("execute_streaming_unchecked must not be called in release builds");
+        }
+    }
+}
+
+/// Streaming shell tool execution with real-time output via channel.
+impl ShellTool {
+    /// Common implementation shared by both checked and unchecked streaming paths.
+    async fn execute_streaming_impl(
+        &self,
+        command: String,
+        output_tx: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+        bypass_allowlist: bool,
+        cancel_token: Option<AgentCancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let working_directory: Option<&str> = None;
+        let timeout_secs = self.timeout_secs;
+
+        if !bypass_allowlist {
+            if let Err(e) = self.check_command_allowed(&command) {
+                let content = e.to_string();
+                debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                let _ = output_tx.send((content, true));
+                return Ok(ToolResult { success: false, output: String::new(), error: Some(e.to_string()) });
+            }
+        }
+
+        let cwd = match self.resolve_working_directory(working_directory).await {
+            Ok(c) => c,
+            Err(e) => {
+                let content = format!("error: {e}");
+                debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                let _ = output_tx.send((content, true));
+                return Ok(ToolResult { success: false, output: String::new(), error: Some(e.to_string()) });
+            }
+        };
+
+        let workspace = match tokio::fs::canonicalize(&self.workspace_dir).await {
+            Ok(p) => p,
+            Err(e) => {
+                let content = format!("error: {e}");
+                debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                let _ = output_tx.send((content, true));
+                return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("failed to resolve workspace dir: {e}")) });
+            }
+        };
+
+        if self.command_targets_workspace_root(&command, &cwd, &workspace) {
+            let content = "error: refused to delete workspace root".to_string();
+            debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+            let _ = output_tx.send((content, true));
+            return Ok(ToolResult { success: false, output: String::new(), error: Some("Refusing to delete the Workspace root directory. Delete files inside the Workspace instead.".to_string()) });
+        }
+
+        if sandbox_enabled(&self.config) {
+            if let Err(e) = ensure_sandbox_home(&self.config).await {
+                let content = format!("sandbox error: {e}");
+                debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                let _ = output_tx.send((content, true));
+                return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("sandbox init failed: {e}")) });
+            }
+        }
+
+        let mut child = if bypass_allowlist {
+            // Dev/debug path: bypass allowlist. Use cmd.exe /C to run arbitrary commands
+            // reliably across all environments (Tauri, dev server, etc.).
+            let mut c = Command::new("cmd.exe");
+            c.args(["/C", &command]);
+            debug!(target: "e2e", "[e2e-debug-spawn] program=cmd.exe args=/C {} cwd={}", preview(&command, 80), cwd.display());
+            c
+        } else if cfg!(target_os = "windows") {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-lc").arg(&command);
+            c
+        };
+        child
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if sandbox_enabled(&self.config) && self.config.security.sandbox.strip_environment {
+            child.env_clear();
+            for (key, value) in sandbox_env(&self.config) {
+                child.env(key, value);
+            }
+        }
+
+        let mut child = match child.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let content = format!("spawn error: {e}");
+                debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                let _ = output_tx.send((content, true));
+                return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("failed to spawn command: {e}")) });
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut running = true;
+
+        // Spawn stdout reader.
+        let out_tx = output_tx.clone();
+        if let Some(out) = stdout {
+            tokio::spawn(async move {
+                                use tracing::debug;
+                let mut reader = BufReader::new(out);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    let content = std::mem::take(&mut line);
+                    debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=false content=\"{}\"", now_ts(), preview(&content, 80));
+                    let _ = out_tx.send((content, false));
+                }
+            });
+        }
+
+        // Spawn stderr reader.
+        let err_tx = output_tx.clone();
+        if let Some(err) = stderr {
+            tokio::spawn(async move {
+                                use tracing::debug;
+                let mut reader = BufReader::new(err);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    let content = std::mem::take(&mut line);
+                    debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                    let _ = err_tx.send((content, true));
+                }
+            });
+        }
+
+        // Wait for child to exit with timeout.
+        while Instant::now() < deadline && running {
+            let remaining = deadline - Instant::now();
+            let wait_result = if let Some(token) = cancel_token.clone() {
+                tokio::select! {
+                    result = tokio::time::timeout(remaining, child.wait()) => result,
+                    _ = token.cancelled() => {
+                        let _ = child.kill().await;
+                        let content = "cancelled by user".to_string();
+                        debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                        let _ = output_tx.send((content, true));
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("agent run cancelled".to_string()),
+                        });
+                    }
+                }
+            } else {
+                tokio::time::timeout(remaining, child.wait()).await
+            };
+            match wait_result {
+                Ok(Ok(status)) => {
+                    running = false;
+                    if !status.success() {
+                        let content = format!("exited with status {}", status.code().unwrap_or(-1));
+                        debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                        let _ = output_tx.send((content, true));
+                    }
+                    return Ok(ToolResult {
+                        success: status.success(),
+                        output: String::new(),
+                        error: if status.success() { None } else { Some(format!("command exited with status {}", status.code().unwrap_or(-1))) },
+                    });
+                }
+                Ok(Err(e)) => {
+                    running = false;
+                    let content = format!("wait error: {e}");
+                    debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                    let _ = output_tx.send((content, true));
+                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("wait error: {e}")) });
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let content = format!("timed out after {timeout_secs}s");
+                    debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+                    let _ = output_tx.send((content, true));
+                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("command timed out after {timeout_secs}s")) });
+                }
+            }
+        }
+
+        if running {
+            let _ = child.kill().await;
+            let content = format!("timed out after {timeout_secs}s");
+            debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
+            let _ = output_tx.send((content, true));
+            return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("command timed out after {timeout_secs}s")) });
+        }
+
+        Ok(ToolResult { success: false, output: String::new(), error: Some("unexpected exit".into()) })
+    }
+}
+
+/// E2E debug: returns the first `max_chars` chars of `s`, appending "..."
+/// if `s` was longer. Never slices in the middle of a UTF-8 codepoint.
+fn preview(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }

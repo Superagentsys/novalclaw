@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -23,6 +24,20 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+
+/// E2E debug: formats current wall-clock time as HH:MM:SS.mmm UTC.
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
 
 /// Live execution event sent from backend to frontend via Tauri emit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +48,28 @@ pub enum AgentRunEvent {
         run_id: String,
         agent_name: String,
         session_id: Option<String>,
+    },
+    ModelStarted {
+        run_id: String,
+        step_id: String,
+        title: String,
+    },
+    ModelDelta {
+        run_id: String,
+        step_id: String,
+        content: String,
+    },
+    ModelCompleted {
+        run_id: String,
+        step_id: String,
+        title: String,
+    },
+    ToolCallCreated {
+        run_id: String,
+        step_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        title: String,
     },
     ToolStarted {
         run_id: String,
@@ -51,7 +88,7 @@ pub enum AgentRunEvent {
         run_id: String,
         tool_name: String,
         output: String,
-        is_final: bool,
+        is_stderr: bool,
     },
     FileChanged {
         run_id: String,
@@ -62,11 +99,16 @@ pub enum AgentRunEvent {
     RunCompleted {
         run_id: String,
         success: bool,
+        reply: String,
         reply_preview: String,
     },
     RunError {
         run_id: String,
         error: String,
+    },
+    RunCancelled {
+        run_id: String,
+        reason: String,
     },
 }
 
@@ -648,14 +690,40 @@ async fn process_inbound_message_streaming(
     };
     let inbound = inbound_from_payload(payload);
 
+    let run_id = inbound
+        .metadata
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+    eprintln!("[e2e-tauri-command-start] timestamp={} run_id={}", now_ts(), run_id);
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let terminal_seen = Arc::new(AtomicBool::new(false));
 
     // Spawn a background task that forwards events to the Tauri frontend.
     let handle = tokio::spawn({
         let app = app_handle.clone();
         let mut rx = rx;
+        let terminal_seen = terminal_seen.clone();
         async move {
             while let Some(evt) = rx.recv().await {
+                let type_name = evt.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let rid = evt.get("run_id").and_then(|r| r.as_str()).unwrap_or("-");
+                let is_terminal = matches!(type_name, "run_completed" | "run_failed" | "run_cancelled");
+                if terminal_seen.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "[e2e-tauri-ignored-after-terminal] timestamp={} run_id={} type={}",
+                        now_ts(),
+                        rid,
+                        type_name
+                    );
+                    continue;
+                }
+                eprintln!("[e2e-tauri-emit] timestamp={} run_id={} type={}", now_ts(), rid, type_name);
+                if is_terminal {
+                    terminal_seen.store(true, Ordering::SeqCst);
+                }
                 if app.emit("agent-run-event", evt).is_err() {
                     break;
                 }
@@ -667,10 +735,84 @@ async fn process_inbound_message_streaming(
         .process_inbound_streaming(&inbound, tx)
         .await;
 
-    // The spawned task drains the channel and emits all events.
+    eprintln!("[e2e-tauri-command-return] timestamp={} run_id={}", now_ts(), run_id);
+    // Drain the event-forwarding task first so terminal_seen reflects any
+    // run_completed/run_failed/run_cancelled already emitted by core.
     let _ = handle.await;
 
+    if let Err(err) = &result {
+        if !terminal_seen.load(Ordering::SeqCst)
+            && !err.to_string().to_lowercase().contains("cancelled")
+        {
+            let _ = app_handle.emit(
+                "agent-run-event",
+                serde_json::json!({
+                    "type": "run_failed",
+                    "run_id": run_id,
+                    "error": err.to_string(),
+                }),
+            );
+        }
+    }
+
     result.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_agent_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .cancel_agent_run(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Debug-only: directly executes a shell command and streams output as agent-run-events.
+/// Does NOT go through LLM. Used to verify runtime streaming infrastructure.
+/// Usage: call this from DevTools / browser console to test shell streaming.
+#[tauri::command]
+async fn debug_shell_stream(
+    app_handle: AppHandle,
+    command: String,
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Spawn background task to forward events to the Tauri frontend.
+    let handle = tokio::spawn({
+        let app = app_handle.clone();
+        let mut rx = rx;
+        async move {
+            while let Some(evt) = rx.recv().await {
+                let type_name = evt.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let rid = evt.get("run_id").and_then(|r| r.as_str()).unwrap_or("-");
+                eprintln!("[e2e-tauri-emit] timestamp={} run_id={} type={}", now_ts(), rid, type_name);
+                if app.emit("agent-run-event", evt).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    runtime
+        .debug_shell_stream(command, run_id, tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = handle.await;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1628,6 +1770,8 @@ pub fn run() {
             route_inbound_message,
             process_inbound_message,
             process_inbound_message_streaming,
+            cancel_agent_run,
+            debug_shell_stream,
             get_chat_session_history,
             delete_chat_session,
             session_tree_snapshot,

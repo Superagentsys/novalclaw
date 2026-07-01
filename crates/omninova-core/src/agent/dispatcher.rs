@@ -1,148 +1,26 @@
-﻿use crate::agent::budget::BudgetTracker;
+use crate::agent::budget::BudgetTracker;
+use crate::agent::event_bus::EventBus;
 use crate::agent::history::sanitize_messages_for_provider;
-use crate::agent::{AgentEvent, FileDiffStats, ToolExecutionEvent};
+use crate::agent::tool_runner::ToolRunner;
+use crate::agent::{build_tool_prepare_summary, build_tool_summary, AgentCancellationToken, AgentEvent, ToolExecutionEvent};
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Instant;
+use tracing;
 
-/// Builds a human-readable Chinese summary for a tool call.
-pub fn build_tool_summary(tool_name: &str, args: &serde_json::Value) -> String {
-    match tool_name {
-        "file_list" | "list_directory" => {
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                format!("正在列出目录：{}", p)
-            } else {
-                "正在列出目录".into()
-            }
-        }
-        "file_read" | "read_file" => {
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                format!("正在读取文件：{}", p)
-            } else {
-                "正在读取文件".into()
-            }
-        }
-        "file_write" | "write_file" => {
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                format!("正在写入文件：{}", p)
-            } else {
-                "正在写入文件".into()
-            }
-        }
-        "file_edit" | "edit_file" | "str_replace_editor" => {
-            if let Some(p) = args.get("file_path").and_then(|v| v.as_str()) {
-                format!("正在编辑文件：{}", p)
-            } else {
-                "正在编辑文件".into()
-            }
-        }
-        "glob_search" | "glob" => {
-            if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
-                format!("正在搜索文件：{}", p)
-            } else {
-                "正在搜索文件".into()
-            }
-        }
-        "content_search" | "search" | "grep" => {
-            if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
-                format!("正在搜索内容：{}", q)
-            } else {
-                "正在搜索内容".into()
-            }
-        }
-        "shell" | "bash" | "run_command" | "Command" => {
-            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                let display = if cmd.len() > 80 { format!("{}...", &cmd[..80]) } else { cmd.to_string() };
-                format!("正在执行命令：{}", display)
-            } else if let Some(cmd) = args.get("script").and_then(|v| v.as_str()) {
-                let display = if cmd.len() > 80 { format!("{}...", &cmd[..80]) } else { cmd.to_string() };
-                format!("正在执行脚本：{}", display)
-            } else {
-                "正在执行命令".into()
-            }
-        }
-        "git_operations" | "git" => {
-            if let Some(op) = args.get("operation").and_then(|v| v.as_str()) {
-                format!("正在执行 Git 操作：{}", op)
-            } else {
-                "正在执行 Git 操作".into()
-            }
-        }
-        "browser" => {
-            if let Some(u) = args.get("url").and_then(|v| v.as_str()) {
-                format!("正在访问网页：{}", u)
-            } else {
-                "正在操作浏览器".into()
-            }
-        }
-        "delegate" => "正在委托子任务".into(),
-        _ => format!("正在执行工具：{}", tool_name),
-    }
-}
-
-/// Truncates a string for UI display.
-pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max_chars {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max_chars).collect();
-    format!("{}\n... [输出已截断，原始长度 {} 字符]", head, s.len())
-}
-
-/// Extracts diff stats from git diff --numstat output.
-fn extract_diff_stats(tool_name: &str, output: &str) -> Option<FileDiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor") {
-        return None;
-    }
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let additions: i32 = parts[0].parse().unwrap_or(0);
-            let deletions: i32 = parts[1].parse().unwrap_or(0);
-            if additions > 0 || deletions > 0 {
-                return Some(FileDiffStats { additions, deletions });
-            }
-        }
-    }
-    None
-}
-
-/// Tries to compute diff stats from the written content itself (non-git fallback).
-fn compute_content_diff(tool_name: &str, args: &serde_json::Value, output: &str) -> Option<FileDiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor") {
-        return None;
-    }
-    if matches!(tool_name, "file_write" | "write_file") {
-        let content_lines = args.get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.lines().count().max(usize::from(!s.is_empty())))
-            .unwrap_or(0);
-        if content_lines > 0 {
-            return Some(FileDiffStats { additions: content_lines as i32, deletions: 0 });
-        }
-    }
-    // If output says success and contains a path, estimate additions from content.
-    if output.to_lowercase().contains("success")
-        || output.to_lowercase().starts_with("wrote ")
-        || output.contains("写入成功")
-        || output.contains("已保存")
-        || output.contains("saved")
-        || output == "ok"
-    {
-        let content_lines = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.lines().count().max(usize::from(!s.is_empty())))
-            .unwrap_or(0);
-        if content_lines > 0 {
-            return Some(FileDiffStats { additions: content_lines as i32, deletions: 0 });
-        }
-    }
-    None
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
 }
 
 /// Stateless dispatcher for one agent turn:
@@ -154,10 +32,9 @@ pub struct AgentDispatcher<'a> {
     max_tool_iterations: usize,
     security: &'a SecurityContext,
     budget: &'a BudgetTracker,
-    /// Optional synchronous callback invoked immediately after each tool execution
-    /// (Started and Completed events). This is the real-time event path.
-    /// Wrapped in Arc so AgentDispatcher remains Clone.
-    on_tool_event: Option<Arc<dyn Fn(ToolExecutionEvent) + Send + Sync + 'static>>,
+    /// Optional EventBus for real-time structured events.
+    event_bus: Option<EventBus>,
+    cancel_token: Option<AgentCancellationToken>,
 }
 
 impl<'a> Clone for AgentDispatcher<'a> {
@@ -169,7 +46,8 @@ impl<'a> Clone for AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
-            on_tool_event: self.on_tool_event.clone(),
+            event_bus: self.event_bus.clone(),
+            cancel_token: self.cancel_token.clone(),
         }
     }
 }
@@ -190,33 +68,32 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations,
             security,
             budget,
-            on_tool_event: None,
+            event_bus: None,
+            cancel_token: None,
         }
     }
 
-    /// Sets the real-time event callback. Events are emitted synchronously
-    /// as tools execute, with no channel or spawned-task overhead.
-    pub fn with_on_tool_event(
-        mut self,
-        on_event: Option<Arc<dyn Fn(ToolExecutionEvent) + Send + Sync + 'static>>,
-    ) -> Self {
-        self.on_tool_event = on_event;
+    /// Sets the EventBus for real-time structured events.
+    pub fn with_event_bus(mut self, bus: Option<EventBus>) -> Self {
+        self.event_bus = bus;
         self
     }
 
-    /// Emits a tool event synchronously if a callback is registered.
-    fn emit_tool_event(&self, event: ToolExecutionEvent) {
-        if let Some(ref cb) = self.on_tool_event {
-            cb(event);
-        }
+    pub fn with_cancel_token(mut self, cancel_token: Option<AgentCancellationToken>) -> Self {
+        self.cancel_token = cancel_token;
+        self
     }
 
     /// Run the tool-calling loop against `messages` and return final assistant text.
+    /// Uses the legacy path (no real-time events).
     pub async fn run(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
         *messages = sanitize_messages_for_provider(std::mem::take(messages));
         let iteration_cap = self.max_tool_iterations.max(1);
 
         for iteration in 0..iteration_cap {
+            if let Some(token) = &self.cancel_token {
+                token.check()?;
+            }
             if let Some(reason) = self.budget.check() {
                 let text = format!(
                     "[budget exceeded] {reason}. Stopping here ({}).",
@@ -298,7 +175,8 @@ impl<'a> AgentDispatcher<'a> {
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
-                let (tool_result, _exec_event) = self.execute_tool_call(&tool_call, &args).await?;
+                let (tool_result, _exec_event) =
+                    self.execute_tool_call_internal(&tool_call, &args, None).await?;
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
                     "content": tool_result,
@@ -329,10 +207,167 @@ impl<'a> AgentDispatcher<'a> {
         self.provider.chat_stream(request, tok_tx).await
     }
 
-    /// Streaming variant of [`run`]: drives the tool-calling loop with budget
-    /// awareness and emits tool events via the synchronous `on_tool_event` callback
-    /// immediately as each tool starts/completes.  Token deltas are forwarded
-    /// to `events` as [`AgentEvent::Token`].
+    /// Streaming variant with real-time EventBus support.
+    /// Drives the tool-calling loop with budget awareness and emits structured
+    /// `AgentRunEvent`s via the EventBus immediately as each tool executes.
+    pub async fn run_streaming_with_bus(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
+        *messages = sanitize_messages_for_provider(std::mem::take(messages));
+        let iteration_cap = self.max_tool_iterations.max(1);
+        let mut written_files: Vec<String> = Vec::new();
+
+        for iteration in 0..iteration_cap {
+            if let Some(reason) = self.budget.check() {
+                let text = format!(
+                    "[budget exceeded] {reason}. Stopping here ({}).",
+                    self.budget.summary()
+                );
+                self.security
+                    .audit()
+                    .record_event(
+                        "budget_exceeded",
+                        false,
+                        &reason,
+                        serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
+                    )
+                    .await;
+                messages.push(ChatMessage::assistant(&text));
+                if let Some(ref bus) = self.event_bus {
+                    bus.run_failed(format!("budget exceeded: {reason}"));
+                }
+                return Err(anyhow::anyhow!(text));
+            }
+
+            let provider_name = self
+                .security
+                .audit()
+                .context()
+                .provider
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+
+            let (tok_tx, mut tok_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let tok_tx_clone = tok_tx.clone();
+            let model_title = if iteration == 0 {
+                "正在分析项目文件".to_string()
+            } else {
+                "正在整理最终回复".to_string()
+            };
+            let model_step_id = self
+                .event_bus
+                .as_ref()
+                .map(|bus| bus.model_started(model_title.clone()));
+            let bus_for_delta = self.event_bus.clone();
+            let model_step_for_delta = model_step_id.clone();
+            let _handle = tokio::spawn(async move {
+                while let Some(delta) = tok_rx.recv().await {
+                    if let (Some(bus), Some(step_id)) = (&bus_for_delta, &model_step_for_delta) {
+                        bus.model_delta(step_id.clone(), delta);
+                    }
+                }
+            });
+            let chat_result = self.stream_once(messages, true, tok_tx_clone).await;
+
+            if let Ok(response) = &chat_result {
+                self.budget.record_call(response.usage.as_ref());
+            }
+            match &chat_result {
+                Ok(response) => {
+                    crate::observability::record_provider_call(&provider_name, "ok");
+                    self.security
+                        .audit_provider_call(
+                            iteration,
+                            response.tool_calls.len(),
+                            true,
+                            "provider returned response",
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    crate::observability::record_provider_call(&provider_name, "error");
+                    self.security
+                        .audit_provider_call(iteration, 0, false, &err.to_string())
+                        .await;
+                }
+            }
+            let response = chat_result?;
+            if let Some(token) = &self.cancel_token {
+                token.check()?;
+            }
+            if let (Some(bus), Some(step_id)) = (&self.event_bus, model_step_id) {
+                bus.model_completed(step_id, "模型阶段完成".to_string());
+            }
+
+            if response.tool_calls.is_empty() {
+                let validation_summary = self.validate_web_artifacts(&written_files, messages).await?;
+                let mut text = response.text.unwrap_or_default();
+                if let Some(summary) = validation_summary {
+                    if !text.contains("验证结果") {
+                        if !text.trim().is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(&summary);
+                    }
+                }
+                messages.push(ChatMessage::assistant(&text));
+                return Ok(text);
+            }
+
+            let assistant_payload = serde_json::json!({
+                "content": response.text,
+                "reasoning_content": response.reasoning_content,
+                "tool_calls": response.tool_calls,
+            })
+            .to_string();
+            messages.push(ChatMessage::assistant(assistant_payload));
+
+            for tool_call in response.tool_calls {
+                if let Some(token) = &self.cancel_token {
+                    token.check()?;
+                }
+                let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(ref bus) = self.event_bus {
+                    bus.tool_call_created(
+                        tool_call.id.clone(),
+                        tool_call.name.clone(),
+                        build_tool_prepare_summary(&tool_call.name, &args),
+                    );
+                }
+
+                // Execute tool via internal helper (with EventBus support).
+                let (tool_result, exec_event) = self
+                    .execute_tool_call_internal(&tool_call, &args, self.event_bus.clone())
+                    .await?;
+                if matches!(
+                    tool_call.name.as_str(),
+                    "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor" | "file_patch" | "apply_patch"
+                ) {
+                    if let Some(ToolExecutionEvent::Completed { success: true, .. }) = &exec_event {
+                        if let Some(path) = args
+                            .get("path")
+                            .or_else(|| args.get("file_path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !written_files.iter().any(|item| item == path) {
+                                written_files.push(path.to_string());
+                            }
+                        }
+                    }
+                }
+
+                let tool_payload = serde_json::json!({
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                })
+                .to_string();
+                messages.push(ChatMessage::tool(tool_payload));
+            }
+        }
+
+        Ok("tool call loop limit reached".to_string())
+    }
+
+    /// Streaming variant with token event forwarding to `events` (legacy path).
     pub async fn run_streaming(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -426,21 +461,17 @@ impl<'a> AgentDispatcher<'a> {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
                 let summary = build_tool_summary(&tool_call.name, &args);
-
-                // Emit Started synchronously — immediately, before execute_tool_call.
-                self.emit_tool_event(ToolExecutionEvent::Started {
+                let _ = events.send(AgentEvent::ToolExecution(ToolExecutionEvent::Started {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
                     summary,
-                });
-
-                let (tool_result, exec_event) = self.execute_tool_call(&tool_call, &args).await?;
-
-                // Emit Completed/Failed synchronously — immediately after execution.
+                }));
+                let (tool_result, exec_event) = self
+                    .execute_tool_call_internal(&tool_call, &args, None)
+                    .await?;
                 if let Some(evt) = exec_event {
-                    self.emit_tool_event(evt);
+                    let _ = events.send(AgentEvent::ToolExecution(evt));
                 }
-
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
                     "content": tool_result,
@@ -454,12 +485,8 @@ impl<'a> AgentDispatcher<'a> {
         Ok("tool call loop limit reached".to_string())
     }
 
-    /// Variant of `run_streaming` without token events (used by the HTTP gateway
-    /// for real-time UI streaming). Tool events are still emitted synchronously.
-    pub async fn run_streaming_no_tokens(
-        &self,
-        messages: &mut Vec<ChatMessage>,
-    ) -> Result<String> {
+    /// Variant without token events ?? used by the gateway HTTP path.
+    pub async fn run_streaming_no_tokens(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
         *messages = sanitize_messages_for_provider(std::mem::take(messages));
         let iteration_cap = self.max_tool_iterations.max(1);
 
@@ -493,7 +520,7 @@ impl<'a> AgentDispatcher<'a> {
             let (tok_tx, mut tok_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let chat_result = self.stream_once(messages, true, tok_tx).await;
 
-            // Drain token stream so provider future can complete (no forwarding needed).
+            // Drain token stream so provider future can complete.
             let _handle = tokio::spawn(async move {
                 while tok_rx.recv().await.is_some() {}
             });
@@ -539,19 +566,10 @@ impl<'a> AgentDispatcher<'a> {
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
-                let summary = build_tool_summary(&tool_call.name, &args);
 
-                self.emit_tool_event(ToolExecutionEvent::Started {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
-                    summary,
-                });
-
-                let (tool_result, exec_event) = self.execute_tool_call(&tool_call, &args).await?;
-
-                if let Some(evt) = exec_event {
-                    self.emit_tool_event(evt);
-                }
+                let (tool_result, _exec_event) = self
+                    .execute_tool_call_internal(&tool_call, &args, self.event_bus.clone())
+                    .await?;
 
                 let tool_payload = serde_json::json!({
                     "tool_call_id": tool_call.id,
@@ -565,19 +583,15 @@ impl<'a> AgentDispatcher<'a> {
         Ok("tool call loop limit reached".to_string())
     }
 
-    /// Like `run_streaming` but also collects `ToolExecutionEvent`s for the final response.
+    /// Collects tool execution events for the final reply (legacy path).
     pub async fn run_with_events(
         &self,
         messages: &mut Vec<ChatMessage>,
     ) -> Result<(String, Vec<ToolExecutionEvent>)> {
         let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let realtime = self.on_tool_event.clone();
         let on_event = {
             let c = collected.clone();
             move |evt: ToolExecutionEvent| {
-                if let Some(cb) = realtime.as_ref() {
-                    cb(evt.clone());
-                }
                 if let Ok(mut v) = c.lock() {
                     v.push(evt);
                 }
@@ -590,7 +604,8 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
-            on_tool_event: Some(Arc::new(on_event)),
+            event_bus: self.event_bus.clone(),
+            cancel_token: self.cancel_token.clone(),
         };
         let reply = dispatcher.run_streaming_no_tokens(messages).await?;
         let events = Arc::try_unwrap(collected)
@@ -600,144 +615,252 @@ impl<'a> AgentDispatcher<'a> {
         Ok((reply, events))
     }
 
-    async fn execute_tool_call(
+    async fn validate_read_file(
         &self,
-        tool_call: &ToolCall,
-        args: &serde_json::Value,
-    ) -> Result<(String, Option<ToolExecutionEvent>)> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|t| t.name() == tool_call.name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", tool_call.name))?;
-
-        match self
-            .security
-            .gate_tool_execution(tool_call.name.as_str(), args)
-            .await?
-        {
-            crate::security::ToolExecutionGate::Blocked { reason } => {
-                let msg = format!("tool blocked by security policy: {reason}");
-                return Ok((
-                    msg.clone(),
-                    Some(ToolExecutionEvent::Completed {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        success: false,
-                        duration_ms: 0,
-                        result_summary: msg,
-                        diff_stats: None,
-                    }),
-                ));
-            }
-            crate::security::ToolExecutionGate::ApprovalRequired { .. } => {
-                let msg = "tool execution requires user approval";
-                return Ok((
-                    msg.to_string(),
-                    Some(ToolExecutionEvent::Completed {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        success: false,
-                        duration_ms: 0,
-                        result_summary: msg.to_string(),
-                        diff_stats: None,
-                    }),
-                ));
-            }
-            crate::security::ToolExecutionGate::Proceed { .. } => {}
-        }
-
-        let start = Instant::now();
-        let result = tool.execute(args.clone()).await;
-        let elapsed = start.elapsed();
-
+        file_read: &dyn Tool,
+        token: AgentCancellationToken,
+        target: &str,
+    ) -> Result<Option<String>> {
+        token.check()?;
+        let args = serde_json::json!({ "path": target });
+        let tool_call_id = format!("validation-{}", uuid::Uuid::new_v4());
+        let title = format!("验证文件存在：{target}");
+        let step_id = if let Some(bus) = &self.event_bus {
+            bus.tool_call_created(tool_call_id.clone(), "file_read".to_string(), format!("准备{title}"));
+            bus.tool_started(tool_call_id.clone(), "file_read".to_string(), format!("开始{title}"), None)
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        let timer = std::time::Instant::now();
+        let result = file_read.execute_with_cancel(args, token).await;
+        let elapsed_ms = timer.elapsed().as_millis() as u64;
         match result {
             Ok(tool_result) => {
-                let output = if tool_result.success {
-                    tool_result.output.clone()
+                let success = tool_result.success;
+                let summary = if success {
+                    format!("{target} 存在")
                 } else {
-                    tool_result.error.clone().unwrap_or(tool_result.output)
+                    tool_result.error.clone().unwrap_or_else(|| format!("{target} 不存在或无法读取"))
                 };
-                let truncated = truncate_for_display(&output, 2000);
-                let diff_stats = extract_diff_stats(&tool_call.name, &output)
-                    .or_else(|| compute_content_diff(&tool_call.name, args, &output));
-
-                if is_command_output_tool(&tool_call.name) && !output.trim().is_empty() {
-                    self.emit_tool_event(ToolExecutionEvent::CommandOutput {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        output: truncate_for_display(&output, 20 * 1024),
-                        is_final: true,
-                    });
+                if let Some(bus) = &self.event_bus {
+                    bus.tool_completed(
+                        step_id,
+                        tool_call_id,
+                        "file_read".to_string(),
+                        success,
+                        elapsed_ms,
+                        summary,
+                        None,
+                    );
                 }
-
-                // Emit FileChanged events immediately for file write/edit tools.
-                if tool_call.name == "file_write" || tool_call.name == "write_file"
-                    || tool_call.name == "file_edit" || tool_call.name == "edit_file"
-                    || tool_call.name == "str_replace_editor"
-                {
-                    let path = args
-                        .get("path")
-                        .or_else(|| args.get("file_path"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    if let Some(ds) = diff_stats.clone() {
-                        self.emit_tool_event(ToolExecutionEvent::FileChanged {
-                            path,
-                            additions: ds.additions,
-                            deletions: ds.deletions,
-                        });
-                    } else if let Some(ds) = compute_content_diff(&tool_call.name, args, &output) {
-                        self.emit_tool_event(ToolExecutionEvent::FileChanged {
-                            path,
-                            additions: ds.additions,
-                            deletions: ds.deletions,
-                        });
-                    }
-                }
-
-                Ok((
-                    output,
-                    Some(ToolExecutionEvent::Completed {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        success: tool_result.success,
-                        duration_ms: elapsed.as_millis() as u64,
-                        result_summary: truncated,
-                        diff_stats,
-                    }),
-                ))
+                Ok(if success { Some(tool_result.output) } else { None })
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if is_command_output_tool(&tool_call.name) && !msg.trim().is_empty() {
-                    self.emit_tool_event(ToolExecutionEvent::CommandOutput {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        output: truncate_for_display(&msg, 20 * 1024),
-                        is_final: true,
-                    });
+            Err(err) => {
+                if let Some(bus) = &self.event_bus {
+                    bus.tool_completed(step_id, tool_call_id, "file_read".to_string(), false, elapsed_ms, err.to_string(), None);
                 }
-                Ok((
-                    msg.clone(),
-                    Some(ToolExecutionEvent::Completed {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        success: false,
-                        duration_ms: elapsed.as_millis() as u64,
-                        result_summary: msg,
-                        diff_stats: None,
-                    }),
-                ))
+                Err(err)
             }
         }
     }
+
+    async fn validate_web_artifacts(
+        &self,
+        written_files: &[String],
+        messages: &[ChatMessage],
+    ) -> Result<Option<String>> {
+        let normalized_written: Vec<String> = written_files
+            .iter()
+            .map(|path| path.replace('\\', "/").to_lowercase())
+            .collect();
+        let wrote_index = normalized_written
+            .iter()
+            .any(|path| path == "index.html" || path.ends_with("/index.html"));
+        let wrote_style = normalized_written
+            .iter()
+            .any(|path| path == "style.css" || path.ends_with("/style.css"));
+        let wrote_script = normalized_written
+            .iter()
+            .any(|path| path == "script.js" || path.ends_with("/script.js"));
+        if !(wrote_index || wrote_style || wrote_script) {
+            return Ok(None);
+        }
+
+        let user_requested_three_files = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| {
+                let lower = message.content.to_lowercase();
+                lower.contains("index.html") && lower.contains("style.css") && lower.contains("script.js")
+            })
+            .unwrap_or(false);
+        let multi_file_mode = user_requested_three_files || wrote_style || wrote_script;
+
+        let Some(file_read) = self.tools.iter().find(|tool| tool.name() == "file_read") else {
+            return Err(anyhow::anyhow!("验证失败：file_read 工具不可用"));
+        };
+
+        let token = self.cancel_token.clone().unwrap_or_default();
+        let mut index_output = self
+            .validate_read_file(file_read.as_ref(), token.clone(), "index.html")
+            .await?;
+        if index_output.is_none() {
+            return Err(anyhow::anyhow!("验证失败：index.html 不存在或无法读取"));
+        }
+
+        if multi_file_mode {
+            let style_output = self
+                .validate_read_file(file_read.as_ref(), token.clone(), "style.css")
+                .await?;
+            let script_output = self
+                .validate_read_file(file_read.as_ref(), token.clone(), "script.js")
+                .await?;
+            if style_output.is_none() || script_output.is_none() {
+                return Err(anyhow::anyhow!(
+                    "验证失败：多文件网站需要 index.html、style.css、script.js 都存在"
+                ));
+            }
+
+            let mut index_text = index_output.clone().unwrap_or_default();
+            let mut refs_ok = index_text.contains("style.css") && index_text.contains("script.js");
+            if !refs_ok {
+                token.check()?;
+                let mut hunks = Vec::new();
+                if !index_text.contains("style.css") {
+                    hunks.push(serde_json::json!({
+                        "old_text": "</head>",
+                        "new_text": "  <link rel=\"stylesheet\" href=\"style.css\">\n</head>",
+                        "summary": "修复 style.css 引用"
+                    }));
+                }
+                if !index_text.contains("script.js") {
+                    hunks.push(serde_json::json!({
+                        "old_text": "</body>",
+                        "new_text": "  <script src=\"script.js\"></script>\n</body>",
+                        "summary": "修复 script.js 引用"
+                    }));
+                }
+
+                if hunks.is_empty() {
+                    return Err(anyhow::anyhow!("验证失败：index.html 未同时引用 style.css 和 script.js"));
+                }
+
+                let patch_call = ToolCall {
+                    id: format!("validation-fix-{}", uuid::Uuid::new_v4()),
+                    name: "file_patch".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "index.html",
+                        "hunks": hunks,
+                    })
+                    .to_string(),
+                };
+                let patch_args: serde_json::Value = serde_json::from_str(&patch_call.arguments)?;
+                if let Some(bus) = &self.event_bus {
+                    bus.tool_call_created(
+                        patch_call.id.clone(),
+                        patch_call.name.clone(),
+                        build_tool_prepare_summary(&patch_call.name, &patch_args),
+                    );
+                }
+                let (patch_result, _) = self
+                    .execute_tool_call_internal(&patch_call, &patch_args, self.event_bus.clone())
+                    .await?;
+                if !patch_result.contains("\"hunks_count\"") {
+                    return Err(anyhow::anyhow!(
+                        "验证失败：index.html 未同时引用 style.css 和 script.js，且自动修复失败：{}",
+                        patch_result
+                    ));
+                }
+
+                index_output = self
+                    .validate_read_file(file_read.as_ref(), token.clone(), "index.html")
+                    .await?;
+                index_text = index_output.clone().unwrap_or_default();
+                refs_ok = index_text.contains("style.css") && index_text.contains("script.js");
+            }
+
+            if let Some(bus) = &self.event_bus {
+                let tool_call_id = format!("validation-{}", uuid::Uuid::new_v4());
+                let title = "验证 index.html 引用 style.css 和 script.js".to_string();
+                bus.tool_call_created(tool_call_id.clone(), "validation".to_string(), format!("准备{title}"));
+                let step_id = bus.tool_started(tool_call_id.clone(), "validation".to_string(), format!("开始{title}"), None);
+                bus.tool_completed(
+                    step_id,
+                    tool_call_id,
+                    "validation".to_string(),
+                    refs_ok,
+                    0,
+                    if refs_ok {
+                        "index.html 已引用 style.css 和 script.js".to_string()
+                    } else {
+                        "index.html 未同时引用 style.css 和 script.js".to_string()
+                    },
+                    None,
+                );
+            }
+            if !refs_ok {
+                return Err(anyhow::anyhow!("验证失败：index.html 未同时引用 style.css 和 script.js"));
+            }
+
+            return Ok(Some(
+                "验证结果：\n- index.html 存在\n- style.css 存在\n- script.js 存在\n- index.html 引用检查通过".to_string(),
+            ));
+        }
+
+        let index_text = index_output.unwrap_or_default();
+        let inline_ok = index_text.contains("<style") && index_text.contains("<script");
+        if let Some(bus) = &self.event_bus {
+            let tool_call_id = format!("validation-{}", uuid::Uuid::new_v4());
+            let title = "验证 index.html 内联 CSS/JS".to_string();
+            bus.tool_call_created(tool_call_id.clone(), "validation".to_string(), format!("准备{title}"));
+            let step_id = bus.tool_started(tool_call_id.clone(), "validation".to_string(), format!("开始{title}"), None);
+            bus.tool_completed(
+                step_id,
+                tool_call_id,
+                "validation".to_string(),
+                inline_ok,
+                0,
+                if inline_ok {
+                    "index.html 包含内联 <style> 和 <script>".to_string()
+                } else {
+                    "index.html 未包含内联 <style> 和 <script>".to_string()
+                },
+                None,
+            );
+        }
+        if !inline_ok {
+            return Err(anyhow::anyhow!(
+                "验证失败：单文件网站需要 index.html 包含内联 <style> 和 <script>"
+            ));
+        }
+
+        Ok(Some(
+            "验证结果：\n- index.html 存在\n- index.html 包含内联 <style>\n- index.html 包含内联 <script>".to_string(),
+        ))
+    }
+
+    /// Internal tool execution — delegates to ToolRunner.
+    /// Handles both legacy ToolExecutionEvent and the new AgentRunEvent via EventBus.
+    async fn execute_tool_call_internal(
+        &self,
+        tool_call: &ToolCall,
+        args: &serde_json::Value,
+        event_bus: Option<EventBus>,
+    ) -> Result<(String, Option<ToolExecutionEvent>)> {
+        let runner = ToolRunner::new(self.tools, self.security)
+            .with_event_bus(event_bus)
+            .with_cancel_token(self.cancel_token.clone());
+        runner.run_tool(tool_call, args).await
+    }
 }
 
-fn is_command_output_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "shell" | "bash" | "run_command" | "Command" | "git_operations" | "git"
-    )
+/// E2E debug: returns the first `max_chars` chars of `s`, appending "..."
+/// if `s` was longer. Never slices in the middle of a UTF-8 codepoint.
+fn preview(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }

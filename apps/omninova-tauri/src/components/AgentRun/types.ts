@@ -8,13 +8,56 @@ export interface RunDiffStats {
   deletions: number;
 }
 
+export type AgentRunStepStatus = "running" | "success" | "error" | "warning";
+
+export interface AgentRunChangedFile {
+  path: string;
+  additions: number;
+  deletions: number;
+}
+
+export interface AgentRunPatchHunk {
+  path: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  additions: number;
+  deletions: number;
+  summary: string;
+}
+
+export interface AgentRunStep {
+  id: string;
+  tool_name: string;
+  title: string;
+  status: AgentRunStepStatus;
+  duration_ms?: number;
+  result_summary?: string;
+  outputs: string[];
+  changed_files: AgentRunChangedFile[];
+  patch_hunks: AgentRunPatchHunk[];
+  additions: number;
+  deletions: number;
+}
+
 export type AgentRunEvent =
   | AgentRunEventRunStarted
+  | AgentRunEventModelStarted
+  | AgentRunEventModelDelta
+  | AgentRunEventModelCompleted
+  | AgentRunEventToolCallCreated
   | AgentRunEventToolStarted
   | AgentRunEventToolCompleted
   | AgentRunEventCommandOutput
   | AgentRunEventFileChanged
+  | AgentRunEventPatchStarted
+  | AgentRunEventPatchHunk
+  | AgentRunEventPatchApplied
+  | AgentRunEventPatchFailed
   | AgentRunEventRunCompleted
+  | AgentRunEventRunFailed
+  | AgentRunEventRunCancelled
   | AgentRunEventError;
 
 export interface AgentRunEventRunStarted {
@@ -22,6 +65,36 @@ export interface AgentRunEventRunStarted {
   run_id: string;
   agent_name: string;
   session_id: string | null;
+}
+
+export interface AgentRunEventModelStarted {
+  type: "model_started";
+  run_id: string;
+  step_id: string;
+  title: string;
+}
+
+export interface AgentRunEventModelDelta {
+  type: "model_delta";
+  run_id: string;
+  step_id: string;
+  content: string;
+}
+
+export interface AgentRunEventModelCompleted {
+  type: "model_completed";
+  run_id: string;
+  step_id: string;
+  title: string;
+}
+
+export interface AgentRunEventToolCallCreated {
+  type: "tool_call_created";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  title: string;
 }
 
 export interface AgentRunEventToolStarted {
@@ -49,22 +122,82 @@ export interface AgentRunEventCommandOutput {
   tool_call_id: string;
   tool_name: string;
   output: string;
-  is_final: boolean;
+  is_stderr: boolean;
 }
 
 export interface AgentRunEventFileChanged {
   type: "file_changed";
   run_id: string;
+  step_id?: string;
+  tool_call_id?: string | null;
   path: string;
   additions: number;
   deletions: number;
+}
+
+export interface AgentRunEventPatchStarted {
+  type: "patch_started";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  path: string;
+  title: string;
+}
+
+export interface AgentRunEventPatchHunk {
+  type: "patch_hunk";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  path: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  additions: number;
+  deletions: number;
+  summary: string;
+}
+
+export interface AgentRunEventPatchApplied {
+  type: "patch_applied";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  path: string;
+  additions: number;
+  deletions: number;
+  hunks_count: number;
+  result_summary: string;
+}
+
+export interface AgentRunEventPatchFailed {
+  type: "patch_failed";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  path: string;
+  error: string;
 }
 
 export interface AgentRunEventRunCompleted {
   type: "run_completed";
   run_id: string;
   success: boolean;
+  reply?: string;
   reply_preview: string;
+}
+
+export interface AgentRunEventRunFailed {
+  type: "run_failed";
+  run_id: string;
+  error: string;
+}
+
+export interface AgentRunEventRunCancelled {
+  type: "run_cancelled";
+  run_id: string;
+  reason: string;
 }
 
 export interface AgentRunEventError {
@@ -101,7 +234,7 @@ export interface RunEventCommandOutput {
   tool_call_id?: string;
   tool_name: string;
   output: string;
-  is_final: boolean;
+  is_stderr: boolean;
 }
 
 export interface RunEventFileChanged {
@@ -116,16 +249,26 @@ export function getEventStatusLabel(
 ): string {
   switch (event.type) {
     case "run_started":
+    case "model_started":
+    case "model_delta":
+    case "tool_call_created":
     case "tool_started":
     case "command_output":
+    case "patch_started":
+    case "patch_hunk":
     case "toolStarted":
     case "commandOutput":
       return "running";
     case "run_completed":
+    case "model_completed":
     case "fileChanged":
     case "file_changed":
+    case "patch_applied":
       return "success";
     case "error":
+    case "run_failed":
+    case "run_cancelled":
+    case "patch_failed":
       return "error";
     case "tool_completed":
     case "toolCompleted":
@@ -146,6 +289,8 @@ export function getToolLabel(toolName: string): string {
     file_edit: "修改文件",
     edit_file: "修改文件",
     str_replace_editor: "修改文件",
+    file_patch: "修改文件",
+    apply_patch: "修改文件",
     file_list_enhanced: "列出文件",
     glob_search: "搜索文件",
     glob: "搜索文件",
