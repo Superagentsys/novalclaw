@@ -880,10 +880,19 @@ struct DepStatusPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SkillSummaryItem {
+    name: String,
+    description: String,
+    subdomain: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SkillsPackageSummaryPayload {
     dir: String,
     total: usize,
     names: Vec<String>,
+    items: Vec<SkillSummaryItem>,
 }
 
 #[tauri::command]
@@ -1073,11 +1082,37 @@ async fn skills_package_summary(
         .iter()
         .map(|skill| skill.metadata.name.clone())
         .collect::<Vec<_>>();
+    let items = skills
+        .iter()
+        .map(|skill| {
+            // Description can be long; truncate for a compact card.
+            let desc = skill.metadata.description.trim();
+            let description = if desc.chars().count() > 200 {
+                let truncated: String = desc.chars().take(200).collect();
+                format!("{truncated}…")
+            } else {
+                desc.to_string()
+            };
+            let subdomain = skill
+                .metadata
+                .metadata
+                .get("subdomain")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            SkillSummaryItem {
+                name: skill.metadata.name.clone(),
+                description,
+                subdomain,
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(SkillsPackageSummaryPayload {
         dir: target.to_string_lossy().into_owned(),
         total: names.len(),
         names,
+        items,
     })
 }
 
