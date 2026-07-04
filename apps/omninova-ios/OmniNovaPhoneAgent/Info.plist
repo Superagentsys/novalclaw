@@ -17,7 +17,7 @@
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.1.9.2</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
@@ -46,6 +46,13 @@
     <string>将来电语音转为文字，生成通话记录与关键信息摘要。</string>
     <key>NSContactsUsageDescription</key>
     <string>识别来电号码是否在通讯录中，辅助骚扰识别。</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>用于连接局域网内的 OmniNova 网关，实现通话助手与 Agent 对话。</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>UIBackgroundModes</key>
     <array>
         <string>audio</string>

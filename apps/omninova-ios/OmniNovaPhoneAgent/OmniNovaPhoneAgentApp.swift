@@ -11,6 +11,16 @@ struct OmniNovaPhoneAgentApp: App {
     @State private var spamDetector = SpamDetector()
     private let extractor = KeyInfoExtractor()
 
+    private func connectGatewayIfConfigured() async {
+        if let saved = AgentGatewayClient.loadSavedBaseURL() {
+            gatewayClient.configure(baseURL: saved)
+            await gatewayClient.checkConnection()
+            if gatewayClient.isConnected, let data = await gatewayClient.fetchSpamRules() {
+                spamDetector.updateRules(from: data)
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -29,9 +39,7 @@ struct OmniNovaPhoneAgentApp: App {
                             handleCallEnded(callUUID: uuid)
                         }
                     )
-                    if let data = await gatewayClient.fetchSpamRules() {
-                        spamDetector.updateRules(from: data)
-                    }
+                    await connectGatewayIfConfigured()
                 }
         }
     }

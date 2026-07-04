@@ -34,6 +34,10 @@ pub enum ChannelKind {
     Dingtalk,
     Email,
     Webhook,
+    /// iOS Phone Agent（VoIP / CallKit）
+    PhoneVoip,
+    /// Android Phone Agent（蜂窝 / Telecom）
+    CellularTelecom,
     Other(String),
 }
 
