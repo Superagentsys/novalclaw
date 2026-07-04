@@ -187,6 +187,25 @@ impl OpenAiProvider {
         }
     }
 
+    /// 构建 POST 请求。本地推理服务（如 Ollama / LM Studio）通常无需 API Key，
+    /// 因此仅在存在 credential 时附加 `Authorization` 头，否则不带鉴权直接请求。
+    fn authorized_post(&self, path: &str) -> reqwest::RequestBuilder {
+        let req = self.client.post(format!("{}{}", self.base_url, path));
+        match self.credential.as_ref() {
+            Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
+            None => req,
+        }
+    }
+
+    /// 构建 GET 请求，鉴权头处理同 [`authorized_post`]。
+    fn authorized_get(&self, path: &str) -> reqwest::RequestBuilder {
+        let req = self.client.get(format!("{}{}", self.base_url, path));
+        match self.credential.as_ref() {
+            Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
+            None => req,
+        }
+    }
+
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         tools
             .filter(|items| !items.is_empty())
@@ -370,10 +389,6 @@ impl Provider for OpenAiProvider {
     }
 
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or configure api_key.")
-        })?;
-
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
@@ -386,9 +401,7 @@ impl Provider for OpenAiProvider {
         };
 
         let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
+            .authorized_post("/chat/completions")
             .json(&native_request)
             .send()
             .await
@@ -435,10 +448,6 @@ impl Provider for OpenAiProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         use futures_util::StreamExt;
 
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or configure api_key.")
-        })?;
-
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
@@ -451,9 +460,7 @@ impl Provider for OpenAiProvider {
         };
 
         let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
+            .authorized_post("/chat/completions")
             .json(&native_request)
             .send()
             .await
@@ -572,15 +579,12 @@ impl Provider for OpenAiProvider {
     }
 
     async fn health_check(&self) -> bool {
-        if let Some(credential) = self.credential.as_ref() {
-            let response = self
-                .client
-                .get(format!("{}/models", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .send()
-                .await;
-            return response.map(|r| r.status().is_success()).unwrap_or(false);
-        }
-        true
+        // 无论是否配置 API Key 都真实探测 `/models`；本地服务（Ollama 等）
+        // 未启动时应如实返回不健康，而非因缺少 Key 而假报健康。
+        self.authorized_get("/models")
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 }

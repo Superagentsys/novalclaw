@@ -46,7 +46,7 @@
 # enabled = true
 #
 # [model_providers.ollama]
-# base_url = "http://localhost:11434"
+# base_url = "http://localhost:11434/v1"   # 需带 /v1（OpenAI 兼容端点）；本地服务无需 API Key
 # default_model = "llama3.2"
 # models = ["llama3.2", "qwen2.5", "deepseek-r1", "mistral"]
 # enabled = true

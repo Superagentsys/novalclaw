@@ -618,7 +618,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'ollama',
     name: 'Ollama (Local)',
     type: 'ollama',
-    base_url: 'http://localhost:11434',
+    base_url: 'http://localhost:11434/v1',
     models: [
       'llama3.2',
       'llama3.1',
