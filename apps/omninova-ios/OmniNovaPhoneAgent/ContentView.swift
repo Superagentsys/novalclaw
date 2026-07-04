@@ -8,8 +8,9 @@ struct ContentView: View {
     @Environment(AgentGatewayClient.self) private var gateway
     @Environment(AgentResponseSynthesizer.self) private var synthesizer
 
-    @State private var gatewayURL = "http://192.168.1.100:10809"
+    @AppStorage("omninova.gateway.url") private var gatewayURL = ""
     @State private var showSettings = false
+    @State private var connectionHint = ""
 
     var body: some View {
         NavigationStack {
@@ -31,6 +32,12 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) { settingsSheet }
+            .onAppear {
+                if !gatewayURL.isEmpty {
+                    gateway.configure(baseURL: gatewayURL)
+                    Task { await gateway.checkConnection() }
+                }
+            }
         }
     }
 
@@ -104,12 +111,26 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("OmniNova 网关") {
-                    TextField("地址", text: $gatewayURL)
+                    TextField("http://192.168.x.x:10809", text: $gatewayURL)
                         .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    Text("填写 Mac 局域网地址，网关需监听 0.0.0.0:10809")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     Button("连接") {
                         gateway.configure(baseURL: gatewayURL)
-                        Task { await gateway.checkConnection() }
+                        Task {
+                            await gateway.checkConnection()
+                            connectionHint = gateway.isConnected
+                                ? "已连接 \(gatewayURL)"
+                                : "连接失败，请确认 Mac 网关已启动且与 iPhone 在同一 Wi‑Fi"
+                        }
+                    }
+                    if !connectionHint.isEmpty {
+                        Text(connectionHint)
+                            .font(.caption)
+                            .foregroundStyle(gateway.isConnected ? .green : .orange)
                     }
                 }
                 Section("权限") {
@@ -124,8 +145,10 @@ struct ContentView: View {
                     }
                 }
                 Section("关于") {
-                    Text("OmniNova Phone Agent v0.1.0")
+                    Text("OmniNova Phone Agent v0.1.9.2")
                     Text("技能：phone-call-assistant")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("未签名 IPA 需 AltStore / Sideloadly 重签后安装")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -140,10 +163,22 @@ struct ContentView: View {
     }
 
     private func startSimulatedCall() {
+        guard gateway.isConnected else {
+            connectionHint = "请先连接 OmniNova 网关"
+            showSettings = true
+            return
+        }
         let sessionId = UUID().uuidString.lowercased()
         logStore.startSession(sessionId: sessionId, channel: .simulated)
-        do {
-            try speech.startListening(
+        Task {
+            await speech.requestAuthorization()
+            guard speech.authorizationStatus == .authorized else {
+                connectionHint = "需要麦克风与语音识别权限"
+                showSettings = true
+                return
+            }
+            do {
+                try speech.startListening(
                 onPartial: { partial in
                     logStore.appendTurn(sessionId: sessionId, role: "caller", text: partial, isFinal: false)
                 },
@@ -155,9 +190,10 @@ struct ContentView: View {
                         synthesizer.speak(reply)
                     }
                 }
-            )
-        } catch {
-            print("[SimCall] start failed: \(error)")
+                )
+            } catch {
+                print("[SimCall] start failed: \(error)")
+            }
         }
     }
 }

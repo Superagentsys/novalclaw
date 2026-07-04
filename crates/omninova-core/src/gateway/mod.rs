@@ -898,6 +898,18 @@ impl GatewayRuntime {
             .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
             .route("/api/doctor", get(http_api_doctor))
             .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
+            // Phone Agent (iOS/Android) compatibility API
+            .route("/api/health", get(http_health))
+            .route("/api/inbound", post(http_ingress))
+            .route("/api/webhook", post(http_phone_conversation_sync))
+            .route(
+                "/api/skill/phone-call-assistant/rules",
+                get(http_phone_spam_rules),
+            )
+            .route(
+                "/api/skill/phone-call-assistant/extract",
+                post(http_phone_extract_ack),
+            )
             .route("/metrics", get(http_metrics))
             .route("/ws/chat", get(ws::ws_chat_handler))
             .with_state(self);
@@ -1420,6 +1432,70 @@ async fn http_health(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<GatewayHealth>, Json<GatewayError>> {
     Ok(Json(runtime.health().await))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PhoneConversationSyncRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    session: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PhoneExtractRequest {
+    session_id: Option<String>,
+}
+
+/// iOS/Android 通话结束后上传会话 JSON（当前仅确认接收，抽取在端侧完成）。
+async fn http_phone_conversation_sync(
+    Json(body): Json<PhoneConversationSyncRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    if body.kind != "conversation_sync" {
+        return Err(Json(GatewayError {
+            message: format!("unsupported phone event type: {}", body.kind),
+        }));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 网关侧暂不重复抽取；端侧 `KeyInfoExtractor` 已处理，此处返回 ack。
+async fn http_phone_extract_ack(
+    Json(body): Json<PhoneExtractRequest>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "extraction handled on device",
+        "session_id": body.session_id
+    })))
+}
+
+fn resolve_phone_spam_rules_path(cfg: &Config) -> PathBuf {
+    if let Some(dir) = cfg.skills.open_skills_dir.as_ref() {
+        let candidate = PathBuf::from(dir).join("phone-call-assistant/spam_detection_rules.json");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("skills/phone-call-assistant/spam_detection_rules.json")
+}
+
+async fn http_phone_spam_rules(
+    State(runtime): State<GatewayRuntime>,
+) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+    let cfg = runtime.get_config().await;
+    let path = resolve_phone_spam_rules_path(&cfg);
+    let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        Json(GatewayError {
+            message: format!("phone spam rules not found at {}: {e}", path.display()),
+        })
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        Json(GatewayError {
+            message: format!("invalid phone spam rules JSON: {e}"),
+        })
+    })?;
+    Ok(Json(value))
 }
 
 async fn http_chat(

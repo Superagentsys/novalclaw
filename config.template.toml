@@ -194,10 +194,9 @@
 
 # --- Gateway ---
 # [gateway]
-# host = "127.0.0.1"
+# host = "0.0.0.0"          # 手机/局域网访问需监听所有网卡（默认 127.0.0.1 仅本机）
 # port = 10809
-# require_pairing = true
-# allow_public_bind = false
+# allow_public_bind = true  # 绑定 0.0.0.0 时建议开启
 # session_ttl_secs = 86400
 # max_sessions = 500
 # webhook_require_nonce = false

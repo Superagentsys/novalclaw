@@ -130,6 +130,8 @@ fn channel_name(channel: &ChannelKind) -> String {
         ChannelKind::Dingtalk => "dingtalk".to_string(),
         ChannelKind::Email => "email".to_string(),
         ChannelKind::Webhook => "webhook".to_string(),
+        ChannelKind::PhoneVoip => "phone_voip".to_string(),
+        ChannelKind::CellularTelecom => "cellular_telecom".to_string(),
         ChannelKind::Other(value) => value.to_lowercase(),
     }
 }
