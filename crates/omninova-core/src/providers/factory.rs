@@ -129,16 +129,33 @@ fn resolve_model(
     }
 }
 
+/// 归一化 OpenAI 兼容服务的 base_url。
+///
+/// `OpenAiProvider` 会拼接 `{base_url}/chat/completions`，因此 base_url 必须已包含
+/// `/v1`。Ollama 的原生端口 `http://localhost:11434` 常被直接填入，这里对本地
+/// OpenAI 兼容 provider 自动补上 `/v1`，避免请求打到错误路径（404）。
+fn normalize_openai_base_url(provider_name: &str, url: String) -> String {
+    let trimmed = url.trim().trim_end_matches('/').to_string();
+    let needs_v1 = matches!(provider_name, "ollama" | "lmstudio")
+        && !trimmed.ends_with("/v1")
+        && !trimmed.contains("/v1/");
+    if needs_v1 {
+        format!("{trimmed}/v1")
+    } else {
+        trimmed
+    }
+}
+
 fn resolve_base_url(
     provider_name: &str,
     config: &Config,
     profile: Option<&ModelProviderConfig>,
 ) -> Option<String> {
     if let Some(url) = profile.and_then(|p| p.base_url.clone()) {
-        return Some(url);
+        return Some(normalize_openai_base_url(provider_name, url));
     }
     if let Some(url) = config.api_url.clone() {
-        return Some(url);
+        return Some(normalize_openai_base_url(provider_name, url));
     }
     match provider_name {
         "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),

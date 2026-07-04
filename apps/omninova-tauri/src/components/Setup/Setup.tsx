@@ -84,6 +84,41 @@ const setupTabs: SetupTabItem[] = [
   { id: "persona", label: "Agent 人设", icon: "🧠" },
 ];
 
+/** 当仅启用一个 provider 时，自动设为 default_provider / default_model。 */
+function resolveDefaultProviderSelection(
+  providers: Config["providers"],
+  currentDefaultProvider: string,
+  currentDefaultModel: string
+): Pick<Config, "default_provider" | "default_model"> {
+  const enabled = providers.filter((provider) => provider.enabled);
+  const enabledIds = enabled.map((provider) => provider.id);
+
+  let defaultProvider = enabledIds.includes(currentDefaultProvider)
+    ? currentDefaultProvider
+    : "";
+
+  if (enabled.length === 1) {
+    defaultProvider = enabled[0].id;
+  }
+
+  const activeProvider = providers.find(
+    (provider) => provider.id === defaultProvider
+  );
+  let defaultModel =
+    activeProvider?.models.includes(currentDefaultModel)
+      ? currentDefaultModel
+      : "";
+
+  if (activeProvider && !defaultModel && activeProvider.models.length > 0) {
+    defaultModel = activeProvider.models[0];
+  }
+
+  return {
+    default_provider: defaultProvider,
+    default_model: defaultModel,
+  };
+}
+
 const SETUP_PAGE_META: Record<
   SetupTab,
   { title: string; subtitle: string }
@@ -171,28 +206,17 @@ export function Setup({
   );
 
   const handleProvidersChange = (providers: Config["providers"]) => {
-    const enabledProviderIds = providers
-      .filter((provider) => provider.enabled)
-      .map((provider) => provider.id);
-    const currentDefaultProvider = enabledProviderIds.includes(
-      config.default_provider ?? ""
-    )
-      ? config.default_provider
-      : "";
-    const currentProvider = providers.find(
-      (provider) => provider.id === currentDefaultProvider
-    );
-    const currentDefaultModel = currentProvider?.models.includes(
+    const { default_provider, default_model } = resolveDefaultProviderSelection(
+      providers,
+      config.default_provider ?? "",
       config.default_model ?? ""
-    )
-      ? config.default_model
-      : "";
+    );
 
     setConfig({
       ...config,
       providers,
-      default_provider: currentDefaultProvider,
-      default_model: currentDefaultModel,
+      default_provider,
+      default_model,
     });
   };
 
@@ -243,13 +267,24 @@ export function Setup({
         invokeTauri<GatewayStatus>("gateway_status"),
       ]);
 
-      setConfig({
+      const merged: Config = {
         ...initialConfig,
         ...nextConfig,
         robot: nextConfig.robot ?? DEFAULT_ROBOT_CONFIG,
         providers: nextConfig.providers ?? DEFAULT_PROVIDERS,
         skills: nextConfig.skills ?? initialConfig.skills,
         agent: nextConfig.agent ?? initialConfig.agent,
+      };
+      const { default_provider, default_model } = resolveDefaultProviderSelection(
+        merged.providers,
+        merged.default_provider ?? "",
+        merged.default_model ?? ""
+      );
+
+      setConfig({
+        ...merged,
+        default_provider,
+        default_model,
       });
       setGatewayStatus(nextGatewayStatus);
       setActionMessage("已加载当前配置。");
