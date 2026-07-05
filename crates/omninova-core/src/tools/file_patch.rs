@@ -26,6 +26,12 @@ struct PatchHunkOutput {
     additions: i32,
     deletions: i32,
     summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_text: Option<String>,
+    #[serde(default)]
+    text_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +61,27 @@ fn count_lines(text: &str) -> usize {
     } else {
         text.lines().count().max(1)
     }
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (index, ch) in input.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    (out, truncated)
+}
+
+fn text_preview(input: &str) -> (Option<String>, bool) {
+    if input.is_empty() {
+        return (None, false);
+    }
+    let (preview, truncated) = truncate_chars(input, 8_000);
+    (Some(preview), truncated)
 }
 
 fn line_start_offset(text: &str, one_based_line: usize) -> Option<usize> {
@@ -88,6 +115,7 @@ fn line_range_offset(text: &str, one_based_line: usize, line_count: usize) -> Op
 
 fn apply_hunk(content: &mut String, hunk: &PatchHunkInput) -> anyhow::Result<PatchHunkOutput> {
     let old_text = hunk.old_text.clone().unwrap_or_default();
+    let captured_old_text: String;
     let summary = hunk
         .summary
         .clone()
@@ -102,6 +130,7 @@ fn apply_hunk(content: &mut String, hunk: &PatchHunkInput) -> anyhow::Result<Pat
             let old_start = content[..byte_start].lines().count() + 1;
             let old_lines = count_lines(&old_text);
             let new_lines = count_lines(&hunk.new_text);
+            captured_old_text = old_text.clone();
             content.replace_range(byte_start..byte_end, &hunk.new_text);
             (
                 old_start,
@@ -120,6 +149,7 @@ fn apply_hunk(content: &mut String, hunk: &PatchHunkInput) -> anyhow::Result<Pat
                 anyhow::bail!("patch hunk line range is outside file: {summary}");
             };
             let new_lines = count_lines(&hunk.new_text);
+            captured_old_text = content[byte_start..byte_end].to_string();
             content.replace_range(byte_start..byte_end, &hunk.new_text);
             (
                 old_start,
@@ -130,6 +160,8 @@ fn apply_hunk(content: &mut String, hunk: &PatchHunkInput) -> anyhow::Result<Pat
                 old_lines.saturating_sub(new_lines) as i32,
             )
         };
+    let (old_text_preview, old_truncated) = text_preview(&captured_old_text);
+    let (new_text_preview, new_truncated) = text_preview(&hunk.new_text);
 
     Ok(PatchHunkOutput {
         old_start,
@@ -139,6 +171,9 @@ fn apply_hunk(content: &mut String, hunk: &PatchHunkInput) -> anyhow::Result<Pat
         additions,
         deletions,
         summary,
+        old_text: old_text_preview,
+        new_text: new_text_preview,
+        text_truncated: old_truncated || new_truncated,
     })
 }
 

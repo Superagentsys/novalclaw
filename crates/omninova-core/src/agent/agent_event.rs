@@ -116,6 +116,16 @@ pub enum AgentRunEvent {
         deletions: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         change_type: Option<ChangeType>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_text: Option<String>,
+        #[serde(default)]
+        content_truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_total_chars: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_preview_chars: Option<usize>,
     },
 
     /// A structured patch is about to be applied to a file.
@@ -140,6 +150,12 @@ pub enum AgentRunEvent {
         additions: i32,
         deletions: i32,
         summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_text: Option<String>,
+        #[serde(default)]
+        text_truncated: bool,
     },
 
     /// A structured patch was applied successfully.

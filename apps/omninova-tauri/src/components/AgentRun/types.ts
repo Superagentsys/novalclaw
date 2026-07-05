@@ -25,6 +25,9 @@ export interface AgentRunPatchHunk {
   additions: number;
   deletions: number;
   summary: string;
+  old_text?: string;
+  new_text?: string;
+  text_truncated?: boolean;
 }
 
 export interface AgentRunStep {
@@ -133,6 +136,12 @@ export interface AgentRunEventFileChanged {
   path: string;
   additions: number;
   deletions: number;
+  change_type?: "created" | "modified" | "deleted" | "added" | "removed";
+  old_text?: string;
+  new_text?: string;
+  content_truncated?: boolean;
+  content_total_chars?: number;
+  content_preview_chars?: number;
 }
 
 export interface AgentRunEventPatchStarted {
@@ -157,6 +166,9 @@ export interface AgentRunEventPatchHunk {
   additions: number;
   deletions: number;
   summary: string;
+  old_text?: string;
+  new_text?: string;
+  text_truncated?: boolean;
 }
 
 export interface AgentRunEventPatchApplied {

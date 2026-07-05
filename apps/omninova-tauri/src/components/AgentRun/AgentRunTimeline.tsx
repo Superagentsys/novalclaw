@@ -2,6 +2,8 @@ import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "
 import { listen } from "@tauri-apps/api/event";
 import type { AgentRunChangedFile, AgentRunEvent, AgentRunStep, RunEvent } from "./types";
 import { AgentRunEventCard } from "./AgentRunEventCard";
+import { AgentDiffPanel } from "../AgentDiff/AgentDiffPanel";
+import { buildAgentDiffState } from "../AgentDiff/diffStore";
 
 type RawEvent = RunEvent | AgentRunEvent | Record<string, unknown>;
 
@@ -511,6 +513,7 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
       [events, liveEvents, liveSessionId]
     );
     const steps = useMemo(() => aggregateSteps(rawEvents), [rawEvents]);
+    const diffState = useMemo(() => buildAgentDiffState(rawEvents), [rawEvents]);
     const running = isRunning || isLiveRunning;
     const elapsed = liveSessionId ? liveElapsed : elapsedSec;
     const status = overallStatus(rawEvents, steps, running);
@@ -548,6 +551,7 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
 
         {!collapsed && (
           <div className="agent-run-steps">
+            <AgentDiffPanel diffState={diffState} />
             {steps.length > 0 ? (
               steps.map((step) => <AgentRunEventCard key={step.id} step={step} />)
             ) : (

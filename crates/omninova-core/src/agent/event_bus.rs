@@ -207,6 +207,11 @@ impl EventBus {
         additions: i32,
         deletions: i32,
         change_type: Option<crate::agent::agent_event::ChangeType>,
+        old_text: Option<String>,
+        new_text: Option<String>,
+        content_truncated: bool,
+        content_total_chars: Option<usize>,
+        content_preview_chars: Option<usize>,
     ) {
         self.emit(AgentRunEvent::file_changed {
             run_id: self.inner.run_id.clone(),
@@ -216,6 +221,11 @@ impl EventBus {
             additions,
             deletions,
             change_type,
+            old_text,
+            new_text,
+            content_truncated,
+            content_total_chars,
+            content_preview_chars,
         });
     }
 
@@ -248,6 +258,9 @@ impl EventBus {
         additions: i32,
         deletions: i32,
         summary: String,
+        old_text: Option<String>,
+        new_text: Option<String>,
+        text_truncated: bool,
     ) {
         self.emit(AgentRunEvent::patch_hunk {
             run_id: self.inner.run_id.clone(),
@@ -261,6 +274,9 @@ impl EventBus {
             additions,
             deletions,
             summary,
+            old_text,
+            new_text,
+            text_truncated,
         });
     }
 

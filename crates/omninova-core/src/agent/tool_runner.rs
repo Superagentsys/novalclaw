@@ -59,6 +59,34 @@ fn patch_diff_stats(output: &str) -> Option<DiffStats> {
     })
 }
 
+fn file_write_output(output: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    if value.get("path").and_then(|v| v.as_str()).is_some()
+        && value.get("new_text").is_some()
+        && value.get("change_type").is_some()
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn file_write_diff_stats(output: &str) -> Option<DiffStats> {
+    let value = file_write_output(output)?;
+    Some(DiffStats {
+        additions: value.get("additions").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        deletions: value.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+    })
+}
+
+fn file_write_change_type(value: &serde_json::Value) -> ChangeType {
+    match value.get("change_type").and_then(|v| v.as_str()).unwrap_or("modified") {
+        "created" | "added" => ChangeType::Created,
+        "deleted" | "removed" => ChangeType::Deleted,
+        _ => ChangeType::Modified,
+    }
+}
+
 /// Unified tool runner — the single entry point for all tool executions
 /// in the agent runtime.
 ///
@@ -320,6 +348,11 @@ impl<'a> ToolRunner<'a> {
                                 additions: ds.additions,
                                 deletions: ds.deletions,
                             })
+                        } else if is_file_write {
+                            file_write_diff_stats(&output).map(|ds| FileDiffStats {
+                                additions: ds.additions,
+                                deletions: ds.deletions,
+                            })
                         } else {
                             None
                         }
@@ -354,6 +387,9 @@ impl<'a> ToolRunner<'a> {
                                             hunk.get("additions").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                                             hunk.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                                             hunk.get("summary").and_then(|v| v.as_str()).unwrap_or("局部修改").to_string(),
+                                            hunk.get("old_text").and_then(|v| v.as_str()).map(str::to_string),
+                                            hunk.get("new_text").and_then(|v| v.as_str()).map(str::to_string),
+                                            hunk.get("text_truncated").and_then(|v| v.as_bool()).unwrap_or(false),
                                         );
                                     }
                                 }
@@ -376,6 +412,11 @@ impl<'a> ToolRunner<'a> {
                                     additions,
                                     deletions,
                                     Some(ChangeType::Modified),
+                                    None,
+                                    None,
+                                    false,
+                                    None,
+                                    None,
                                 );
                             }
                         } else {
@@ -390,23 +431,51 @@ impl<'a> ToolRunner<'a> {
                     // file_changed for write/edit tools.
                     if is_file_write {
                         let path = tool_path_arg(args);
+                        let write_output = file_write_output(&output);
 
                         if let Some(ref ds) = diff_stats {
+                            let change_type = write_output
+                                .as_ref()
+                                .map(file_write_change_type)
+                                .unwrap_or_else(|| {
+                                    if is_success
+                                        && (output.contains("created")
+                                            || output.contains("写入成功")
+                                            || output.contains("已创建"))
+                                    {
+                                        ChangeType::Created
+                                    } else {
+                                        ChangeType::Modified
+                                    }
+                                });
+                            let old_text = write_output
+                                .as_ref()
+                                .and_then(|value| value.get("old_text").and_then(|v| v.as_str()).map(str::to_string));
+                            let new_text = write_output
+                                .as_ref()
+                                .and_then(|value| value.get("new_text").and_then(|v| v.as_str()).map(str::to_string));
+                            let content_truncated = write_output
+                                .as_ref()
+                                .and_then(|value| value.get("content_truncated").and_then(|v| v.as_bool()))
+                                .unwrap_or(false);
+                            let content_total_chars = write_output
+                                .as_ref()
+                                .and_then(|value| value.get("content_total_chars").and_then(|v| v.as_u64()).map(|n| n as usize));
+                            let content_preview_chars = write_output
+                                .as_ref()
+                                .and_then(|value| value.get("content_preview_chars").and_then(|v| v.as_u64()).map(|n| n as usize));
                             bus.file_changed(
                                 step_id.clone(),
                                 Some(tool_call.id.clone()),
                                 path.clone(),
                                 ds.additions,
                                 ds.deletions,
-                                Some(if is_success
-                                    && (output.contains("created")
-                                        || output.contains("写入成功")
-                                        || output.contains("已创建"))
-                                {
-                                    ChangeType::Created
-                                } else {
-                                    ChangeType::Modified
-                                }),
+                                Some(change_type),
+                                old_text,
+                                new_text,
+                                content_truncated,
+                                content_total_chars,
+                                content_preview_chars,
                             );
                         } else if let Some(ds) = compute_content_diff(&tool_call.name, args, &output) {
                             bus.file_changed(
@@ -415,6 +484,11 @@ impl<'a> ToolRunner<'a> {
                                 path,
                                 ds.additions,
                                 ds.deletions,
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
                                 None,
                             );
                         }
