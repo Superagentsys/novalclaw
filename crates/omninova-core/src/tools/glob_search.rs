@@ -46,11 +46,16 @@ impl Tool for GlobSearchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
 
-        if pattern.contains("..") || pattern.starts_with('/') {
+        let bytes = pattern.as_bytes();
+        let is_windows_absolute = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/');
+        if pattern.contains("..") || pattern.starts_with('/') || pattern.starts_with('\\') || is_windows_absolute {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Pattern must not contain '..' or start with '/'".to_string()),
+                error: Some("Pattern must be workspace-relative and must not contain '..' or absolute paths".to_string()),
             });
         }
 

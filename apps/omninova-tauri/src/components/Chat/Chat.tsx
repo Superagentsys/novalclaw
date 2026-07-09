@@ -1,6 +1,8 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { invokeTauri } from "../../utils/tauri";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   isTauriEnvironment,
   pickComposerAttachmentPaths,
@@ -18,14 +20,18 @@ import {
   type StoredChatMessage,
 } from "../../utils/chatStorage";
 import type {
+  AgentRunEvent,
+} from "../AgentRun/types";
+import type {
+  AgentPersonaConfig,
   Config,
-  GatewayHealth,
   GatewayInboundResponse,
   GatewayStatus,
-  ProviderHealthSummary,
   ExecutionStep,
   RouteDecision,
+  WorkspaceStatus,
 } from "../../types/config";
+import { AgentRunTimeline } from "../AgentRun/AgentRunTimeline";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -110,6 +116,19 @@ const TEXT_FILE_EXTENSIONS = new Set([
 function fileExtensionLower(name: string): string {
   const i = name.lastIndexOf(".");
   return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+function workspaceBasename(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.at(-1) ?? path;
+}
+
+function summarizeWorkspacePath(path: string | null | undefined): string {
+  if (!path) return "选择 Workspace";
+  const name = workspaceBasename(path);
+  if (name.length <= 24) return name;
+  return `${name.slice(0, 10)}…${name.slice(-10)}`;
 }
 
 function isProbablyTextFile(file: File): boolean {
@@ -250,7 +269,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 输入草稿与运行状态按会话隔离，避免一个会话影响其它会话。
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [runs, setRuns] = useState<
-    Record<string, { elapsedSec: number; steps: ExecutionStep[] }>
+    Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string; longRunning?: boolean }>
   >({});
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
@@ -263,13 +282,42 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 每个会话独立的取消标志与计时器。
   const cancelledRef = useRef<Record<string, boolean>>({});
   const elapsedTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+  const safetyTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const runAvatarIdsRef = useRef<Record<string, string>>({});
+  const activeRunIdRef = useRef<string | null>(null);
+  const terminalRunIdsRef = useRef<Set<string>>(new Set());
+  const completedRunIdsRef = useRef<Set<string>>(new Set());
+  const insertedReplyRunIdsRef = useRef<Set<string>>(new Set());
+  const runsRef = useRef(runs);
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [desktopVisionMaster, setDesktopVisionMaster] = useState(false);
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
   const [desktopVisionMaxPx, setDesktopVisionMaxPx] = useState(1280);
+  const [workspaceDir, setWorkspaceDir] = useState<string | null>(null);
+  const [workspaceSource, setWorkspaceSource] = useState<"agent" | "global" | null>(null);
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  /**
+   * Session-level temporary workspace. Set by the chat-page Workspace button
+   * without modifying the agent's default workspace. This takes the highest
+   * priority when the Agent processes a message (higher than per-agent or
+   * global workspace_dir).
+   */
+  const [sessionWorkspaceDirs, setSessionWorkspaceDirs] = useState<Record<string, string>>({});
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
+  const sessionWorkspaceDir = sessionWorkspaceDirs[activeAvatarId] ?? null;
+  const activeWorkspaceDir = sessionWorkspaceDir ?? workspaceDir;
+  const workspaceSummary = summarizeWorkspacePath(activeWorkspaceDir);
+  const workspaceLabel = sessionWorkspaceDir
+    ? "临时"
+    : workspaceSource === "agent"
+      ? "Agent"
+      : workspaceSource === "global"
+        ? "全局"
+        : "Workspace";
   const messages = useMemo(
     () => messagesBySession[activeAvatarId] ?? [],
     [messagesBySession, activeAvatarId]
@@ -280,7 +328,92 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const sending = Boolean(activeRun);
   const elapsedSec = activeRun?.elapsedSec ?? 0;
   const activeSteps = activeRun?.steps ?? [];
+  const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
+
+  useEffect(() => {
+    runsRef.current = runs;
+  }, [runs]);
+
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
+
+  const findAvatarIdByRunId = useCallback((runId: string): string | null => {
+    const mapped = runAvatarIdsRef.current[runId];
+    if (mapped) return mapped;
+    const entry = Object.entries(runsRef.current).find(([, run]) => run.runId === runId);
+    return entry?.[0] ?? null;
+  }, []);
+
+  const finishRun = useCallback(
+    (runId: string) => {
+      const avatarId = findAvatarIdByRunId(runId);
+      terminalRunIdsRef.current.add(runId);
+
+      const safetyTimer = safetyTimersRef.current[runId];
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        delete safetyTimersRef.current[runId];
+      }
+
+      if (avatarId) {
+        const elapsedTimer = elapsedTimersRef.current[avatarId];
+        if (elapsedTimer) {
+          clearInterval(elapsedTimer);
+          delete elapsedTimersRef.current[avatarId];
+        }
+      }
+
+      setRuns((prev) => {
+        const targetAvatarId =
+          avatarId ??
+          Object.entries(prev).find(([, run]) => run.runId === runId)?.[0] ??
+          null;
+        if (!targetAvatarId) return prev;
+        const currentRun = prev[targetAvatarId];
+        if (!currentRun || currentRun.runId !== runId) return prev;
+        const next = { ...prev };
+        delete next[targetAvatarId];
+        runsRef.current = next;
+        return next;
+      });
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+      }
+      if (avatarId) {
+        cancelledRef.current[avatarId] = false;
+      }
+      delete runAvatarIdsRef.current[runId];
+    },
+    [findAvatarIdByRunId]
+  );
+
+  const appendAssistantMessageOnce = useCallback(
+    (runId: string, content: string, avatarId: string) => {
+      const reply = content.trim();
+      if (!reply || insertedReplyRunIdsRef.current.has(runId)) return false;
+      insertedReplyRunIdsRef.current.add(runId);
+
+      setMessagesBySession((prev) => ({
+        ...prev,
+        [avatarId]: [
+          ...(prev[avatarId] ?? []),
+          {
+            role: "assistant",
+            content: reply,
+          },
+        ],
+      }));
+      setAvatars((prev) =>
+        prev.map((a) =>
+          a.id === avatarId ? { ...a, lastAt: formatTime(new Date()) } : a
+        )
+      );
+      return true;
+    },
+    []
+  );
 
   const setActiveInput = useCallback(
     (value: string) =>
@@ -390,12 +523,37 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, [activeAvatarId, sessionId, gatewayStatus, loadSessionHistory]);
 
   useEffect(() => {
+    if (!workspaceMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && workspaceMenuRef.current?.contains(target)) return;
+      setWorkspaceMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setWorkspaceMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [workspaceMenuOpen]);
+
+  useEffect(() => {
     void invokeTauri<Config>("get_setup_config")
       .then((cfg) => {
         const master = cfg.multimodal?.desktop_vision_enabled ?? false;
         const maxPx = cfg.multimodal?.desktop_vision_max_dimension_px ?? 1280;
         setDesktopVisionMaster(master);
         setDesktopVisionMaxPx(maxPx);
+        const agentWorkspace = cfg.agent?.workspace_dir ?? null;
+        const globalWorkspace = cfg.workspace_dir ?? null;
+        setWorkspaceDir(agentWorkspace || globalWorkspace || null);
+        setWorkspaceSource(agentWorkspace ? "agent" : globalWorkspace ? "global" : null);
+        setWorkspaceStatus(cfg.workspace_status ?? null);
         const stored = localStorage.getItem(DESKTOP_VISION_SESSION_KEY);
         if (stored === "1") setDesktopVisionOn(true);
         else if (stored === "0") setDesktopVisionOn(false);
@@ -419,16 +577,189 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, []);
 
   useEffect(() => {
-    if (!stickToBottomRef.current && !sending) return;
+    if (!stickToBottomRef.current) return;
     scrollMessagesToEnd("auto");
   }, [messages, sending, activeSteps, elapsedSec, scrollMessagesToEnd]);
+
+  // 窗口缩放导致消息重新换行时，保持视口顶部正在浏览的消息位置不变。
+  useEffect(() => {
+    const container = messagesScrollRef.current;
+    if (!container) return;
+
+    type ScrollAnchor = {
+      element: HTMLElement;
+      offsetTop: number;
+    };
+
+    let anchor: ScrollAnchor | null = null;
+    let adjusting = false;
+
+    const captureAnchor = () => {
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (distanceFromBottom < 80) {
+        anchor = null;
+        return;
+      }
+
+      const containerTop = container.getBoundingClientRect().top;
+      const bubbles = container.querySelectorAll<HTMLElement>(".chat-bubble");
+      let firstVisible: HTMLElement | null = null;
+      let low = 0;
+      let high = bubbles.length - 1;
+
+      while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        const bubble = bubbles.item(middle);
+        if (bubble.getBoundingClientRect().bottom > containerTop) {
+          firstVisible = bubble;
+          high = middle - 1;
+        } else {
+          low = middle + 1;
+        }
+      }
+
+      anchor = firstVisible
+        ? {
+            element: firstVisible,
+            offsetTop: firstVisible.getBoundingClientRect().top - containerTop,
+          }
+        : null;
+    };
+
+    const handleScroll = () => {
+      if (!adjusting) captureAnchor();
+    };
+
+    captureAnchor();
+    container.addEventListener("scroll", handleScroll, { passive: true });
+
+    const ro = new ResizeObserver(() => {
+      adjusting = true;
+
+      if (stickToBottomRef.current) {
+        container.scrollTop = container.scrollHeight;
+      } else if (anchor?.element.isConnected) {
+        const currentOffsetTop =
+          anchor.element.getBoundingClientRect().top -
+          container.getBoundingClientRect().top;
+        container.scrollTop += currentOffsetTop - anchor.offsetTop;
+      }
+
+      captureAnchor();
+      adjusting = false;
+    });
+
+    ro.observe(container);
+    return () => {
+      ro.disconnect();
+      container.removeEventListener("scroll", handleScroll);
+    };
+  }, []);
 
   useEffect(() => {
     const timers = elapsedTimersRef.current;
     return () => {
       Object.values(timers).forEach((timer) => clearInterval(timer));
+      Object.values(safetyTimersRef.current).forEach((timer) => clearTimeout(timer));
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listen<AgentRunEvent | Record<string, unknown>>("agent-run-event", (event) => {
+      const payload = event.payload as AgentRunEvent & {
+        type?: string;
+        run_id?: string;
+        reply?: string;
+        reply_preview?: string;
+        error?: string;
+        message?: string;
+      };
+      const runId = payload.run_id;
+      if (import.meta.env.DEV && payload.type !== "model_delta") {
+        console.log("[chat-agent-run-event payload]", payload);
+      }
+      if (disposed || !runId) return;
+
+      const eventType = payload.type;
+      const isTerminalEvent =
+        eventType === "run_completed" ||
+        eventType === "run_failed" ||
+        eventType === "run_cancelled" ||
+        eventType === "error";
+      if (terminalRunIdsRef.current.has(runId) && !isTerminalEvent) {
+        if (import.meta.env.DEV && payload.type !== "model_delta") {
+          console.debug("[chat-agent-run-event ignored after terminal]", payload);
+        }
+        return;
+      }
+      if (
+        !isTerminalEvent
+      ) {
+        return;
+      }
+
+      const avatarId = findAvatarIdByRunId(runId);
+      if (!avatarId) {
+        finishRun(runId);
+        return;
+      }
+      terminalRunIdsRef.current.add(runId);
+
+      if (eventType === "run_completed") {
+        if (!completedRunIdsRef.current.has(runId)) {
+          completedRunIdsRef.current.add(runId);
+          const finalReply = payload.reply || payload.reply_preview || "";
+          if (import.meta.env.DEV) {
+            console.log("[appendAssistantMessageOnce] run_id=" + runId + " reply_len=" + finalReply.length);
+          }
+          if (!cancelledRef.current[avatarId]) {
+            appendAssistantMessageOnce(runId, finalReply, avatarId);
+          }
+        }
+        if (import.meta.env.DEV) {
+          console.log("[finishRun] run_id=" + runId);
+        }
+        finishRun(runId);
+        return;
+      }
+
+      if (eventType === "run_cancelled") {
+        if (!completedRunIdsRef.current.has(runId)) {
+          completedRunIdsRef.current.add(runId);
+          appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
+        }
+        finishRun(runId);
+        return;
+      }
+
+      if (!completedRunIdsRef.current.has(runId)) {
+        completedRunIdsRef.current.add(runId);
+        const rawError = payload.error || payload.message || "Agent run failed";
+        setError(rawError);
+        if (!cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
+        }
+      }
+      finishRun(runId);
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [appendAssistantMessageOnce, findAvatarIdByRunId, finishRun]);
 
   const refreshGatewayStatus = async () => {
     try {
@@ -491,6 +822,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         return next;
       });
       setInputs((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setSessionWorkspaceDirs((prev) => {
+        if (!prev[id]) return prev;
         const next = { ...prev };
         delete next[id];
         return next;
@@ -579,9 +916,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   };
 
   const handleCancel = useCallback(() => {
-    // 仅取消当前查看的会话。
+    if (!activeRunId) return;
     cancelledRef.current[activeAvatarId] = true;
-  }, [activeAvatarId]);
+    void invokeTauri<void>("cancel_agent_run", { runId: activeRunId }).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(`取消失败：${message}`);
+    });
+  }, [activeAvatarId, activeRunId]);
 
   const handleSend = async () => {
     // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
@@ -589,7 +930,20 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     const avatarId = activeAvatarId;
     const targetSessionId = sessionId;
     const text = input.trim();
-    if (!text || runs[avatarId]) return;
+    const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
+    if (active && terminalRunIdsRef.current.has(active)) {
+      finishRun(active);
+    } else if (active) {
+      setError("当前 Agent 仍在执行，请等待完成或取消。");
+      return;
+    }
+    if (!text) return;
+    // Generate a run_id for real-time event correlation.
+    const runId = crypto.randomUUID();
+    runAvatarIdsRef.current[runId] = avatarId;
+    if (import.meta.env.DEV) {
+      console.log("[agent-run-id]", runId);
+    }
 
     if (gatewayStatus !== "connected") {
       setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
@@ -603,11 +957,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     ];
     const writeSteps = (steps: ExecutionStep[]) => {
       localSteps = steps;
-      setRuns((prev) =>
-        prev[avatarId]
+      setRuns((prev) => {
+        const next = prev[avatarId]
           ? { ...prev, [avatarId]: { ...prev[avatarId], steps } }
-          : prev
-      );
+          : prev;
+        runsRef.current = next;
+        return next;
+      });
     };
     const updateStep = (
       title: string,
@@ -622,24 +978,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           : localSteps.map((step, i) => (i === idx ? nextStep : step))
       );
     };
-    const finishRun = () => {
-      const timer = elapsedTimersRef.current[avatarId];
-      if (timer) {
-        clearInterval(timer);
-        delete elapsedTimersRef.current[avatarId];
-      }
-      setRuns((prev) => {
-        if (!prev[avatarId]) return prev;
-        const next = { ...prev };
-        delete next[avatarId];
-        return next;
-      });
-    };
-
     setActiveInput("");
     setError(null);
     cancelledRef.current[avatarId] = false;
-    setRuns((prev) => ({ ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps } }));
+    activeRunIdRef.current = runId;
+    setRuns((prev) => {
+      const next = { ...prev, [avatarId]: { elapsedSec: 0, steps: localSteps, runId } };
+      runsRef.current = next;
+      return next;
+    });
 
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
@@ -653,8 +1000,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     );
 
     elapsedTimersRef.current[avatarId] = setInterval(() => {
-      setRuns((prev) =>
-        prev[avatarId]
+      setRuns((prev) => {
+        const next = prev[avatarId]
           ? {
               ...prev,
               [avatarId]: {
@@ -662,14 +1009,22 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                 elapsedSec: prev[avatarId].elapsedSec + 1,
               },
             }
-          : prev
-      );
+          : prev;
+        runsRef.current = next;
+        return next;
+      });
     }, 1000);
 
     let route: RouteDecision | null = null;
+
     try {
       const metadata: Record<string, unknown> = {
         preferred_provider: selectedModel === "auto" ? undefined : selectedModel,
+        // Session-scoped temporary workspace (takes highest priority in the backend).
+        // Clears when the user closes the app or starts a new session.
+        ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
+        // Run ID for real-time event correlation between frontend and backend.
+        run_id: runId,
       };
 
       if (desktopVisionOn && desktopVisionMaster && isTauriEnvironment()) {
@@ -689,7 +1044,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           const msg = err instanceof Error ? err.message : String(err);
           updateStep("桌面视觉", "error", msg);
           setError(`桌面截图失败：${msg}`);
-          finishRun();
+          finishRun(runId);
           setMessagesBySession((prev) => ({
             ...prev,
             [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
@@ -719,56 +1074,49 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         updateStep("路由选择", "done", "路由预览不可用，交由网关处理");
       }
       updateStep("Agent 执行", "running", "正在调用模型和工具；界面不设置超时，会持续等待后端完成");
-      const result = await invokeTauri<GatewayInboundResponse>("process_inbound_message", {
-        payload,
-      });
+      // Long-running notice only. This must not finish the run.
+      safetyTimersRef.current[runId] = setTimeout(() => {
+        if (import.meta.env.DEV) {
+          console.warn("[handleSend] LONG RUN still running run_id=" + runId);
+        }
+        setRuns((prev) => {
+          const current = prev[avatarId];
+          if (!current || current.runId !== runId) return prev;
+          const next = { ...prev, [avatarId]: { ...current, longRunning: true } };
+          runsRef.current = next;
+          return next;
+        });
+        updateStep("Agent 仍在执行", "running", "Agent 仍在生成页面代码，耗时较长，可继续等待或点击取消。");
+      }, 30_000);
+        if (import.meta.env.DEV) {
+          console.log("[handleSend] BEFORE_INVOKE run_id=" + runId + " ts=" + Date.now());
+        }
+        void invokeTauri<GatewayInboundResponse>("process_inbound_message_streaming", {
+          payload,
+        }).then((result) => {
+          if (import.meta.env.DEV) {
+            console.log("[handleSend] AFTER_INVOKE run_id=" + runId + " ts=" + Date.now());
+            console.log("[handleSend] resolved run_id=" + runId + " reply_len=" + (result?.reply?.length ?? -1));
+          }
 
-      if (cancelledRef.current[avatarId]) {
-        setMessagesBySession((prev) => ({
-          ...prev,
-          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
-        }));
-        setInputs((prev) => ({ ...prev, [avatarId]: text }));
-        return;
-      }
-
-      const replyText = result?.reply || "(空回复)";
-      const steps = result?.steps?.length ? result.steps : localSteps;
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [avatarId]: [
-          ...(prev[avatarId] ?? []),
-          {
-            role: "assistant",
-            content: replyText,
-            agent: result?.route?.agent_name,
-            steps,
-          },
-        ],
-      }));
+          // Normal completion is driven only by terminal agent-run-event payloads:
+          // run_completed / run_failed / run_cancelled. The invoke Promise may
+          // resolve late or never resolve, so it must not mutate chat completion state.
+        })
+        .catch((e) => {
+          if (import.meta.env.DEV) {
+            console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
+          }
+          // The Tauri command emits run_failed for backend errors when a run_id exists.
+          // Chat cleanup still happens only from that terminal event.
+        });
     } catch (e) {
-      if (cancelledRef.current[avatarId]) {
-        setMessagesBySession((prev) => ({
-          ...prev,
-          [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
-        }));
-        setInputs((prev) => ({ ...prev, [avatarId]: text }));
-        return;
+      if (import.meta.env.DEV) {
+        console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
-
-      const msg = e instanceof Error ? e.message : String(e);
-      const errorDetail = await buildSendErrorMessage(msg, route);
-      const errorContent = `发送失败：${errorDetail}`;
-      setError(errorContent);
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [avatarId]: [
-          ...(prev[avatarId] ?? []),
-          { role: "error", content: errorContent },
-        ],
-      }));
+      finishRun(runId);
     } finally {
-      finishRun();
+      // outer finally (safety timer cleanup)
     }
   };
 
@@ -862,6 +1210,98 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, [mergePathsIntoInput]);
+
+  /**
+   * Chat-page Workspace button — two modes:
+   * 1. Shift+click  → save to agent config (persistent, survives session)
+   * 2. plain click  → session-scoped temporary workspace (highest priority,
+   *                    resets on app restart / new chat session)
+   *
+   * Requirement #11: "聊天页点 Workspace 按钮选目录，只作为当前会话临时
+   * workspace，不要强制覆盖 Agent 默认 workspace，除非用户点击'保存到该 Agent'。"
+   */
+  const handleChooseWorkspace = useCallback(async (event?: React.MouseEvent) => {
+    const saveToAgent = event?.shiftKey ?? false;
+    setWorkspaceMenuOpen(false);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: saveToAgent ? "选择该 Agent 的 Workspace 目录" : "选择临时 Workspace 目录",
+      });
+      if (selected == null) return;
+      const dir = selected as string;
+
+      if (saveToAgent) {
+        // Save to the agent config (persistent).
+        const current = await invokeTauri<Config>("get_setup_config").catch(() => null);
+        const next: Config = {
+          ...(current ?? ({} as Config)),
+          agent: {
+            ...(current?.agent ?? {}),
+            workspace_dir: dir,
+          } as AgentPersonaConfig,
+        };
+        const saveResult = await invokeTauri<{ gateway_restarted: boolean }>(
+          "save_setup_config",
+          { config: next }
+        );
+        setWorkspaceDir(dir);
+        setWorkspaceSource("agent");
+        setSessionWorkspaceDirs((prev) => {
+          if (!prev[activeAvatarId]) return prev;
+          const next = { ...prev };
+          delete next[activeAvatarId];
+          return next;
+        });
+        if (saveResult?.gateway_restarted) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+          const status = await invokeTauri<GatewayStatus>("gateway_status").catch(() => null);
+          if (status) {
+            setGatewayStatus(status.running ? "connected" : "disconnected");
+          }
+          const refreshed = await invokeTauri<Config>("get_setup_config").catch(() => null);
+          if (refreshed) {
+            const agentWorkspace = refreshed.agent?.workspace_dir ?? null;
+            const globalWorkspace = refreshed.workspace_dir ?? null;
+            setWorkspaceDir(agentWorkspace || globalWorkspace || null);
+            setWorkspaceSource(agentWorkspace ? "agent" : globalWorkspace ? "global" : null);
+            setWorkspaceStatus(refreshed.workspace_status ?? null);
+          }
+        }
+      } else {
+        // Session-scoped temporary workspace (no save, no gateway restart).
+        setSessionWorkspaceDirs((prev) => ({ ...prev, [activeAvatarId]: dir }));
+      }
+    } catch (err) {
+      setError(
+        `选择 Workspace 失败：${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }, [activeAvatarId]);
+
+  const handleOpenWorkspace = useCallback(async () => {
+    setWorkspaceMenuOpen(false);
+    if (!activeWorkspaceDir) {
+      setError("请先选择 Workspace。");
+      return;
+    }
+    try {
+      await invokeTauri<void>("open_workspace_dir", { path: activeWorkspaceDir });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [activeWorkspaceDir]);
+
+  const handleClearSessionWorkspace = useCallback(() => {
+    setWorkspaceMenuOpen(false);
+    setSessionWorkspaceDirs((prev) => {
+      if (!prev[activeAvatarId]) return prev;
+      const next = { ...prev };
+      delete next[activeAvatarId];
+      return next;
+    });
+  }, [activeAvatarId]);
 
   const handleComposerDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -1141,6 +1581,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             </div>
           </div>
 
+          {workspaceStatus && workspaceStatus.state !== "ok" && !sessionWorkspaceDir ? (
+            <div
+              className={`chat-workspace-banner chat-workspace-banner--${workspaceStatus.state}`}
+              role="status"
+            >
+              <strong>Workspace 未就绪：</strong>
+              {workspaceStatus.message}
+              {workspaceStatus.path ? (
+                <code className="chat-workspace-banner-path">{workspaceStatus.path}</code>
+              ) : null}
+              <button
+                type="button"
+                className="chat-workspace-banner-action"
+                onClick={() => void handleChooseWorkspace()}
+                disabled={sending}
+              >
+                {workspaceStatus.state === "unselected" ? "选择目录" : "重新选择"}
+              </button>
+            </div>
+          ) : null}
+
           <div
             ref={messagesScrollRef}
             className="chat-messages"
@@ -1189,9 +1650,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   <span className="typing-dot" />
                   <span className="typing-dot" />
                   <span className="typing-dot" />
-                  <span className="typing-elapsed">{elapsedSec}s</span>
+                  <span className="typing-elapsed">
+                    {activeRun?.longRunning
+                      ? `Agent 仍在执行，已运行 ${elapsedSec}s`
+                      : `${elapsedSec}s`}
+                  </span>
                 </div>
-                {activeSteps.length ? <ExecutionSteps steps={activeSteps} /> : null}
+                {activeSteps.length > 0 || activeRunId ? (
+                  <ExecutionSteps steps={activeSteps} liveSessionId={activeRunId} />
+                ) : null}
               </div>
             )}
           </div>
@@ -1213,6 +1680,69 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             <ChatMediaInteraction
               appendTranscript={appendVoiceTranscript}
               disabled={sending || gatewayStatus !== "connected"}
+              trailingActions={
+                <div
+                  ref={workspaceMenuRef}
+                  className={`chat-workspace-actions${
+                    sessionWorkspaceDir ? " chat-workspace-actions--temporary" : ""
+                  }`}
+                >
+                  <button
+                    type="button"
+                    className="chat-workspace-pill"
+                    title={
+                      activeWorkspaceDir
+                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}\n普通点击 = 重新选择临时 Workspace；Shift+点击 = 保存到该 Agent；右键 = 更多操作`
+                        : "选择 Workspace（普通点击 = 当前会话临时 Workspace；Shift+点击 = 保存到该 Agent）"
+                    }
+                    aria-label={
+                      activeWorkspaceDir
+                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}`
+                        : "选择 Workspace"
+                    }
+                    onClick={(e) => void handleChooseWorkspace(e)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      if (!sending) setWorkspaceMenuOpen((open) => !open);
+                    }}
+                    disabled={sending}
+                  >
+                    <span aria-hidden>📁</span>
+                    {activeWorkspaceDir ? (
+                      <span className="chat-workspace-pill-scope">{workspaceLabel}</span>
+                    ) : null}
+                    <span className="chat-workspace-pill-path">{workspaceSummary}</span>
+                  </button>
+                  {workspaceMenuOpen ? (
+                    <div className="chat-workspace-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={(e) => void handleChooseWorkspace(e)}
+                      >
+                        重新选择 Workspace
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void handleOpenWorkspace()}
+                        disabled={!activeWorkspaceDir}
+                      >
+                        打开当前 Workspace 文件夹
+                      </button>
+                      {sessionWorkspaceDir ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={handleClearSessionWorkspace}
+                        >
+                          清除当前会话临时 Workspace
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              }
             />
 
             <input
@@ -1268,7 +1798,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     : "网关未连接…（仍可拖入文件编辑草稿）"
                 }
                 rows={1}
-                disabled={sending || gatewayStatus !== "connected"}
+                disabled={gatewayStatus !== "connected"}
               />
               {sending ? (
                 <button
@@ -1344,8 +1874,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   );
 }
 
-function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
+function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; liveSessionId?: string | null }) {
   const statusLabel = (status?: ExecutionStep["status"]) => {
+    const labels: Record<string, string> = {
+      running: "进行中",
+      done: "完成",
+      error: "失败",
+      pending: "等待",
+    };
+    return labels[status ?? ""] ?? "记录";
+
     switch (status) {
       case "running":
         return "进行中";
@@ -1363,12 +1901,31 @@ function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
   return (
     <div className="chat-execution-steps">
       <div className="chat-execution-title">执行步骤</div>
+      {liveSessionId ? (
+        <div className="mt-1">
+          <AgentRunTimeline
+            events={[]}
+            isRunning={true}
+            defaultCollapsed={false}
+            liveSessionId={liveSessionId}
+          />
+        </div>
+      ) : null}
       <ol>
         {steps.map((step, index) => (
           <li key={`${step.title}-${index}`} className={`chat-execution-step chat-execution-step--${step.status ?? "info"}`}>
             <span className="chat-execution-step-title">{step.title}</span>
             <span className="chat-execution-step-status">{statusLabel(step.status)}</span>
             {step.detail ? <div className="chat-execution-step-detail">{step.detail}</div> : null}
+            {!liveSessionId && step.run_events && step.run_events.length > 0 && (
+              <div className="mt-1">
+                <AgentRunTimeline
+                  events={step.run_events}
+                  isRunning={step.status === "running"}
+                  defaultCollapsed={true}
+                />
+              </div>
+            )}
           </li>
         ))}
       </ol>
@@ -1376,49 +1933,3 @@ function ExecutionSteps({ steps }: { steps: ExecutionStep[] }) {
   );
 }
 
-async function buildSendErrorMessage(
-  rawMessage: string,
-  route: RouteDecision | null
-) {
-  const isConnectivityIssue =
-    rawMessage.includes("请求超时") ||
-    rawMessage.includes("连接失败") ||
-    rawMessage.includes("网络请求失败") ||
-    rawMessage.includes("timed out") ||
-    rawMessage.includes("timeout") ||
-    rawMessage.includes("connection refused") ||
-    rawMessage.includes("connect error");
-
-  if (!isConnectivityIssue) {
-    return rawMessage;
-  }
-
-  try {
-    const [gatewayHealth, providers] = await Promise.all([
-      invokeTauri<GatewayHealth>("gateway_health"),
-      invokeTauri<ProviderHealthSummary[]>("provider_health_overview"),
-    ]);
-
-    const routedProviderId =
-      route?.provider ?? providers.find((item) => item.is_default)?.id ?? gatewayHealth.provider;
-    const matchedProvider = providers.find((item) => item.id === routedProviderId);
-    const agentHint = route?.agent_name ? `，Agent 为 ${route.agent_name}` : "";
-    const providerHint = routedProviderId ? `，Provider 为 ${routedProviderId}` : "";
-
-    if (!gatewayHealth.provider_healthy) {
-      return `${rawMessage}。网关已响应，但当前 Provider 健康检查失败${providerHint}${agentHint}，请检查 API Key、Base URL、网络连通性或本地模型服务是否启动。`;
-    }
-
-    if (matchedProvider?.healthy === false) {
-      return `${rawMessage}。路由命中的 Provider 健康检查失败${providerHint}${agentHint}，请优先检查该模型服务是否可达。`;
-    }
-
-    if (matchedProvider?.enabled === false) {
-      return `${rawMessage}。当前路由命中的 Provider 未启用${providerHint}${agentHint}，请先在配置页启用并保存。`;
-    }
-
-    return `${rawMessage}。网关健康检查正常${providerHint}${agentHint}，更可能是模型推理耗时过长而不是网关断连。界面不会主动超时；如长期无响应，请检查上游模型服务状态。`;
-  } catch {
-    return `${rawMessage}。另外，超时后未能取得健康检查结果，请确认网关仍在运行，并检查上游模型服务是否可达。`;
-  }
-}

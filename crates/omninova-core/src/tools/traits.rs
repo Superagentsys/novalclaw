@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use crate::agent::AgentCancellationToken;
 use serde::{Deserialize, Serialize};
 
 /// Result of a tool execution
@@ -17,6 +18,14 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
+/// Channel sender for streaming tool output.
+/// Each tuple is `(content, is_stderr)`:
+///   - `(line, false)` → stdout line
+///   - `(line, true)`  → stderr line
+///
+/// Completion is signaled by `tool_completed` / `tool_failed`, never by this channel.
+pub type OutputSender = tokio::sync::mpsc::UnboundedSender<(String, bool)>;
+
 /// Core tool trait — implement for any capability
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -31,6 +40,42 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
+
+    /// Execute the tool with a cancellation token.
+    /// Default implementation checks before and after the regular execution.
+    async fn execute_with_cancel(
+        &self,
+        args: serde_json::Value,
+        cancel_token: AgentCancellationToken,
+    ) -> anyhow::Result<ToolResult> {
+        cancel_token.check()?;
+        let result = self.execute(args).await;
+        cancel_token.check()?;
+        result
+    }
+
+    /// Streaming variant: sends output chunks via `output_tx`.
+    /// Default implementation falls back to `execute` (no streaming).
+    async fn execute_streaming(
+        &self,
+        args: serde_json::Value,
+        _output_tx: OutputSender,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute(args).await
+    }
+
+    /// Streaming variant with cancellation.
+    async fn execute_streaming_with_cancel(
+        &self,
+        args: serde_json::Value,
+        output_tx: OutputSender,
+        cancel_token: AgentCancellationToken,
+    ) -> anyhow::Result<ToolResult> {
+        cancel_token.check()?;
+        let result = self.execute_streaming(args, output_tx).await;
+        cancel_token.check()?;
+        result
+    }
 
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {

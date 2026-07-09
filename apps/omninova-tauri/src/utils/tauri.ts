@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 
+const VERBOSE_INVOKE_LOG_COMMANDS = new Set([
+  "process_inbound_message_streaming",
+  "route_inbound_message",
+]);
+
 export const isTauriEnvironment = () =>
   typeof window !== "undefined" &&
   Boolean(
@@ -16,5 +21,20 @@ export async function invokeTauri<T>(
     );
   }
 
-  return invoke<T>(command, args);
+  const shouldLogPayload = import.meta.env.DEV && VERBOSE_INVOKE_LOG_COMMANDS.has(command);
+  if (shouldLogPayload) {
+    console.log("[invokeTauri:start]", command, args);
+  }
+  try {
+    const result = await invoke<T>(command, args);
+    if (shouldLogPayload) {
+      console.log("[invokeTauri:resolved]", command, result);
+    }
+    return result;
+  } catch (error) {
+    if (import.meta.env.DEV) {
+      console.error("[invokeTauri:error]", command, error);
+    }
+    throw error;
+  }
 }

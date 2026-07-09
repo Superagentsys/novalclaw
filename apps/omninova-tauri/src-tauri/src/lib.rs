@@ -16,15 +16,107 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::AppHandle;
-use tauri::Manager;
-use tauri::WindowEvent;
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+
+/// E2E debug: formats current wall-clock time as HH:MM:SS.mmm UTC.
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+/// Live execution event sent from backend to frontend via Tauri emit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum AgentRunEvent {
+    RunStarted {
+        run_id: String,
+        agent_name: String,
+        session_id: Option<String>,
+    },
+    ModelStarted {
+        run_id: String,
+        step_id: String,
+        title: String,
+    },
+    ModelDelta {
+        run_id: String,
+        step_id: String,
+        content: String,
+    },
+    ModelCompleted {
+        run_id: String,
+        step_id: String,
+        title: String,
+    },
+    ToolCallCreated {
+        run_id: String,
+        step_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        title: String,
+    },
+    ToolStarted {
+        run_id: String,
+        tool_name: String,
+        summary: String,
+    },
+    ToolCompleted {
+        run_id: String,
+        tool_name: String,
+        success: bool,
+        duration_ms: u64,
+        result_summary: String,
+        diff_stats: Option<RunDiffStats>,
+    },
+    CommandOutput {
+        run_id: String,
+        tool_name: String,
+        output: String,
+        is_stderr: bool,
+    },
+    FileChanged {
+        run_id: String,
+        path: String,
+        additions: i32,
+        deletions: i32,
+    },
+    RunCompleted {
+        run_id: String,
+        success: bool,
+        reply: String,
+        reply_preview: String,
+    },
+    RunError {
+        run_id: String,
+        error: String,
+    },
+    RunCancelled {
+        run_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunDiffStats {
+    pub additions: i32,
+    pub deletions: i32,
+}
 
 struct AppState {
     runtime: GatewayRuntime,
@@ -189,13 +281,23 @@ struct SetupAuditConfig {
     record_arguments: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SetupWorkspaceStatus {
+    state: String, // "unselected" | "missing" | "inaccessible" | "ok"
+    path: Option<String>,
+    message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetupAppConfig {
     api_key: Option<String>,
     api_url: Option<String>,
     default_provider: Option<String>,
     default_model: Option<String>,
+    #[serde(default)]
     workspace_dir: String,
+    #[serde(default)]
+    workspace_status: SetupWorkspaceStatus,
     omninoval_gateway_url: Option<String>,
     omninoval_config_dir: Option<String>,
     robot: Option<RobotConfig>,
@@ -209,6 +311,21 @@ struct SetupAppConfig {
     observability: SetupObservabilityConfig,
     #[serde(default)]
     audit: SetupAuditConfig,
+    /// Per-agent settings (workspace_dir, system_prompt, etc.) from the Agent tab.
+    #[serde(default)]
+    agent: Option<AgentPersonaSetup>,
+}
+
+/// Corresponds to the frontend `AgentPersonaConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AgentPersonaSetup {
+    name: String,
+    workspace_dir: Option<String>,
+    system_prompt: Option<String>,
+    compact_context: Option<bool>,
+    max_tool_iterations: Option<usize>,
+    max_history_messages: Option<usize>,
+    mbti_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -356,10 +473,50 @@ async fn get_setup_config(
 }
 
 #[tauri::command]
+async fn open_workspace_dir(
+    path: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let fallback_workspace = {
+        let runtime = {
+            let app_state = state.lock().await;
+            app_state.runtime.clone()
+        };
+        runtime.get_config().await.workspace_dir
+    };
+
+    let target = normalize_optional_string(path)
+        .map(|path| expand_tilde_path(&path))
+        .unwrap_or(fallback_workspace);
+    if target.as_os_str().is_empty() {
+        return Err("请先选择 Workspace。".into());
+    }
+
+    if !target.exists() || !target.is_dir() {
+        return Err("Workspace 目录不存在，请重新选择 Workspace。".into());
+    }
+
+    let target = std::fs::canonicalize(&target)
+        .map_err(|_| "无法打开 Workspace 文件夹，请检查路径是否存在。".to_string())?;
+
+    let opened = if cfg!(target_os = "windows") {
+        StdCommand::new("explorer").arg(&target).spawn()
+    } else if cfg!(target_os = "macos") {
+        StdCommand::new("open").arg(&target).spawn()
+    } else {
+        StdCommand::new("xdg-open").arg(&target).spawn()
+    };
+
+    opened
+        .map(|_| ())
+        .map_err(|_| "无法打开 Workspace 文件夹，请检查路径是否存在。".to_string())
+}
+
+#[tauri::command]
 async fn save_setup_config(
     config: SetupAppConfig,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+) -> Result<SaveSetupResult, String> {
     let state_ref = state.inner().clone();
     sync_gateway_task_state(&state_ref).await;
 
@@ -370,17 +527,33 @@ async fn save_setup_config(
 
     let current = runtime.get_config().await;
     let current_gateway_url = format!("http://{}:{}", current.gateway.host, current.gateway.port);
+    let current_workspace_dir = current.workspace_dir.clone();
     let mut next = setup_config_to_core(current, config)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
+    let workspace_changed = current_workspace_dir != next.workspace_dir;
 
     save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
-    if current_gateway_url != next_gateway_url {
+    let mut restarted = false;
+    if current_gateway_url != next_gateway_url || workspace_changed {
+        // Restart gateway so new workspace_dir takes effect and tools are recreated.
         stop_gateway_inner(&state_ref).await;
+        sleep(Duration::from_millis(200)).await;
+        if let Err(e) = start_gateway_inner(state_ref.clone()).await {
+            return Err(format!("配置已保存但网关重启失败: {e}"));
+        }
+        restarted = true;
     }
 
-    Ok(())
+    Ok(SaveSetupResult {
+        gateway_restarted: restarted,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SaveSetupResult {
+    gateway_restarted: bool,
 }
 
 #[tauri::command]
@@ -501,6 +674,145 @@ async fn process_inbound_message(
         .process_inbound(&inbound)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Starts an agent run with real-time event emission to the frontend.
+/// The caller should listen for "agent-run-event" on the window to receive live updates.
+#[tauri::command]
+async fn process_inbound_message_streaming(
+    app_handle: AppHandle,
+    payload: UiInboundPayload,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayInboundResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let inbound = inbound_from_payload(payload);
+
+    let run_id = inbound
+        .metadata
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+    eprintln!("[e2e-tauri-command-start] timestamp={} run_id={}", now_ts(), run_id);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let terminal_seen = Arc::new(AtomicBool::new(false));
+
+    // Spawn a background task that forwards events to the Tauri frontend.
+    let handle = tokio::spawn({
+        let app = app_handle.clone();
+        let mut rx = rx;
+        let terminal_seen = terminal_seen.clone();
+        async move {
+            while let Some(evt) = rx.recv().await {
+                let type_name = evt.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let rid = evt.get("run_id").and_then(|r| r.as_str()).unwrap_or("-");
+                let is_terminal = matches!(type_name, "run_completed" | "run_failed" | "run_cancelled");
+                if terminal_seen.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "[e2e-tauri-ignored-after-terminal] timestamp={} run_id={} type={}",
+                        now_ts(),
+                        rid,
+                        type_name
+                    );
+                    continue;
+                }
+                eprintln!("[e2e-tauri-emit] timestamp={} run_id={} type={}", now_ts(), rid, type_name);
+                if is_terminal {
+                    terminal_seen.store(true, Ordering::SeqCst);
+                }
+                if app.emit("agent-run-event", evt).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = runtime
+        .process_inbound_streaming(&inbound, tx)
+        .await;
+
+    eprintln!("[e2e-tauri-command-return] timestamp={} run_id={}", now_ts(), run_id);
+    // Drain the event-forwarding task first so terminal_seen reflects any
+    // run_completed/run_failed/run_cancelled already emitted by core.
+    let _ = handle.await;
+
+    if let Err(err) = &result {
+        if !terminal_seen.load(Ordering::SeqCst)
+            && !err.to_string().to_lowercase().contains("cancelled")
+        {
+            let _ = app_handle.emit(
+                "agent-run-event",
+                serde_json::json!({
+                    "type": "run_failed",
+                    "run_id": run_id,
+                    "error": err.to_string(),
+                }),
+            );
+        }
+    }
+
+    result.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_agent_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .cancel_agent_run(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Debug-only: directly executes a shell command and streams output as agent-run-events.
+/// Does NOT go through LLM. Used to verify runtime streaming infrastructure.
+/// Usage: call this from DevTools / browser console to test shell streaming.
+#[tauri::command]
+async fn debug_shell_stream(
+    app_handle: AppHandle,
+    command: String,
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Spawn background task to forward events to the Tauri frontend.
+    let handle = tokio::spawn({
+        let app = app_handle.clone();
+        let mut rx = rx;
+        async move {
+            while let Some(evt) = rx.recv().await {
+                let type_name = evt.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let rid = evt.get("run_id").and_then(|r| r.as_str()).unwrap_or("-");
+                eprintln!("[e2e-tauri-emit] timestamp={} run_id={} type={}", now_ts(), rid, type_name);
+                if app.emit("agent-run-event", evt).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    runtime
+        .debug_shell_stream(command, run_id, tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = handle.await;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -863,6 +1175,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         default_provider: config.default_provider.clone(),
         default_model: config.default_model.clone(),
         workspace_dir: config.workspace_dir.to_string_lossy().to_string(),
+        workspace_status: compute_effective_workspace_status(config),
         omninoval_gateway_url: Some(format!(
             "http://{}:{}",
             config.gateway.host, config.gateway.port
@@ -886,6 +1199,19 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             enabled: config.security.audit.enabled,
             record_arguments: config.security.audit.record_arguments,
         },
+        agent: Some(AgentPersonaSetup {
+            name: config.agent.name.clone(),
+            workspace_dir: config
+                .agents
+                .get(&config.agent.name)
+                .and_then(|a| a.workspace_dir.clone())
+                .map(|p| p.to_string_lossy().to_string()),
+            system_prompt: config.agent.system_prompt.clone(),
+            compact_context: Some(config.agent.compact_context),
+            max_tool_iterations: Some(config.agent.max_tool_iterations),
+            max_history_messages: Some(config.agent.max_history_messages),
+            mbti_type: None,
+        }),
     }
 }
 
@@ -975,9 +1301,9 @@ fn setup_config_to_core(
     current.default_provider = normalize_optional_string(setup.default_provider);
     current.default_model = normalize_optional_string(setup.default_model);
 
-    if !setup.workspace_dir.trim().is_empty() {
-        current.workspace_dir = expand_tilde_path(&setup.workspace_dir);
-    }
+    current.workspace_dir = normalize_optional_string(Some(setup.workspace_dir))
+        .map(|workspace_dir| expand_tilde_path(&workspace_dir))
+        .unwrap_or_default();
 
     if let Some(config_dir) = normalize_optional_string(setup.omninoval_config_dir) {
         current.config_path = expand_tilde_path(&config_dir).join("config.toml");
@@ -1033,6 +1359,25 @@ fn setup_config_to_core(
         current.channels_config = channels_to_core(channels);
     }
 
+    // Persist per-agent workspace_dir to the agents HashMap.
+    if let Some(agent_setup) = setup.agent {
+        current.agent.name = agent_setup.name.clone();
+        current.agent.system_prompt = agent_setup.system_prompt.clone();
+        current.agent.compact_context = agent_setup.compact_context.unwrap_or(true);
+        current.agent.max_tool_iterations = agent_setup.max_tool_iterations.unwrap_or(20);
+        current.agent.max_history_messages = agent_setup.max_history_messages.unwrap_or(50);
+
+        let agent_name = agent_setup.name.clone();
+        let delegate = current.agents.entry(agent_name.clone()).or_default();
+        if let Some(ws) = agent_setup.workspace_dir {
+            if !ws.trim().is_empty() {
+                delegate.workspace_dir = Some(expand_tilde_path(&ws));
+            } else {
+                delegate.workspace_dir = None;
+            }
+        }
+    }
+
     current.multimodal.desktop_vision_enabled = setup.multimodal.desktop_vision_enabled;
     current.multimodal.desktop_vision_max_dimension_px = setup
         .multimodal
@@ -1051,10 +1396,12 @@ fn setup_config_to_core(
 
 fn config_fallback_candidates(config: &Config) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(parent) = config.workspace_dir.parent() {
-        candidates.push(parent.join(".omninova").join("config.toml"));
+    if !config.workspace_dir.as_os_str().is_empty() {
+        if let Some(parent) = config.workspace_dir.parent() {
+            candidates.push(parent.join(".omninova").join("config.toml"));
+        }
+        candidates.push(config.workspace_dir.join(".omninova").join("config.toml"));
     }
-    candidates.push(config.workspace_dir.join(".omninova").join("config.toml"));
     candidates
         .into_iter()
         .filter(|path| path != &config.config_path)
@@ -1132,7 +1479,15 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
         changed = true;
     }
 
-    let auto_approved_tools = ["browser", "shell", "file_read", "file_write", "file_edit"];
+    let auto_approved_tools = [
+        "browser",
+        "shell",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "file_list",
+        "git_operations",
+    ];
     for tool in auto_approved_tools {
         if !config
             .autonomy
@@ -1141,6 +1496,24 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
             .any(|existing| existing.eq_ignore_ascii_case(tool))
         {
             config.autonomy.auto_approve.push(tool.to_string());
+            changed = true;
+        }
+    }
+
+    // Make sure common read-only / workspace-safe Git operations are in
+    // the shell allowlist so the model can answer "what changed in this
+    // repo?" without prompting. The shell tool additionally constrains
+    // commands via the high-risk deny list, so this only widens access to
+    // safe commands (status, diff, log, branch, add, commit, checkout, stash).
+    let safe_git_commands = ["git"];
+    for command in safe_git_commands {
+        if !config
+            .autonomy
+            .allowed_commands
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(command))
+        {
+            config.autonomy.allowed_commands.push(command.to_string());
             changed = true;
         }
     }
@@ -1267,6 +1640,78 @@ fn display_provider_name(id: &str) -> String {
     }
 }
 
+/// Inspect the configured workspace directory and classify its state for
+/// the frontend so the chat UI can surface actionable messages instead of
+/// letting the model fail tool calls with permission errors.
+fn compute_workspace_status(workspace_dir: &std::path::Path) -> SetupWorkspaceStatus {
+    let path_str = workspace_dir.to_string_lossy().to_string();
+    if workspace_dir.as_os_str().is_empty() {
+        return SetupWorkspaceStatus {
+            state: "unselected".into(),
+            path: None,
+            message: "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。".into(),
+        };
+    }
+    match std::fs::metadata(workspace_dir) {
+        Ok(meta) if meta.is_dir() => {
+            // Touch the directory to confirm write access; if even read
+            // works but write fails (e.g. read-only mount) we still
+            // consider it inaccessible.
+            let probe = workspace_dir.join(".omninova-write-probe");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    SetupWorkspaceStatus {
+                        state: "ok".into(),
+                        path: Some(path_str),
+                        message: "Workspace 可访问".into(),
+                    }
+                }
+                Err(_) => SetupWorkspaceStatus {
+                    state: "inaccessible".into(),
+                    path: Some(path_str),
+                    message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+                },
+            }
+        }
+        Ok(_) => SetupWorkspaceStatus {
+            state: "inaccessible".into(),
+            path: Some(path_str),
+            message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+        },
+        Err(_) => {
+            // Try to create the directory; if creation succeeds the
+            // workspace is reachable. Otherwise mark it inaccessible.
+            match std::fs::create_dir_all(workspace_dir) {
+                Ok(()) => SetupWorkspaceStatus {
+                    state: "ok".into(),
+                    path: Some(path_str),
+                    message: "Workspace 已自动创建，可访问".into(),
+                },
+                Err(_) => SetupWorkspaceStatus {
+                    state: "missing".into(),
+                    path: Some(path_str),
+                    message: "当前 Workspace 不存在或无访问权限，请重新选择。".into(),
+                },
+            }
+        }
+    }
+}
+
+fn compute_effective_workspace_status(config: &Config) -> SetupWorkspaceStatus {
+    let agent_workspace = config
+        .agents
+        .get(&config.agent.name)
+        .and_then(|agent| agent.workspace_dir.as_deref());
+    let workspace = agent_workspace.unwrap_or(config.workspace_dir.as_path());
+    compute_workspace_status(workspace)
+}
+
 /// Worker-thread stack size for the async runtime that backs Tauri commands.
 ///
 /// The `Config` struct is large (~8.7 KiB) and very deeply nested, so serde
@@ -1317,12 +1762,16 @@ pub fn run() {
             save_config,
             reload_config,
             get_setup_config,
+            open_workspace_dir,
             save_setup_config,
             gateway_status,
             gateway_health,
             provider_health_overview,
             route_inbound_message,
             process_inbound_message,
+            process_inbound_message_streaming,
+            cancel_agent_run,
+            debug_shell_stream,
             get_chat_session_history,
             delete_chat_session,
             session_tree_snapshot,

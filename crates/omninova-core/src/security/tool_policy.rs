@@ -11,9 +11,24 @@ const HIGH_RISK_TOOLS: &[&str] = &[
     "shell",
     "file_write",
     "file_edit",
+    "file_patch",
     "git_operations",
     "browser",
     "http_request",
+];
+
+const READ_ONLY_WORKSPACE_TOOLS: &[&str] = &[
+    "file_read",
+    "read_file",
+    "file_list",
+    "list_directory",
+    "glob_search",
+    "glob",
+    "file_search",
+    "content_search",
+    "grep_search",
+    "grep",
+    "search",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,7 +57,7 @@ pub fn resolve_shell_allowlist(config: &Config) -> Vec<String> {
 }
 
 pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
-    config
+    let direct = config
         .autonomy
         .auto_approve
         .iter()
@@ -51,7 +66,41 @@ pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
             .approvals
             .auto_approve
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(tool_name))
+            .any(|t| t.eq_ignore_ascii_case(tool_name));
+    if direct {
+        return true;
+    }
+    if matches!(tool_name, "file_patch" | "apply_patch") {
+        return ["file_write", "file_edit"].iter().any(|alias| {
+            config
+                .autonomy
+                .auto_approve
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(alias))
+                || config
+                    .approvals
+                    .auto_approve
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(alias))
+        });
+    }
+    if is_read_only_workspace_tool(tool_name) {
+        return ["file_read", "read_file", "file_list", "list_directory"]
+            .iter()
+            .any(|alias| {
+                config
+                    .autonomy
+                    .auto_approve
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(alias))
+                    || config
+                        .approvals
+                        .auto_approve
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(alias))
+            });
+    }
+    false
 }
 
 pub fn is_tool_denied(config: &Config, tool_name: &str) -> bool {
@@ -127,10 +176,19 @@ pub fn evaluate_tool_call(
         }
     }
 
-    if matches!(tool_name, "file_read" | "file_write" | "file_edit") {
+    if matches!(tool_name, "file_read" | "file_write" | "file_edit" | "file_patch" | "apply_patch")
+        || is_read_only_workspace_tool(tool_name)
+    {
         if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
             if let Some(reason) = path_hits_forbidden(config, path) {
                 return ToolPolicyDecision::Deny { reason };
+            }
+        }
+        if let Some(pattern) = arguments.get("pattern").and_then(|v| v.as_str()) {
+            if pattern_looks_outside_workspace(pattern) {
+                return ToolPolicyDecision::Deny {
+                    reason: "search pattern must stay inside workspace".to_string(),
+                };
             }
         }
     }
@@ -140,12 +198,18 @@ pub fn evaluate_tool_call(
     }
 
     if config.approvals.enabled {
-        if config
-            .approvals
-            .require_approval
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(tool_name))
-        {
+        let is_patch_tool = matches!(tool_name, "file_patch" | "apply_patch");
+        let requires_direct = !is_patch_tool
+            && config
+                .approvals
+                .require_approval
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(tool_name));
+        let requires_equivalent_write = is_patch_tool
+            && config.approvals.require_approval.iter().any(|t| {
+                t.eq_ignore_ascii_case("file_write") || t.eq_ignore_ascii_case("file_edit")
+            });
+        if requires_direct || requires_equivalent_write {
             return ToolPolicyDecision::RequireApproval {
                 reason: format!("tool '{tool_name}' requires explicit approval"),
             };
@@ -183,6 +247,24 @@ fn is_high_risk_tool(tool_name: &str) -> bool {
     HIGH_RISK_TOOLS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+}
+
+fn is_read_only_workspace_tool(tool_name: &str) -> bool {
+    READ_ONLY_WORKSPACE_TOOLS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+}
+
+fn pattern_looks_outside_workspace(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') || trimmed.contains("..") {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 #[cfg(test)]

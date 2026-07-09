@@ -116,7 +116,7 @@ pub async fn run_tui(config: Config) -> Result<String> {
 
     // A single long-lived agent owns the conversation; a worker task drives it
     // sequentially so the UI loop never blocks on model calls.
-    let agent: Agent = runtime.build_interactive_agent().await;
+    let agent: Agent = runtime.build_interactive_agent().await?;
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
     tokio::spawn(async move {
@@ -228,6 +228,50 @@ fn handle_agent_event(app: &mut App, ev: AgentEvent) {
                 text: e,
             });
             app.busy = false;
+        }
+        AgentEvent::ToolExecution(evt) => {
+            if app.show_steps {
+                match evt {
+                    crate::agent::ToolExecutionEvent::Started { summary, .. } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!("⚡ {}", summary),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::Completed {
+                        tool_name,
+                        success,
+                        duration_ms,
+                        result_summary,
+                        diff_stats,
+                        ..
+                    } => {
+                        let icon = if success { "✅" } else { "❌" };
+                        let stats = diff_stats
+                            .map(|d| format!(" +{} -{}", d.additions, d.deletions))
+                            .unwrap_or_default();
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!(
+                                "{} {} 完成 ({}ms){} — {}",
+                                icon, tool_name, duration_ms, stats, result_summary
+                            ),
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::CommandOutput { output, .. } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: output,
+                        });
+                    }
+                    crate::agent::ToolExecutionEvent::FileChanged { path, additions, deletions } => {
+                        app.transcript.push(Msg {
+                            role: Role::Tool,
+                            text: format!("📝 {} (+{}/-{})", path, additions, deletions),
+                        });
+                    }
+                }
+            }
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::channels::adapters::platform_webhook::{
 };
 use crate::channels::adapters::webhook::{WebhookInboundPayload, inbound_from_webhook};
 use crate::channels::{ChannelKind, InboundMessage};
-use crate::config::Config;
+use crate::config::{resolve_effective_workspace_dir, Config};
 use crate::memory::{Memory, factory::build_memory_from_config};
 use crate::providers::ChatMessage;
 use crate::providers::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
@@ -23,11 +23,12 @@ use crate::security::{
 use crate::skills::{format_skills_prompt, load_skills_from_dir};
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
-    FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
+    FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
     MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::agent::sanitize_messages_for_provider;
+use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
 use crate::Agent;
 use std::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
@@ -36,11 +37,27 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+const WORKSPACE_REQUIRED_MESSAGE: &str =
+    "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
+
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
 
 #[derive(Clone)]
 pub struct GatewayRuntime {
@@ -52,6 +69,107 @@ pub struct GatewayRuntime {
     active_inbound: Arc<AtomicUsize>,
     active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
     session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
+    run_registry: AgentRunRegistry,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentRunRegistry {
+    inner: Arc<RwLock<HashMap<String, ActiveAgentRun>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveAgentRun {
+    run_id: String,
+    session_id: String,
+    started_at: SystemTime,
+    cancel_token: AgentCancellationToken,
+}
+
+impl AgentRunRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn start_run(
+        &self,
+        run_id: String,
+        session_id: String,
+    ) -> anyhow::Result<AgentCancellationToken> {
+        let mut runs = self.inner.write().await;
+        if runs
+            .values()
+            .any(|run| run.session_id == session_id && !run.cancel_token.is_cancelled())
+        {
+            return Err(anyhow::anyhow!(
+                "当前会话已有任务正在运行，请等待完成或取消。"
+            ));
+        }
+        let token = AgentCancellationToken::new();
+        runs.insert(
+            run_id.clone(),
+            ActiveAgentRun {
+                run_id,
+                session_id,
+                started_at: SystemTime::now(),
+                cancel_token: token.clone(),
+            },
+        );
+        Ok(token)
+    }
+
+    async fn finish_run(&self, run_id: &str) {
+        self.inner.write().await.remove(run_id);
+    }
+
+    pub async fn cancel_run(&self, run_id: &str) -> anyhow::Result<()> {
+        let token = {
+            let runs = self.inner.read().await;
+            runs.get(run_id).map(|run| run.cancel_token.clone())
+        };
+        match token {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!("未找到正在运行的 Agent Run")),
+        }
+    }
+}
+
+struct ActiveRunGuard {
+    registry: AgentRunRegistry,
+    run_id: String,
+    finished: bool,
+}
+
+impl ActiveRunGuard {
+    fn new(registry: AgentRunRegistry, run_id: String) -> Self {
+        Self {
+            registry,
+            run_id,
+            finished: false,
+        }
+    }
+
+    async fn finish(mut self) {
+        self.registry.finish_run(&self.run_id).await;
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let registry = self.registry.clone();
+        let run_id = self.run_id.clone();
+        tokio::spawn(async move {
+            registry.finish_run(&run_id).await;
+        });
+    }
 }
 
 impl GatewayRuntime {
@@ -65,6 +183,7 @@ impl GatewayRuntime {
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            run_registry: AgentRunRegistry::new(),
         }
     }
 
@@ -78,6 +197,7 @@ impl GatewayRuntime {
             active_inbound: Arc::new(AtomicUsize::new(0)),
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
+            run_registry: AgentRunRegistry::new(),
         }
     }
 
@@ -109,6 +229,10 @@ impl GatewayRuntime {
         Ok(())
     }
 
+    pub async fn cancel_agent_run(&self, run_id: &str) -> anyhow::Result<()> {
+        self.run_registry.cancel_run(run_id).await
+    }
+
     pub async fn refresh_memory_from_config(&mut self) -> anyhow::Result<()> {
         let cfg = self.config.read().await.clone();
         self.memory = build_memory_from_config(&cfg).await?;
@@ -120,7 +244,19 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let mut tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
+        let agent_delegate = cfg.agents.get(&route_agent_name);
+        let effective_workspace = resolve_effective_workspace_dir(
+            None,
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        )
+        .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route_agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
         attach_delegate_tool(
             &cfg,
             self,
@@ -136,7 +272,7 @@ impl GatewayRuntime {
         if cfg.skills.open_skills_enabled {
             let skills_dir = cfg.skills.open_skills_dir.as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+                .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
                 let prompt = format_skills_prompt(&skills);
                 if !prompt.is_empty() {
@@ -154,11 +290,23 @@ impl GatewayRuntime {
     /// Build a ready-to-use in-process `Agent` (provider + tools + skills +
     /// security), for interactive front-ends like the terminal UI that drive
     /// multi-turn streaming conversations and keep history in-memory.
-    pub async fn build_interactive_agent(&self) -> Agent {
+    pub async fn build_interactive_agent(&self) -> anyhow::Result<Agent> {
         let cfg = self.config.read().await.clone();
         let route_agent_name = cfg.agent.name.clone();
         let provider = build_provider_from_config(&cfg);
-        let mut tools = create_tools_for_route(&cfg, &route_agent_name, self.memory.clone());
+        let agent_delegate = cfg.agents.get(&route_agent_name);
+        let effective_workspace = resolve_effective_workspace_dir(
+            None,
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        )
+        .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route_agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
         // Give the interactive agent the delegate tool so it can hand subtasks
         // to other configured agents (multi-agent), matching `chat()`.
         attach_delegate_tool(
@@ -179,7 +327,7 @@ impl GatewayRuntime {
                 .open_skills_dir
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+                .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
                 let prompt = format_skills_prompt(&skills);
                 if !prompt.is_empty() {
@@ -190,7 +338,7 @@ impl GatewayRuntime {
         }
 
         let security = SecurityContext::from_config(&cfg);
-        Agent::new(provider, tools, self.memory.clone(), agent_cfg, security)
+        Ok(Agent::new(provider, tools, self.memory.clone(), agent_cfg, security))
     }
 
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
@@ -239,6 +387,43 @@ impl GatewayRuntime {
                 route.agent_name, route.provider, route.model
             ))
             .await;
+
+        // Resolve effective workspace for this request.
+        // Priority: session metadata > per-agent workspace > global workspace.
+        let agent_delegate = cfg.agents.get(&route.agent_name);
+        let session_workspace_path: Option<std::path::PathBuf> = inbound
+            .metadata
+            .get("workspace_dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let effective_workspace = resolve_effective_workspace_dir(
+            session_workspace_path.as_deref(),
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        );
+        let effective_workspace = match effective_workspace {
+            Some(w) if !w.as_os_str().is_empty() => w,
+            _ => {
+                let message = WORKSPACE_REQUIRED_MESSAGE;
+                steps.push(ExecutionStep::error(
+                    "Workspace",
+                    message,
+                ));
+                anyhow::bail!(message);
+            }
+        };
+        steps.push(ExecutionStep::done(
+            "Workspace",
+            format!("{}", effective_workspace.display()),
+        ));
+        security
+            .audit_route(&format!(
+                "agent={} workspace={}",
+                route.agent_name,
+                effective_workspace.display()
+            ))
+            .await;
         let lineage = self
             .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
             .await?;
@@ -261,7 +446,12 @@ impl GatewayRuntime {
             model: route.model.clone(),
         };
         let provider = build_provider_with_selection(&cfg, &selection);
-        let mut tools = create_tools_for_route(&cfg, &route.agent_name, self.memory.clone());
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route.agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
         if attach_delegate_tool(
             &cfg,
             self,
@@ -271,10 +461,10 @@ impl GatewayRuntime {
             lineage.spawn_depth,
             &mut tools,
         ) {
-            steps.push(ExecutionStep::done("子代理委派", "已启用 delegate 工具"));
+            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
         }
         steps.push(ExecutionStep::done(
-            "准备工具",
+            "加载工具",
             format!("可用工具数：{}", tools.len()),
         ));
 
@@ -286,10 +476,23 @@ impl GatewayRuntime {
         }
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
 
+        // Always tell the agent where its workspace lives so it can answer
+        // "where am I working?" and so the LLM has a single source of truth
+        // for absolute paths. Path /home or /workspace style guesses should
+        // never be used to answer that question.
+        {
+            let workspace_note = format!(
+                "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
+                effective_workspace.display()
+            );
+            let current = agent_cfg.system_prompt.unwrap_or_default();
+            agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
+        }
+
         if cfg.skills.open_skills_enabled {
             let skills_dir = cfg.skills.open_skills_dir.as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.workspace_dir.join("skills"));
+                .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
                 let prompt = format_skills_prompt(&skills);
                 if !prompt.is_empty() {
@@ -346,14 +549,18 @@ impl GatewayRuntime {
         }
 
         steps.push(ExecutionStep::running("Agent 执行", "调用模型；如模型请求工具，将继续执行工具循环"));
-        let reply = if vision_images.is_empty() {
-            agent.process_message(&inbound.text).await?
+        let (reply, run_events) = if vision_images.is_empty() {
+            agent.process_message_with_events(&inbound.text).await?
         } else {
-            agent
-                .process_message_with_images(&inbound.text, &vision_images)
-                .await?
+            // Vision is not yet supported in process_message_with_events; degrade.
+            let reply = agent.process_message(&inbound.text).await?;
+            (reply, Vec::new())
         };
-        steps.push(ExecutionStep::done("Agent 执行", "模型返回最终回复"));
+        let run_events: Vec<RunEvent> = run_events.into_iter().map(RunEvent::from).collect();
+        steps.push(
+            ExecutionStep::done("Agent 执行", "模型返回最终回复")
+                .with_events(run_events)
+        );
         steps.extend(extract_tool_steps(&agent.export_messages()));
         if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
@@ -413,6 +620,369 @@ impl GatewayRuntime {
             }
         }
         result
+    }
+
+    /// Streaming variant of [`process_inbound`]: emits [`AgentRunEvent`]s via `events_tx`
+    /// in real-time so the frontend can display a live execution timeline.
+    pub async fn process_inbound_streaming(
+        &self,
+        inbound: &InboundMessage,
+        events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> anyhow::Result<GatewayInboundResponse> {
+        let started = std::time::Instant::now();
+        let cfg = self.config.read().await.clone();
+        let route = resolve_agent_route(&cfg, inbound);
+        let security = SecurityContext::for_inbound(&cfg, inbound, &route);
+        let channel_label = security.audit().context().channel.clone();
+        crate::observability::record_inbound_request(&channel_label);
+        security.audit_inbound_start(inbound.text.chars().count()).await;
+
+        let mut steps = vec![ExecutionStep::done(
+            "接收请求",
+            format!(
+                "channel={:?}, session={}, trace={}",
+                inbound.channel,
+                inbound.session_id.as_deref().unwrap_or("-"),
+                security.trace_id()
+            ),
+        )];
+
+        let _slot = acquire_inbound_slot(&cfg, &self.active_inbound)?;
+        let _child_slot =
+            acquire_subagent_guard(&cfg, inbound, &self.active_children_by_parent).await?;
+        steps.push(ExecutionStep::done(
+            "路由选择",
+            format!(
+                "Agent: {}{}{}",
+                route.agent_name,
+                route.provider.as_ref().map(|p| format!(", Provider: {p}")).unwrap_or_default(),
+                route.model.as_ref().map(|m| format!(", Model: {m}")).unwrap_or_default()
+            ),
+        ));
+        security
+            .audit_route(&format!(
+                "agent={} provider={:?} model={:?}",
+                route.agent_name, route.provider, route.model
+            ))
+            .await;
+
+        let agent_delegate = cfg.agents.get(&route.agent_name);
+        let session_workspace_path: Option<std::path::PathBuf> = inbound
+            .metadata
+            .get("workspace_dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let effective_workspace = resolve_effective_workspace_dir(
+            session_workspace_path.as_deref(),
+            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            &cfg.workspace_dir,
+        );
+        let effective_workspace = match effective_workspace {
+            Some(w) if !w.as_os_str().is_empty() => w,
+            _ => {
+                let message = WORKSPACE_REQUIRED_MESSAGE;
+                steps.push(ExecutionStep::error("Workspace", message));
+                anyhow::bail!(message);
+            }
+        };
+        steps.push(ExecutionStep::done("Workspace", format!("{}", effective_workspace.display())));
+        security
+            .audit_route(&format!(
+                "agent={} workspace={}",
+                route.agent_name,
+                effective_workspace.display()
+            ))
+            .await;
+
+        let lineage = self
+            .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
+            .await?;
+
+        let mut tools = create_tools_for_route(
+            &cfg,
+            &route.agent_name,
+            self.memory.clone(),
+            &effective_workspace,
+        );
+
+        if attach_delegate_tool(
+            &cfg,
+            self,
+            &route.agent_name,
+            inbound.session_id.as_deref(),
+            &inbound.channel,
+            lineage.spawn_depth,
+            &mut tools,
+        ) {
+            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
+        }
+        steps.push(ExecutionStep::done(
+            "加载工具",
+            format!("可用工具数：{}", tools.len()),
+        ));
+
+        let mut agent_cfg = cfg.agent.clone();
+        if let Some(delegate) = cfg.agents.get(&route.agent_name) {
+            if let Some(prompt) = &delegate.system_prompt {
+                agent_cfg.system_prompt = Some(prompt.clone());
+            }
+        }
+        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
+
+        {
+            let workspace_note = format!(
+                "\n[环境信息] 当前 Workspace 目录是：{}。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
+                effective_workspace.display()
+            );
+            let current = agent_cfg.system_prompt.unwrap_or_default();
+            agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
+        }
+
+        if cfg.skills.open_skills_enabled {
+            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| effective_workspace.join("skills"));
+            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
+                let prompt = format_skills_prompt(&skills);
+                if !prompt.is_empty() {
+                    let current = agent_cfg.system_prompt.unwrap_or_default();
+                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
+                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
+                }
+            }
+        }
+
+        let agent_security = security.clone();
+        let mut agent = Agent::new(
+            build_provider_from_config(&cfg),
+            tools,
+            self.memory.clone(),
+            agent_cfg.clone(),
+            agent_security.clone(),
+        );
+
+        if let Some(session_id) = inbound.session_id.as_deref() {
+            let _guard = self.session_store_guard.lock().await;
+            match load_session_history(&cfg, &inbound.channel, session_id).await {
+                Ok(history) if !history.is_empty() => {
+                    let sanitized = sanitize_messages_for_provider(history);
+                    steps.push(ExecutionStep::done(
+                        "加载会话历史",
+                        format!("历史消息数：{}", sanitized.len()),
+                    ));
+                    agent.import_messages(sanitized);
+                }
+                Ok(_) => steps.push(ExecutionStep::done("加载会话历史", "无历史消息")),
+                Err(e) => {
+                    steps.push(ExecutionStep::error("加载会话历史", e.to_string()));
+                    warn!("failed to load session history for {}: {}", session_id, e);
+                }
+            }
+        }
+
+        // Use the frontend-provided run_id if available, otherwise generate a new one.
+        let run_id = metadata_str(inbound, &["run_id"])
+            .map(String::from)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_key = inbound
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("{:?}:default", inbound.channel));
+        let cancel_token = match self
+            .run_registry
+            .start_run(run_id.clone(), session_key)
+            .await
+        {
+            Ok(token) => token,
+            Err(err) => {
+                if let Ok(v) = serde_json::to_value(&AgentRunEvent::run_failed {
+                    run_id: run_id.clone(),
+                    error: err.to_string(),
+                }) {
+                    let _ = events_tx.send(v);
+                }
+                return Err(err);
+            }
+        };
+        let run_guard = ActiveRunGuard::new(self.run_registry.clone(), run_id.clone());
+
+        let events_tx_inner = events_tx.clone();
+        let emit_fn = move |evt: crate::agent::AgentRunEvent| {
+            if let Ok(v) = serde_json::to_value(&evt) {
+                let _ = events_tx_inner.send(v);
+            }
+        };
+
+        // Forward the frontend's run_id and session_id through to the agent.
+        let session_id = inbound.session_id.as_deref().map(String::from);
+        tracing::debug!(target: "e2e", "[e2e-gateway-agent-call] timestamp={} run_id={}", now_ts(), run_id);
+        let result = agent
+            .process_message_with_events_streaming(
+                &inbound.text,
+                Box::new(emit_fn),
+                Some(run_id.clone()),
+                session_id,
+                cancel_token.clone(),
+            )
+            .await;
+        tracing::debug!(target: "e2e", "[e2e-gateway-agent-return] timestamp={} run_id={}", now_ts(), run_id);
+        run_guard.finish().await;
+
+        let reply_text = match &result {
+            Ok((reply, _)) => {
+                security
+                    .audit_inbound_complete(true, &format!("reply_len={}", reply.len()))
+                    .await;
+                crate::observability::record_inbound_duration(
+                    &channel_label, "ok", started.elapsed().as_secs_f64(),
+                );
+                reply.clone()
+            }
+            Err(err) => {
+                crate::observability::record_inbound_error("process_inbound_streaming");
+                security
+                    .audit_inbound_complete(false, &err.to_string())
+                    .await;
+                crate::observability::record_inbound_duration(
+                    &channel_label, "error", started.elapsed().as_secs_f64(),
+                );
+                return Err(anyhow::anyhow!(err.to_string()));
+            }
+        };
+
+        tracing::debug!(target: "e2e", "[e2e-gateway-return] timestamp={} run_id={} reply_len={}", now_ts(), run_id, reply_text.len());
+        Ok(GatewayInboundResponse { route, reply: reply_text, steps })
+    }
+
+    /// Debug-only: directly executes a shell command and streams output as agent-run-events.
+    /// Does NOT go through LLM. Used to verify runtime streaming infrastructure.
+    pub async fn debug_shell_stream(
+        &self,
+        command: String,
+        run_id: String,
+        events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        use crate::agent::event_bus::EventBus;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use std::process::Stdio;
+
+        let events_tx_inner = events_tx.clone();
+        let emit_fn = move |evt: crate::agent::AgentRunEvent| {
+            if let Ok(v) = serde_json::to_value(&evt) {
+                let _ = events_tx_inner.send(v);
+            }
+        };
+
+        let (bus, drain_handle) = EventBus::new(run_id.clone(), emit_fn);
+
+        tokio::spawn(async move {
+            drain_handle.drain().await;
+        });
+
+        bus.run_started("debug-shell".to_string(), None, None);
+
+        // Resolve cwd: prefer workspace root, fallback to current_dir.
+        let cfg = self.config.read().await.clone();
+        let workspace = cfg.workspace_dir.clone();
+        drop(cfg);
+
+        let cwd = if workspace.exists() {
+            tracing::debug!(target: "e2e", "[e2e-debug-cwd] cwd={} exists=true", workspace.display());
+            workspace
+        } else {
+            let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            tracing::debug!(target: "e2e", "[e2e-debug-cwd] cwd={} exists={}", fallback.display(), fallback.exists());
+            if !fallback.exists() {
+                bus.run_failed(format!("debug_shell_stream cwd does not exist: {}", fallback.display()));
+                return Err(anyhow::anyhow!("cwd does not exist: {}", fallback.display()));
+            }
+            fallback
+        };
+
+        let step_id = bus.step_started("debug shell streaming".to_string(), None);
+        let tool_call_id = uuid::Uuid::new_v4().to_string();
+        bus.tool_started(
+            tool_call_id.clone(),
+            "shell".to_string(),
+            format!("执行: {}", truncate_for_step(&command, 50)),
+            None,
+        );
+
+        let preview_cmd = truncate_for_step(&command, 80);
+        tracing::debug!(target: "e2e", "[e2e-debug-spawn] program=cmd.exe arg0=/C command={} cwd={} exists={}",
+            preview_cmd, cwd.display(), cwd.exists());
+
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn: {}", e))?;
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let step_id_out = step_id.clone();
+        let tool_call_id_out = tool_call_id.clone();
+        let bus_for_stdout = bus.clone();
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(out) = stdout {
+                let mut lines = BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    bus_for_stdout.command_output(
+                        step_id_out.clone(),
+                        tool_call_id_out.clone(),
+                        "shell".to_string(),
+                        line,
+                        false,
+                    );
+                }
+            }
+        });
+
+        let step_id_err = step_id.clone();
+        let tool_call_id_err = tool_call_id.clone();
+        let bus_for_stderr = bus.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(err) = stderr {
+                let mut lines = BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    bus_for_stderr.command_output(
+                        step_id_err.clone(),
+                        tool_call_id_err.clone(),
+                        "shell".to_string(),
+                        line,
+                        true,
+                    );
+                }
+            }
+        });
+
+        let status = child.wait().await.map_err(|e| anyhow::anyhow!("wait error: {}", e))?;
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+
+        let success = status.success();
+        bus.tool_completed(
+            step_id,
+            tool_call_id,
+            "shell".to_string(),
+            success,
+            0,
+            String::new(),
+            None,
+        );
+        let reply = if success {
+            "命令执行成功".to_string()
+        } else {
+            "命令执行失败".to_string()
+        };
+        bus.run_completed(reply.clone(), reply);
+
+        Ok(())
     }
 
     async fn validate_and_resolve_session_lineage(
@@ -633,7 +1203,7 @@ impl GatewayRuntime {
             .await
     }
 
-    /// 供桌面聊天 UI 展示的会话历史（过滤 system/tool 与纯工具调用轮次）。
+    /// ????? UI ?????????? system/tool ??????????
     pub async fn get_session_history(
         &self,
         channel: &ChannelKind,
@@ -656,8 +1226,8 @@ impl GatewayRuntime {
         }
     }
 
-    /// 删除某个会话：从内存血缘树与持久化会话存储中移除其记录。
-    /// 返回是否确有记录被删除。
+    /// ????????????????????????????
+    /// ????????????
     pub async fn delete_session(
         &self,
         channel: &ChannelKind,
@@ -666,13 +1236,13 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let key = session_key(channel, session_id);
 
-        // 内存血缘树
+        // ?????
         {
             let mut tree = self.session_tree.write().await;
             tree.remove(&key);
         }
 
-        // 持久化存储
+        // ?????
         let path = session_store_path(&cfg);
         let mut store = load_session_store(&path).await?;
         let removed = store.sessions.remove(&key).is_some();
@@ -1205,7 +1775,7 @@ fn truncate_for_step(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in trimmed.chars().enumerate() {
         if idx >= max_chars {
-            out.push('…');
+            out.push_str("...");
             return out;
         }
         out.push(ch);
@@ -1263,6 +1833,57 @@ pub struct ExecutionStep {
     pub title: String,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_events: Vec<RunEvent>,
+}
+
+/// Enriched run events produced during a tool call loop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum RunEvent {
+    ToolStarted { tool_call_id: String, tool_name: String, summary: String },
+    ToolCompleted {
+        tool_call_id: String,
+        tool_name: String,
+        success: bool,
+        duration_ms: u64,
+        result_summary: String,
+        diff_stats: Option<RunDiffStats>,
+    },
+    CommandOutput { tool_call_id: String, tool_name: String, output: String, is_stderr: bool },
+    FileChanged { path: String, additions: i32, deletions: i32 },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunDiffStats {
+    pub additions: i32,
+    pub deletions: i32,
+}
+
+impl From<ToolExecutionEvent> for RunEvent {
+    fn from(evt: ToolExecutionEvent) -> Self {
+        match evt {
+            ToolExecutionEvent::Started { tool_call_id, tool_name, summary } => {
+                RunEvent::ToolStarted { tool_call_id, tool_name, summary }
+            }
+            ToolExecutionEvent::Completed { tool_call_id, tool_name, success, duration_ms, result_summary, diff_stats } => {
+                RunEvent::ToolCompleted {
+                    tool_call_id,
+                    tool_name,
+                    success,
+                    duration_ms,
+                    result_summary,
+                    diff_stats: diff_stats.map(|d| RunDiffStats { additions: d.additions, deletions: d.deletions }),
+                }
+            }
+            ToolExecutionEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr } => {
+                RunEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr }
+            }
+            ToolExecutionEvent::FileChanged { path, additions, deletions } => {
+                RunEvent::FileChanged { path, additions, deletions }
+            }
+        }
+    }
 }
 
 impl ExecutionStep {
@@ -1271,6 +1892,7 @@ impl ExecutionStep {
             title: title.into(),
             status: "done".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
     }
 
@@ -1279,6 +1901,7 @@ impl ExecutionStep {
             title: title.into(),
             status: "running".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
     }
 
@@ -1287,9 +1910,18 @@ impl ExecutionStep {
             title: title.into(),
             status: "error".to_string(),
             detail: Some(detail.into()),
+            run_events: Vec::new(),
         }
     }
+
+    fn with_events(mut self, events: Vec<RunEvent>) -> Self {
+        self.run_events = events;
+        self
+    }
 }
+
+// Re-exports for backward compatibility with external crate users.
+pub use crate::agent::AgentRunEvent;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewaySessionTreeResponse {
@@ -1351,7 +1983,7 @@ pub struct GatewaySessionTreeQuery {
     pub sort_order: Option<String>,
 }
 
-/// 聊天界面可展示的一条历史消息。
+/// ???????????????
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayChatMessage {
     pub role: String,
@@ -1977,7 +2609,7 @@ fn channel_label(channel: &ChannelKind) -> String {
     }
 }
 
-/// 将网关持久化的 `ChatMessage` 转为 UI 气泡列表。
+/// ??????? `ChatMessage` ?? UI ?????
 fn messages_for_chat_ui(messages: &[ChatMessage]) -> Vec<GatewayChatMessage> {
     let mut out = Vec::new();
     for msg in messages {
@@ -2560,12 +3192,22 @@ pub struct GatewayError {
 }
 
 pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
-    let workspace = config.workspace_dir.clone();
+    create_workspace_tools(&config.workspace_dir, config)
+}
+
+/// Build all workspace-scoped tools with the given effective workspace root.
+pub fn create_workspace_tools(
+    effective_workspace: &PathBuf,
+    config: &Config,
+) -> Vec<Box<dyn Tool>> {
+    let workspace = effective_workspace.clone();
     let shell_allowlist = resolve_shell_allowlist(config);
     vec![
         Box::new(FileReadTool::new(workspace.clone())),
         Box::new(FileWriteTool::new(workspace.clone())),
         Box::new(FileEditTool::new(workspace.clone())),
+        Box::new(FilePatchTool::new(workspace.clone())),
+        Box::new(FileListTool::new(workspace.clone())),
         Box::new(GlobSearchTool::new(workspace.clone())),
         Box::new(ContentSearchTool::new(workspace.clone())),
         Box::new(GitOperationsTool::new(workspace.clone())),
@@ -2745,9 +3387,10 @@ fn attach_delegate_tool(
 fn create_tools_for_route(
     config: &Config,
     route_agent_name: &str,
-    memory: Arc<dyn Memory>,
+    _memory: Arc<dyn Memory>,
+    effective_workspace: &PathBuf,
 ) -> Vec<Box<dyn Tool>> {
-    let tools = create_all_tools(config, memory);
+    let tools = create_workspace_tools(effective_workspace, config);
     let Some(delegate) = config.agents.get(route_agent_name) else {
         return tools;
     };
@@ -2795,10 +3438,11 @@ mod tests {
                 ..DelegateAgentConfig::default()
             },
         );
+        let effective_ws = PathBuf::from("/fake/workspace");
 
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::InMemoryMemory::new());
-        let tools = create_tools_for_route(&config, "researcher", memory);
+        let tools = create_tools_for_route(&config, "researcher", memory, &effective_ws);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
     }

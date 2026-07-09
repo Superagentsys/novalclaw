@@ -1,7 +1,9 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
+use crate::agent::event_bus::EventBus;
 use crate::agent::planner::{self, Reflection};
 use crate::agent::prompt::bootstrap_system_messages;
+use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
 use crate::providers::{ChatMessage, Provider};
@@ -10,6 +12,27 @@ use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::warn;
+
+fn now_ts() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs();
+    let h = (t / 3600) % 24;
+    let m = (t / 60) % 60;
+    let s = t % 60;
+    let ms = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+fn truncate_chars_with_ellipsis(input: &str, max_chars: usize) -> String {
+    let mut out: String = input.chars().take(max_chars).collect();
+    if input.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
 
 /// Cap on per-step result text quoted back into reflector prompts.
 const REFLECT_RESULT_SNIPPET_CHARS: usize = 2_000;
@@ -91,6 +114,151 @@ impl Agent {
             );
             dispatcher.run(&mut self.messages).await
         }
+    }
+
+    /// Like `process_message` but also collects rich tool-execution events
+    /// for a live execution timeline. Returns `(reply_text, collected_events)`.
+    pub async fn process_message_with_events(
+        &mut self,
+        message: &str,
+    ) -> Result<(String, Vec<ToolExecutionEvent>)> {
+        if self.messages.is_empty() {
+            self.messages.extend(bootstrap_system_messages(&self.config));
+        }
+
+        let _ = self
+            .memory
+            .store(
+                &format!("conversation/{}", uuid::Uuid::new_v4()),
+                message,
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+
+        self.messages.push(ChatMessage::user(message));
+
+        let budget = BudgetTracker::new(self.config.budget.clone());
+        let dispatcher = AgentDispatcher::new(
+            self.provider.as_ref(),
+            &self.tools,
+            &self.tool_specs,
+            self.config.max_tool_iterations,
+            &self.security,
+            &budget,
+        );
+
+        let (reply, events) = dispatcher.run_with_events(&mut self.messages).await?;
+
+        Ok((reply, events))
+    }
+
+    /// Like `process_message_with_events` but also calls `on_event` immediately
+    /// for each tool execution event, enabling real-time event streaming.
+    /// Uses the new `EventBus` for structured, seq-ordered events.
+    /// Processes a user message with real-time event streaming to the frontend.
+    /// Events (tool_started, command_output, tool_completed, etc.) are forwarded
+    /// via `on_event` as they happen, without waiting for the run to complete.
+    ///
+    /// `external_run_id` — if provided, the frontend already generated this run_id
+    /// and all events must use it. Otherwise a new one is generated.
+    /// `external_session_id` — session context for the run.
+    pub async fn process_message_with_events_streaming(
+        &mut self,
+        message: &str,
+        on_event: Box<dyn Fn(AgentRunEvent) + Send + Sync + 'static>,
+        external_run_id: Option<String>,
+        external_session_id: Option<String>,
+        cancel_token: AgentCancellationToken,
+    ) -> Result<(String, Vec<AgentRunEvent>)> {
+        if self.messages.is_empty() {
+            self.messages.extend(bootstrap_system_messages(&self.config));
+        }
+
+        let _ = self
+            .memory
+            .store(
+                &format!("conversation/{}", uuid::Uuid::new_v4().to_string()),
+                message,
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+
+        self.messages.push(ChatMessage::user(message));
+
+        let budget = BudgetTracker::new(self.config.budget.clone());
+
+        // Use the frontend-provided run_id if available, otherwise generate one.
+        let run_id = external_run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        tracing::debug!(target: "e2e", "[e2e-agent-start] timestamp={} run_id={}", now_ts(), run_id);
+
+        // Box<dyn Fn> is callable directly — deref coercion handles it.
+        let emit_fn = move |evt: AgentRunEvent| {
+            on_event(evt);
+        };
+        let (bus, drain_handle) = EventBus::new(run_id.clone(), emit_fn);
+
+        // The drain task runs in background and exits when the channel closes.
+        // We intentionally do NOT await drain_handle here — the caller does not
+        // need to wait for flush. Awaiting it would deadlock: drain needs the
+        // channel to close, which needs bus to drop, which needs this function
+        // to return.
+        tokio::spawn(async move {
+            drain_handle.drain().await;
+        });
+
+        bus.run_started(self.config.name.clone(), external_session_id, None);
+
+        let dispatcher = AgentDispatcher::new(
+            self.provider.as_ref(),
+            &self.tools,
+            &self.tool_specs,
+            self.config.max_tool_iterations,
+            &self.security,
+            &budget,
+        )
+        .with_event_bus(Some(bus.clone()))
+        .with_cancel_token(Some(cancel_token.clone()));
+
+        let run_future = dispatcher.run_streaming_with_bus(&mut self.messages);
+        let dispatch_result = tokio::select! {
+            result = run_future => result,
+            _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
+        };
+
+        let reply_text = match dispatch_result {
+            Ok(reply) => {
+                let preview = truncate_chars_with_ellipsis(&reply, 200);
+                if cancel_token.is_cancelled() {
+                    bus.run_cancelled("任务已取消".to_string());
+                    tracing::debug!(target: "e2e", "[e2e-agent-dispatch-cancelled-late] timestamp={} run_id={}", now_ts(), run_id);
+                    Err(anyhow::anyhow!("agent run cancelled"))
+                } else {
+                    bus.run_completed(reply.clone(), preview);
+                    tracing::debug!(target: "e2e", "[e2e-agent-dispatch-ok] timestamp={} run_id={} reply_len={}", now_ts(), run_id, reply.len());
+                    Ok(reply)
+                }
+            }
+            Err(e) => {
+                if cancel_token.is_cancelled() {
+                    bus.run_cancelled("任务已取消".to_string());
+                    tracing::debug!(target: "e2e", "[e2e-agent-dispatch-cancelled] timestamp={} run_id={}", now_ts(), run_id);
+                } else {
+                    bus.run_failed(e.to_string());
+                    tracing::debug!(target: "e2e", "[e2e-agent-dispatch-err] timestamp={} run_id={} error={}", now_ts(), run_id, e);
+                }
+                Err(e)
+            }
+        }?;
+
+        // Events were already streamed via on_event as they happened.
+        // bus.collect() is safe here — it only reads from the collected Vec,
+        // it does NOT wait for the drain task.
+        let events = bus.collect();
+
+        tracing::debug!(target: "e2e", "[e2e-agent-return] timestamp={} run_id={} reply_len={} event_count={}", now_ts(), run_id, reply_text.len(), events.len());
+        Ok((reply_text, events))
     }
 
     /// Streaming variant of [`process_message`]: drives the budget-aware tool
