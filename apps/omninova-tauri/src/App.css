@@ -1519,7 +1519,7 @@
 }
 
 .chat-media-actions {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 8px;
   padding: 0 4px;
