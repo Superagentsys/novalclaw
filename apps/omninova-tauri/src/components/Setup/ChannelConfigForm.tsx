@@ -160,9 +160,7 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
                 <li>
                   在「事件订阅」中设置请求地址为网关地址 +
                   <code>/webhook/feishu</code>（如{" "}
-                  <code>https://your-domain/webhook/feishu</code>
-                  ），并获取 <strong>Verification Token</strong> 和{" "}
-                  <strong>Encrypt Key</strong>
+                  <code>https://your-domain/webhook/feishu</code>）
                 </li>
                 <li>
                   订阅 <code>im.message.receive_v1</code>{" "}
