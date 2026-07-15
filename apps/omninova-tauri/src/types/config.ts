@@ -119,10 +119,6 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     fields: [
       { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
       { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password" },
-      { key: "verification_token", label: "Verification Token", placeholder: "事件订阅验证 Token", type: "text" },
-      { key: "encrypt_key", label: "Encrypt Key", placeholder: "事件加密密钥（可选）", type: "password" },
-      { key: "webhook_url", label: "Webhook 回调地址", placeholder: "https://your-domain/webhook/feishu", type: "text" },
-      { key: "token_env", label: "Secret 环境变量", placeholder: "FEISHU_APP_SECRET", type: "text" },
     ],
   },
   {
