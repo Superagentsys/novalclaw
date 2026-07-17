@@ -24,6 +24,9 @@ const EMPTY_ENTRY: ChannelEntryConfig = {
 
 const DEFAULT_CHANNEL_ID = "feishu";
 
+/** 飞书 / Lark 仅暴露 App ID、App Secret */
+const FEISHU_LIKE_FIELD_KEYS = new Set(["app_id", "app_secret"]);
+
 export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
   const [selectedId, setSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
 
@@ -31,6 +34,16 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
     [selectedId]
   );
+
+  const visibleFields = useMemo(() => {
+    if (!selectedPreset) return [];
+    if (selectedPreset.id === "feishu" || selectedPreset.id === "lark") {
+      return selectedPreset.fields.filter((field) =>
+        FEISHU_LIKE_FIELD_KEYS.has(field.key)
+      );
+    }
+    return selectedPreset.fields;
+  }, [selectedPreset]);
 
   const getEntry = (id: keyof ChannelsConfig): ChannelEntryConfig =>
     value[id] ?? { ...EMPTY_ENTRY };
@@ -121,7 +134,7 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
           </div>
 
           <div className="setup-grid">
-            {selectedPreset.fields.map((field) => (
+            {visibleFields.map((field) => (
               <label key={field.key}>
                 {field.label}
                 <input
@@ -155,7 +168,7 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
                 </li>
                 <li>
                   在「凭证与基础信息」中获取 <strong>App ID</strong> 和{" "}
-                  <strong>App Secret</strong>
+                  <strong>App Secret</strong>（本页仅需填写这两项）
                 </li>
                 <li>
                   在「事件订阅」中设置请求地址为网关地址 +
