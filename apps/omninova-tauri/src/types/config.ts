@@ -169,8 +169,6 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     fields: [
       { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
       { key: "app_secret", label: "App Secret", placeholder: "Lark 应用密钥", type: "password" },
-      { key: "verification_token", label: "Verification Token", placeholder: "事件验证 Token", type: "text" },
-      { key: "token_env", label: "Secret 环境变量", placeholder: "LARK_APP_SECRET", type: "text" },
     ],
   },
   {
