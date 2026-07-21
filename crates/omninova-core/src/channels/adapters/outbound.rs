@@ -1,5 +1,8 @@
 use crate::channels::ChannelKind;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // =============================================================================
@@ -90,6 +93,7 @@ impl OutboundResult {
         OutboundResultSummary {
             ok: self.ok,
             provider: self.provider.clone(),
+            delivery: self.delivery.clone(),
             platform_message_id: self.platform_message_id.clone(),
             error_code: self.error_code.clone(),
             message: self.message.clone(),
@@ -102,6 +106,7 @@ impl OutboundResult {
 pub struct OutboundResultSummary {
     pub ok: bool,
     pub provider: String,
+    pub delivery: OutboundDeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,10 +133,6 @@ pub enum OutboundDeliveryStatus {
     SkippedEmptyReply,
     /// Sent via mock sender (no real API call)
     MockSent,
-    /// Successfully delivered to platform (for webhook response)
-    Delivered,
-    /// Failed to deliver to platform (for webhook response)
-    DeliveryFailed,
 }
 
 /// Trait for sending outbound messages to various channels
@@ -191,7 +192,7 @@ impl ChannelOutboundSender for MockOutboundSender {
             text: text.to_string(),
             timestamp: Instant::now(),
         });
-        OutboundResult::success("mock", mock_id)
+        OutboundResult::mock_sent("mock", mock_id)
     }
 
     fn channel_kind(&self) -> ChannelKind {
@@ -250,6 +251,222 @@ impl TokenCache {
     }
 }
 
+// =============================================================================
+// Feishu / Lark real senders
+// =============================================================================
+
+const TOKEN_EXPIRY_SAFETY_MARGIN_SECS: u64 = 60;
+
+#[derive(Clone)]
+struct PlatformOutboundSender {
+    provider: &'static str,
+    channel: ChannelKind,
+    api_base_url: &'static str,
+    app_id: String,
+    app_secret: String,
+    client: Client,
+    token_cache: Arc<TokenCache>,
+}
+
+impl PlatformOutboundSender {
+    fn new(
+        provider: &'static str,
+        channel: ChannelKind,
+        api_base_url: &'static str,
+        app_id: String,
+        app_secret: String,
+        token_cache: Arc<TokenCache>,
+    ) -> Self {
+        Self {
+            provider,
+            channel,
+            api_base_url,
+            app_id,
+            app_secret,
+            client: Client::new(),
+            token_cache,
+        }
+    }
+
+    async fn tenant_access_token(&self) -> Result<String, OutboundResult> {
+        let cache_key = format!("{}:{}", self.provider, self.app_id);
+        if let Some(token) = self.token_cache.get(&cache_key) {
+            return Ok(token);
+        }
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/auth/v3/tenant_access_token/internal",
+                self.api_base_url
+            ))
+            .json(&json!({ "app_id": self.app_id, "app_secret": self.app_secret }))
+            .send()
+            .await
+            .map_err(|_| {
+                OutboundResult::failed(self.provider, "token_fetch_failed", "token request failed")
+            })?;
+
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().await.map_err(|_| {
+            OutboundResult::failed(
+                self.provider,
+                "token_fetch_failed",
+                "token response was invalid",
+            )
+        })?;
+        if !status.is_success()
+            || body
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                != 0
+        {
+            return Err(OutboundResult::failed(
+                self.provider,
+                "token_fetch_failed",
+                &format!("token request failed (HTTP {})", status.as_u16()),
+            ));
+        }
+
+        let token = body
+            .get("tenant_access_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| {
+                OutboundResult::failed(self.provider, "token_fetch_failed", "token was missing")
+            })?
+            .to_string();
+        let expires_in = body
+            .get("expire")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(3600)
+            .saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN_SECS)
+            .max(1);
+        self.token_cache.set(cache_key, token.clone(), expires_in);
+        Ok(token)
+    }
+
+    async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
+        let token = match self.tenant_access_token().await {
+            Ok(token) => token,
+            Err(result) => return result,
+        };
+
+        let response = match self
+            .client
+            .post(format!(
+                "{}/im/v1/messages?receive_id_type=chat_id",
+                self.api_base_url
+            ))
+            .bearer_auth(token)
+            .json(&json!({
+                "receive_id": target.chat_id,
+                "msg_type": "text",
+                "content": json!({ "text": text }).to_string(),
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return OutboundResult::failed(
+                    self.provider,
+                    "message_send_failed",
+                    "message request failed",
+                )
+            }
+        };
+
+        let status = response.status();
+        let body = match response.json::<serde_json::Value>().await {
+            Ok(body) => body,
+            Err(_) => {
+                return OutboundResult::failed(
+                    self.provider,
+                    "message_send_failed",
+                    "message response was invalid",
+                )
+            }
+        };
+        if !status.is_success()
+            || body
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                != 0
+        {
+            return OutboundResult::failed(
+                self.provider,
+                "message_send_failed",
+                &format!("message request failed (HTTP {})", status.as_u16()),
+            );
+        }
+
+        let message_id = body
+            .pointer("/data/message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or("accepted")
+            .to_string();
+        OutboundResult::success(self.provider, message_id)
+    }
+}
+
+#[derive(Clone)]
+pub struct FeishuOutboundSender(PlatformOutboundSender);
+
+impl FeishuOutboundSender {
+    pub fn new(app_id: String, app_secret: String, token_cache: Arc<TokenCache>) -> Self {
+        Self(PlatformOutboundSender::new(
+            "feishu",
+            ChannelKind::Feishu,
+            "https://open.feishu.cn/open-apis",
+            app_id,
+            app_secret,
+            token_cache,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelOutboundSender for FeishuOutboundSender {
+    async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
+        self.0.send_text_reply(target, text).await
+    }
+
+    fn channel_kind(&self) -> ChannelKind {
+        self.0.channel.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct LarkOutboundSender(PlatformOutboundSender);
+
+impl LarkOutboundSender {
+    pub fn new(app_id: String, app_secret: String, token_cache: Arc<TokenCache>) -> Self {
+        Self(PlatformOutboundSender::new(
+            "lark",
+            ChannelKind::Lark,
+            "https://open.larksuite.com/open-apis",
+            app_id,
+            app_secret,
+            token_cache,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelOutboundSender for LarkOutboundSender {
+    async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
+        self.0.send_text_reply(target, text).await
+    }
+
+    fn channel_kind(&self) -> ChannelKind {
+        self.0.channel.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +512,7 @@ mod tests {
     fn token_cache_stores_and_retrieves() {
         let cache = TokenCache::new();
         cache.set("key1".to_string(), "token123".to_string(), 3600);
-        
+
         assert_eq!(cache.get("key1"), Some("token123".to_string()));
         assert_eq!(cache.get("key2"), None);
     }
@@ -335,8 +552,8 @@ mod tests {
             token_env: None,
             extra: std::collections::HashMap::new(),
         };
-        // Note: FeishuOutboundSender would need to be implemented separately
-        // This test documents the expected behavior
+        // The gateway turns this missing configuration into `not_configured`
+        // before constructing the real Feishu sender.
         assert!(config.extra.get("app_id").is_none());
         assert!(config.extra.get("app_secret").is_none());
     }

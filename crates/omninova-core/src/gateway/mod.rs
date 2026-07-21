@@ -1,51 +1,56 @@
 pub mod pairing;
 pub mod ws;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::http::HeaderMap;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use crate::agent::sanitize_messages_for_provider;
+use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
 use crate::channels::adapters::outbound::{
-    ChannelOutboundSender, MockOutboundSender, OutboundDeliveryStatus, OutboundResult, OutboundResultSummary, ReplyTarget, TokenCache,
+    ChannelOutboundSender, FeishuOutboundSender, LarkOutboundSender, MockOutboundSender,
+    OutboundDeliveryStatus, OutboundResult, OutboundResultSummary, ReplyTarget, TokenCache,
 };
 use crate::channels::adapters::platform_webhook::{
     inbound_from_platform_webhook, verification_response,
 };
-use crate::channels::adapters::webhook::{WebhookInboundPayload, inbound_from_webhook};
+use crate::channels::adapters::webhook::{inbound_from_webhook, WebhookInboundPayload};
 use crate::channels::{ChannelKind, InboundMessage};
 use crate::config::{resolve_effective_workspace_dir, Config};
-use crate::memory::{Memory, factory::build_memory_from_config};
+use crate::memory::{factory::build_memory_from_config, Memory};
 use crate::providers::ChatMessage;
-use crate::providers::{ProviderSelection, build_provider_from_config, build_provider_with_selection};
-use crate::routing::{RouteDecision, resolve_agent_route};
+use crate::providers::{
+    build_provider_from_config, build_provider_with_selection, ProviderSelection,
+};
+use crate::routing::{resolve_agent_route, RouteDecision};
 use crate::security::{
-    ApprovalController, EstopController, EstopState, PendingApproval, SecurityContext,
-    is_tool_globally_allowed, resolve_shell_allowlist,
+    is_tool_globally_allowed, resolve_shell_allowlist, ApprovalController, EstopController,
+    EstopState, PendingApproval, SecurityContext,
 };
 use crate::skills::{format_skills_prompt, load_skills_from_dir};
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
-    FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
-    MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool, WebSearchTool,
+    FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
+    HttpRequestTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool,
+    WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
-use crate::agent::sanitize_messages_for_provider;
-use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
 use crate::Agent;
-use std::hash::{Hash, Hasher};
+use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_TOKEN_CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
 const WORKSPACE_REQUIRED_MESSAGE: &str =
     "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
 
@@ -273,7 +278,10 @@ impl GatewayRuntime {
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
         if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+            let skills_dir = cfg
+                .skills
+                .open_skills_dir
+                .as_ref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
@@ -341,7 +349,13 @@ impl GatewayRuntime {
         }
 
         let security = SecurityContext::from_config(&cfg);
-        Ok(Agent::new(provider, tools, self.memory.clone(), agent_cfg, security))
+        Ok(Agent::new(
+            provider,
+            tools,
+            self.memory.clone(),
+            agent_cfg,
+            security,
+        ))
     }
 
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
@@ -349,7 +363,10 @@ impl GatewayRuntime {
         resolve_agent_route(&cfg, inbound)
     }
 
-    pub async fn process_inbound(&self, inbound: &InboundMessage) -> anyhow::Result<GatewayInboundResponse> {
+    pub async fn process_inbound(
+        &self,
+        inbound: &InboundMessage,
+    ) -> anyhow::Result<GatewayInboundResponse> {
         let started = std::time::Instant::now();
         self.ensure_not_stopped().await?;
         let cfg = self.config.read().await.clone();
@@ -638,7 +655,9 @@ impl GatewayRuntime {
         let security = SecurityContext::for_inbound(&cfg, inbound, &route);
         let channel_label = security.audit().context().channel.clone();
         crate::observability::record_inbound_request(&channel_label);
-        security.audit_inbound_start(inbound.text.chars().count()).await;
+        security
+            .audit_inbound_start(inbound.text.chars().count())
+            .await;
 
         let mut steps = vec![ExecutionStep::done(
             "接收请求",
@@ -658,8 +677,16 @@ impl GatewayRuntime {
             format!(
                 "Agent: {}{}{}",
                 route.agent_name,
-                route.provider.as_ref().map(|p| format!(", Provider: {p}")).unwrap_or_default(),
-                route.model.as_ref().map(|m| format!(", Model: {m}")).unwrap_or_default()
+                route
+                    .provider
+                    .as_ref()
+                    .map(|p| format!(", Provider: {p}"))
+                    .unwrap_or_default(),
+                route
+                    .model
+                    .as_ref()
+                    .map(|m| format!(", Model: {m}"))
+                    .unwrap_or_default()
             ),
         ));
         security
@@ -689,7 +716,10 @@ impl GatewayRuntime {
                 anyhow::bail!(message);
             }
         };
-        steps.push(ExecutionStep::done("Workspace", format!("{}", effective_workspace.display())));
+        steps.push(ExecutionStep::done(
+            "Workspace",
+            format!("{}", effective_workspace.display()),
+        ));
         security
             .audit_route(&format!(
                 "agent={} workspace={}",
@@ -743,7 +773,10 @@ impl GatewayRuntime {
         }
 
         if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg.skills.open_skills_dir.as_ref()
+            let skills_dir = cfg
+                .skills
+                .open_skills_dir
+                .as_ref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| effective_workspace.join("skills"));
             if let Ok(skills) = load_skills_from_dir(&skills_dir) {
@@ -751,7 +784,10 @@ impl GatewayRuntime {
                 if !prompt.is_empty() {
                     let current = agent_cfg.system_prompt.unwrap_or_default();
                     agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
+                    steps.push(ExecutionStep::done(
+                        "加载技能提示",
+                        "已注入 workspace skills",
+                    ));
                 }
             }
         }
@@ -838,7 +874,9 @@ impl GatewayRuntime {
                     .audit_inbound_complete(true, &format!("reply_len={}", reply.len()))
                     .await;
                 crate::observability::record_inbound_duration(
-                    &channel_label, "ok", started.elapsed().as_secs_f64(),
+                    &channel_label,
+                    "ok",
+                    started.elapsed().as_secs_f64(),
                 );
                 reply.clone()
             }
@@ -848,14 +886,20 @@ impl GatewayRuntime {
                     .audit_inbound_complete(false, &err.to_string())
                     .await;
                 crate::observability::record_inbound_duration(
-                    &channel_label, "error", started.elapsed().as_secs_f64(),
+                    &channel_label,
+                    "error",
+                    started.elapsed().as_secs_f64(),
                 );
                 return Err(anyhow::anyhow!(err.to_string()));
             }
         };
 
         tracing::debug!(target: "e2e", "[e2e-gateway-return] timestamp={} run_id={} reply_len={}", now_ts(), run_id, reply_text.len());
-        Ok(GatewayInboundResponse { route, reply: reply_text, steps })
+        Ok(GatewayInboundResponse {
+            route,
+            reply: reply_text,
+            steps,
+        })
     }
 
     /// Debug-only: directly executes a shell command and streams output as agent-run-events.
@@ -867,8 +911,8 @@ impl GatewayRuntime {
         events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     ) -> anyhow::Result<()> {
         use crate::agent::event_bus::EventBus;
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
 
         let events_tx_inner = events_tx.clone();
         let emit_fn = move |evt: crate::agent::AgentRunEvent| {
@@ -897,8 +941,14 @@ impl GatewayRuntime {
             let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             tracing::debug!(target: "e2e", "[e2e-debug-cwd] cwd={} exists={}", fallback.display(), fallback.exists());
             if !fallback.exists() {
-                bus.run_failed(format!("debug_shell_stream cwd does not exist: {}", fallback.display()));
-                return Err(anyhow::anyhow!("cwd does not exist: {}", fallback.display()));
+                bus.run_failed(format!(
+                    "debug_shell_stream cwd does not exist: {}",
+                    fallback.display()
+                ));
+                return Err(anyhow::anyhow!(
+                    "cwd does not exist: {}",
+                    fallback.display()
+                ));
             }
             fallback
         };
@@ -964,7 +1014,10 @@ impl GatewayRuntime {
             }
         });
 
-        let status = child.wait().await.map_err(|e| anyhow::anyhow!("wait error: {}", e))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("wait error: {}", e))?;
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
 
@@ -1070,7 +1123,8 @@ impl GatewayRuntime {
             Some(parent_key) => {
                 let parent_meta = self.resolve_parent_lineage(cfg, parent_key).await?;
                 if let Some(expected_parent_agent_id) = resolved_parent_agent_id.as_ref() {
-                    if parent_meta.agent_name.as_deref() != Some(expected_parent_agent_id.as_str()) {
+                    if parent_meta.agent_name.as_deref() != Some(expected_parent_agent_id.as_str())
+                    {
                         anyhow::bail!(
                             "parentAgentId '{}' does not match parent session agent",
                             expected_parent_agent_id
@@ -1261,8 +1315,7 @@ impl GatewayRuntime {
         query: &GatewaySessionTreeQuery,
     ) -> anyhow::Result<GatewaySessionTreeResponse> {
         let query = normalize_session_tree_query(query);
-        if let (Some(min_depth), Some(max_depth)) = (query.min_spawn_depth, query.max_spawn_depth)
-        {
+        if let (Some(min_depth), Some(max_depth)) = (query.min_spawn_depth, query.max_spawn_depth) {
             if min_depth > max_depth {
                 anyhow::bail!("min_spawn_depth cannot be greater than max_spawn_depth");
             }
@@ -1468,7 +1521,12 @@ impl GatewayRuntime {
             .route("/config", get(http_get_config).post(http_set_config))
             .route("/api/status", get(http_api_status))
             .route("/api/tools", get(http_api_tools))
-            .route("/api/memory", get(http_api_memory_list).post(http_api_memory_store).delete(http_api_memory_forget))
+            .route(
+                "/api/memory",
+                get(http_api_memory_list)
+                    .post(http_api_memory_store)
+                    .delete(http_api_memory_forget),
+            )
             .route("/api/doctor", get(http_api_doctor))
             .route("/api/cron", get(http_api_cron_list).post(http_api_cron_add))
             // Phone Agent (iOS/Android) compatibility API
@@ -1504,10 +1562,7 @@ impl GatewayRuntime {
                             warn!("prometheus metrics server stopped: {e}");
                         }
                     }
-                    Err(e) => warn!(
-                        "failed to bind prometheus metrics on {}: {e}",
-                        metrics_addr
-                    ),
+                    Err(e) => warn!("failed to bind prometheus metrics on {}: {e}", metrics_addr),
                 }
             });
         }
@@ -1555,15 +1610,12 @@ fn acquire_inbound_slot(
     cfg: &Config,
     active: &Arc<AtomicUsize>,
 ) -> anyhow::Result<Option<InboundSlotGuard>> {
-    let limit = cfg
-        .agent_defaults_extended
-        .max_concurrent
-        .or_else(|| {
-            cfg.agent_defaults_extended
-                .subagents
-                .as_ref()
-                .and_then(|s| s.max_concurrent)
-        });
+    let limit = cfg.agent_defaults_extended.max_concurrent.or_else(|| {
+        cfg.agent_defaults_extended
+            .subagents
+            .as_ref()
+            .and_then(|s| s.max_concurrent)
+    });
     let Some(limit) = limit else {
         return Ok(None);
     };
@@ -1600,11 +1652,7 @@ async fn acquire_subagent_guard(
     if let Some(max_depth) = subagents.max_spawn_depth {
         let depth = metadata_u32(inbound, &["spawn_depth", "spawnDepth"]).unwrap_or(0);
         if depth > max_depth {
-            anyhow::bail!(
-                "subagent spawn depth {} exceeds limit {}",
-                depth,
-                max_depth
-            );
+            anyhow::bail!("subagent spawn depth {} exceeds limit {}", depth, max_depth);
         }
     }
 
@@ -1726,8 +1774,12 @@ fn metadata_u32(inbound: &InboundMessage, keys: &[&str]) -> Option<u32> {
 }
 
 fn metadata_str<'a>(inbound: &'a InboundMessage, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| inbound.metadata.get(*key).and_then(serde_json::Value::as_str))
+    keys.iter().find_map(|key| {
+        inbound
+            .metadata
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+    })
 }
 
 fn extract_tool_steps(messages: &[ChatMessage]) -> Vec<ExecutionStep> {
@@ -1740,12 +1792,21 @@ fn extract_tool_steps(messages: &[ChatMessage]) -> Vec<ExecutionStep> {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
                     continue;
                 };
-                let Some(tool_calls) = value.get("tool_calls").and_then(serde_json::Value::as_array) else {
+                let Some(tool_calls) = value
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                else {
                     continue;
                 };
                 for call in tool_calls {
-                    let id = call.get("id").and_then(serde_json::Value::as_str).unwrap_or("-");
-                    let name = call.get("name").and_then(serde_json::Value::as_str).unwrap_or("unknown_tool");
+                    let id = call
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let name = call
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown_tool");
                     let args = call
                         .get("arguments")
                         .and_then(serde_json::Value::as_str)
@@ -1889,18 +1950,13 @@ impl PlatformWebhookResponse {
         reply: String,
         outbound_result: OutboundResultSummary,
     ) -> Self {
-        let delivery = if outbound_result.ok {
-            OutboundDeliveryStatus::Delivered
-        } else {
-            OutboundDeliveryStatus::DeliveryFailed
-        };
         Self {
             ok: true,
             channel: channel.to_string(),
             message_id,
             conversation_id,
             agent_reply: Some(reply),
-            outbound_delivery: delivery,
+            outbound_delivery: outbound_result.delivery.clone(),
             outbound_result: Some(outbound_result),
             error: None,
         }
@@ -1946,7 +2002,11 @@ pub struct ExecutionStep {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RunEvent {
-    ToolStarted { tool_call_id: String, tool_name: String, summary: String },
+    ToolStarted {
+        tool_call_id: String,
+        tool_name: String,
+        summary: String,
+    },
     ToolCompleted {
         tool_call_id: String,
         tool_name: String,
@@ -1955,8 +2015,17 @@ pub enum RunEvent {
         result_summary: String,
         diff_stats: Option<RunDiffStats>,
     },
-    CommandOutput { tool_call_id: String, tool_name: String, output: String, is_stderr: bool },
-    FileChanged { path: String, additions: i32, deletions: i32 },
+    CommandOutput {
+        tool_call_id: String,
+        tool_name: String,
+        output: String,
+        is_stderr: bool,
+    },
+    FileChanged {
+        path: String,
+        additions: i32,
+        deletions: i32,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1968,25 +2037,53 @@ pub struct RunDiffStats {
 impl From<ToolExecutionEvent> for RunEvent {
     fn from(evt: ToolExecutionEvent) -> Self {
         match evt {
-            ToolExecutionEvent::Started { tool_call_id, tool_name, summary } => {
-                RunEvent::ToolStarted { tool_call_id, tool_name, summary }
-            }
-            ToolExecutionEvent::Completed { tool_call_id, tool_name, success, duration_ms, result_summary, diff_stats } => {
-                RunEvent::ToolCompleted {
-                    tool_call_id,
-                    tool_name,
-                    success,
-                    duration_ms,
-                    result_summary,
-                    diff_stats: diff_stats.map(|d| RunDiffStats { additions: d.additions, deletions: d.deletions }),
-                }
-            }
-            ToolExecutionEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr } => {
-                RunEvent::CommandOutput { tool_call_id, tool_name, output, is_stderr }
-            }
-            ToolExecutionEvent::FileChanged { path, additions, deletions } => {
-                RunEvent::FileChanged { path, additions, deletions }
-            }
+            ToolExecutionEvent::Started {
+                tool_call_id,
+                tool_name,
+                summary,
+            } => RunEvent::ToolStarted {
+                tool_call_id,
+                tool_name,
+                summary,
+            },
+            ToolExecutionEvent::Completed {
+                tool_call_id,
+                tool_name,
+                success,
+                duration_ms,
+                result_summary,
+                diff_stats,
+            } => RunEvent::ToolCompleted {
+                tool_call_id,
+                tool_name,
+                success,
+                duration_ms,
+                result_summary,
+                diff_stats: diff_stats.map(|d| RunDiffStats {
+                    additions: d.additions,
+                    deletions: d.deletions,
+                }),
+            },
+            ToolExecutionEvent::CommandOutput {
+                tool_call_id,
+                tool_name,
+                output,
+                is_stderr,
+            } => RunEvent::CommandOutput {
+                tool_call_id,
+                tool_name,
+                output,
+                is_stderr,
+            },
+            ToolExecutionEvent::FileChanged {
+                path,
+                additions,
+                deletions,
+            } => RunEvent::FileChanged {
+                path,
+                additions,
+                deletions,
+            },
         }
     }
 }
@@ -2342,8 +2439,11 @@ async fn http_webhook(
             .or_else(|| headers.get("x-signature"))
             .or_else(|| headers.get("x-hub-signature-256"))
             .and_then(|v| v.to_str().ok());
-        let signed_payload = signed_webhook_payload(&cfg, &headers, &raw_body)
-            .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        let signed_payload = signed_webhook_payload(&cfg, &headers, &raw_body).map_err(|e| {
+            Json(GatewayError {
+                message: e.to_string(),
+            })
+        })?;
         let verified = verify_webhook_signature_with_policy_options(
             &signed_payload,
             signature,
@@ -2352,7 +2452,11 @@ async fn http_webhook(
             &priority_algorithms,
             cfg.gateway.webhook_signature_strict_priority,
         )
-            .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        .map_err(|e| {
+            Json(GatewayError {
+                message: e.to_string(),
+            })
+        })?;
         if !verified {
             return Err(Json(GatewayError {
                 message: "invalid webhook signature".to_string(),
@@ -2362,9 +2466,11 @@ async fn http_webhook(
     runtime
         .validate_webhook_replay(&headers)
         .await
-        .map_err(|e| Json(GatewayError {
-            message: e.to_string(),
-        }))?;
+        .map_err(|e| {
+            Json(GatewayError {
+                message: e.to_string(),
+            })
+        })?;
 
     let payload: WebhookInboundPayload = serde_json::from_str(&raw_body).map_err(|e| {
         Json(GatewayError {
@@ -2384,7 +2490,7 @@ async fn http_wechat_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Wechat).await
 }
 
@@ -2392,7 +2498,7 @@ async fn http_feishu_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Feishu).await
 }
 
@@ -2400,7 +2506,7 @@ async fn http_lark_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Lark).await
 }
 
@@ -2408,7 +2514,7 @@ async fn http_dingtalk_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Dingtalk).await
 }
 
@@ -2417,14 +2523,17 @@ async fn http_channel_webhook(
     headers: HeaderMap,
     raw_body: String,
     channel: ChannelKind,
-) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     let cfg = runtime.get_config().await;
 
     // Security: Reject requests for disabled channels
     if !is_channel_enabled(&cfg, &channel) {
-        return Err(Json(GatewayError {
-            message: format!("{:?} channel is disabled", channel),
-        }));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(GatewayError {
+                message: format!("{:?} channel is disabled", channel),
+            }),
+        ));
     }
 
     let channel_name = format!("{:?}", channel).to_lowercase();
@@ -2447,8 +2556,14 @@ async fn http_channel_webhook(
             .or_else(|| headers.get("x-signature"))
             .or_else(|| headers.get("x-hub-signature-256"))
             .and_then(|v| v.to_str().ok());
-        let signed_payload = signed_webhook_payload(&cfg, &headers, &raw_body)
-            .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        let signed_payload = signed_webhook_payload(&cfg, &headers, &raw_body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: e.to_string(),
+                }),
+            )
+        })?;
         let verified = verify_webhook_signature_with_policy_options(
             &signed_payload,
             signature,
@@ -2457,59 +2572,266 @@ async fn http_channel_webhook(
             &priority_algorithms,
             cfg.gateway.webhook_signature_strict_priority,
         )
-        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: e.to_string(),
+                }),
+            )
+        })?;
         if !verified {
-            return Err(Json(GatewayError {
-                message: "invalid webhook signature".to_string(),
-            }));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(GatewayError {
+                    message: "invalid webhook signature".to_string(),
+                }),
+            ));
         }
     }
 
     runtime
         .validate_webhook_replay(&headers)
         .await
-        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: e.to_string(),
+                }),
+            )
+        })?;
 
     let payload: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
-        Json(GatewayError {
-            message: format!("invalid channel webhook payload: {e}"),
-        })
+        (
+            StatusCode::BAD_REQUEST,
+            Json(GatewayError {
+                message: format!("invalid channel webhook payload: {e}"),
+            }),
+        )
     })?;
 
-    if let Some(challenge_str) = payload.get("challenge").and_then(serde_json::Value::as_str) {
-        return Ok(Json(PlatformWebhookResponse {
-            ok: true,
-            channel: channel_name,
-            message_id: None,
-            conversation_id: None,
-            agent_reply: None,
-            outbound_delivery: OutboundDeliveryStatus::NotImplemented,
-            outbound_result: None,
-            error: None,
-        }));
+    if let Some(challenge) = verification_response(&payload) {
+        return Ok(Json(challenge));
     }
 
     let inbound = inbound_from_platform_webhook(channel, payload).map_err(|e| {
-        Json(GatewayError {
-            message: e.to_string(),
-        })
+        (
+            StatusCode::BAD_REQUEST,
+            Json(GatewayError {
+                message: e.to_string(),
+            }),
+        )
     })?;
 
-    let response = runtime.process_inbound(&inbound).await.map_err(|e| {
-        Json(GatewayError {
-            message: format!("agent_runtime_failed: {}", e),
-        })
-    })?;
+    let response = match runtime.process_inbound(&inbound).await {
+        Ok(response) => response,
+        Err(_) => {
+            return Ok(platform_webhook_response_json(
+                PlatformWebhookResponse::error(&channel_name, "agent_runtime_failed"),
+            ))
+        }
+    };
 
-    Ok(Json(PlatformWebhookResponse::success(
-        &channel_name,
-        inbound.metadata.get("message_id").and_then(|v| v.as_str()).map(String::from),
-        inbound.session_id.clone(),
-        response.reply,
-    )))
+    let message_id = inbound
+        .metadata
+        .get("message_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let webhook_response = match deliver_platform_reply(&cfg, &inbound, &response.reply).await {
+        Some(outbound_result) => PlatformWebhookResponse::success_with_outbound(
+            &channel_name,
+            message_id,
+            inbound.session_id.clone(),
+            response.reply,
+            outbound_result.to_summary(),
+        ),
+        None => PlatformWebhookResponse::success(
+            &channel_name,
+            message_id,
+            inbound.session_id.clone(),
+            response.reply,
+        ),
+    };
+    Ok(platform_webhook_response_json(webhook_response))
 }
 
-fn signed_webhook_payload(config: &Config, headers: &HeaderMap, raw_body: &str) -> anyhow::Result<String> {
+fn platform_webhook_response_json(response: PlatformWebhookResponse) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(response).unwrap_or_else(|_| {
+        serde_json::json!({
+            "ok": false,
+            "error": "webhook_response_serialization_failed"
+        })
+    }))
+}
+
+fn outbound_token_cache() -> Arc<TokenCache> {
+    OUTBOUND_TOKEN_CACHE
+        .get_or_init(|| Arc::new(TokenCache::new()))
+        .clone()
+}
+
+fn channel_entry_for_outbound<'a>(
+    config: &'a Config,
+    channel: &ChannelKind,
+) -> Option<&'a crate::config::schema::ChannelEntry> {
+    match channel {
+        ChannelKind::Feishu => config.channels_config.feishu.as_ref(),
+        ChannelKind::Lark => config.channels_config.lark.as_ref(),
+        _ => None,
+    }
+}
+
+fn config_string(entry: &crate::config::schema::ChannelEntry, key: &str) -> Option<String> {
+    entry
+        .extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            entry
+                .extra
+                .get(&format!("{key}_env"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|env_key| std::env::var(env_key).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn reply_target_from_inbound(inbound: &InboundMessage) -> Option<ReplyTarget> {
+    let chat_id = ["conversation_id", "chat_id"]
+        .iter()
+        .find_map(|key| {
+            inbound
+                .metadata
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            inbound
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })?;
+
+    let message_id = inbound
+        .metadata
+        .get("message_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let user_id = inbound.user_id.clone().or_else(|| {
+        inbound
+            .metadata
+            .get("open_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    });
+    Some(ReplyTarget {
+        channel: inbound.channel.clone(),
+        chat_id,
+        message_id,
+        user_id,
+    })
+}
+
+async fn send_with_sender(
+    sender: &dyn ChannelOutboundSender,
+    target: &ReplyTarget,
+    reply: &str,
+) -> OutboundResult {
+    sender.send_text_reply(target, reply).await
+}
+
+async fn deliver_platform_reply(
+    config: &Config,
+    inbound: &InboundMessage,
+    reply: &str,
+) -> Option<OutboundResult> {
+    let entry = channel_entry_for_outbound(config, &inbound.channel)?;
+    let outbound_mode = config_string(entry, "outbound_mode")
+        .unwrap_or_else(|| "disabled".to_string())
+        .to_ascii_lowercase();
+
+    if outbound_mode == "disabled" {
+        return None;
+    }
+
+    let provider = match inbound.channel {
+        ChannelKind::Feishu => "feishu",
+        ChannelKind::Lark => "lark",
+        _ => return None,
+    };
+    if reply.trim().is_empty() {
+        return Some(OutboundResult::skipped_empty_reply(provider));
+    }
+    let Some(target) = reply_target_from_inbound(inbound) else {
+        return Some(OutboundResult::failed(
+            provider,
+            "missing_reply_target",
+            "reply target was missing",
+        ));
+    };
+
+    match outbound_mode.as_str() {
+        "mock" => {
+            let sender = MockOutboundSender::new();
+            Some(send_with_sender(&sender, &target, reply).await)
+        }
+        "real" => {
+            let Some(app_id) = config_string(entry, "app_id") else {
+                return Some(OutboundResult::not_configured(
+                    provider,
+                    "app_id was missing",
+                ));
+            };
+            let Some(app_secret) = config_string(entry, "app_secret") else {
+                return Some(OutboundResult::not_configured(
+                    provider,
+                    "app_secret was missing",
+                ));
+            };
+            let token_cache = outbound_token_cache();
+            let result = match inbound.channel {
+                ChannelKind::Feishu => {
+                    let sender = FeishuOutboundSender::new(app_id, app_secret, token_cache);
+                    send_with_sender(&sender, &target, reply).await
+                }
+                ChannelKind::Lark => {
+                    let sender = LarkOutboundSender::new(app_id, app_secret, token_cache);
+                    send_with_sender(&sender, &target, reply).await
+                }
+                _ => OutboundResult::failed(
+                    provider,
+                    "not_implemented",
+                    "sender was not implemented",
+                ),
+            };
+            Some(result)
+        }
+        _ => Some(OutboundResult::not_configured(
+            provider,
+            "outbound_mode must be disabled, mock, or real",
+        )),
+    }
+}
+
+fn signed_webhook_payload(
+    config: &Config,
+    headers: &HeaderMap,
+    raw_body: &str,
+) -> anyhow::Result<String> {
     if !config.gateway.webhook_signing_include_timestamp {
         return Ok(raw_body.to_string());
     }
@@ -2670,7 +2992,10 @@ fn match_session_tree_filters(
         }
     }
     if let Some(parent_session_key) = query.parent_session_key.as_deref() {
-        if !cmp(entry.parent_session_key.as_deref(), Some(parent_session_key)) {
+        if !cmp(
+            entry.parent_session_key.as_deref(),
+            Some(parent_session_key),
+        ) {
             return false;
         }
     }
@@ -2733,7 +3058,10 @@ fn match_session_tree_filters(
     true
 }
 
-fn sort_session_tree_entries(entries: &mut [GatewaySessionTreeNode], query: &GatewaySessionTreeQuery) {
+fn sort_session_tree_entries(
+    entries: &mut [GatewaySessionTreeNode],
+    query: &GatewaySessionTreeQuery,
+) {
     let sort_by = query.sort_by.as_deref().unwrap_or("updated_at");
     let asc = query
         .sort_order
@@ -2747,7 +3075,11 @@ fn sort_session_tree_entries(entries: &mut [GatewaySessionTreeNode], query: &Gat
             "agent_name" => a.agent_name.cmp(&b.agent_name),
             _ => a.updated_at.cmp(&b.updated_at),
         };
-        if asc { ord } else { ord.reverse() }
+        if asc {
+            ord
+        } else {
+            ord.reverse()
+        }
     });
 }
 
@@ -2765,7 +3097,12 @@ fn normalize_session_tree_query(query: &GatewaySessionTreeQuery) -> GatewaySessi
     normalized.sort_by = normalized
         .sort_by
         .map(|v| v.trim().to_lowercase())
-        .filter(|v| matches!(v.as_str(), "updated_at" | "spawn_depth" | "session_id" | "agent_name"));
+        .filter(|v| {
+            matches!(
+                v.as_str(),
+                "updated_at" | "spawn_depth" | "session_id" | "agent_name"
+            )
+        });
     normalized.sort_order = normalized
         .sort_order
         .map(|v| v.trim().to_lowercase())
@@ -3056,7 +3393,8 @@ async fn acquire_lockfile_guard(
                     }
                 }
                 if std::time::Instant::now() >= deadline {
-                    let timeout_events = SESSION_LOCK_TIMEOUT_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let timeout_events =
+                        SESSION_LOCK_TIMEOUT_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         "session lock timeout: target={}, retries={}, total_timeouts={}",
                         target.display(),
@@ -3136,7 +3474,10 @@ async fn http_approvals_list(
     State(runtime): State<GatewayRuntime>,
     Query(query): Query<GatewayApprovalsQuery>,
 ) -> Result<Json<Vec<PendingApproval>>, Json<GatewayError>> {
-    match runtime.list_approvals(query.pending_only.unwrap_or(true)).await {
+    match runtime
+        .list_approvals(query.pending_only.unwrap_or(true))
+        .await
+    {
         Ok(items) => Ok(Json(items)),
         Err(e) => Err(Json(GatewayError {
             message: e.to_string(),
@@ -3264,9 +3605,11 @@ async fn http_api_memory_store(
         .memory
         .store(&req.key, &req.content, category, None)
         .await
-        .map_err(|e| Json(GatewayError {
-            message: e.to_string(),
-        }))?;
+        .map_err(|e| {
+            Json(GatewayError {
+                message: e.to_string(),
+            })
+        })?;
     Ok(Json(serde_json::json!({ "ok": true, "key": req.key })))
 }
 
@@ -3332,7 +3675,9 @@ async fn http_api_cron_list(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
     let Some(store) = &runtime.cron_store else {
-        return Ok(Json(serde_json::json!({ "jobs": [], "note": "cron store not initialized" })));
+        return Ok(Json(
+            serde_json::json!({ "jobs": [], "note": "cron store not initialized" }),
+        ));
     };
     let jobs = store.list();
     let items: Vec<serde_json::Value> = jobs
@@ -3493,10 +3838,7 @@ impl AgentInvoker for GatewayRuntime {
         let child_session_id = format!("subagent-{}", uuid::Uuid::new_v4());
         let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
         metadata.insert("agent".into(), serde_json::json!(request.agent));
-        metadata.insert(
-            "spawn_depth".into(),
-            serde_json::json!(request.child_depth),
-        );
+        metadata.insert("spawn_depth".into(), serde_json::json!(request.child_depth));
         // Parent lineage requires a registered parent session; sessionless
         // parents still propagate depth so spawn limits hold.
         if let Some(parent_session_id) = &request.parent_session_id {
@@ -3634,17 +3976,18 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayRuntime, GatewaySessionTreeQuery, SessionLineageMeta, acquire_inbound_slot,
-        acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        resolve_agent_max_tool_iterations, split_session_key,
+        acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
+        resolve_agent_max_tool_iterations, split_session_key, GatewayRuntime,
+        GatewaySessionTreeQuery, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{Config, DelegateAgentConfig};
+    use axum::http::{HeaderMap, StatusCode};
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
     #[test]
@@ -3659,8 +4002,7 @@ mod tests {
         );
         let effective_ws = PathBuf::from("/fake/workspace");
 
-        let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::InMemoryMemory::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
         let tools = create_tools_for_route(&config, "researcher", memory, &effective_ws);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
@@ -3684,10 +4026,9 @@ mod tests {
         ));
 
         // One other agent -> attached.
-        config.agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig::default(),
-        );
+        config
+            .agents
+            .insert("researcher".to_string(), DelegateAgentConfig::default());
         assert!(attach_delegate_tool(
             &config,
             &runtime,
@@ -3715,10 +4056,9 @@ mod tests {
     #[test]
     fn attach_delegate_tool_respects_depth_and_allowlist() {
         let mut config = Config::default();
-        config.agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig::default(),
-        );
+        config
+            .agents
+            .insert("researcher".to_string(), DelegateAgentConfig::default());
         config.agents.insert(
             "writer".to_string(),
             DelegateAgentConfig {
@@ -3726,11 +4066,10 @@ mod tests {
                 ..DelegateAgentConfig::default()
             },
         );
-        config.agent_defaults_extended.subagents =
-            Some(crate::config::schema::SubagentsConfig {
-                max_spawn_depth: Some(1),
-                ..crate::config::schema::SubagentsConfig::default()
-            });
+        config.agent_defaults_extended.subagents = Some(crate::config::schema::SubagentsConfig {
+            max_spawn_depth: Some(1),
+            ..crate::config::schema::SubagentsConfig::default()
+        });
         let runtime = GatewayRuntime::new(config.clone());
 
         // Depth at limit -> child depth would exceed -> not attached.
@@ -4012,8 +4351,10 @@ mod tests {
         assert!(snapshot
             .sessions
             .iter()
-            .any(|entry| entry.session_key.as_deref() == Some("cli:debug-session")
-                && entry.parent_agent_id.as_deref() == Some("omninova")));
+            .any(
+                |entry| entry.session_key.as_deref() == Some("cli:debug-session")
+                    && entry.parent_agent_id.as_deref() == Some("omninova")
+            ));
     }
 
     #[tokio::test]
@@ -4293,7 +4634,10 @@ mod tests {
         assert!(super::is_channel_enabled(&config, &ChannelKind::Lark));
 
         let config_disabled = make_config_with_channel(ChannelKind::Lark, false);
-        assert!(!super::is_channel_enabled(&config_disabled, &ChannelKind::Lark));
+        assert!(!super::is_channel_enabled(
+            &config_disabled,
+            &ChannelKind::Lark
+        ));
     }
 
     #[test]
@@ -4320,7 +4664,10 @@ mod tests {
         assert_eq!(response.message_id, Some("msg_123".to_string()));
         assert_eq!(response.conversation_id, Some("chat_456".to_string()));
         assert_eq!(response.agent_reply, Some("Hello from agent".to_string()));
-        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::HttpResponseOnly));
+        assert!(matches!(
+            response.outbound_delivery,
+            super::OutboundDeliveryStatus::HttpResponseOnly
+        ));
         assert!(response.error.is_none());
     }
 
@@ -4331,14 +4678,20 @@ mod tests {
         assert!(!response.ok);
         assert_eq!(response.channel, "feishu");
         assert!(response.agent_reply.is_none());
-        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::NotImplemented));
+        assert!(matches!(
+            response.outbound_delivery,
+            super::OutboundDeliveryStatus::NotImplemented
+        ));
         assert_eq!(response.error, Some("agent runtime failed".to_string()));
     }
 
     #[test]
     fn outbound_delivery_status_default() {
         let status = super::OutboundDeliveryStatus::default();
-        assert!(matches!(status, super::OutboundDeliveryStatus::NotImplemented));
+        assert!(matches!(
+            status,
+            super::OutboundDeliveryStatus::NotImplemented
+        ));
     }
 
     #[test]
@@ -4346,6 +4699,7 @@ mod tests {
         let summary = super::OutboundResultSummary {
             ok: true,
             provider: "feishu".to_string(),
+            delivery: super::OutboundDeliveryStatus::Sent,
             platform_message_id: Some("om_reply_123".to_string()),
             error_code: None,
             message: None,
@@ -4361,8 +4715,190 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.channel, "feishu");
         assert!(response.agent_reply.is_some());
-        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::Delivered));
+        assert!(matches!(
+            response.outbound_delivery,
+            super::OutboundDeliveryStatus::Sent
+        ));
         assert!(response.outbound_result.is_some());
-        assert_eq!(response.outbound_result.as_ref().unwrap().provider, "feishu");
+        assert_eq!(
+            response.outbound_result.as_ref().unwrap().provider,
+            "feishu"
+        );
+    }
+
+    fn outbound_test_config(channel: ChannelKind, mode: &str, with_credentials: bool) -> Config {
+        let mut config = make_config_with_channel(channel.clone(), true);
+        config.default_provider = Some("mock".to_string());
+        config.workspace_dir = temp_workspace();
+        let entry = match channel {
+            ChannelKind::Feishu => config.channels_config.feishu.as_mut().unwrap(),
+            ChannelKind::Lark => config.channels_config.lark.as_mut().unwrap(),
+            _ => unreachable!("test only configures Feishu/Lark"),
+        };
+        entry.extra.insert("outbound_mode".to_string(), json!(mode));
+        if with_credentials {
+            entry.extra.insert("app_id".to_string(), json!("cli_test"));
+            entry
+                .extra
+                .insert("app_secret".to_string(), json!("fake_secret"));
+        }
+        config
+    }
+
+    fn feishu_inbound(chat_id: Option<&str>) -> InboundMessage {
+        let mut metadata = HashMap::new();
+        metadata.insert("message_id".to_string(), json!("om_test"));
+        if let Some(chat_id) = chat_id {
+            metadata.insert("chat_id".to_string(), json!(chat_id));
+        }
+        InboundMessage {
+            channel: ChannelKind::Feishu,
+            user_id: Some("ou_test".to_string()),
+            session_id: chat_id.map(ToString::to_string),
+            text: "hello".to_string(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_runtime_success_uses_mock_sender() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let body = r#"{"event":{"sender":{"open_id":"ou_test"},"message":{"message_id":"om_test","chat_id":"oc_test","content":"{\"text\":\"hello\"}"}}}"#.to_string();
+        let response =
+            super::http_channel_webhook(runtime, HeaderMap::new(), body, ChannelKind::Feishu)
+                .await
+                .expect("mock webhook should succeed")
+                .0;
+        assert_eq!(response.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            response.get("outbound_delivery").and_then(|v| v.as_str()),
+            Some("mock_sent")
+        );
+        assert_eq!(
+            response
+                .pointer("/outbound_result/provider")
+                .and_then(|v| v.as_str()),
+            Some("mock")
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_empty_reply_is_skipped() {
+        let result = super::deliver_platform_reply(
+            &outbound_test_config(ChannelKind::Feishu, "mock", false),
+            &feishu_inbound(Some("oc_test")),
+            "   ",
+        )
+        .await
+        .expect("Feishu outbound mode should produce a result");
+        assert_eq!(
+            result.delivery,
+            super::OutboundDeliveryStatus::SkippedEmptyReply
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_missing_reply_target_fails_without_sending() {
+        let result = super::deliver_platform_reply(
+            &outbound_test_config(ChannelKind::Feishu, "mock", false),
+            &feishu_inbound(None),
+            "reply",
+        )
+        .await
+        .expect("Feishu outbound mode should produce a result");
+        assert_eq!(result.delivery, super::OutboundDeliveryStatus::Failed);
+        assert_eq!(result.error_code.as_deref(), Some("missing_reply_target"));
+    }
+
+    #[tokio::test]
+    async fn outbound_real_mode_requires_app_credentials() {
+        let result = super::deliver_platform_reply(
+            &outbound_test_config(ChannelKind::Lark, "real", false),
+            &InboundMessage {
+                channel: ChannelKind::Lark,
+                ..feishu_inbound(Some("oc_test"))
+            },
+            "reply",
+        )
+        .await
+        .expect("real outbound mode should return a configuration result");
+        assert_eq!(
+            result.delivery,
+            super::OutboundDeliveryStatus::NotConfigured
+        );
+        assert_eq!(result.error_code.as_deref(), Some("not_configured"));
+    }
+
+    #[test]
+    fn outbound_failure_keeps_runtime_success_and_redacts_secrets() {
+        let failure = crate::channels::adapters::outbound::OutboundResult::failed(
+            "feishu",
+            "token_fetch_failed",
+            "token request failed (HTTP 401)",
+        );
+        let response = super::PlatformWebhookResponse::success_with_outbound(
+            "feishu",
+            Some("om_test".to_string()),
+            Some("oc_test".to_string()),
+            "agent reply".to_string(),
+            failure.to_summary(),
+        );
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            value.get("outbound_delivery").and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            value
+                .pointer("/outbound_result/error_code")
+                .and_then(|v| v.as_str()),
+            Some("token_fetch_failed")
+        );
+        assert!(!value.to_string().contains("fake_secret"));
+        assert!(!value.to_string().contains("access_token"));
+    }
+
+    #[tokio::test]
+    async fn challenge_bypasses_runtime_and_sender() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            r#"{"type":"url_verification","challenge":"test_challenge"}"#.to_string(),
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("challenge should return directly")
+        .0;
+        assert_eq!(
+            response.get("challenge").and_then(|v| v.as_str()),
+            Some("test_challenge")
+        );
+        assert!(response.get("agent_reply").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_channel_is_rejected_before_runtime_and_sender() {
+        let runtime = GatewayRuntime::new(make_config_with_channel(ChannelKind::Feishu, false));
+        let result = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            r#"{"event":{"message":{"content":"{\"text\":\"hello\"}"}}}"#.to_string(),
+            ChannelKind::Feishu,
+        )
+        .await;
+        assert!(matches!(result, Err((StatusCode::FORBIDDEN, _))));
+    }
+
+    #[tokio::test]
+    async fn disabled_outbound_mode_preserves_http_response_only() {
+        let result = super::deliver_platform_reply(
+            &outbound_test_config(ChannelKind::Feishu, "disabled", false),
+            &feishu_inbound(Some("oc_test")),
+            "reply",
+        )
+        .await;
+        assert!(result.is_none());
     }
 }

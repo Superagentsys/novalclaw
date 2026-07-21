@@ -333,7 +333,8 @@
 #
 # [channels_config.feishu]
 # enabled = false
-# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "..." }
+# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "...", outbound_mode = "disabled" }
+# outbound_mode: "disabled" (default HTTP response only), "mock" (no platform API call), or "real" (send reply through Feishu).
 #   # 说明：
 #   # - app_id: 飞书应用的 App ID（格式如 cli_xxx）
 #   # - app_secret: 飞书应用的 App Secret
@@ -382,7 +383,8 @@
 #
 # [channels_config.lark]
 # enabled = false
-# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "..." }
+# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "...", outbound_mode = "disabled" }
+# outbound_mode: "disabled" (default HTTP response only), "mock" (no platform API call), or "real" (send reply through Lark).
 #   # Lark（国际版飞书）与飞书配置格式相同
 #
 # [channels_config.dingtalk]
