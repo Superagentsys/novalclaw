@@ -4,30 +4,32 @@ import {
   type ChannelEntryConfig,
   type ChannelsConfig,
   type ChannelPreset,
+  type ChannelField,
 } from "../../types/config";
 
 interface ChannelConfigFormProps {
   value: ChannelsConfig;
   onChange: (channels: ChannelsConfig) => void;
+  validationError?: string;
+  onValidationChange?: (error: string | undefined) => void;
 }
 
 const EMPTY_ENTRY: ChannelEntryConfig = {
   enabled: false,
-  token: "",
-  token_env: "",
-  app_id: "",
-  app_secret: "",
-  verification_token: "",
-  encrypt_key: "",
-  webhook_url: "",
+  extra: {},
 };
 
 const DEFAULT_CHANNEL_ID = "feishu";
 
-/** 飞书 / Lark 仅暴露 App ID、App Secret */
-const FEISHU_LIKE_FIELD_KEYS = new Set(["app_id", "app_secret"]);
+/** Feishu/Lark channels require app_id and app_secret in extra */
+const FEISHU_LIKE_CHANNEL_IDS = new Set(["feishu", "lark"]);
 
-export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
+export function ChannelConfigForm({
+  value,
+  onChange,
+  validationError,
+  onValidationChange,
+}: ChannelConfigFormProps) {
   const [selectedId, setSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
@@ -37,36 +39,95 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
 
   const visibleFields = useMemo(() => {
     if (!selectedPreset) return [];
-    if (selectedPreset.id === "feishu" || selectedPreset.id === "lark") {
-      return selectedPreset.fields.filter((field) =>
-        FEISHU_LIKE_FIELD_KEYS.has(field.key)
+    // Feishu/Lark only show app_id and app_secret (both are extra fields)
+    if (FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset.id)) {
+      return selectedPreset.fields.filter(
+        (field) => field.key === "app_id" || field.key === "app_secret"
       );
     }
     return selectedPreset.fields;
   }, [selectedPreset]);
 
   const getEntry = (id: keyof ChannelsConfig): ChannelEntryConfig =>
-    value[id] ?? { ...EMPTY_ENTRY };
+    value[id] ?? { ...EMPTY_ENTRY, extra: {} };
 
   const setEntry = (id: keyof ChannelsConfig, entry: ChannelEntryConfig) => {
-    onChange({ ...value, [id]: entry });
+    // Clean up empty strings and empty extra
+    const cleanedEntry: ChannelEntryConfig = {
+      ...entry,
+      token: entry.token?.trim() || undefined,
+      token_env: entry.token_env?.trim() || undefined,
+      extra: entry.extra
+        ? Object.fromEntries(
+            Object.entries(entry.extra).filter(([, v]) => v.trim() !== "")
+          )
+        : undefined,
+    };
+    if (Object.keys(cleanedEntry.extra || {}).length === 0) {
+      cleanedEntry.extra = undefined;
+    }
+    onChange({ ...value, [id]: cleanedEntry });
   };
 
-  const enabledList = CHANNEL_PRESETS.filter((preset) =>
-    getEntry(preset.id).enabled
+  const enabledList = CHANNEL_PRESETS.filter(
+    (preset) => getEntry(preset.id).enabled
   ).map((preset) => preset.name);
 
-  const entry = selectedPreset
-    ? getEntry(selectedPreset.id)
-    : { ...EMPTY_ENTRY };
+  const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
 
-  const handleFieldChange = (
-    key: keyof ChannelEntryConfig,
-    fieldValue: string | boolean
-  ) => {
-    if (!selectedPreset) return;
-    setEntry(selectedPreset.id, { ...entry, [key]: fieldValue });
+  /** Get field value: check extra for extra fields, otherwise direct property */
+  const getFieldValue = (field: ChannelField): string => {
+    if (field.isExtra) {
+      return entry.extra?.[field.key] ?? "";
+    }
+    const val = (entry as unknown as Record<string, unknown>)[field.key];
+    return typeof val === "string" ? val : "";
   };
+
+  /** Handle field value change */
+  const handleFieldChange = (field: ChannelField, fieldValue: string | boolean) => {
+    if (!selectedPreset) return;
+
+    if (field.key === "enabled") {
+      setEntry(selectedPreset.id, { ...entry, enabled: fieldValue as boolean });
+      return;
+    }
+
+    const updatedEntry = { ...entry };
+    if (field.isExtra) {
+      updatedEntry.extra = { ...(updatedEntry.extra ?? {}), [field.key]: fieldValue as string };
+    } else {
+      (updatedEntry as unknown as Record<string, unknown>)[field.key] = fieldValue;
+    }
+    setEntry(selectedPreset.id, updatedEntry);
+  };
+
+  /** Validate Feishu/Lark has required fields when enabled */
+  const validateFeishuLike = (): string | undefined => {
+    if (!FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset?.id ?? "")) {
+      return undefined;
+    }
+    if (!entry.enabled) {
+      return undefined;
+    }
+    const appId = entry.extra?.["app_id"] ?? "";
+    const appSecret = entry.extra?.["app_secret"] ?? "";
+    if (!appId.trim()) {
+      return "启用飞书时，App ID 不能为空";
+    }
+    if (!appSecret.trim()) {
+      return "启用飞书时，App Secret 不能为空";
+    }
+    return undefined;
+  };
+
+  // Trigger validation when entry changes
+  useMemo(() => {
+    const error = validateFeishuLike();
+    if (onValidationChange) {
+      onValidationChange(error);
+    }
+  }, [entry, selectedPreset, onValidationChange]);
 
   return (
     <section className="setup-section">
@@ -110,7 +171,7 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
             type="checkbox"
             checked={entry.enabled}
             onChange={(event) =>
-              handleFieldChange("enabled", event.target.checked)
+              handleFieldChange({ key: "enabled", label: "", placeholder: "" } as ChannelField, event.target.checked)
             }
           />
           启用 {selectedPreset?.name ?? ""}
@@ -122,7 +183,12 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
           <div className="channel-config-header">
             <strong>{selectedPreset.name}</strong>
             <span className="provider-meta">
-              {selectedPreset.id} · {selectedPreset.category === "im" ? "即时通讯" : selectedPreset.category === "webhook" ? "Webhook" : "其他"}
+              {selectedPreset.id} ·{" "}
+              {selectedPreset.category === "im"
+                ? "即时通讯"
+                : selectedPreset.category === "webhook"
+                ? "Webhook"
+                : "其他"}
             </span>
             <span
               className={`provider-health-badge ${
@@ -133,15 +199,21 @@ export function ChannelConfigForm({ value, onChange }: ChannelConfigFormProps) {
             </span>
           </div>
 
+          {validationError && (
+            <div className="setup-error" style={{ marginBottom: "12px" }}>
+              {validationError}
+            </div>
+          )}
+
           <div className="setup-grid">
             {visibleFields.map((field) => (
               <label key={field.key}>
                 {field.label}
                 <input
                   type={field.type ?? "text"}
-                  value={(entry[field.key] as string) ?? ""}
+                  value={getFieldValue(field)}
                   onChange={(event) =>
-                    handleFieldChange(field.key, event.target.value)
+                    handleFieldChange(field, event.target.value)
                   }
                   placeholder={
                     field.placeholder || selectedPreset.tokenEnvHint

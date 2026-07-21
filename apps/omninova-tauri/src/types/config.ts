@@ -65,11 +65,8 @@ export interface ChannelEntryConfig {
   enabled: boolean;
   token?: string;
   token_env?: string;
-  app_id?: string;
-  app_secret?: string;
-  verification_token?: string;
-  encrypt_key?: string;
-  webhook_url?: string;
+  /** Extra channel-specific fields (e.g., app_id, app_secret, signing_secret, webhook_path) */
+  extra?: Record<string, string>;
 }
 
 export interface ChannelsConfig {
@@ -89,10 +86,13 @@ export interface ChannelsConfig {
 }
 
 export interface ChannelField {
-  key: keyof ChannelEntryConfig;
+  /** Field key: "token", "token_env", or extra field name like "app_id", "app_secret" */
+  key: string;
   label: string;
   placeholder: string;
   type?: "text" | "password";
+  /** If true, field is stored in channel.extra */
+  isExtra?: boolean;
 }
 
 export interface ChannelPreset {
@@ -109,6 +109,11 @@ const COMMON_TOKEN_FIELDS: ChannelField[] = [
   { key: "token_env", label: "Token 环境变量", placeholder: "", type: "text" },
 ];
 
+const FEISHU_LIKE_FIELDS: ChannelField[] = [
+  { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text", isExtra: true },
+  { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password", isExtra: true },
+];
+
 export const CHANNEL_PRESETS: ChannelPreset[] = [
   {
     id: "feishu",
@@ -116,10 +121,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "FEISHU_APP_SECRET",
     isDefault: true,
-    fields: [
-      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password" },
-    ],
+    fields: FEISHU_LIKE_FIELDS,
   },
   {
     id: "telegram",
@@ -155,10 +157,10 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "WECHAT_TOKEN",
     fields: [
-      { key: "app_id", label: "Corp ID / App ID", placeholder: "企业 ID 或应用 ID", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "应用密钥", type: "password" },
+      { key: "app_id", label: "Corp ID / App ID", placeholder: "企业 ID 或应用 ID", type: "text", isExtra: true },
+      { key: "app_secret", label: "App Secret", placeholder: "应用密钥", type: "password", isExtra: true },
       { key: "token", label: "Token", placeholder: "回调 Token", type: "password" },
-      { key: "encrypt_key", label: "EncodingAESKey", placeholder: "消息加解密密钥", type: "password" },
+      { key: "encrypt_key", label: "EncodingAESKey", placeholder: "消息加解密密钥", type: "password", isExtra: true },
       { key: "token_env", label: "Secret 环境变量", placeholder: "WECHAT_TOKEN", type: "text" },
     ],
   },
@@ -167,10 +169,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     name: "Lark (国际版飞书)",
     category: "im",
     tokenEnvHint: "LARK_APP_SECRET",
-    fields: [
-      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "Lark 应用密钥", type: "password" },
-    ],
+    fields: FEISHU_LIKE_FIELDS,
   },
   {
     id: "dingtalk",
@@ -178,8 +177,8 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "DINGTALK_TOKEN",
     fields: [
-      { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password" },
+      { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text", isExtra: true },
+      { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password", isExtra: true },
       { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },
       { key: "token_env", label: "Secret 环境变量", placeholder: "DINGTALK_TOKEN", type: "text" },
     ],
@@ -219,7 +218,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     tokenEnvHint: "WEBHOOK_SECRET",
     fields: [
       { key: "token", label: "Signing Secret", placeholder: "Webhook 签名密钥", type: "password" },
-      { key: "webhook_url", label: "回调地址", placeholder: "https://your-domain/webhook", type: "text" },
+      { key: "webhook_url", label: "回调地址", placeholder: "https://your-domain/webhook", type: "text", isExtra: true },
       { key: "token_env", label: "Secret 环境变量", placeholder: "WEBHOOK_SECRET", type: "text" },
     ],
   },

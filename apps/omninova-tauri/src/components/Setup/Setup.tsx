@@ -14,6 +14,44 @@ import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 import { open } from "@tauri-apps/plugin-dialog";
 
+/** Sensitive field names that should be redacted in JSON preview */
+const SENSITIVE_KEYS = new Set([
+  "app_secret",
+  "app_secret_env",
+  "secret",
+  "signing_secret",
+  "signing_secret_env",
+  "encrypt_key",
+  "token",
+  "token_env",
+  "password",
+  "api_key",
+  "api_key_env",
+]);
+
+/** Redact sensitive values in a JSON object for display */
+function redactSensitiveFields(obj: unknown): unknown {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(redactSensitiveFields);
+  }
+  if (typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (SENSITIVE_KEYS.has(key.toLowerCase()) && typeof value === "string") {
+        result[key] = "********";
+      } else if (typeof value === "object" && value !== null) {
+        result[key] = redactSensitiveFields(value);
+      } else {
+        result[key] = value;
+      }
+    }
+    return result;
+  }
+  return obj;
+}
 export interface SetupProps {
   /** 配置完成且网关启动成功后调用，用于进入对话界面 */
   onConfigSuccess?: () => void;
@@ -170,6 +208,7 @@ export function Setup({
     "load" | "save" | "start" | "stop" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
+  const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
@@ -200,10 +239,10 @@ export function Setup({
     }));
   }, [config.default_provider, enabledProviders]);
 
-  const jsonPreview = useMemo(
-    () => JSON.stringify(config, null, 2),
-    [config]
-  );
+  const jsonPreview = useMemo(() => {
+    const redacted = redactSensitiveFields(config);
+    return JSON.stringify(redacted, null, 2);
+  }, [config]);
 
   const handleProvidersChange = (providers: Config["providers"]) => {
     const { default_provider, default_model } = resolveDefaultProviderSelection(
@@ -305,6 +344,10 @@ export function Setup({
   };
 
   const handleSaveConfig = async () => {
+    if (channelValidationError) {
+      setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
     setBusyAction("save");
     try {
       const restarted = await saveSetupConfig();
@@ -323,6 +366,10 @@ export function Setup({
   };
 
   const handleSaveAndStartGateway = async () => {
+    if (channelValidationError) {
+      setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
     setBusyAction("start");
     try {
       const restarted = await saveSetupConfig();
@@ -740,7 +787,14 @@ export function Setup({
       case "providers":
         return <ProviderConfigForm value={config.providers} onChange={handleProvidersChange} />;
       case "channels":
-        return <ChannelConfigForm value={config.channels} onChange={(channels) => setConfig({ ...config, channels })} />;
+        return (
+          <ChannelConfigForm
+            value={config.channels}
+            onChange={(channels) => setConfig({ ...config, channels })}
+            validationError={channelValidationError}
+            onValidationChange={setChannelValidationError}
+          />
+        );
       case "skills":
         return (
           <div className="setup-section">
