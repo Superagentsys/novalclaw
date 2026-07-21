@@ -6,6 +6,9 @@ use axum::http::StatusCode;
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use crate::channels::adapters::outbound::{
+    ChannelOutboundSender, MockOutboundSender, OutboundDeliveryStatus, OutboundResult, OutboundResultSummary, ReplyTarget, TokenCache,
+};
 use crate::channels::adapters::platform_webhook::{
     inbound_from_platform_webhook, verification_response,
 };
@@ -1853,22 +1856,11 @@ pub struct PlatformWebhookResponse {
     pub agent_reply: Option<String>,
     #[serde(default)]
     pub outbound_delivery: OutboundDeliveryStatus,
+    /// Outbound result details (without secrets)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbound_result: Option<OutboundResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum OutboundDeliveryStatus {
-    /// Outbound reply not implemented yet
-    #[default]
-    NotImplemented,
-    /// HTTP response only (webhook response)
-    HttpResponseOnly,
-    /// Successfully delivered to platform
-    Delivered,
-    /// Failed to deliver to platform
-    DeliveryFailed,
 }
 
 impl PlatformWebhookResponse {
@@ -1885,6 +1877,31 @@ impl PlatformWebhookResponse {
             conversation_id,
             agent_reply: Some(reply),
             outbound_delivery: OutboundDeliveryStatus::HttpResponseOnly,
+            outbound_result: None,
+            error: None,
+        }
+    }
+
+    pub fn success_with_outbound(
+        channel: &str,
+        message_id: Option<String>,
+        conversation_id: Option<String>,
+        reply: String,
+        outbound_result: OutboundResultSummary,
+    ) -> Self {
+        let delivery = if outbound_result.ok {
+            OutboundDeliveryStatus::Delivered
+        } else {
+            OutboundDeliveryStatus::DeliveryFailed
+        };
+        Self {
+            ok: true,
+            channel: channel.to_string(),
+            message_id,
+            conversation_id,
+            agent_reply: Some(reply),
+            outbound_delivery: delivery,
+            outbound_result: Some(outbound_result),
             error: None,
         }
     }
@@ -1897,12 +1914,22 @@ impl PlatformWebhookResponse {
             conversation_id: None,
             agent_reply: None,
             outbound_delivery: OutboundDeliveryStatus::NotImplemented,
+            outbound_result: None,
             error: Some(error.into()),
         }
     }
 
-    pub fn challenge(challenge: &str) -> serde_json::Value {
-        serde_json::json!({ "challenge": challenge })
+    pub fn challenge(channel: &str) -> Self {
+        Self {
+            ok: true,
+            channel: channel.to_string(),
+            message_id: None,
+            conversation_id: None,
+            agent_reply: None,
+            outbound_delivery: OutboundDeliveryStatus::NotImplemented,
+            outbound_result: None,
+            error: None,
+        }
     }
 }
 
@@ -2457,6 +2484,7 @@ async fn http_channel_webhook(
             conversation_id: None,
             agent_reply: None,
             outbound_delivery: OutboundDeliveryStatus::NotImplemented,
+            outbound_result: None,
             error: None,
         }));
     }
@@ -4314,8 +4342,27 @@ mod tests {
     }
 
     #[test]
-    fn platform_webhook_response_challenge() {
-        let challenge = super::PlatformWebhookResponse::challenge("test_challenge");
-        assert_eq!(challenge.get("challenge").and_then(|v| v.as_str()), Some("test_challenge"));
+    fn platform_webhook_response_success_with_outbound() {
+        let summary = super::OutboundResultSummary {
+            ok: true,
+            provider: "feishu".to_string(),
+            platform_message_id: Some("om_reply_123".to_string()),
+            error_code: None,
+            message: None,
+        };
+        let response = super::PlatformWebhookResponse::success_with_outbound(
+            "feishu",
+            Some("msg_123".to_string()),
+            Some("chat_456".to_string()),
+            "Agent reply".to_string(),
+            summary,
+        );
+
+        assert!(response.ok);
+        assert_eq!(response.channel, "feishu");
+        assert!(response.agent_reply.is_some());
+        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::Delivered));
+        assert!(response.outbound_result.is_some());
+        assert_eq!(response.outbound_result.as_ref().unwrap().provider, "feishu");
     }
 }
