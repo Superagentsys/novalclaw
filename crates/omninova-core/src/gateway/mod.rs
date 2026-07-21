@@ -1840,6 +1840,72 @@ pub struct GatewayInboundResponse {
     pub steps: Vec<ExecutionStep>,
 }
 
+/// Response structure for platform webhooks (Feishu/Lark)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlatformWebhookResponse {
+    pub ok: bool,
+    pub channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_reply: Option<String>,
+    #[serde(default)]
+    pub outbound_delivery: OutboundDeliveryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundDeliveryStatus {
+    /// Outbound reply not implemented yet
+    #[default]
+    NotImplemented,
+    /// HTTP response only (webhook response)
+    HttpResponseOnly,
+    /// Successfully delivered to platform
+    Delivered,
+    /// Failed to deliver to platform
+    DeliveryFailed,
+}
+
+impl PlatformWebhookResponse {
+    pub fn success(
+        channel: &str,
+        message_id: Option<String>,
+        conversation_id: Option<String>,
+        reply: String,
+    ) -> Self {
+        Self {
+            ok: true,
+            channel: channel.to_string(),
+            message_id,
+            conversation_id,
+            agent_reply: Some(reply),
+            outbound_delivery: OutboundDeliveryStatus::HttpResponseOnly,
+            error: None,
+        }
+    }
+
+    pub fn error(channel: &str, error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            channel: channel.to_string(),
+            message_id: None,
+            conversation_id: None,
+            agent_reply: None,
+            outbound_delivery: OutboundDeliveryStatus::NotImplemented,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn challenge(challenge: &str) -> serde_json::Value {
+        serde_json::json!({ "challenge": challenge })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionStep {
     pub title: String,
@@ -2291,7 +2357,7 @@ async fn http_wechat_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Wechat).await
 }
 
@@ -2299,7 +2365,7 @@ async fn http_feishu_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Feishu).await
 }
 
@@ -2307,7 +2373,7 @@ async fn http_lark_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Lark).await
 }
 
@@ -2315,7 +2381,7 @@ async fn http_dingtalk_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Dingtalk).await
 }
 
@@ -2324,7 +2390,7 @@ async fn http_channel_webhook(
     headers: HeaderMap,
     raw_body: String,
     channel: ChannelKind,
-) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
+) -> Result<Json<PlatformWebhookResponse>, Json<GatewayError>> {
     let cfg = runtime.get_config().await;
 
     // Security: Reject requests for disabled channels
@@ -2333,6 +2399,8 @@ async fn http_channel_webhook(
             message: format!("{:?} channel is disabled", channel),
         }));
     }
+
+    let channel_name = format!("{:?}", channel).to_lowercase();
 
     if let Some(secret) = channel_webhook_signing_secret(&cfg, &channel) {
         let allowed_algorithms = cfg
@@ -2381,8 +2449,16 @@ async fn http_channel_webhook(
         })
     })?;
 
-    if let Some(challenge) = verification_response(&payload) {
-        return Ok(Json(challenge));
+    if let Some(challenge_str) = payload.get("challenge").and_then(serde_json::Value::as_str) {
+        return Ok(Json(PlatformWebhookResponse {
+            ok: true,
+            channel: channel_name,
+            message_id: None,
+            conversation_id: None,
+            agent_reply: None,
+            outbound_delivery: OutboundDeliveryStatus::NotImplemented,
+            error: None,
+        }));
     }
 
     let inbound = inbound_from_platform_webhook(channel, payload).map_err(|e| {
@@ -2390,17 +2466,19 @@ async fn http_channel_webhook(
             message: e.to_string(),
         })
     })?;
+
     let response = runtime.process_inbound(&inbound).await.map_err(|e| {
         Json(GatewayError {
-            message: e.to_string(),
+            message: format!("agent_runtime_failed: {}", e),
         })
     })?;
-    let value = serde_json::to_value(response).map_err(|e| {
-        Json(GatewayError {
-            message: e.to_string(),
-        })
-    })?;
-    Ok(Json(value))
+
+    Ok(Json(PlatformWebhookResponse::success(
+        &channel_name,
+        inbound.metadata.get("message_id").and_then(|v| v.as_str()).map(String::from),
+        inbound.session_id.clone(),
+        response.reply,
+    )))
 }
 
 fn signed_webhook_payload(config: &Config, headers: &HeaderMap, raw_body: &str) -> anyhow::Result<String> {
@@ -4194,5 +4272,50 @@ mod tests {
     fn is_channel_enabled_works_for_telegram() {
         let config = make_config_with_channel(ChannelKind::Telegram, true);
         assert!(super::is_channel_enabled(&config, &ChannelKind::Telegram));
+    }
+
+    // =============================================================================
+    // Platform webhook response tests
+    // =============================================================================
+
+    #[test]
+    fn platform_webhook_response_success() {
+        let response = super::PlatformWebhookResponse::success(
+            "feishu",
+            Some("msg_123".to_string()),
+            Some("chat_456".to_string()),
+            "Hello from agent".to_string(),
+        );
+
+        assert!(response.ok);
+        assert_eq!(response.channel, "feishu");
+        assert_eq!(response.message_id, Some("msg_123".to_string()));
+        assert_eq!(response.conversation_id, Some("chat_456".to_string()));
+        assert_eq!(response.agent_reply, Some("Hello from agent".to_string()));
+        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::HttpResponseOnly));
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn platform_webhook_response_error() {
+        let response = super::PlatformWebhookResponse::error("feishu", "agent runtime failed");
+
+        assert!(!response.ok);
+        assert_eq!(response.channel, "feishu");
+        assert!(response.agent_reply.is_none());
+        assert!(matches!(response.outbound_delivery, super::OutboundDeliveryStatus::NotImplemented));
+        assert_eq!(response.error, Some("agent runtime failed".to_string()));
+    }
+
+    #[test]
+    fn outbound_delivery_status_default() {
+        let status = super::OutboundDeliveryStatus::default();
+        assert!(matches!(status, super::OutboundDeliveryStatus::NotImplemented));
+    }
+
+    #[test]
+    fn platform_webhook_response_challenge() {
+        let challenge = super::PlatformWebhookResponse::challenge("test_challenge");
+        assert_eq!(challenge.get("challenge").and_then(|v| v.as_str()), Some("test_challenge"));
     }
 }
