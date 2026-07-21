@@ -288,6 +288,8 @@ export interface GatewayStatus {
   running: boolean;
   url: string;
   last_error?: string | null;
+  /** Error code for programmatic error handling */
+  error_code?: string | null;
 }
 
 export type ChannelKindValue =

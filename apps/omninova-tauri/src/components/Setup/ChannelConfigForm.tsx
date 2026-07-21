@@ -12,6 +12,26 @@ interface ChannelConfigFormProps {
   onChange: (channels: ChannelsConfig) => void;
   validationError?: string;
   onValidationChange?: (error: string | undefined) => void;
+  gatewayUrl?: string;
+  onHealthCheck?: () => Promise<{ ok: boolean; message?: string }>;
+  onCopyWebhookUrl?: (url: string) => void;
+}
+
+/** Get webhook path for a channel */
+function getWebhookPath(channelId: string): string {
+  switch (channelId) {
+    case "feishu": return "/webhook/feishu";
+    case "lark": return "/webhook/lark";
+    case "wechat": return "/webhook/wechat";
+    case "dingtalk": return "/webhook/dingtalk";
+    case "webhook": return "/webhook";
+    default: return "/webhook";
+  }
+}
+
+/** Check if URL is localhost/127.0.0.1 */
+function isLocalhost(url: string): boolean {
+  return url.includes("127.0.0.1") || url.includes("localhost");
 }
 
 const EMPTY_ENTRY: ChannelEntryConfig = {
@@ -29,13 +49,61 @@ export function ChannelConfigForm({
   onChange,
   validationError,
   onValidationChange,
+  gatewayUrl,
+  onHealthCheck,
+  onCopyWebhookUrl,
 }: ChannelConfigFormProps) {
   const [selectedId, setSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
+  const [healthStatus, setHealthStatus] = useState<"idle" | "checking" | "ok" | "error">("idle");
+  const [healthMessage, setHealthMessage] = useState<string>("");
+  const [copyStatus, setCopyStatus] = useState<string>("");
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
     [selectedId]
   );
+
+  const webhookPath = useMemo(() => getWebhookPath(selectedId), [selectedId]);
+  const fullWebhookUrl = gatewayUrl ? `${gatewayUrl.replace(/\/$/, "")}${webhookPath}` : "";
+  const isLocal = gatewayUrl ? isLocalhost(gatewayUrl) : true;
+
+  /** Handle health check button click */
+  const handleHealthCheck = async () => {
+    if (!onHealthCheck) return;
+    setHealthStatus("checking");
+    setHealthMessage("");
+    try {
+      const result = await onHealthCheck();
+      if (result.ok) {
+        setHealthStatus("ok");
+        setHealthMessage("Gateway 健康检查通过");
+      } else {
+        setHealthStatus("error");
+        setHealthMessage(result.message || "健康检查失败");
+      }
+    } catch (err) {
+      setHealthStatus("error");
+      setHealthMessage(err instanceof Error ? err.message : "连接失败");
+    }
+  };
+
+  /** Handle copy webhook URL */
+  const handleCopyWebhookUrl = () => {
+    if (!fullWebhookUrl) return;
+    if (onCopyWebhookUrl) {
+      onCopyWebhookUrl(fullWebhookUrl);
+    } else {
+      void navigator.clipboard.writeText(fullWebhookUrl);
+    }
+    setCopyStatus("已复制");
+    setTimeout(() => setCopyStatus(""), 2000);
+  };
+
+  /** Reset health status when gateway URL changes */
+  useMemo(() => {
+    setHealthStatus("idle");
+    setHealthMessage("");
+  }, [gatewayUrl]);
 
   const visibleFields = useMemo(() => {
     if (!selectedPreset) return [];
@@ -197,6 +265,40 @@ export function ChannelConfigForm({
             >
               {entry.enabled ? "已启用" : "未启用"}
             </span>
+          </div>
+
+          {/* Webhook URL section */}
+          <div className="channel-webhook-section">
+            <div className="webhook-url-row">
+              <span className="webhook-url-label">Webhook 地址：</span>
+              <code className="webhook-url-value">{fullWebhookUrl || "未配置 Gateway 地址"}</code>
+              <button
+                type="button"
+                className="setup-btn setup-btn--secondary"
+                onClick={handleCopyWebhookUrl}
+                disabled={!fullWebhookUrl}
+              >
+                {copyStatus || "复制"}
+              </button>
+              <button
+                type="button"
+                className={`setup-btn setup-btn--secondary ${healthStatus === "checking" ? "is-loading" : ""}`}
+                onClick={handleHealthCheck}
+                disabled={healthStatus === "checking"}
+              >
+                {healthStatus === "checking" ? "检测中..." : "测试连接"}
+              </button>
+            </div>
+            {healthMessage && (
+              <div className={`health-message ${healthStatus}`}>
+                {healthMessage}
+              </div>
+            )}
+            {isLocal && fullWebhookUrl && (
+              <div className="localhost-warning">
+                ⚠️ 127.0.0.1 / localhost 只能被本机访问，飞书、Slack 等公网平台无法直接回调。真实接入需要公网服务器、反向代理或内网穿透。
+              </div>
+            )}
           </div>
 
           {validationError && (

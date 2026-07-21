@@ -122,6 +122,8 @@ struct AppState {
     runtime: GatewayRuntime,
     gateway_task: Option<JoinHandle<Result<(), String>>>,
     last_gateway_error: Option<String>,
+    /// Error code for the last gateway error (e.g., "port_in_use", "already_running")
+    last_gateway_error_code: Option<String>,
 }
 
 const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
@@ -373,6 +375,8 @@ struct GatewayStatusPayload {
     running: bool,
     url: String,
     last_error: Option<String>,
+    /// Error code for programmatic error handling
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -991,11 +995,32 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
         runtime.set_config(config).await.map_err(|e| e.to_string())?;
     }
 
+    // Validate config before starting
+    let cfg = runtime.get_config().await;
+    if cfg.gateway.port == 0 {
+        return Err("Gateway 启动失败：端口配置无效（端口不能为 0）。请检查配置中的 gateway.port。".to_string());
+    }
+    if cfg.gateway.host.is_empty() {
+        return Err("Gateway 启动失败：主机配置无效（host 不能为空）。请检查配置中的 gateway.host。".to_string());
+    }
+
+    // Check if already running
+    {
+        let app_state = state_ref.lock().await;
+        if app_state.gateway_task.is_some() {
+            let status = gateway_status_from_state(&state_ref).await;
+            if status.running {
+                return Err("Gateway 已经在运行中，请先停止后再启动。".to_string());
+            }
+        }
+    }
+
     {
         let mut app_state = state_ref.lock().await;
         if app_state.gateway_task.is_none() {
             let runtime = app_state.runtime.clone();
             app_state.last_gateway_error = None;
+            app_state.last_gateway_error_code = None;
             app_state.gateway_task = Some(tokio::spawn(async move {
                 runtime.serve_http().await.map_err(|error| error.to_string())
             }));
@@ -1007,15 +1032,54 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
     let status = gateway_status_from_state(&state_ref).await;
 
     if !status.running {
-        return Err(
-            status
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "网关启动失败".to_string()),
-        );
+        let error_msg = status.last_error.clone().unwrap_or_else(|| "网关启动失败".to_string());
+        let enhanced_msg = enhance_error_message(&error_msg, status.error_code.as_deref());
+        return Err(enhanced_msg);
     }
 
     Ok(status)
+}
+
+/// Enhance error message with user-friendly suggestions
+fn enhance_error_message(error: &str, error_code: Option<&str>) -> String {
+    let code = error_code.unwrap_or("");
+    if code == "port_in_use" || error.to_lowercase().contains("addr_in_use") {
+        let port = extract_port_from_error(error);
+        format!(
+            "Gateway 启动失败：端口 {port} 可能已被占用，请检查是否已有进程监听。\n\
+            如需排查，可使用命令：netstat -ano | findstr :{port}"
+        )
+    } else if code == "permission_denied" || error.to_lowercase().contains("permission") {
+        "Gateway 启动失败：权限不足，无法绑定端口。尝试以管理员身份运行程序。".to_string()
+    } else if code == "invalid_config" {
+        "Gateway 启动失败：配置无效，请检查 gateway.host 和 gateway.port。".to_string()
+    } else if code == "bind_failed" {
+        "Gateway 启动失败：地址绑定失败，可能是端口被占用或权限不足。".to_string()
+    } else {
+        format!("Gateway 启动失败：{error}")
+    }
+}
+
+/// Extract port number from error message
+fn extract_port_from_error(error: &str) -> String {
+    // Try to find common port patterns in error message
+    // Look for 10809 first
+    if error.contains("10809") {
+        return "10809".to_string();
+    }
+    
+    // Look for any 4-5 digit number that looks like a port
+    let port_candidates: Vec<&str> = error
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| s.len() >= 4 && s.len() <= 5)
+        .collect();
+    
+    if let Some(port) = port_candidates.first() {
+        return port.to_string();
+    }
+    
+    // Default to 10809
+    "10809".to_string()
 }
 
 #[tauri::command]
@@ -1119,12 +1183,13 @@ async fn skills_package_summary(
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
-    let (runtime, running, last_error): (GatewayRuntime, bool, Option<String>) = {
+    let (runtime, running, last_error, error_code): (GatewayRuntime, bool, Option<String>, Option<String>) = {
         let app_state = state.lock().await;
         (
             app_state.runtime.clone(),
             app_state.gateway_task.is_some(),
             app_state.last_gateway_error.clone(),
+            app_state.last_gateway_error_code.clone(),
         )
     };
     let cfg = runtime.get_config().await;
@@ -1133,6 +1198,7 @@ async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatu
         running,
         url: format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
         last_error,
+        error_code,
     }
 }
 
@@ -1154,15 +1220,44 @@ async fn sync_gateway_task_state(state: &Arc<Mutex<AppState>>) {
         return;
     };
 
-    let last_error = match task.await {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(error) if error.is_cancelled() => None,
-        Err(error) => Some(error.to_string()),
+    let (last_error, error_code) = match task.await {
+        Ok(Ok(())) => (None, None),
+        Ok(Err(error)) => {
+            let err_str = error.to_string();
+            let code = extract_error_code(&err_str);
+            (Some(err_str), code)
+        }
+        Err(error) if error.is_cancelled() => (None, None),
+        Err(error) => {
+            let err_str = error.to_string();
+            let code = extract_error_code(&err_str);
+            (Some(err_str), code)
+        }
     };
 
     let mut app_state = state.lock().await;
     app_state.last_gateway_error = last_error;
+    app_state.last_gateway_error_code = error_code;
+}
+
+/// Extract error code from error message for programmatic handling
+fn extract_error_code(error: &str) -> Option<String> {
+    let lower = error.to_lowercase();
+    // Check for AddrInUse, addr_in_use, address already in use, etc.
+    if lower.contains("addr_in_use") || lower.contains("address already in use") 
+        || lower.contains("in use") && lower.contains("port") {
+        Some("port_in_use".to_string())
+    } else if lower.contains("already") && lower.contains("running") {
+        Some("already_running".to_string())
+    } else if lower.contains("permission") || lower.contains("denied") {
+        Some("permission_denied".to_string())
+    } else if lower.contains("invalid") && (lower.contains("port") || lower.contains("address")) {
+        Some("invalid_config".to_string())
+    } else if lower.contains("bind") {
+        Some("bind_failed".to_string())
+    } else {
+        Some("startup_failed".to_string())
+    }
 }
 
 async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
@@ -1171,6 +1266,7 @@ async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
         task.abort();
     }
     app_state.last_gateway_error = None;
+    app_state.last_gateway_error_code = None;
 }
 
 fn setup_config_from_core(config: &Config) -> SetupAppConfig {
@@ -1865,6 +1961,7 @@ pub fn run() {
         runtime: GatewayRuntime::new(config),
         gateway_task: None,
         last_gateway_error: None,
+        last_gateway_error_code: None,
     }));
 
     let app = tauri::Builder::default()
@@ -2310,5 +2407,92 @@ mod channel_tests {
         assert!(merged.extra.contains_key("app_secret"));
         assert!(merged.extra.contains_key("signing_secret"));
         assert!(merged.extra.contains_key("webhook_path")); // Preserved from existing
+    }
+
+    // =============================================================================
+    // Gateway error message tests
+    // =============================================================================
+
+    /// Test: extract_error_code identifies port_in_use
+    #[test]
+    fn test_extract_error_code_port_in_use() {
+        let error = "Address already in use:AddrInUse (os error 10048)";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("port_in_use".to_string()));
+    }
+
+    /// Test: extract_error_code identifies already_running
+    #[test]
+    fn test_extract_error_code_already_running() {
+        let error = "Gateway already running on port 10809";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("already_running".to_string()));
+    }
+
+    /// Test: extract_error_code identifies permission_denied
+    #[test]
+    fn test_extract_error_code_permission_denied() {
+        let error = "Permission denied when binding to port";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("permission_denied".to_string()));
+    }
+
+    /// Test: extract_error_code identifies invalid_config
+    #[test]
+    fn test_extract_error_code_invalid_config() {
+        let error = "Invalid port configuration: 0";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("invalid_config".to_string()));
+    }
+
+    /// Test: extract_error_code identifies bind_failed
+    #[test]
+    fn test_extract_error_code_bind_failed() {
+        let error = "Failed to bind to address";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("bind_failed".to_string()));
+    }
+
+    /// Test: extract_error_code falls back to startup_failed
+    #[test]
+    fn test_extract_error_code_startup_failed() {
+        let error = "Unknown startup error";
+        let code = super::extract_error_code(error);
+        assert_eq!(code, Some("startup_failed".to_string()));
+    }
+
+    /// Test: enhance_error_message adds helpful text for port_in_use
+    #[test]
+    fn test_enhance_error_message_port_in_use() {
+        let error = "Address already in use:AddrInUse (os error 10048)";
+        let enhanced = super::enhance_error_message(error, Some("port_in_use"));
+        // Should mention port and troubleshooting
+        assert!(enhanced.contains("端口"));
+        assert!(enhanced.contains("netstat"));
+    }
+
+    /// Test: enhance_error_message for permission_denied
+    #[test]
+    fn test_enhance_error_message_permission_denied() {
+        let error = "Permission denied";
+        let enhanced = super::enhance_error_message(error, Some("permission_denied"));
+        assert!(enhanced.contains("权限不足"));
+        assert!(enhanced.contains("管理员"));
+    }
+
+    /// Test: extract_port_from_error finds port in error
+    #[test]
+    fn test_extract_port_from_error() {
+        let error = "Address already in use:AddrInUse in 0.0.0.0:10809";
+        let port = super::extract_port_from_error(error);
+        assert_eq!(port, "10809");
+    }
+
+    /// Test: extract_port_from_error defaults to 10809
+    #[test]
+    fn test_extract_port_from_error_default() {
+        let error = "Some other error";
+        let port = super::extract_port_from_error(error);
+        assert_eq!(port, "10809");
     }
 }

@@ -2197,8 +2197,21 @@ async fn http_ingress(
     State(runtime): State<GatewayRuntime>,
     Json(req): Json<GatewayRouteRequest>,
 ) -> Result<Json<GatewayInboundResponse>, Json<GatewayError>> {
+    let cfg = runtime.get_config().await;
+
+    // Security: Validate channel if explicitly specified
+    let channel = req.channel.unwrap_or(ChannelKind::Cli);
+    if channel != ChannelKind::Cli {
+        // Non-CLI channels require explicit enablement
+        if !is_channel_enabled(&cfg, &channel) {
+            return Err(Json(GatewayError {
+                message: format!("{:?} channel is disabled", channel),
+            }));
+        }
+    }
+
     let inbound = InboundMessage {
-        channel: req.channel.unwrap_or(ChannelKind::Cli),
+        channel,
         user_id: req.user_id,
         session_id: req.session_id,
         text: req.text,
@@ -2313,6 +2326,14 @@ async fn http_channel_webhook(
     channel: ChannelKind,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
     let cfg = runtime.get_config().await;
+
+    // Security: Reject requests for disabled channels
+    if !is_channel_enabled(&cfg, &channel) {
+        return Err(Json(GatewayError {
+            message: format!("{:?} channel is disabled", channel),
+        }));
+    }
+
     if let Some(secret) = channel_webhook_signing_secret(&cfg, &channel) {
         let allowed_algorithms = cfg
             .gateway
@@ -2341,9 +2362,7 @@ async fn http_channel_webhook(
             &priority_algorithms,
             cfg.gateway.webhook_signature_strict_priority,
         )
-        .map_err(|e| Json(GatewayError {
-            message: e.to_string(),
-        }))?;
+        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
         if !verified {
             return Err(Json(GatewayError {
                 message: "invalid webhook signature".to_string(),
@@ -2354,9 +2373,7 @@ async fn http_channel_webhook(
     runtime
         .validate_webhook_replay(&headers)
         .await
-        .map_err(|e| Json(GatewayError {
-            message: e.to_string(),
-        }))?;
+        .map_err(|e| Json(GatewayError { message: e.to_string() }))?;
 
     let payload: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
         Json(GatewayError {
@@ -2436,6 +2453,26 @@ fn channel_webhook_signing_secret(config: &Config, channel: &ChannelKind) -> Opt
     };
 
     channel_entry_signing_secret(entry).or_else(|| webhook_signing_secret(config))
+}
+
+/// Check if a channel is enabled in the configuration
+fn is_channel_enabled(config: &Config, channel: &ChannelKind) -> bool {
+    let entry = match channel {
+        ChannelKind::Wechat => config.channels_config.wechat.as_ref(),
+        ChannelKind::Feishu => config.channels_config.feishu.as_ref(),
+        ChannelKind::Lark => config.channels_config.lark.as_ref(),
+        ChannelKind::Dingtalk => config.channels_config.dingtalk.as_ref(),
+        ChannelKind::Telegram => config.channels_config.telegram.as_ref(),
+        ChannelKind::Discord => config.channels_config.discord.as_ref(),
+        ChannelKind::Slack => config.channels_config.slack.as_ref(),
+        ChannelKind::Whatsapp => config.channels_config.whatsapp.as_ref(),
+        ChannelKind::Matrix => config.channels_config.matrix.as_ref(),
+        ChannelKind::Irc => config.channels_config.irc.as_ref(),
+        ChannelKind::Email => config.channels_config.email.as_ref(),
+        ChannelKind::Msteams => config.channels_config.msteams.as_ref(),
+        _ => None,
+    };
+    entry.map(|e| e.enabled).unwrap_or(false)
 }
 
 fn channel_entry_signing_secret(
@@ -4103,5 +4140,59 @@ mod tests {
         assert_eq!(filtered.offset, 1);
         assert_eq!(filtered.sessions.len(), 1);
         assert_eq!(filtered.sessions[0].session_key.as_deref(), Some("cli:c2"));
+    }
+
+    // =============================================================================
+    // Channel enabled security tests
+    // =============================================================================
+
+    fn make_config_with_channel(channel: ChannelKind, enabled: bool) -> Config {
+        let mut config = Config::default();
+        let entry = crate::config::schema::ChannelEntry {
+            enabled,
+            token: None,
+            token_env: None,
+            extra: HashMap::new(),
+        };
+        match channel {
+            ChannelKind::Feishu => config.channels_config.feishu = Some(entry),
+            ChannelKind::Lark => config.channels_config.lark = Some(entry),
+            ChannelKind::Telegram => config.channels_config.telegram = Some(entry),
+            _ => {}
+        }
+        config
+    }
+
+    #[test]
+    fn is_channel_enabled_returns_true_for_enabled_channel() {
+        let config = make_config_with_channel(ChannelKind::Feishu, true);
+        assert!(super::is_channel_enabled(&config, &ChannelKind::Feishu));
+    }
+
+    #[test]
+    fn is_channel_enabled_returns_false_for_disabled_channel() {
+        let config = make_config_with_channel(ChannelKind::Feishu, false);
+        assert!(!super::is_channel_enabled(&config, &ChannelKind::Feishu));
+    }
+
+    #[test]
+    fn is_channel_enabled_returns_false_for_unknown_channel() {
+        let config = Config::default();
+        assert!(!super::is_channel_enabled(&config, &ChannelKind::Feishu));
+    }
+
+    #[test]
+    fn is_channel_enabled_works_for_lark() {
+        let config = make_config_with_channel(ChannelKind::Lark, true);
+        assert!(super::is_channel_enabled(&config, &ChannelKind::Lark));
+
+        let config_disabled = make_config_with_channel(ChannelKind::Lark, false);
+        assert!(!super::is_channel_enabled(&config_disabled, &ChannelKind::Lark));
+    }
+
+    #[test]
+    fn is_channel_enabled_works_for_telegram() {
+        let config = make_config_with_channel(ChannelKind::Telegram, true);
+        assert!(super::is_channel_enabled(&config, &ChannelKind::Telegram));
     }
 }

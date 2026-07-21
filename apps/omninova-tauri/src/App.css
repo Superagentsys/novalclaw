@@ -2876,3 +2876,80 @@
 .channel-guide a:hover {
   text-decoration: underline;
 }
+
+/* Webhook URL section */
+.channel-webhook-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.webhook-url-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.webhook-url-label {
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.webhook-url-value {
+  flex: 1;
+  min-width: 200px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.health-message {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.health-message.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #166534;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.health-message.error {
+  background: rgba(239, 68, 68, 0.12);
+  color: #991b1b;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.health-message.checking {
+  background: rgba(59, 130, 246, 0.12);
+  color: #1e40af;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.localhost-warning {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #92400e;
+  line-height: 1.6;
+}
+
+/* Loading state for buttons */
+.setup-btn.is-loading {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+

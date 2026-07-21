@@ -371,25 +371,35 @@ export function Setup({
       return;
     }
     setBusyAction("start");
+    setActionMessage(""); // Clear previous errors
     try {
       const restarted = await saveSetupConfig();
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
-      const msg = restarted
-        ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
-        : `网关已启动：${nextGatewayStatus.url}`;
-      setActionMessage(msg);
-      if (nextGatewayStatus.running && onConfigSuccess) {
-        onConfigSuccess();
+      if (nextGatewayStatus.running) {
+        const msg = restarted
+          ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
+          : `网关已启动：${nextGatewayStatus.url}`;
+        setActionMessage(msg);
+        if (onConfigSuccess) {
+          onConfigSuccess();
+        }
+      } else {
+        // Gateway failed to start - show detailed error
+        const errorMsg = nextGatewayStatus.last_error || "网关启动失败，原因未知";
+        setActionMessage(errorMsg);
       }
     } catch (error) {
-      setActionMessage(
-        `启动网关失败：${error instanceof Error ? error.message : String(error)}`
-      );
-      const nextGatewayStatus = await invokeTauri<GatewayStatus>(
-        "gateway_status"
-      ).catch(() => gatewayStatus);
-      setGatewayStatus(nextGatewayStatus);
+      // Tauri returns the error message as a string
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setActionMessage(errorMsg);
+      // Refresh status
+      try {
+        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
+        setGatewayStatus(nextGatewayStatus);
+      } catch {
+        // Ignore status refresh errors
+      }
     } finally {
       setBusyAction(null);
     }
@@ -412,14 +422,27 @@ export function Setup({
 
   const handleStopGateway = async () => {
     setBusyAction("stop");
+    setActionMessage(""); // Clear previous errors
     try {
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("stop_gateway");
       setGatewayStatus(nextGatewayStatus);
-      setActionMessage("网关已停止。");
+      if (!nextGatewayStatus.running) {
+        setActionMessage("网关已停止。");
+      } else {
+        // Should not happen normally, but handle gracefully
+        setActionMessage("网关停止可能未完全成功，请检查状态。");
+      }
     } catch (error) {
-      setActionMessage(
-        `停止网关失败：${error instanceof Error ? error.message : String(error)}`
-      );
+      // Tauri returns the error message as a string
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setActionMessage(errorMsg);
+      // Refresh status
+      try {
+        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
+        setGatewayStatus(nextGatewayStatus);
+      } catch {
+        // Ignore status refresh errors
+      }
     } finally {
       setBusyAction(null);
     }
@@ -793,6 +816,19 @@ export function Setup({
             onChange={(channels) => setConfig({ ...config, channels })}
             validationError={channelValidationError}
             onValidationChange={setChannelValidationError}
+            gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
+            onHealthCheck={async () => {
+              // Health check is done by gateway_status command
+              const status = await invokeTauri<GatewayStatus>("gateway_status");
+              if (status.running) {
+                return { ok: true };
+              } else {
+                return { ok: false, message: status.last_error || "Gateway 未运行" };
+              }
+            }}
+            onCopyWebhookUrl={(url) => {
+              void navigator.clipboard.writeText(url);
+            }}
           />
         );
       case "skills":
