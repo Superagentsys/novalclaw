@@ -348,10 +348,29 @@ impl PlatformOutboundSender {
     }
 
     async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
+        println!(
+            "[{}-outbound] send_text_reply_start chat_id_present={} text_len={}",
+            self.provider,
+            !target.chat_id.is_empty(),
+            text.len()
+        );
+        
         let token = match self.tenant_access_token().await {
-            Ok(token) => token,
-            Err(result) => return result,
+            Ok(token) => {
+                println!("[{}-outbound] token_fetch_ok", self.provider);
+                token
+            }
+            Err(result) => {
+                println!("[{}-outbound] token_fetch_failed error_code={:?}", self.provider, result.error_code);
+                return result;
+            }
         };
+
+        println!(
+            "[{}-outbound] send_text_start receive_id_type=chat_id chat_id_present={}",
+            self.provider,
+            !target.chat_id.is_empty()
+        );
 
         let response = match self
             .client
@@ -359,7 +378,7 @@ impl PlatformOutboundSender {
                 "{}/im/v1/messages?receive_id_type=chat_id",
                 self.api_base_url
             ))
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .json(&json!({
                 "receive_id": target.chat_id,
                 "msg_type": "text",
@@ -369,47 +388,58 @@ impl PlatformOutboundSender {
             .await
         {
             Ok(response) => response,
-            Err(_) => {
+            Err(e) => {
+                println!("[{}-outbound] send_text_failed error={}", self.provider, e);
                 return OutboundResult::failed(
                     self.provider,
                     "message_send_failed",
-                    "message request failed",
-                )
+                    &format!("message request failed: {}", e),
+                );
             }
         };
 
         let status = response.status();
         let body = match response.json::<serde_json::Value>().await {
             Ok(body) => body,
-            Err(_) => {
+            Err(e) => {
+                println!("[{}-outbound] send_text_failed invalid_response", self.provider);
                 return OutboundResult::failed(
                     self.provider,
                     "message_send_failed",
-                    "message response was invalid",
-                )
+                    &format!("message response invalid: {}", e),
+                );
             }
         };
-        if !status.is_success()
-            || body
-                .get("code")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0)
-                != 0
-        {
-            return OutboundResult::failed(
-                self.provider,
-                "message_send_failed",
-                &format!("message request failed (HTTP {})", status.as_u16()),
-            );
-        }
 
-        let message_id = body
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let platform_msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let platform_message_id = body
             .pointer("/data/message_id")
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.trim().is_empty())
-            .unwrap_or("accepted")
-            .to_string();
-        OutboundResult::success(self.provider, message_id)
+            .map(String::from);
+
+        if code == 0 {
+            println!(
+                "[{}-outbound] send_text_ok platform_message_id_present={}",
+                self.provider,
+                platform_message_id.is_some()
+            );
+            OutboundResult::success(self.provider, platform_message_id.unwrap_or_else(|| "accepted".to_string()))
+        } else {
+            println!(
+                "[{}-outbound] send_text_failed http_status={} platform_error_code={} message={}",
+                self.provider,
+                status.as_u16(),
+                code,
+                platform_msg
+            );
+            OutboundResult::failed(
+                self.provider,
+                &format!("platform_error_{}", code),
+                platform_msg,
+            )
+        }
     }
 }
 

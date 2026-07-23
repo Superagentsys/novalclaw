@@ -43,6 +43,8 @@ home.workspace = true
 avif-serialize.workspace = true
 base64ct.workspace = true
 globset.workspace = true
+screenshots.workspace = true
+png.workspace = true
 url.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
 futures-util = "0.3"

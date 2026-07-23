@@ -1,5 +1,6 @@
 pub mod pairing;
 pub mod ws;
+pub mod feishu_worker;
 
 use crate::agent::sanitize_messages_for_provider;
 use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
@@ -13,6 +14,7 @@ use crate::channels::adapters::platform_webhook::{
 use crate::channels::adapters::webhook::{inbound_from_webhook, WebhookInboundPayload};
 use crate::channels::{ChannelKind, InboundMessage};
 use crate::config::{resolve_effective_workspace_dir, Config};
+use crate::gateway::feishu_worker::FeishuJobSender;
 use crate::memory::{factory::build_memory_from_config, Memory};
 use crate::providers::ChatMessage;
 use crate::providers::{
@@ -162,6 +164,10 @@ pub struct GatewayRuntime {
     active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
     session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
     run_registry: AgentRunRegistry,
+    /// Feishu async job queue sender (for background worker processing)
+    feishu_job_sender: Arc<RwLock<Option<FeishuJobSender>>>,
+    /// Feishu worker queue length tracker
+    feishu_queue_len: Arc<RwLock<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +282,8 @@ impl GatewayRuntime {
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
             run_registry: AgentRunRegistry::new(),
+            feishu_job_sender: Arc::new(RwLock::new(None)),
+            feishu_queue_len: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -290,7 +298,45 @@ impl GatewayRuntime {
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
             run_registry: AgentRunRegistry::new(),
+            feishu_job_sender: Arc::new(RwLock::new(None)),
+            feishu_queue_len: Arc::new(RwLock::new(0)),
         }
+    }
+    
+    /// Initialize the Feishu async worker with the given queue
+    pub async fn init_feishu_worker(&self, sender: FeishuJobSender) {
+        let mut lock = self.feishu_job_sender.write().await;
+        *lock = Some(sender);
+    }
+    
+    /// Get approximate queue length
+    pub async fn feishu_queue_len(&self) -> usize {
+        *self.feishu_queue_len.read().await
+    }
+    
+    /// Increment queue length
+    pub async fn inc_feishu_queue_len(&self) {
+        let mut len = self.feishu_queue_len.write().await;
+        *len += 1;
+    }
+    
+    /// Try to send a job to the Feishu worker queue
+    pub async fn try_send_feishu_job(&self, job: crate::gateway::feishu_worker::FeishuAsyncJob) -> Result<(), crate::gateway::feishu_worker::EnqueueError> {
+        let sender = self.feishu_job_sender.read().await;
+        if let Some(ref s) = *sender {
+            s.send(job).await.map_err(|_| crate::gateway::feishu_worker::EnqueueError::QueueFull)?;
+            drop(sender);
+            self.inc_feishu_queue_len().await;
+            Ok(())
+        } else {
+            Err(crate::gateway::feishu_worker::EnqueueError::QueueFull)
+        }
+    }
+
+    /// Check if the Feishu async worker is initialized
+    pub async fn is_feishu_worker_initialized(&self) -> bool {
+        let sender = self.feishu_job_sender.read().await;
+        sender.is_some()
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
@@ -1644,6 +1690,16 @@ impl GatewayRuntime {
         let addr: SocketAddr = format!("{}:{}", cfg.gateway.host, cfg.gateway.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
+        
+        // Initialize Feishu async worker
+        use crate::gateway::feishu_worker::{spawn_worker, FeishuWorkerState};
+        let mut worker_state = FeishuWorkerState::new();
+        let receiver = worker_state.take_receiver();
+        let queue_len = worker_state.queue_len.clone();
+        self.init_feishu_worker(worker_state.sender()).await;
+        let runtime = self.clone();
+        let _worker_handle = spawn_worker(receiver, runtime, queue_len);
+        println!("[gateway] feishu_async_worker started");
 
         if self.cron_store.is_none() {
             let cron_path = cfg.workspace_dir.join("cron.json");
@@ -2842,6 +2898,7 @@ async fn http_channel_webhook(
     }
 
     let text_preview = extract_text_for_log(&payload);
+    let payload_clone = payload.clone(); // Keep original payload for async job
     let effective_event_type = header_event_type.as_deref()
         .or_else(|| payload.get("event").and_then(|e| e.get("type")).and_then(|v| v.as_str()))
         .or_else(|| payload.get("type").and_then(|v| v.as_str()))
@@ -3023,7 +3080,57 @@ async fn http_channel_webhook(
         channel_name, user_id_present, inbound.session_id.is_some(), metadata_has_message_id, metadata_has_chat_id, inbound.text.len()
     );
 
-    // Process in Runtime (synchronous to ensure proper ordering)
+    // ==== FEISHU ASYNC PROCESSING ====
+    // For Feishu, check if async worker is available (tests may not have it initialized)
+    if inbound_channel == ChannelKind::Feishu {
+        let is_async_available = runtime.is_feishu_worker_initialized().await;
+        
+        if is_async_available {
+            let is_chat_only = inbound.metadata.get("chat_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            
+            let job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
+                inbound_channel,
+                inbound,
+                payload_clone,
+                is_chat_only,
+            );
+            
+            match runtime.try_send_feishu_job(job).await {
+                Ok(()) => {
+                    let queue_len = runtime.feishu_queue_len().await;
+                    println!(
+                        "[{}-webhook] ack_queued ack_ms={} queue_len={}",
+                        channel_name,
+                        0,
+                        queue_len
+                    );
+                    return Ok(Json(serde_json::json!({
+                        "ok": true,
+                        "accepted": true,
+                        "processing": "queued"
+                    })));
+                }
+                Err(_) => {
+                    println!(
+                        "[{}-worker] queue_full capacity=100",
+                        channel_name
+                    );
+                    return Ok(Json(serde_json::json!({
+                        "ok": false,
+                        "accepted": false,
+                        "processing": "queue_full",
+                        "retryable": true
+                    })));
+                }
+            }
+        } else {
+            println!("[{}-webhook] sync_mode reason=worker_not_initialized", channel_name);
+        }
+    }
+
+    // Process in Runtime (synchronous to ensure proper ordering) - for non-Feishu channels
     println!("[{}-webhook] runtime_start", channel_name);
     let response = match runtime.process_inbound(&inbound).await {
         Ok(response) => {
