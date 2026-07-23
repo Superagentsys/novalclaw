@@ -67,6 +67,8 @@ export interface ChannelEntryConfig {
   token_env?: string;
   /** Extra channel-specific fields (e.g., app_id, app_secret, signing_secret, webhook_path) */
   extra?: Record<string, string>;
+  /** Explicit flag to clear app_secret. When true, the backend removes app_secret from extra. */
+  clear_app_secret?: boolean;
 }
 
 export interface ChannelsConfig {
@@ -112,6 +114,7 @@ const COMMON_TOKEN_FIELDS: ChannelField[] = [
 const FEISHU_LIKE_FIELDS: ChannelField[] = [
   { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text", isExtra: true },
   { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password", isExtra: true },
+  { key: "outbound_mode", label: "Outbound Mode", placeholder: "real/mock/disabled", type: "text", isExtra: true },
 ];
 
 export const CHANNEL_PRESETS: ChannelPreset[] = [

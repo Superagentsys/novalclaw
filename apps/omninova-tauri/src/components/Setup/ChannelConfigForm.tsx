@@ -57,6 +57,8 @@ export function ChannelConfigForm({
   const [healthStatus, setHealthStatus] = useState<"idle" | "checking" | "ok" | "error">("idle");
   const [healthMessage, setHealthMessage] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<string>("");
+  /** Tracks whether the user has clicked "Clear App Secret" for the current channel */
+  const [clearAppSecretRequested, setClearAppSecretRequested] = useState<Record<string, boolean>>({});
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
@@ -107,10 +109,10 @@ export function ChannelConfigForm({
 
   const visibleFields = useMemo(() => {
     if (!selectedPreset) return [];
-    // Feishu/Lark only show app_id and app_secret (both are extra fields)
+    // Feishu/Lark only show app_id, app_secret, and outbound_mode (all are extra fields)
     if (FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset.id)) {
       return selectedPreset.fields.filter(
-        (field) => field.key === "app_id" || field.key === "app_secret"
+        (field) => field.key === "app_id" || field.key === "app_secret" || field.key === "outbound_mode"
       );
     }
     return selectedPreset.fields;
@@ -133,6 +135,10 @@ export function ChannelConfigForm({
     };
     if (Object.keys(cleanedEntry.extra || {}).length === 0) {
       cleanedEntry.extra = undefined;
+    }
+    // Preserve clear_app_secret flag if set
+    if (clearAppSecretRequested[id]) {
+      cleanedEntry.clear_app_secret = true;
     }
     onChange({ ...value, [id]: cleanedEntry });
   };
@@ -180,12 +186,17 @@ export function ChannelConfigForm({
     }
     const appId = entry.extra?.["app_id"] ?? "";
     const appSecret = entry.extra?.["app_secret"] ?? "";
+    const outboundMode = entry.extra?.["outbound_mode"] ?? "disabled";
+    
     if (!appId.trim()) {
       return "启用飞书时，App ID 不能为空";
     }
-    if (!appSecret.trim()) {
+    
+    // Only require app_secret when outbound_mode is "real" or "mock"
+    if ((outboundMode === "real" || outboundMode === "mock") && !appSecret.trim()) {
       return "启用飞书时，App Secret 不能为空";
     }
+    
     return undefined;
   };
 
@@ -308,21 +319,71 @@ export function ChannelConfigForm({
           )}
 
           <div className="setup-grid">
-            {visibleFields.map((field) => (
-              <label key={field.key}>
-                {field.label}
-                <input
-                  type={field.type ?? "text"}
-                  value={getFieldValue(field)}
-                  onChange={(event) =>
-                    handleFieldChange(field, event.target.value)
-                  }
-                  placeholder={
-                    field.placeholder || selectedPreset.tokenEnvHint
-                  }
-                />
-              </label>
-            ))}
+            {visibleFields.map((field) => {
+              // Special handling for outbound_mode - render as dropdown
+              if (field.key === "outbound_mode") {
+                return (
+                  <label key={field.key}>
+                    {field.label}
+                    <select
+                      value={getFieldValue(field) || "disabled"}
+                      onChange={(event) =>
+                        handleFieldChange(field, event.target.value)
+                      }
+                    >
+                      <option value="disabled">disabled（禁用）</option>
+                      <option value="mock">mock（模拟）</option>
+                      <option value="real">real（真实）</option>
+                    </select>
+                  </label>
+                );
+              }
+              return (
+                <label key={field.key}>
+                  {field.label}
+                  {field.key === "app_secret" ? (
+                    <div className="app-secret-input-row">
+                      <input
+                        type={field.type ?? "text"}
+                        value={getFieldValue(field)}
+                        onChange={(event) =>
+                          handleFieldChange(field, event.target.value)
+                        }
+                        placeholder={
+                          field.placeholder || selectedPreset.tokenEnvHint
+                        }
+                      />
+                      <button
+                        type="button"
+                        className="setup-btn setup-btn--secondary app-secret-clear-btn"
+                        onClick={() => {
+                          setClearAppSecretRequested((prev) => ({
+                            ...prev,
+                            [selectedPreset!.id]: true,
+                          }));
+                          // Clear the input value to empty, which will be submitted as part of the form
+                          handleFieldChange(field, "");
+                        }}
+                        title="清除 App Secret"
+                      >
+                        清除
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      type={field.type ?? "text"}
+                      value={getFieldValue(field)}
+                      onChange={(event) =>
+                        handleFieldChange(field, event.target.value)
+                      }
+                      placeholder={
+                        field.placeholder || selectedPreset.tokenEnvHint
+                      }
+                    />
+                  )}
+                </label>
+              );
+            })}
           </div>
 
           {selectedPreset.id === "feishu" && (

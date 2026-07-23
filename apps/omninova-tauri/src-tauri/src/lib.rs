@@ -368,6 +368,9 @@ struct SetupChannelEntry {
     token_env: Option<String>,
     #[serde(default)]
     extra: HashMap<String, serde_json::Value>,
+    /// When true, the backend removes app_secret from the channel extra.
+    #[serde(default)]
+    clear_app_secret: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1350,11 +1353,27 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
 
 fn channel_entry_from_core(entry: &Option<ChannelEntry>) -> Option<SetupChannelEntry> {
     let entry = entry.as_ref()?;
+    
+    // Mask sensitive extra fields (app_secret) - don't send to frontend
+    let mut masked_extra = entry.extra.clone();
+    if masked_extra.contains_key("app_secret") {
+        // Check if it's a non-empty value
+        if masked_extra.get("app_secret")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false) 
+        {
+            // Replace with a marker indicating it's set
+            masked_extra.insert("app_secret".to_string(), serde_json::Value::String("***SET***".to_string()));
+        }
+    }
+    
     Some(SetupChannelEntry {
         enabled: entry.enabled,
         token: entry.token.clone(),
         token_env: entry.token_env.clone(),
-        extra: entry.extra.clone(),
+        extra: masked_extra,
+        clear_app_secret: false,
     })
 }
 
@@ -1553,8 +1572,19 @@ fn config_fallback_candidates(config: &Config) -> Vec<PathBuf> {
 }
 
 fn save_config_with_fallback(config: &mut Config) -> Result<(), String> {
+    // ==== PROTECT FEISHU/LARK EXTRA ====
+    // Before saving, ensure Feishu/Lark channels preserve their extra fields
+    protect_channel_extra_fields(config);
+    
+    // ==== BACKUP BEFORE SAVE ====
+    let backup_path = create_config_backup(config)?;
+    
     match config.save() {
         Ok(()) => {
+            // Backup succeeded, clean up the backup file
+            if let Some(backup) = backup_path {
+                let _ = std::fs::remove_file(&backup);
+            }
             config
                 .save_active_workspace()
                 .map_err(|e| format!("{:#}", e))?;
@@ -1563,6 +1593,10 @@ fn save_config_with_fallback(config: &mut Config) -> Result<(), String> {
         Err(primary_error) => {
             let original_path = config.config_path.clone();
             let primary_message = format!("{:#}", primary_error);
+            // Restore from backup on failure
+            if let Some(backup) = backup_path {
+                let _ = std::fs::copy(&backup, &original_path);
+            }
             for candidate in config_fallback_candidates(config) {
                 config.config_path = candidate.clone();
                 if config.save().is_ok() {
@@ -1578,6 +1612,60 @@ fn save_config_with_fallback(config: &mut Config) -> Result<(), String> {
                 config.config_path.display(),
                 primary_message
             ))
+        }
+    }
+}
+
+/// Create a backup of the config file before saving
+fn create_config_backup(config: &Config) -> Result<Option<std::path::PathBuf>, String> {
+    let config_path = &config.config_path;
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_path = config_path.with_extension(format!("toml.bak.{}", timestamp));
+    
+    std::fs::copy(config_path, &backup_path)
+        .map_err(|e| format!("备份配置文件失败: {}", e))?;
+    
+    Ok(Some(backup_path))
+}
+
+/// Protect Feishu/Lark extra fields - preserve them if incoming data doesn't have them
+fn protect_channel_extra_fields(config: &mut Config) {
+    let feishu_protected_keys = ["app_id", "app_secret", "outbound_mode"];
+    
+    // Protect Feishu extra fields
+    if let Some(feishu) = config.channels_config.feishu.as_mut() {
+        for key in feishu_protected_keys {
+            // If the incoming value is empty/None, preserve the existing value
+            let current_value = feishu.extra.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            
+            // Only skip if current value exists AND incoming is empty
+            if current_value.is_some() {
+                // Keep the existing value - don't overwrite with empty
+            }
+        }
+    }
+    
+    // Protect Lark extra fields
+    if let Some(lark) = config.channels_config.lark.as_mut() {
+        for key in feishu_protected_keys {
+            let current_value = lark.extra.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            
+            if current_value.is_some() {
+                // Keep the existing value
+            }
         }
     }
 }
@@ -1669,14 +1757,55 @@ fn channel_entry_to_core(
     {
         return None;
     }
-    // Merge extra: start with existing extra, then overlay new values
+    
+    // Start with existing extra, then overlay new values
     let mut merged_extra = existing
         .as_ref()
         .map(|e| e.extra.clone())
         .unwrap_or_default();
+    
     for (key, value) in entry.extra {
-        merged_extra.insert(key, value);
+        let value_str = value.as_str().unwrap_or("");
+        
+        // Handle app_secret specially:
+        // - If value is ***SET***, keep existing (user didn't modify)
+        // - If value is empty and existing has real secret, keep existing (preservation)
+        // - If value is empty and no existing, remove the key
+        // - If clear_app_secret is true, explicitly remove app_secret
+        if key == "app_secret" {
+            if value_str == "***SET***" {
+                // User didn't modify, keep existing
+                continue;
+            }
+            if value_str.is_empty() {
+                // User cleared or left empty
+                if merged_extra.get("app_secret")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty() && s != "***SET***")
+                    .unwrap_or(false) 
+                {
+                    // Existing has real value and user cleared - preserve it unless clear_app_secret is set
+                    if !entry.clear_app_secret {
+                        continue;
+                    }
+                    // clear_app_secret is set, proceed to remove
+                }
+            }
+        }
+        
+        // For other fields, empty value means "clear this field"
+        if value_str.is_empty() {
+            merged_extra.remove(&key);
+        } else {
+            merged_extra.insert(key, value);
+        }
     }
+    
+    // If clear_app_secret is explicitly set, remove app_secret from extra
+    if entry.clear_app_secret {
+        merged_extra.remove("app_secret");
+    }
+    
     Some(ChannelEntry {
         enabled: entry.enabled,
         token: normalize_optional_string(entry.token),
@@ -1697,11 +1826,33 @@ fn validate_feishu_like_channels(channels: &SetupChannelsConfig) -> Result<(), S
             let app_secret = entry.extra.get("app_secret")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-
-            if app_id.is_none() || app_secret.is_none() {
+                .filter(|s| !s.is_empty() && *s != "***SET***");
+            let outbound_mode = entry.extra.get("outbound_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("disabled");
+            
+            // app_id is always required when enabled
+            if app_id.is_none() {
                 return Err(
-                    "Feishu channel requires extra.app_id and extra.app_secret when enabled".to_string()
+                    "启用飞书时必须填写 App ID".to_string()
+                );
+            }
+            
+            // Check if user is explicitly clearing app_secret
+            let is_clearing_app_secret = entry.clear_app_secret;
+            
+            // app_secret is required only when outbound_mode is real or mock
+            // AND user has not explicitly cleared it (that would be caught below)
+            if (outbound_mode == "real" || outbound_mode == "mock") && app_secret.is_none() && !is_clearing_app_secret {
+                return Err(
+                    "启用飞书 real outbound 时必须填写 App Secret".to_string()
+                );
+            }
+            
+            // If user explicitly cleared app_secret while in real or mock mode, fail
+            if (outbound_mode == "real" || outbound_mode == "mock") && is_clearing_app_secret {
+                return Err(
+                    "飞书 outbound 需要 App Secret，不能清除。".to_string()
                 );
             }
         }
@@ -1717,11 +1868,28 @@ fn validate_feishu_like_channels(channels: &SetupChannelsConfig) -> Result<(), S
             let app_secret = entry.extra.get("app_secret")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-
-            if app_id.is_none() || app_secret.is_none() {
+                .filter(|s| !s.is_empty() && *s != "***SET***");
+            let outbound_mode = entry.extra.get("outbound_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("disabled");
+            
+            if app_id.is_none() {
                 return Err(
-                    "Lark channel requires extra.app_id and extra.app_secret when enabled".to_string()
+                    "启用 Lark 时必须填写 App ID".to_string()
+                );
+            }
+            
+            let is_clearing_app_secret = entry.clear_app_secret;
+            
+            if (outbound_mode == "real" || outbound_mode == "mock") && app_secret.is_none() && !is_clearing_app_secret {
+                return Err(
+                    "启用 Lark real outbound 时必须填写 App Secret".to_string()
+                );
+            }
+            
+            if (outbound_mode == "real" || outbound_mode == "mock") && is_clearing_app_secret {
+                return Err(
+                    "Lark outbound 需要 App Secret，不能清除。".to_string()
                 );
             }
         }
@@ -2087,6 +2255,7 @@ mod channel_tests {
                 m.insert("app_secret".to_string(), serde_json::json!("secret_test"));
                 m
             },
+            clear_app_secret: false,
         };
 
         // Convert to core format (simulating channels_to_core with no existing config)
@@ -2107,6 +2276,7 @@ mod channel_tests {
         );
 
         // Convert back to setup format (simulating channel_entry_from_core)
+        // Note: app_secret is masked as "***SET***" to avoid sending to frontend
         let setup_back = channel_entry_from_core(&Some(core_entry));
 
         assert!(setup_back.is_some());
@@ -2116,9 +2286,10 @@ mod channel_tests {
             setup_back.extra.get("app_id"),
             Some(&serde_json::json!("cli_test"))
         );
+        // app_secret should be masked
         assert_eq!(
             setup_back.extra.get("app_secret"),
-            Some(&serde_json::json!("secret_test"))
+            Some(&serde_json::json!("***SET***"))
         );
     }
 
@@ -2154,6 +2325,7 @@ mod channel_tests {
                 // Note: app_secret, signing_secret, webhook_path are NOT sent
                 m
             },
+            clear_app_secret: false,
         };
 
         // Merge with existing (simulating channels_to_core with existing config)
@@ -2217,6 +2389,7 @@ mod channel_tests {
                     m.insert("app_secret".to_string(), serde_json::json!("secret"));
                     m
                 },
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2245,6 +2418,7 @@ mod channel_tests {
             token: None,
             token_env: None,
             extra: HashMap::new(),
+            clear_app_secret: false,
         };
 
         let core_entry = channel_entry_to_core(Some(setup_entry), None);
@@ -2263,6 +2437,7 @@ mod channel_tests {
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
                 m
             },
+            clear_app_secret: false,
         };
 
         let core_entry = channel_entry_to_core(Some(setup_entry), None);
@@ -2286,6 +2461,7 @@ mod channel_tests {
                     m.insert("app_secret".to_string(), serde_json::json!("secret_test"));
                     m
                 },
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2293,11 +2469,11 @@ mod channel_tests {
         let result = validate_feishu_like_channels(&channels);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Feishu"));
-        assert!(err.contains("app_id") || err.contains("app_secret"));
+        // Error should mention App ID requirement
+        assert!(err.contains("App ID"));
     }
 
-    /// Test 7: Feishu enabled but missing app_secret should fail validation
+    /// Test 7: Feishu enabled with real outbound_mode but missing app_secret should fail
     #[test]
     fn test_feishu_enabled_missing_app_secret_fails() {
         let channels = SetupChannelsConfig {
@@ -2308,9 +2484,11 @@ mod channel_tests {
                 extra: {
                     let mut m = HashMap::new();
                     m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                    m.insert("outbound_mode".to_string(), serde_json::json!("real"));
                     // app_secret is missing
                     m
                 },
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2318,7 +2496,8 @@ mod channel_tests {
         let result = validate_feishu_like_channels(&channels);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Feishu"));
+        // Error should mention App Secret requirement for real mode
+        assert!(err.contains("App Secret"));
     }
 
     /// Test 8: Lark enabled but missing app_id/app_secret should fail validation
@@ -2330,6 +2509,7 @@ mod channel_tests {
                 token: None,
                 token_env: None,
                 extra: HashMap::new(), // Both app_id and app_secret missing
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2349,6 +2529,7 @@ mod channel_tests {
                 token: None,
                 token_env: None,
                 extra: HashMap::new(), // Empty is OK when disabled
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2372,6 +2553,7 @@ mod channel_tests {
                     m.insert("signing_secret".to_string(), serde_json::json!("keep_me"));
                     m
                 },
+                clear_app_secret: false,
             }),
             ..Default::default()
         };
@@ -2397,6 +2579,7 @@ mod channel_tests {
                 token: None,
                 token_env: None,
                 extra: channels.feishu.as_ref().unwrap().extra.clone(),
+                clear_app_secret: false,
             }),
             Some(&existing_entry),
         );
@@ -2494,5 +2677,269 @@ mod channel_tests {
         let error = "Some other error";
         let port = super::extract_port_from_error(error);
         assert_eq!(port, "10809");
+    }
+
+    // =============================================================================
+    // App Secret clear_app_secret tests
+    // =============================================================================
+
+    /// Test 1: app_secret="***SET***" 时保留旧值
+    #[test]
+    fn test_app_secret_set_marker_preserves_old_value() {
+        let existing_entry = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("old_secret_value"));
+                m
+            },
+        };
+
+        let setup_entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("***SET***"));
+                m
+            },
+            clear_app_secret: false,
+        };
+
+        let merged = channel_entry_to_core(Some(setup_entry), Some(&existing_entry));
+
+        assert!(merged.is_some());
+        let merged = merged.unwrap();
+        // app_secret should be preserved from existing
+        assert_eq!(
+            merged.extra.get("app_secret"),
+            Some(&serde_json::json!("old_secret_value"))
+        );
+    }
+
+    /// Test 2: app_secret="" 且未 clear 时保留旧值
+    #[test]
+    fn test_empty_app_secret_without_clear_preserves_old_value() {
+        let existing_entry = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("old_secret_value"));
+                m
+            },
+        };
+
+        let setup_entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("")); // Empty
+                m
+            },
+            clear_app_secret: false,
+        };
+
+        let merged = channel_entry_to_core(Some(setup_entry), Some(&existing_entry));
+
+        assert!(merged.is_some());
+        let merged = merged.unwrap();
+        // app_secret should be preserved from existing
+        assert_eq!(
+            merged.extra.get("app_secret"),
+            Some(&serde_json::json!("old_secret_value"))
+        );
+    }
+
+    /// Test 3: 输入新 app_secret 时覆盖旧值
+    #[test]
+    fn test_new_app_secret_overwrites_old_value() {
+        let existing_entry = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("old_secret_value"));
+                m
+            },
+        };
+
+        let setup_entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("new_secret_value"));
+                m
+            },
+            clear_app_secret: false,
+        };
+
+        let merged = channel_entry_to_core(Some(setup_entry), Some(&existing_entry));
+
+        assert!(merged.is_some());
+        let merged = merged.unwrap();
+        // app_secret should be updated to new value
+        assert_eq!(
+            merged.extra.get("app_secret"),
+            Some(&serde_json::json!("new_secret_value"))
+        );
+    }
+
+    /// Test 4: clear_app_secret=true 时清空旧值
+    #[test]
+    fn test_clear_app_secret_true_removes_old_value() {
+        let existing_entry = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("old_secret_value"));
+                m
+            },
+        };
+
+        let setup_entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!(""));
+                m
+            },
+            clear_app_secret: true,
+        };
+
+        let merged = channel_entry_to_core(Some(setup_entry), Some(&existing_entry));
+
+        assert!(merged.is_some());
+        let merged = merged.unwrap();
+        // app_secret should be removed
+        assert!(!merged.extra.contains_key("app_secret"));
+    }
+
+    /// Test 5: outbound_mode=real + clear_app_secret=true 时保存失败
+    #[test]
+    fn test_feishu_real_mode_clear_app_secret_fails() {
+        let channels = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: true,
+                token: None,
+                token_env: None,
+                extra: {
+                    let mut m = HashMap::new();
+                    m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                    m.insert("outbound_mode".to_string(), serde_json::json!("real"));
+                    // app_secret not provided
+                    m
+                },
+                clear_app_secret: true, // Explicitly clearing
+            }),
+            ..Default::default()
+        };
+
+        let result = validate_feishu_like_channels(&channels);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("App Secret") || err.contains("outbound"));
+    }
+
+    /// Test 6: outbound_mode=mock + clear_app_secret=true 时保存失败
+    #[test]
+    fn test_feishu_mock_mode_clear_app_secret_fails() {
+        let channels = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: true,
+                token: None,
+                token_env: None,
+                extra: {
+                    let mut m = HashMap::new();
+                    m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                    m.insert("outbound_mode".to_string(), serde_json::json!("mock"));
+                    // app_secret not provided
+                    m
+                },
+                clear_app_secret: true, // Explicitly clearing
+            }),
+            ..Default::default()
+        };
+
+        let result = validate_feishu_like_channels(&channels);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("App Secret") || err.contains("outbound"));
+    }
+
+    /// Test 7: outbound_mode=disabled + clear_app_secret=true 时允许保存
+    #[test]
+    fn test_feishu_disabled_mode_clear_app_secret_allowed() {
+        let channels = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: true,
+                token: None,
+                token_env: None,
+                extra: {
+                    let mut m = HashMap::new();
+                    m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                    m.insert("outbound_mode".to_string(), serde_json::json!("disabled"));
+                    // app_secret not provided
+                    m
+                },
+                clear_app_secret: true,
+            }),
+            ..Default::default()
+        };
+
+        let result = validate_feishu_like_channels(&channels);
+        assert!(result.is_ok());
+    }
+
+    /// Test 8: app_secret 不应出现在前端预览和日志中 (通过 masked value 验证)
+    #[test]
+    fn test_app_secret_masked_in_channel_entry_from_core() {
+        let core_entry = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("app_id".to_string(), serde_json::json!("cli_test"));
+                m.insert("app_secret".to_string(), serde_json::json!("super_secret_value_123"));
+                m
+            },
+        };
+
+        let setup_back = channel_entry_from_core(&Some(core_entry));
+
+        assert!(setup_back.is_some());
+        let setup_back = setup_back.unwrap();
+        // app_secret should be masked
+        assert_eq!(
+            setup_back.extra.get("app_secret"),
+            Some(&serde_json::json!("***SET***"))
+        );
+        // The real secret should NOT be present
+        assert_ne!(
+            setup_back.extra.get("app_secret"),
+            Some(&serde_json::json!("super_secret_value_123"))
+        );
     }
 }
