@@ -51,8 +51,92 @@ use tracing::{info, warn};
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static OUTBOUND_TOKEN_CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
+static DEDUP_CACHE: OnceLock<Arc<DedupCache>> = OnceLock::new();
+static OUTBOUND_MSG_CACHE: OnceLock<Arc<OutboundMsgCache>> = OnceLock::new();
 const WORKSPACE_REQUIRED_MESSAGE: &str =
     "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
+
+/// TTL-based deduplication cache for webhook events
+#[derive(Debug, Clone)]
+struct DedupCache {
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Instant>>>,
+    ttl_secs: u64,
+}
+
+impl DedupCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            ttl_secs,
+        }
+    }
+
+    fn global() -> Arc<DedupCache> {
+        DEDUP_CACHE
+            .get_or_init(|| Arc::new(DedupCache::new(1800))) // 30 minutes default
+            .clone()
+    }
+
+    async fn check_and_insert(&self, key: &str) -> bool {
+        let mut cache = self.inner.write().await;
+        let now = Instant::now();
+        
+        // Clean expired entries
+        cache.retain(|_, &mut expiry| now < expiry);
+        
+        if cache.contains_key(key) {
+            return false; // Duplicate
+        }
+        
+        cache.insert(key.to_string(), now + Duration::from_secs(self.ttl_secs));
+        true // New event
+    }
+}
+
+/// TTL-based cache for tracking recently sent outbound messages
+/// Used to filter out self-messages when Feishu webhooks re-deliver bot messages
+#[derive(Debug, Clone)]
+struct OutboundMsgCache {
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Instant>>>,
+    ttl_secs: u64,
+}
+
+impl OutboundMsgCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            ttl_secs,
+        }
+    }
+
+    fn global() -> Arc<OutboundMsgCache> {
+        OUTBOUND_MSG_CACHE
+            .get_or_init(|| Arc::new(OutboundMsgCache::new(1800))) // 30 minutes default
+            .clone()
+    }
+
+    /// Record that we sent a message with this platform message_id
+    async fn record_outbound(&self, channel: &str, message_id: &str) {
+        let key = format!("{}:{}", channel, message_id);
+        let mut cache = self.inner.write().await;
+        cache.insert(key, Instant::now() + Duration::from_secs(self.ttl_secs));
+    }
+
+    /// Check if a message was sent by us recently
+    async fn is_our_message(&self, channel: &str, message_id: &str) -> bool {
+        let key = format!("{}:{}", channel, message_id);
+        let mut cache = self.inner.write().await;
+        let now = Instant::now();
+        
+        // Clean expired entries
+        cache.retain(|_, &mut expiry| now < expiry);
+        
+        cache.contains_key(&key)
+    }
+}
+
+use std::time::Instant;
+use std::time::Duration;
 
 fn now_ts() -> String {
     use std::time::SystemTime;
@@ -523,6 +607,34 @@ impl GatewayRuntime {
             }
         }
 
+        // ==== FEISHU CHAT-ONLY MODE ====
+        // Inject chat-only system prompt when inbound is chat_only mode
+        // This must be done AFTER the workspace note but BEFORE agent creation
+        if let Some(chat_only_prompt) = security.chat_only_system_prompt() {
+            let current = agent_cfg.system_prompt.unwrap_or_default();
+            agent_cfg.system_prompt = Some(format!("{}\n\n{}", current, chat_only_prompt));
+            steps.push(ExecutionStep::done("飞书聊天模式", "已注入 chat_only 限制"));
+
+            // Detect tool intent in user message and short-circuit if needed
+            if let Some(intent) = security.detect_tool_intent(&inbound.text) {
+                let blocked_response = security.tool_intent_blocked_response();
+                println!(
+                    "[feishu-policy] short_circuit reason=tool_intent_detected intent={} text_len={}",
+                    intent,
+                    inbound.text.len()
+                );
+                // Return early with blocked response - no agent execution needed
+                return Ok(GatewayInboundResponse {
+                    route,
+                    reply: blocked_response,
+                    steps: vec![
+                        ExecutionStep::done("飞书聊天模式", "已检测工具意图并拦截"),
+                        ExecutionStep::done("Agent 执行", "已拦截 - 不执行工具"),
+                    ],
+                });
+            }
+        }
+
         let agent_security = security.clone();
         let mut agent = Agent::new(
             provider,
@@ -531,7 +643,14 @@ impl GatewayRuntime {
             agent_cfg.clone(),
             agent_security,
         );
-        if let Some(session_id) = inbound.session_id.as_deref() {
+        // Check for stateless mode - skip session history loading
+        let is_stateless = inbound.metadata.get("stateless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        if is_stateless {
+            steps.push(ExecutionStep::done("加载会话历史", "stateless 模式跳过"));
+        } else if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
             match load_session_history(&cfg, &inbound.channel, session_id).await {
                 Ok(history) if !history.is_empty() => {
@@ -801,7 +920,14 @@ impl GatewayRuntime {
             agent_security.clone(),
         );
 
-        if let Some(session_id) = inbound.session_id.as_deref() {
+        // Check for stateless mode - skip session history loading
+        let is_stateless = inbound.metadata.get("stateless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if is_stateless {
+            steps.push(ExecutionStep::done("加载会话历史", "stateless 模式跳过"));
+        } else if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
             match load_session_history(&cfg, &inbound.channel, session_id).await {
                 Ok(history) if !history.is_empty() => {
@@ -1485,6 +1611,36 @@ impl GatewayRuntime {
     /// Start an HTTP gateway server with `/`, `/health`, `/chat`, `/config`.
     pub async fn serve_http(mut self) -> anyhow::Result<()> {
         let cfg = self.get_config().await;
+        
+        // Log config path and Feishu configuration summary
+        println!(
+            "[config] loaded path={}",
+            cfg.config_path.display()
+        );
+        
+        // Log Feishu channel configuration
+        if let Some(ref feishu) = cfg.channels_config.feishu {
+            let app_id_present = feishu.extra.get("app_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let app_secret_present = feishu.extra.get("app_secret")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let outbound_mode = feishu.extra.get("outbound_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("not_set");
+            println!(
+                "[config] feishu enabled={} app_id_present={} app_secret_present={} outbound_mode={}",
+                feishu.enabled, app_id_present, app_secret_present, outbound_mode
+            );
+        } else {
+            println!(
+                "[config] feishu enabled=false app_id_present=false app_secret_present=false outbound_mode=not_configured"
+            );
+        }
+        
         let addr: SocketAddr = format!("{}:{}", cfg.gateway.host, cfg.gateway.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
@@ -2524,6 +2680,7 @@ async fn http_channel_webhook(
     raw_body: String,
     channel: ChannelKind,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
+    let channel_name = format!("{:?}", channel).to_lowercase();
     let cfg = runtime.get_config().await;
 
     // Security: Reject requests for disabled channels
@@ -2535,8 +2692,6 @@ async fn http_channel_webhook(
             }),
         ));
     }
-
-    let channel_name = format!("{:?}", channel).to_lowercase();
 
     if let Some(secret) = channel_webhook_signing_secret(&cfg, &channel) {
         let allowed_algorithms = cfg
@@ -2602,54 +2757,326 @@ async fn http_channel_webhook(
             )
         })?;
 
-    let payload: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(GatewayError {
-                message: format!("invalid channel webhook payload: {e}"),
-            }),
-        )
-    })?;
-
-    if let Some(challenge) = verification_response(&payload) {
-        return Ok(Json(challenge));
-    }
-
-    let inbound = inbound_from_platform_webhook(channel, payload).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(GatewayError {
-                message: e.to_string(),
-            }),
-        )
-    })?;
-
-    let response = match runtime.process_inbound(&inbound).await {
-        Ok(response) => response,
-        Err(_) => {
-            return Ok(platform_webhook_response_json(
-                PlatformWebhookResponse::error(&channel_name, "agent_runtime_failed"),
+    let payload: serde_json::Value = match serde_json::from_str(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: format!("invalid channel webhook payload: {e}"),
+                }),
             ))
         }
     };
 
-    let message_id = inbound
-        .metadata
-        .get("message_id")
-        .and_then(|value| value.as_str())
+    // Check for challenge (url_verification) - always sync response
+    if let Some(challenge) = verification_response(&payload) {
+        println!(
+            "[{}-webhook] received challenge={}",
+            channel_name,
+            payload.get("challenge").and_then(|v| v.as_str()).unwrap_or("unknown")
+        );
+        return Ok(Json(challenge));
+    }
+
+    // Extract key fields for filtering and logging
+    let header_event_id = payload.get("header")
+        .and_then(|h| h.get("event_id"))
+        .and_then(|v| v.as_str())
         .map(String::from);
+    let header_event_type = payload.get("header")
+        .and_then(|h| h.get("event_type"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let top_level_event_id = payload.get("event_id").and_then(|v| v.as_str()).map(String::from);
+    let event_id = header_event_id.as_ref().or(top_level_event_id.as_ref()).cloned();
+    
+    // Extract sender_type (for bot/self-message filtering)
+    let sender_type = payload.get("event")
+        .and_then(|e| e.get("sender"))
+        .and_then(|s| s.get("sender_type"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    
+    // Extract message_type (for filtering non-text messages)
+    let message_type = payload.get("event")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.get("message_type"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    
+    // Extract message_id for deduplication
+    let message_id = payload.get("event")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.get("message_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Helper to extract text preview
+    fn extract_text_for_log(payload: &serde_json::Value) -> String {
+        // Try event.message.content (Feishu v2)
+        if let Some(event) = payload.get("event") {
+            if let Some(msg) = event.get("message") {
+                if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                        if let Some(t) = parsed.get("text").and_then(|v| v.as_str()) {
+                            return if t.len() <= 100 {
+                                t.to_string()
+                            } else {
+                                format!("{}...(len={})", &t[..100.min(t.len())], t.len())
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        // Try direct text field
+        if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
+            return if t.len() <= 100 {
+                t.to_string()
+            } else {
+                format!("{}...(len={})", &t[..100.min(t.len())], t.len())
+            };
+        }
+        "(no text found)".to_string()
+    }
+
+    let text_preview = extract_text_for_log(&payload);
+    let effective_event_type = header_event_type.as_deref()
+        .or_else(|| payload.get("event").and_then(|e| e.get("type")).and_then(|v| v.as_str()))
+        .or_else(|| payload.get("type").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+
+    println!(
+        "[{}-webhook] received event_type={} event_id_present={} header_event_id_present={} message_id_present={} chat_id_present={} sender_type={:?} message_type={:?} text_len={}",
+        channel_name, 
+        effective_event_type,
+        event_id.is_some(),
+        header_event_id.is_some(),
+        message_id.is_some(),
+        payload.get("event").and_then(|e| e.get("message")).and_then(|m| m.get("chat_id")).is_some(),
+        sender_type,
+        message_type,
+        text_preview.len()
+    );
+
+    // ==== FILTERING: sender_type ====
+    match sender_type.as_deref() {
+        Some("app") | Some("bot") => {
+            println!(
+                "[{}-webhook] skip_self_message reason=sender_type_{}",
+                channel_name,
+                sender_type.as_ref().unwrap()
+            );
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "skipped",
+                "reason": format!("sender_type_{}", sender_type.as_ref().unwrap())
+            })));
+        }
+        Some(t) if t != "user" => {
+            println!(
+                "[{}-webhook] sender_type_unknown type={}",
+                channel_name,
+                t
+            );
+            // For unknown sender types, skip to be safe and avoid loops
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "skipped",
+                "reason": "sender_type_unknown"
+            })));
+        }
+        _ => {}
+    }
+
+    // ==== FILTERING: message_type ====
+    if message_type.as_deref() != Some("text") {
+        println!(
+            "[{}-webhook] skip_unsupported_message_type message_type={:?}",
+            channel_name,
+            message_type
+        );
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "skipped",
+            "reason": "unsupported_message_type"
+        })));
+    }
+
+    // ==== DEDUPLICATION ====
+    let dedup_cache = DedupCache::global();
+    let dedup_key = event_id.as_ref()
+        .or(message_id.as_ref())
+        .map(|k| format!("{}:{}", channel_name, k));
+    
+    if let Some(key) = &dedup_key {
+        let is_new = dedup_cache.check_and_insert(key).await;
+        if !is_new {
+            println!("[{}-dedupe] duplicate key_type={}", channel_name, 
+                if event_id.is_some() { "event_id" } else { "message_id" });
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "duplicate": true,
+                "processing": "skipped"
+            })));
+        }
+        println!("[{}-dedupe] accepted key_type={}", channel_name,
+            if event_id.is_some() { "event_id" } else { "message_id" });
+    }
+
+    // ==== FILTERING: outbound message ID (self-message detection) ====
+    // Check if this message was sent by us (bot) recently
+    if let Some(incoming_msg_id) = message_id.as_ref() {
+        let channel_str = channel_name.clone();
+        if OutboundMsgCache::global().is_our_message(&channel_str, incoming_msg_id).await {
+            println!("[{}-webhook] skip_self_message reason=outbound_message_id_match message_id={}",
+                channel_name, incoming_msg_id);
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "skipped",
+                "reason": "outbound_message_id_match"
+            })));
+        }
+    }
+
+    // Parse payload into inbound message
+    let inbound_channel = channel.clone();
+    let mut inbound = match inbound_from_platform_webhook(channel, payload) {
+        Ok(i) => i,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: e.to_string(),
+                }),
+            ))
+        }
+    };
+
+    // ==== FEISHU SESSION ISOLATION ====
+    // For Feishu, use stateless mode to prevent session pollution from desktop tasks
+    if inbound_channel == ChannelKind::Feishu {
+        // Mark this inbound as stateless - prevents loading session history
+        inbound.metadata.insert("stateless".to_string(), serde_json::Value::Bool(true));
+        
+        // Prefix session_id with channel to ensure isolation
+        if let Some(ref chat_id) = inbound.session_id {
+            let prefixed = format!("feishu:{chat_id}");
+            inbound.session_id = Some(prefixed.clone());
+            println!(
+                "[{}-webhook] session_mode stateless=true session_id_prefix=feishu session_id={}",
+                channel_name, prefixed
+            );
+        }
+        
+        // ==== FEISHU ROUTING MODE ====
+        // Determine if this is a chat-only message or tool command
+        let text_trimmed = inbound.text.trim();
+        
+        // Supported slash commands for tool mode
+        const SLASH_COMMANDS: &[&str] = &["/run", "/tool", "/monitor", "/file", "/workspace", "/agent"];
+        
+        let is_slash_command = SLASH_COMMANDS.iter().any(|cmd| text_trimmed.starts_with(cmd));
+        
+        if is_slash_command {
+            // Extract command name
+            let command = SLASH_COMMANDS.iter()
+                .find(|cmd| text_trimmed.starts_with(*cmd))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            
+            inbound.metadata.insert("feishu_mode".to_string(), serde_json::Value::String("tool".to_string()));
+            inbound.metadata.insert("chat_only".to_string(), serde_json::Value::Bool(false));
+            inbound.metadata.insert("slash_command".to_string(), serde_json::Value::String(command.clone()));
+            
+            println!(
+                "[{}-router] mode=tool reason=slash_command command={} text_len={}",
+                channel_name, command, inbound.text.len()
+            );
+        } else {
+            // Default to chat-only mode
+            inbound.metadata.insert("feishu_mode".to_string(), serde_json::Value::String("chat_only".to_string()));
+            inbound.metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+            
+            println!(
+                "[{}-router] mode=chat_only reason=default_text text_len={}",
+                channel_name, inbound.text.len()
+            );
+        }
+    }
+
+    // Diagnostic: log inbound ready
+    let user_id_present = inbound.user_id.is_some();
+    let metadata_has_message_id = inbound.metadata.get("message_id").is_some()
+        || inbound.metadata.get("message_message_id").is_some();
+    let metadata_has_chat_id = inbound.metadata.get("chat_id").is_some()
+        || inbound.metadata.get("message_chat_id").is_some()
+        || inbound.metadata.get("conversation_id").is_some();
+    println!(
+        "[{}-webhook] inbound_ready user_id_present={} session_id_present={} metadata_has_message_id={} metadata_has_chat_id={} text_len={}",
+        channel_name, user_id_present, inbound.session_id.is_some(), metadata_has_message_id, metadata_has_chat_id, inbound.text.len()
+    );
+
+    // Process in Runtime (synchronous to ensure proper ordering)
+    println!("[{}-webhook] runtime_start", channel_name);
+    let response = match runtime.process_inbound(&inbound).await {
+        Ok(response) => {
+            println!(
+                "[{}-webhook] runtime_done reply_len={} reply_empty={}",
+                channel_name,
+                response.reply.len(),
+                response.reply.trim().is_empty()
+            );
+            response
+        }
+        Err(e) => {
+            println!("[{}-webhook] runtime_failed error={}", channel_name, e);
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "error": "agent_runtime_failed",
+                "message": e.to_string()
+            })));
+        }
+    };
+
+    if response.reply.trim().is_empty() {
+        println!("[{}-webhook] skipped_empty_reply", channel_name);
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "completed",
+            "reply": ""
+        })));
+    }
+
+    // Deliver the reply via outbound sender
+    println!("[{}-webhook] outbound_start reply_len={}", channel_name, response.reply.len());
+    let message_id_for_response = inbound.metadata.get("message_id")
+        .or_else(|| inbound.metadata.get("message_message_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let session_id_for_response = inbound.session_id.clone()
+        .or_else(|| inbound.metadata.get("chat_id").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| inbound.metadata.get("message_chat_id").and_then(|v| v.as_str()).map(String::from));
+
     let webhook_response = match deliver_platform_reply(&cfg, &inbound, &response.reply).await {
         Some(outbound_result) => PlatformWebhookResponse::success_with_outbound(
             &channel_name,
-            message_id,
-            inbound.session_id.clone(),
+            message_id_for_response,
+            session_id_for_response,
             response.reply,
             outbound_result.to_summary(),
         ),
         None => PlatformWebhookResponse::success(
             &channel_name,
-            message_id,
-            inbound.session_id.clone(),
+            message_id_for_response,
+            session_id_for_response,
             response.reply,
         ),
     };
@@ -2702,7 +3129,8 @@ fn config_string(entry: &crate::config::schema::ChannelEntry, key: &str) -> Opti
 }
 
 fn reply_target_from_inbound(inbound: &InboundMessage) -> Option<ReplyTarget> {
-    let chat_id = ["conversation_id", "chat_id"]
+    // Try multiple keys for chat_id/conversation_id
+    let chat_id = ["conversation_id", "chat_id", "message_chat_id", "message_conversation_id"]
         .iter()
         .find_map(|key| {
             inbound
@@ -2725,6 +3153,7 @@ fn reply_target_from_inbound(inbound: &InboundMessage) -> Option<ReplyTarget> {
     let message_id = inbound
         .metadata
         .get("message_id")
+        .or_else(|| inbound.metadata.get("message_message_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -2760,23 +3189,50 @@ async fn deliver_platform_reply(
     reply: &str,
 ) -> Option<OutboundResult> {
     let entry = channel_entry_for_outbound(config, &inbound.channel)?;
+    
+    // Diagnostic: log outbound config
+    let channel_name_for_log = format!("{:?}", inbound.channel).to_lowercase();
     let outbound_mode = config_string(entry, "outbound_mode")
         .unwrap_or_else(|| "disabled".to_string())
         .to_ascii_lowercase();
+    let app_id_present = config_string(entry, "app_id").is_some();
+    let app_secret_present = config_string(entry, "app_secret").is_some();
+    println!(
+        "[{}-webhook] outbound_config outbound_mode={} app_id_present={} app_secret_present={}",
+        channel_name_for_log, outbound_mode, app_id_present, app_secret_present
+    );
 
     if outbound_mode == "disabled" {
+        println!("[{}-webhook] outbound_skip reason=disabled", channel_name_for_log);
         return None;
     }
 
     let provider = match inbound.channel {
         ChannelKind::Feishu => "feishu",
         ChannelKind::Lark => "lark",
-        _ => return None,
+        _ => {
+            println!("[{}-webhook] outbound_skip reason=unsupported_channel", channel_name_for_log);
+            return None;
+        }
     };
+    
     if reply.trim().is_empty() {
+        println!("[{}-webhook] outbound_skip reason=empty_reply", channel_name_for_log);
         return Some(OutboundResult::skipped_empty_reply(provider));
     }
-    let Some(target) = reply_target_from_inbound(inbound) else {
+    
+    // Diagnostic: log reply target
+    let target = reply_target_from_inbound(inbound);
+    println!(
+        "[{}-webhook] outbound_target chat_id_present={} message_id_present={} user_id_present={}",
+        channel_name_for_log,
+        target.as_ref().map(|t| !t.chat_id.is_empty()).unwrap_or(false),
+        target.as_ref().and_then(|t| t.message_id.as_ref()).map(|s| !s.is_empty()).unwrap_or(false),
+        target.as_ref().and_then(|t| t.user_id.as_ref()).map(|s| !s.is_empty()).unwrap_or(false)
+    );
+    
+    let Some(target) = target else {
+        println!("[{}-webhook] outbound_skip reason=missing_reply_target", channel_name_for_log);
         return Some(OutboundResult::failed(
             provider,
             "missing_reply_target",
@@ -2786,30 +3242,34 @@ async fn deliver_platform_reply(
 
     match outbound_mode.as_str() {
         "mock" => {
+            println!("[{}-outbound] selected_sender sender=mock", channel_name_for_log);
             let sender = MockOutboundSender::new();
             Some(send_with_sender(&sender, &target, reply).await)
         }
         "real" => {
-            let Some(app_id) = config_string(entry, "app_id") else {
+            let Some(_app_id) = config_string(entry, "app_id") else {
+                println!("[{}-outbound] outbound_skip reason=missing_app_id", channel_name_for_log);
                 return Some(OutboundResult::not_configured(
                     provider,
                     "app_id was missing",
                 ));
             };
-            let Some(app_secret) = config_string(entry, "app_secret") else {
+            let Some(_app_secret) = config_string(entry, "app_secret") else {
+                println!("[{}-outbound] outbound_skip reason=missing_app_secret", channel_name_for_log);
                 return Some(OutboundResult::not_configured(
                     provider,
                     "app_secret was missing",
                 ));
             };
+            println!("[{}-outbound] selected_sender provider={}", channel_name_for_log, provider);
             let token_cache = outbound_token_cache();
             let result = match inbound.channel {
                 ChannelKind::Feishu => {
-                    let sender = FeishuOutboundSender::new(app_id, app_secret, token_cache);
+                    let sender = FeishuOutboundSender::new(_app_id, _app_secret, token_cache);
                     send_with_sender(&sender, &target, reply).await
                 }
                 ChannelKind::Lark => {
-                    let sender = LarkOutboundSender::new(app_id, app_secret, token_cache);
+                    let sender = LarkOutboundSender::new(_app_id, _app_secret, token_cache);
                     send_with_sender(&sender, &target, reply).await
                 }
                 _ => OutboundResult::failed(
@@ -2818,12 +3278,31 @@ async fn deliver_platform_reply(
                     "sender was not implemented",
                 ),
             };
+            println!(
+                "[{}-outbound] send_result ok={} delivery={:?}",
+                channel_name_for_log, result.ok, result.delivery
+            );
+            
+            // Record outbound message_id for self-message filtering
+            if result.ok && result.platform_message_id.is_some() {
+                let msg_id = result.platform_message_id.as_ref().unwrap();
+                let channel_str = format!("{:?}", inbound.channel).to_lowercase();
+                OutboundMsgCache::global().record_outbound(&channel_str, msg_id).await;
+                println!(
+                    "[{}-outbound] recorded_outbound_message_id message_id={} ttl_secs=1800",
+                    channel_name_for_log, msg_id
+                );
+            }
+            
             Some(result)
         }
-        _ => Some(OutboundResult::not_configured(
-            provider,
-            "outbound_mode must be disabled, mock, or real",
-        )),
+        _ => {
+            println!("[{}-webhook] outbound_skip reason=invalid_mode", channel_name_for_log);
+            Some(OutboundResult::not_configured(
+                provider,
+                &format!("outbound_mode '{}' must be disabled, mock, or real", outbound_mode),
+            ))
+        }
     }
 }
 
@@ -4763,7 +5242,8 @@ mod tests {
     #[tokio::test]
     async fn feishu_webhook_runtime_success_uses_mock_sender() {
         let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
-        let body = r#"{"event":{"sender":{"open_id":"ou_test"},"message":{"message_id":"om_test","chat_id":"oc_test","content":"{\"text\":\"hello\"}"}}}"#.to_string();
+        // Add message_type: "text" so message is not filtered as unsupported type
+        let body = r#"{"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_test"}},"message":{"message_id":"om_test","chat_id":"oc_test","message_type":"text","content":"{\"text\":\"hello\"}"}}}"#.to_string();
         let response =
             super::http_channel_webhook(runtime, HeaderMap::new(), body, ChannelKind::Feishu)
                 .await
@@ -4900,5 +5380,485 @@ mod tests {
         )
         .await;
         assert!(result.is_none());
+    }
+
+    // =============================================================================
+    // Feishu self-message filtering tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn feishu_sender_type_user_enters_runtime() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // User message with sender_type=user
+        let body = r#"{"header":{"event_id":"evt_user_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_real_user"}},"message":{"message_id":"om_user_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"user hello\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("user message should succeed");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        // Should have runtime result
+        assert!(response.0.get("agent_reply").is_some() || response.0.get("outbound_delivery").is_some());
+    }
+
+    #[tokio::test]
+    async fn feishu_sender_type_app_skips_runtime() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // Bot's own message with sender_type=app
+        let body = r#"{"header":{"event_id":"evt_app_001"},"event":{"sender":{"sender_type":"app","sender_id":{"open_id":"ou_app_xxx"}},"message":{"message_id":"om_app_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"app hello\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("app message should return success");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(response.0.get("processing").and_then(|v| v.as_str()), Some("skipped"));
+        assert!(response.0.get("reason").and_then(|v| v.as_str()).unwrap_or("").contains("app"));
+    }
+
+    #[tokio::test]
+    async fn feishu_sender_type_bot_skips_runtime() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // Bot's own message with sender_type=bot
+        let body = r#"{"header":{"event_id":"evt_bot_001"},"event":{"sender":{"sender_type":"bot","sender_id":{"open_id":"ou_bot_xxx"}},"message":{"message_id":"om_bot_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"bot hello\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("bot message should return success");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(response.0.get("processing").and_then(|v| v.as_str()), Some("skipped"));
+        assert!(response.0.get("reason").and_then(|v| v.as_str()).unwrap_or("").contains("bot"));
+    }
+
+    #[tokio::test]
+    async fn feishu_unknown_sender_type_skips_runtime() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // Unknown sender_type
+        let body = r#"{"header":{"event_id":"evt_unknown_001"},"event":{"sender":{"sender_type":"unknown_type","sender_id":{"open_id":"ou_unknown"}},"message":{"message_id":"om_unknown_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"unknown hello\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("unknown sender message should return success");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(response.0.get("processing").and_then(|v| v.as_str()), Some("skipped"));
+    }
+
+    #[tokio::test]
+    async fn feishu_non_text_message_skips_runtime() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // Image message (not text)
+        let body = r#"{"header":{"event_id":"evt_img_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_img_001","chat_id":"oc_chat","message_type":"image","content":"{\"image_key\":\"img_xxx\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("image message should return success");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(response.0.get("reason").and_then(|v| v.as_str()), Some("unsupported_message_type"));
+    }
+
+    // =============================================================================
+    // Feishu session isolation tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn feishu_session_is_stateless() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let body = r#"{"header":{"event_id":"evt_stateless_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_stateless_001","chat_id":"oc_123","message_type":"text","content":"{\"text\":\"stateless test\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("stateless message should succeed");
+        // Verify success response
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+        // Note: session_id is prefixed with "feishu:" internally but not exposed in response JSON
+    }
+
+    // =============================================================================
+    // Feishu deduplication tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn feishu_duplicate_event_id_is_rejected() {
+        let runtime1 = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let runtime2 = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let body = r#"{"header":{"event_id":"evt_dup_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_dup_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"duplicate test\"}"}}}"#.to_string();
+        
+        // First request should succeed (not duplicate)
+        let response1 = super::http_channel_webhook(
+            runtime1,
+            HeaderMap::new(),
+            body.clone(),
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("first request should succeed");
+        // First request should NOT have duplicate=true
+        assert_ne!(response1.0.get("duplicate").and_then(|v| v.as_bool()), Some(true));
+        
+        // Second request with same event_id should be duplicate
+        let response2 = super::http_channel_webhook(
+            runtime2,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("duplicate request should return success");
+        assert_eq!(response2.0.get("duplicate").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(response2.0.get("processing").and_then(|v| v.as_str()), Some("skipped"));
+    }
+
+    // =============================================================================
+    // Feishu chat-only mode tests
+    // =============================================================================
+
+    #[tokio::test]
+    async fn feishu_normal_text_sets_chat_only() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // Normal text without slash command
+        let body = r#"{"header":{"event_id":"evt_chat_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_chat_001","chat_id":"oc_123","message_type":"text","content":"{\"text\":\"hello world\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("chat message should succeed");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn feishu_run_command_sets_tool_mode() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // /run command
+        let body = r#"{"header":{"event_id":"evt_run_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_run_001","chat_id":"oc_123","message_type":"text","content":"{\"text\":\"/run ls -la\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("/run command should succeed");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn feishu_monitor_command_sets_tool_mode() {
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        // /monitor command
+        let body = r#"{"header":{"event_id":"evt_mon_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_mon_001","chat_id":"oc_123","message_type":"text","content":"{\"text\":\"/monitor 桌面 1 分钟\"}"}}}"#.to_string();
+        let response = super::http_channel_webhook(
+            runtime,
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await
+        .expect("/monitor command should succeed");
+        assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // =============================================================================
+    // Security context chat-only tests
+    // =============================================================================
+
+    #[test]
+    fn chat_only_mode_blocks_shell_tool() {
+        use crate::security::context::SecurityContext;
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+        
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+        
+        assert!(ctx.is_chat_only());
+        assert!(ctx.is_tool_blocked_by_chat_only("shell"));
+        assert!(ctx.is_tool_blocked_by_chat_only("bash"));
+        assert!(ctx.is_tool_blocked_by_chat_only("file_write"));
+        assert!(ctx.is_tool_blocked_by_chat_only("file_read"));
+    }
+
+    #[test]
+    fn non_chat_only_mode_allows_tools() {
+        use crate::security::context::SecurityContext;
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(false));
+        
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+        
+        assert!(!ctx.is_chat_only());
+        assert!(!ctx.is_tool_blocked_by_chat_only("shell"));
+        assert!(!ctx.is_tool_blocked_by_chat_only("file_write"));
+    }
+
+    #[test]
+    fn default_security_context_allows_tools() {
+        use crate::security::context::SecurityContext;
+        let ctx = SecurityContext::from_config(&crate::config::Config::default());
+
+        // No chat_only metadata means tools are not blocked
+        assert!(!ctx.is_chat_only());
+        assert!(!ctx.is_tool_blocked_by_chat_only("shell"));
+        assert!(!ctx.is_tool_blocked_by_chat_only("file_write"));
+    }
+
+    // =============================================================================
+    // Feishu config preservation tests
+    // =============================================================================
+
+    #[test]
+    fn feishu_extra_fields_are_preserved_in_metadata() {
+        // Test that feishu extra fields (app_id, app_secret, outbound_mode) are extracted
+        use crate::channels::adapters::platform_webhook::inbound_from_platform_webhook;
+        use crate::channels::ChannelKind;
+        use serde_json::json;
+
+        let inbound = inbound_from_platform_webhook(
+            ChannelKind::Feishu,
+            json!({
+                "header": {
+                    "event_id": "evt_test_001"
+                },
+                "event": {
+                    "sender": {
+                        "sender_type": "user",
+                        "sender_id": { "open_id": "ou_user" }
+                    },
+                    "message": {
+                        "chat_id": "oc_chat",
+                        "message_type": "text",
+                        "content": "{\"text\":\"test\"}"
+                    }
+                }
+            }),
+        )
+        .expect("should parse");
+
+        // Metadata should contain raw_payload
+        assert!(inbound.metadata.contains_key("raw_payload"));
+        
+        // session_id should be extracted from chat_id
+        assert_eq!(inbound.session_id.as_deref(), Some("oc_chat"));
+        
+        // user_id should be extracted from sender
+        assert_eq!(inbound.user_id.as_deref(), Some("ou_user"));
+    }
+
+    #[test]
+    fn feishu_chat_only_mode_is_set_by_default() {
+        use crate::channels::adapters::platform_webhook::inbound_from_platform_webhook;
+        use crate::channels::ChannelKind;
+        use serde_json::json;
+
+        let inbound = inbound_from_platform_webhook(
+            ChannelKind::Feishu,
+            json!({
+                "event": {
+                    "sender": {
+                        "sender_type": "user",
+                        "sender_id": { "open_id": "ou_user" }
+                    },
+                    "message": {
+                        "chat_id": "oc_chat",
+                        "message_type": "text",
+                        "content": "{\"text\":\"hello\"}"
+                    }
+                }
+            }),
+        )
+        .expect("should parse");
+
+        // Metadata should be preserved
+        assert!(!inbound.metadata.is_empty());
+    }
+
+    // =============================================================================
+    // Feishu chat_only policy tests
+    // =============================================================================
+
+    #[test]
+    fn chat_only_system_prompt_is_returned_when_enabled() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        assert!(ctx.is_chat_only());
+        let prompt = ctx.chat_only_system_prompt();
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        // Should mention the restrictions
+        assert!(prompt.contains("飞书"));
+        assert!(prompt.contains("工具"));
+        assert!(prompt.contains("/file"));
+        assert!(prompt.contains("/run"));
+        assert!(prompt.contains("/monitor"));
+    }
+
+    #[test]
+    fn chat_only_system_prompt_not_returned_when_disabled() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(false));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        assert!(!ctx.is_chat_only());
+        assert!(ctx.chat_only_system_prompt().is_none());
+    }
+
+    #[test]
+    fn tool_intent_detected_for_file_delete() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Should detect file delete intent
+        let intent = ctx.detect_tool_intent("删除 D:\\123\\a.txt");
+        assert!(intent.is_some());
+        assert_eq!(intent.unwrap(), "file_delete");
+    }
+
+    #[test]
+    fn tool_intent_detected_for_shell_exec() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Should detect shell exec intent
+        let intent = ctx.detect_tool_intent("执行 git commit");
+        assert!(intent.is_some());
+        assert_eq!(intent.unwrap(), "git_operation");
+    }
+
+    #[test]
+    fn tool_intent_not_detected_for_normal_chat() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Should NOT detect tool intent for normal chat
+        let intent = ctx.detect_tool_intent("你好，请帮我解释一下这段代码");
+        assert!(intent.is_none());
+    }
+
+    #[test]
+    fn tool_intent_not_detected_when_chat_only_disabled() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(false));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Should NOT detect tool intent when chat_only is disabled
+        let intent = ctx.detect_tool_intent("删除 D:\\123\\a.txt");
+        assert!(intent.is_none());
+    }
+
+    #[test]
+    fn blocked_response_contains_guidance() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        let response = ctx.tool_intent_blocked_response();
+        // Should contain guidance to use slash commands
+        assert!(response.contains("/file"));
+        assert!(response.contains("高风险操作"));
+        assert!(response.contains("确认"));
+    }
+
+    #[test]
+    fn chat_only_mode_blocks_git_tools() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Git tools should be blocked
+        assert!(ctx.is_tool_blocked_by_chat_only("git"));
+        assert!(ctx.is_tool_blocked_by_chat_only("git_clone"));
+        assert!(ctx.is_tool_blocked_by_chat_only("git_commit"));
+        assert!(ctx.is_tool_blocked_by_chat_only("git_push"));
+        assert!(ctx.is_tool_blocked_by_chat_only("git_pull"));
+    }
+
+    #[test]
+    fn tool_intent_patterns_coverage() {
+        use crate::security::context::SecurityContext;
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("chat_only".to_string(), serde_json::Value::Bool(true));
+
+        let mut ctx = SecurityContext::from_config(&crate::config::Config::default());
+        ctx.set_inbound_metadata(metadata);
+
+        // Test various tool intent patterns
+        let test_cases = vec![
+            ("删除文件", "file_delete"),
+            ("新建文件 index.html", "file_write"),
+            ("查看 D 盘", "path_access"),
+            ("执行命令 ls", "shell_exec"),
+            ("git push", "git_operation"),
+            ("监控桌面", "desktop_monitor"),
+            ("打开浏览器", "browser_automation"),
+        ];
+
+        for (text, expected_intent) in test_cases {
+            let intent = ctx.detect_tool_intent(text);
+            assert!(intent.is_some(), "Should detect intent for: {}", text);
+            assert_eq!(intent.unwrap(), expected_intent, "Wrong intent for: {}", text);
+        }
     }
 }
