@@ -6,6 +6,7 @@
 use crate::channels::ChannelKind;
 use crate::channels::adapters::outbound::OutboundResult;
 use crate::desktop_capture::{self, CaptureResult, MonitorResult};
+use crate::gateway::feishu_store::{FeishuStore, EventStatus, JobStatus, ReplyKind, chrono_timestamp};
 use crate::gateway::OutboundMsgCache;
 use crate::gateway::GatewayRuntime;
 use std::sync::Arc;
@@ -49,6 +50,8 @@ pub struct FeishuAsyncJob {
     pub created_at: u64,
     /// Job ID for tracking
     pub job_id: String,
+    /// Event key for persistence tracking
+    pub event_key: String,
 }
 
 impl FeishuAsyncJob {
@@ -58,6 +61,7 @@ impl FeishuAsyncJob {
         inbound: crate::channels::InboundMessage,
         raw_payload: serde_json::Value,
         is_chat_only: bool,
+        event_key: String,
     ) -> Self {
         let feishu_mode = if is_chat_only { "chat_only" } else { "tool" };
         let created_at = std::time::SystemTime::now()
@@ -74,6 +78,7 @@ impl FeishuAsyncJob {
             is_chat_only,
             created_at,
             job_id,
+            event_key,
         }
     }
 }
@@ -508,7 +513,210 @@ fn parse_monitor_duration_from_text(text: &str) -> u64 {
     total_seconds.min(MAX_MONITOR_DURATION_SECS)
 }
 
-/// Send an outbound reply with proper timeout and logging
+/// Send an outbound reply through outbox with proper timeout, logging and persistence.
+/// 
+/// # Privacy semantics
+/// - `ReplyKind::LlmFinal` (or any free-form LLM reply) is NOT recorded with full body.
+///   Such outbox entries are inserted as ABANDONED for audit only.
+/// - `ReplyKind::Progress`, `Timeout`, `Failure`, `ChatOnlyBlocked`, `Unsupported`
+///   are template replies that can be reconstructed and are recorded as PENDING.
+/// - `ReplyKind::MonitorFinal` stores structured result_json for later reconstruction.
+async fn send_reply_with_outbox(
+    runtime: &GatewayRuntime,
+    inbound: &crate::channels::InboundMessage,
+    reply: &str,
+    channel_name: &str,
+    job_id: &str,
+    event_key: &str,
+    reply_kind: &str,
+    timeout_secs: u64,
+) {
+    let store = match runtime.feishu_store() {
+        Some(s) => s,
+        None => {
+            // Fallback to direct send if no store
+            send_reply_with_timeout(runtime, inbound, reply, channel_name, timeout_secs).await;
+            return;
+        }
+    };
+
+    let kind = ReplyKind::from_str(reply_kind);
+    
+    // Privacy-first: free-form LLM replies are audit-only, never retryable
+    if matches!(kind, Some(ReplyKind::LlmFinal) | None) {
+        let outbound_id = format!("{}_{}_audit_{}", job_id, reply_kind, chrono_timestamp());
+        let chat_id = extract_chat_id(inbound);
+        let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
+            outbound_id: outbound_id.clone(),
+            job_id: Some(job_id.to_string()),
+            event_key: Some(event_key.to_string()),
+            channel: channel_name.to_string(),
+            chat_id: chat_id.clone(),
+            reply_kind: Some("audit_only".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        
+        // Attempt to deliver the reply first (we still want the user to get the message)
+        let outbound_result = timeout(
+            Duration::from_secs(timeout_secs),
+            deliver_platform_reply_and_record(runtime, inbound, reply, channel_name)
+        ).await;
+        
+        match outbound_result {
+            Ok(Ok(Some(result))) => {
+                let platform_msg_id = result.platform_message_id.clone().unwrap_or_default();
+                let outbox = crate::gateway::feishu_store::FeishuOutboxInput {
+                    outbound_id,
+                    job_id: Some(job_id.to_string()),
+                    event_key: Some(event_key.to_string()),
+                    channel: channel_name.to_string(),
+                    chat_id,
+                    reply_kind: Some("audit_only".to_string()),
+                    reply: Some(reply.to_string()),
+                    result_json: None,
+                };
+                if let Err(e) = store.insert_outbox_abandoned(
+                    &outbox,
+                    "full_reply_not_stored_for_privacy"
+                ) {
+                    println!("[{}-outbox] failed to audit: {}", channel_name, e);
+                }
+                println!(
+                    "[{}-outbox] audit outbound_id={} reply_kind=llm_final platform_message_id={}",
+                    channel_name, outbox.outbound_id, platform_msg_id
+                );
+            }
+            _ => {
+                println!("[{}-outbox] llm_send_failed_audit_only reply_kind={}", channel_name, reply_kind);
+            }
+        }
+        return;
+    }
+
+    // Template replies are stored as outbox-able PENDING
+    let chat_id = extract_chat_id(inbound);
+    let outbound_id = format!("{}_{}_{}", job_id, reply_kind, chrono_timestamp());
+
+    let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
+        outbound_id: outbound_id.clone(),
+        job_id: Some(job_id.to_string()),
+        event_key: Some(event_key.to_string()),
+        channel: channel_name.to_string(),
+        chat_id: chat_id.clone(),
+        reply_kind: Some(reply_kind.to_string()),
+        reply: None, // Don't store full reply for privacy
+        result_json: None,
+    };
+
+    if let Err(e) = store.insert_outbox(&outbox_input) {
+        println!("[{}-outbox] failed to insert: {}", channel_name, e);
+        // Fallback to direct send
+        send_reply_with_timeout(runtime, inbound, reply, channel_name, timeout_secs).await;
+        return;
+    }
+
+    // Update to SENDING
+    if let Err(e) = store.outbox_sending(&outbound_id) {
+        println!("[{}-outbox] failed to update to sending: {}", channel_name, e);
+    }
+
+    // Actually send the message
+    let outbound_result = timeout(
+        Duration::from_secs(timeout_secs),
+        deliver_platform_reply_and_record(runtime, inbound, reply, channel_name)
+    ).await;
+
+    match outbound_result {
+        Ok(Ok(Some(result))) => {
+            // Success - mark as SENT with platform_message_id
+            let platform_msg_id = result.platform_message_id.clone().unwrap_or_default();
+            if let Err(e) = store.outbox_sent(&outbound_id, &platform_msg_id) {
+                println!("[{}-outbox] failed to mark sent: {}", channel_name, e);
+            }
+            println!(
+                "[{}-outbox] sent outbound_id={} platform_message_id={}",
+                channel_name, outbound_id, platform_msg_id
+            );
+        }
+        Ok(Ok(None)) => {
+            // Skipped (no target)
+            if let Err(e) = store.outbox_sent(&outbound_id, "skipped") {
+                println!("[{}-outbox] failed to mark skipped: {}", channel_name, e);
+            }
+            println!("[{}-outbox] skipped outbound_id={}", channel_name, outbound_id);
+        }
+        Ok(Err(e)) => {
+            // Error during send
+            let retryable = store.outbox_failed(&outbound_id, "send_error", &e.to_string()).unwrap_or(false);
+            println!(
+                "[{}-outbox] failed outbound_id={} error={} retryable={}",
+                channel_name, outbound_id, e, retryable
+            );
+        }
+        Err(_) => {
+            // Timeout
+            let retryable = store.outbox_failed(&outbound_id, "timeout", &format!("Send timeout after {}s", timeout_secs)).unwrap_or(false);
+            println!(
+                "[{}-outbox] timeout outbound_id={} timeout_secs={} retryable={}",
+                channel_name, outbound_id, timeout_secs, retryable
+            );
+        }
+    }
+}
+
+/// Extract chat_id from inbound metadata
+fn extract_chat_id(inbound: &crate::channels::InboundMessage) -> Option<String> {
+    inbound.session_id.clone()
+        .or_else(|| inbound.metadata.get("chat_id").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| inbound.metadata.get("message_chat_id").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| inbound.metadata.get("conversation_id").and_then(|v| v.as_str()).map(String::from))
+}
+
+/// Reconstruct a reply body from its reply_kind and result_json.
+/// Returns Some(reply) if the reply can be reconstructed, None otherwise.
+pub fn reconstruct_reply(kind: ReplyKind, result_json: Option<&str>, chat_only_intent: Option<&str>) -> Option<String> {
+    match kind {
+        ReplyKind::Progress => Some(format!(
+            "已收到监控任务，正在执行。完成后我会在这里返回结果。"
+        )),
+        ReplyKind::Timeout => Some(format!(
+            "抱歉，任务执行超时。请缩短任务时长后重试。"
+        )),
+        ReplyKind::Failure => Some(format!(
+            "任务执行失败，请稍后重试。如果问题持续，请联系管理员。"
+        )),
+        ReplyKind::ChatOnlyBlocked => Some(format!(
+            "当前消息触发了安全限制。请使用 /monitor、/run、/file、/workspace、/agent 等命令明确表达工具意图。"
+        )),
+        ReplyKind::Unsupported => Some(format!(
+            "当前消息类型暂不支持自动处理。"
+        )),
+        ReplyKind::MonitorFinal => {
+            // Reconstruct from result_json (e.g., /monitor results)
+            result_json.and_then(|json| {
+                serde_json::from_str::<serde_json::Value>(json).ok()
+            }).map(|result| {
+                // Reconstruct monitor reply from structured data
+                let changed_str = if result.get("changed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "有变化"
+                } else {
+                    "无明显变化"
+                };
+                let duration = result.get("duration_secs").and_then(|v| v.as_u64()).unwrap_or(30);
+                let start_path = result.get("start_path").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+                let end_path = result.get("end_path").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+                format!(
+                    "桌面监控完成\n监控时长：{} 秒\n截图状态：成功\n变化检测：{}\n开始截图：{}\n结束截图：{}",
+                    duration, changed_str, start_path, end_path
+                )
+            })
+        }
+        ReplyKind::LlmFinal => None, // Free-form LLM reply cannot be reconstructed
+    }
+}
+
+/// Legacy direct send without outbox (for fallback only)
 async fn send_reply_with_timeout(
     runtime: &GatewayRuntime,
     inbound: &crate::channels::InboundMessage,
@@ -557,6 +765,17 @@ pub async fn process_feishu_job(
     let started_at = Instant::now();
     let channel_name = format!("{:?}", job.channel).to_lowercase();
     let job_id = &job.job_id;
+    let event_key = &job.event_key;
+    
+    // Get instance ID for locking
+    let instance_id = format!("pid_{}", std::process::id());
+    
+    // Update job to PROCESSING status
+    if let Some(ref store) = runtime.feishu_store() {
+        if let Err(e) = store.job_start_processing(&job.job_id, &instance_id) {
+            println!("[{}-worker] failed to update job status: {}", channel_name, e);
+        }
+    }
     
     // Extract reply targets from raw payload (for logging only)
     let message_id_present = job.raw_payload.get("event")
@@ -593,7 +812,13 @@ pub async fn process_feishu_job(
             );
             
             let blocked_reply = chat_only_blocked_response();
-            send_reply_with_timeout(&runtime, &job.inbound, &blocked_reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+            send_reply_with_outbox(&runtime, &job.inbound, &blocked_reply, &channel_name, job_id, event_key, "blocked", OUTBOUND_TIMEOUT_SECS).await;
+            
+            // Mark job and event as completed
+            if let Some(ref store) = runtime.feishu_store() {
+                let _ = store.job_completed(job_id);
+                let _ = store.update_event_status(event_key, EventStatus::Processed);
+            }
             
             let duration_ms = started_at.elapsed().as_millis() as u64;
             println!(
@@ -613,7 +838,7 @@ pub async fn process_feishu_job(
         
         // Send progress reply
         let progress_reply = progress_reply_for_command("/monitor");
-        send_reply_with_timeout(&runtime, &job.inbound, &progress_reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+        send_reply_with_outbox(&runtime, &job.inbound, &progress_reply, &channel_name, job_id, event_key, "progress", OUTBOUND_TIMEOUT_SECS).await;
         
         // Run direct monitor
         let duration_secs = parse_monitor_duration_from_text(&job.inbound.text);
@@ -621,7 +846,13 @@ pub async fn process_feishu_job(
         
         // Format and send result
         let reply = format_monitor_result(&result, duration_secs);
-        send_reply_with_timeout(&runtime, &job.inbound, &reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+        send_reply_with_outbox(&runtime, &job.inbound, &reply, &channel_name, job_id, event_key, "final", OUTBOUND_TIMEOUT_SECS).await;
+        
+        // Mark job and event as completed
+        if let Some(ref store) = runtime.feishu_store() {
+            let _ = store.job_completed(job_id);
+            let _ = store.update_event_status(event_key, EventStatus::Processed);
+        }
         
         let duration_ms = started_at.elapsed().as_millis() as u64;
         let status = match &result {
@@ -647,7 +878,7 @@ pub async fn process_feishu_job(
                 "[{}-worker] progress_reply_start job_id={} command={}",
                 channel_name, job_id, command
             );
-            send_reply_with_timeout(&runtime, &job.inbound, &progress_reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+            send_reply_with_outbox(&runtime, &job.inbound, &progress_reply, &channel_name, job_id, event_key, "progress", OUTBOUND_TIMEOUT_SECS).await;
             println!(
                 "[{}-worker] progress_reply_sent job_id={} command={}",
                 channel_name, job_id, command
@@ -683,11 +914,16 @@ pub async fn process_feishu_job(
                 "[{}-worker] failure_reply_start job_id={}",
                 channel_name, job_id
             );
-            send_reply_with_timeout(&runtime, &job.inbound, &error_reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+            send_reply_with_outbox(&runtime, &job.inbound, &error_reply, &channel_name, job_id, event_key, "failure", OUTBOUND_TIMEOUT_SECS).await;
             println!(
                 "[{}-worker] failure_reply_sent job_id={}",
                 channel_name, job_id
             );
+            
+            // Mark job as failed
+            if let Some(ref store) = runtime.feishu_store() {
+                let _ = store.job_failed(job_id, "runtime_error", &format!("{}", e));
+            }
             
             let duration_ms = started_at.elapsed().as_millis() as u64;
             println!(
@@ -708,11 +944,16 @@ pub async fn process_feishu_job(
                 "[{}-worker] timeout_reply_start job_id={}",
                 channel_name, job_id
             );
-            send_reply_with_timeout(&runtime, &job.inbound, &timeout_reply_msg, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+            send_reply_with_outbox(&runtime, &job.inbound, &timeout_reply_msg, &channel_name, job_id, event_key, "timeout", OUTBOUND_TIMEOUT_SECS).await;
             println!(
                 "[{}-worker] timeout_reply_sent job_id={}",
                 channel_name, job_id
             );
+            
+            // Mark job as failed (timeout)
+            if let Some(ref store) = runtime.feishu_store() {
+                let _ = store.job_failed(job_id, "timeout", &format!("Runtime timeout after {}s", RUNTIME_TIMEOUT_SECS));
+            }
             
             let duration_ms = started_at.elapsed().as_millis() as u64;
             println!(
@@ -727,6 +968,13 @@ pub async fn process_feishu_job(
     if let Some(reply) = reply {
         if reply.trim().is_empty() {
             println!("[{}-worker] skipped_empty_reply job_id={}", channel_name, job_id);
+            
+            // Mark job and event as completed
+            if let Some(ref store) = runtime.feishu_store() {
+                let _ = store.job_completed(job_id);
+                let _ = store.update_event_status(event_key, EventStatus::Processed);
+            }
+            
             let duration_ms = started_at.elapsed().as_millis() as u64;
             println!(
                 "[{}-worker] job_completed job_id={} duration_ms={}",
@@ -737,7 +985,13 @@ pub async fn process_feishu_job(
         
         // Send reply via outbound
         println!("[{}-worker] outbound_start job_id={} reply_len={}", channel_name, job_id, reply.len());
-        send_reply_with_timeout(&runtime, &job.inbound, &reply, &channel_name, OUTBOUND_TIMEOUT_SECS).await;
+        send_reply_with_outbox(&runtime, &job.inbound, &reply, &channel_name, job_id, event_key, "final", OUTBOUND_TIMEOUT_SECS).await;
+        
+        // Mark job and event as completed
+        if let Some(ref store) = runtime.feishu_store() {
+            let _ = store.job_completed(job_id);
+            let _ = store.update_event_status(event_key, EventStatus::Processed);
+        }
     }
     
     let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -855,6 +1109,7 @@ mod tests {
             is_chat_only,
             created_at: 0,
             job_id: "test".to_string(),
+            event_key: "test:event_key".to_string(),
         }
     }
 

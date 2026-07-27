@@ -45,6 +45,7 @@ base64ct.workspace = true
 globset.workspace = true
 screenshots.workspace = true
 png.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
 url.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
 futures-util = "0.3"

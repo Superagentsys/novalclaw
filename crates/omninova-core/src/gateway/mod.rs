@@ -1,6 +1,10 @@
 pub mod pairing;
 pub mod ws;
 pub mod feishu_worker;
+pub mod feishu_store;
+
+use crate::gateway::feishu_store::FeishuStore;
+use home;
 
 use crate::agent::sanitize_messages_for_provider;
 use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
@@ -168,6 +172,8 @@ pub struct GatewayRuntime {
     feishu_job_sender: Arc<RwLock<Option<FeishuJobSender>>>,
     /// Feishu worker queue length tracker
     feishu_queue_len: Arc<RwLock<usize>>,
+    /// Feishu SQLite store for event/job/outbox persistence
+    feishu_store: Option<Arc<FeishuStore>>,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +290,7 @@ impl GatewayRuntime {
             run_registry: AgentRunRegistry::new(),
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
+            feishu_store: None,
         }
     }
 
@@ -300,6 +307,7 @@ impl GatewayRuntime {
             run_registry: AgentRunRegistry::new(),
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
+            feishu_store: None,
         }
     }
     
@@ -318,6 +326,138 @@ impl GatewayRuntime {
     pub async fn inc_feishu_queue_len(&self) {
         let mut len = self.feishu_queue_len.write().await;
         *len += 1;
+    }
+    
+    /// Get Feishu store reference
+    pub fn feishu_store(&self) -> Option<Arc<FeishuStore>> {
+        self.feishu_store.clone()
+    }
+    
+    /// Recover pending jobs and outbox items
+    pub async fn recover_pending(&self) {
+        if let Some(ref store) = self.feishu_store {
+            // Recover jobs
+            match store.get_recoverable_jobs() {
+                Ok(recoverable_jobs) => {
+                    let mut recovered_count = 0;
+                    for job in recoverable_jobs {
+                        // Try to re-enqueue the job
+                        if let Some(payload_json) = &job.payload_json {
+                            match serde_json::from_str::<serde_json::Value>(payload_json) {
+                                Ok(payload) => {
+                                    // Reconstruct FeishuAsyncJob
+                                    if let Some(recovered_job) = self.try_reconstruct_job(&job, &payload) {
+                                        match self.try_send_feishu_job(recovered_job).await {
+                                            Ok(()) => {
+                                                recovered_count += 1;
+                                                println!("[feishu-recovery] job_recovered job_id={}", job.job_id);
+                                            }
+                                            Err(_) => {
+                                                // Queue full - mark as dead
+                                                let _ = store.job_abandon(&job.job_id, "queue_full_on_recovery");
+                                            }
+                                        }
+                                    } else {
+                                        // Can't reconstruct - mark as dead
+                                        let _ = store.job_abandon(&job.job_id, "cannot_reconstruct_payload");
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("[feishu-recovery] job_parse_error job_id={} error={}", job.job_id, e);
+                                    let _ = store.job_abandon(&job.job_id, "payload_parse_error");
+                                }
+                            }
+                        } else {
+                            // No payload - can't recover
+                            let _ = store.job_abandon(&job.job_id, "missing_payload");
+                        }
+                    }
+                    if recovered_count > 0 {
+                        println!("[feishu-recovery] jobs_recovered count={}", recovered_count);
+                    }
+                }
+                Err(e) => {
+                    println!("[feishu-recovery] failed to get jobs: {}", e);
+                }
+            }
+            
+            // Recover outbox - distinguish retryable vs audit-only
+            match store.get_recoverable_outbox() {
+                Ok(recoverable_outbox) => {
+                    let mut abandoned_count = 0;
+                    let mut retryable_count = 0;
+                    for item in recoverable_outbox {
+                        let kind = item.reply_kind.as_deref()
+                            .and_then(crate::gateway::feishu_store::ReplyKind::from_str);
+                        
+                        // Privacy-first: only retryable kinds can be sent after restart
+                        let can_retry = matches!(kind, Some(
+                            crate::gateway::feishu_store::ReplyKind::Progress
+                            | crate::gateway::feishu_store::ReplyKind::Timeout
+                            | crate::gateway::feishu_store::ReplyKind::Failure
+                            | crate::gateway::feishu_store::ReplyKind::ChatOnlyBlocked
+                            | crate::gateway::feishu_store::ReplyKind::Unsupported
+                            | crate::gateway::feishu_store::ReplyKind::MonitorFinal
+                        ));
+                        
+                        if can_retry {
+                            // Mark as retryable for next recovery sweep
+                            // Actual retry requires reconstructing reply and re-sending
+                            println!(
+                                "[feishu-outbox] retryable outbound_id={} reply_kind={}",
+                                item.outbound_id,
+                                item.reply_kind.as_deref().unwrap_or("?")
+                            );
+                            let _ = store.outbox_mark_retryable(&item.outbound_id);
+                            retryable_count += 1;
+                        } else {
+                            // Audit-only outbox (e.g., LLM replies) - cannot retry
+                            println!("[feishu-outbox] abandoned reason=privacy_no_full_body outbound_id={}", item.outbound_id);
+                            let _ = store.outbox_abandon(&item.outbound_id, "no_reply_content_for_privacy");
+                            abandoned_count += 1;
+                        }
+                    }
+                    if abandoned_count > 0 {
+                        println!("[feishu-recovery] outbox_abandoned count={} reason=privacy_no_full_body", abandoned_count);
+                    }
+                    if retryable_count > 0 {
+                        println!("[feishu-recovery] outbox_retryable count={}", retryable_count);
+                    }
+                }
+                Err(e) => {
+                    println!("[feishu-recovery] failed to get outbox: {}", e);
+                }
+            }
+        }
+    }
+    
+    /// Try to reconstruct a FeishuAsyncJob from job record and payload
+    fn try_reconstruct_job(&self, job: &crate::gateway::feishu_store::FeishuJob, payload: &serde_json::Value) -> Option<crate::gateway::feishu_worker::FeishuAsyncJob> {
+        use crate::channels::InboundMessage;
+        use crate::channels::ChannelKind;
+        
+        // Extract inbound from payload
+        let inbound = match inbound_from_platform_webhook(
+            ChannelKind::Feishu, 
+            payload.clone()
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                println!("[feishu-recovery] cannot_parse_inbound job_id={} error={}", job.job_id, e);
+                return None;
+            }
+        };
+        
+        // Determine chat_only from mode
+        let is_chat_only = job.mode == "chat_only";
+        
+        Some(crate::gateway::feishu_worker::FeishuAsyncJob::new(
+            ChannelKind::Feishu,
+            inbound,
+            payload.clone(),
+            is_chat_only,
+            job.event_key.clone(),
+        ))
     }
     
     /// Try to send a job to the Feishu worker queue
@@ -1691,6 +1831,30 @@ impl GatewayRuntime {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid gateway bind address: {e}"))?;
         
+        // Initialize Feishu SQLite store
+        let config_dir = cfg.config_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                // Fallback to home dir
+                home::home_dir()
+                    .map(|h| h.join(".omninova"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".omninova"))
+            });
+        let feishu_store = match FeishuStore::open(&config_dir) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                Some(store)
+            }
+            Err(e) => {
+                println!("[feishu-store] failed to open: {}", e);
+                None
+            }
+        };
+        self.feishu_store = feishu_store;
+        
+        // Perform recovery of pending jobs and outbox
+        self.recover_pending().await;
+        
         // Initialize Feishu async worker
         use crate::gateway::feishu_worker::{spawn_worker, FeishuWorkerState};
         let mut worker_state = FeishuWorkerState::new();
@@ -2899,10 +3063,10 @@ async fn http_channel_webhook(
 
     let text_preview = extract_text_for_log(&payload);
     let payload_clone = payload.clone(); // Keep original payload for async job
-    let effective_event_type = header_event_type.as_deref()
-        .or_else(|| payload.get("event").and_then(|e| e.get("type")).and_then(|v| v.as_str()))
-        .or_else(|| payload.get("type").and_then(|v| v.as_str()))
-        .unwrap_or("unknown");
+    let effective_event_type = header_event_type.clone()
+        .or_else(|| payload.get("event").and_then(|e| e.get("type")).and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| payload.get("type").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!(
         "[{}-webhook] received event_type={} event_id_present={} header_event_id_present={} message_id_present={} chat_id_present={} sender_type={:?} message_type={:?} text_len={}",
@@ -3090,15 +3254,105 @@ async fn http_channel_webhook(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             
+            // Build event_key for dedupe
+            let event_key = event_id.as_ref()
+                .or(message_id.as_ref())
+                .map(|k| format!("{}:{}", channel_name, k))
+                .unwrap_or_else(|| format!("{}:{}:{}", channel_name, 
+                    inbound.session_id.as_deref().unwrap_or("unknown"),
+                    crate::gateway::feishu_store::FeishuStore::hash_text(&inbound.text)));
+            
+            // Extract chat_id
+            let chat_id = inbound.session_id.clone()
+                .or_else(|| inbound.metadata.get("chat_id").and_then(|v| v.as_str()).map(String::from))
+                .or_else(|| inbound.metadata.get("message_chat_id").and_then(|v| v.as_str()).map(String::from));
+            
+            // Build metadata JSON (redacted) - serialize immediately to avoid borrow conflict
+            let metadata_json = {
+                let mut meta = serde_json::Map::new();
+                if let Some(ref msg_id) = message_id {
+                    meta.insert("message_id".to_string(), serde_json::Value::String(msg_id.clone()));
+                }
+                if let Some(ref evt_id) = event_id {
+                    meta.insert("event_id".to_string(), serde_json::Value::String(evt_id.clone()));
+                }
+                if let Some(ref sender) = sender_type {
+                    meta.insert("sender_type".to_string(), serde_json::Value::String(sender.clone()));
+                }
+                serde_json::Value::Object(meta)
+            };
+            let metadata_json_str = serde_json::to_string(&metadata_json).ok();
+            
+            // Persist event to SQLite (before enqueuing)
+            if let Some(ref store) = runtime.feishu_store() {
+                let text_for_hash = inbound.text.clone();
+                let event_input = crate::gateway::feishu_store::FeishuEventInput {
+                    event_key: event_key.clone(),
+                    channel: channel_name.clone(),
+                    event_id: event_id.clone(),
+                    message_id: message_id.clone(),
+                    chat_id: chat_id.clone(),
+                    user_id_hash: inbound.user_id.as_ref().map(|uid| 
+                        crate::gateway::feishu_store::FeishuStore::hash_text(uid)),
+                    event_type: Some(effective_event_type.to_string()),
+                    sender_type: sender_type.clone(),
+                    message_type: message_type.clone(),
+                    text: Some(inbound.text.clone()),
+                    skip_reason: None,
+                    metadata_json: metadata_json_str,
+                };
+                
+                match store.insert_event(&event_input) {
+                    Ok(_event) => {
+                        // Event inserted successfully - now create job
+                        let job_input = crate::gateway::feishu_store::FeishuJobInput {
+                            job_id: uuid::Uuid::new_v4().to_string(),
+                            event_key: event_key.clone(),
+                            channel: channel_name.clone(),
+                            mode: if is_chat_only { "chat_only".to_string() } else { "tool".to_string() },
+                            slash_command: inbound.metadata.get("slash_command")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            payload_json: Some(serde_json::to_string(&payload_clone).unwrap_or_default()),
+                        };
+                        
+                        if let Err(e) = store.insert_job(&job_input) {
+                            println!("[{}-webhook] failed to persist job: {}", channel_name, e);
+                        }
+                    }
+                    Err(crate::gateway::feishu_store::StoreError::DuplicateEvent(_)) => {
+                        // Duplicate event - SQLite dedupe worked
+                        println!("[{}-store] duplicate event_key={}", channel_name, event_key);
+                        return Ok(Json(serde_json::json!({
+                            "ok": true,
+                            "accepted": true,
+                            "duplicate": true,
+                            "processing": "skipped"
+                        })));
+                    }
+                    Err(e) => {
+                        println!("[{}-webhook] failed to persist event: {}", channel_name, e);
+                        // Continue anyway - try to process
+                    }
+                }
+            }
+            
             let job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
                 inbound_channel,
                 inbound,
                 payload_clone,
                 is_chat_only,
+                event_key.clone(),
             );
             
             match runtime.try_send_feishu_job(job).await {
                 Ok(()) => {
+                    // Update job status to QUEUED if store is available
+                    if let Some(ref store) = runtime.feishu_store() {
+                        let _ = store.update_event_status(&event_key, 
+                            crate::gateway::feishu_store::EventStatus::Queued);
+                    }
+                    
                     let queue_len = runtime.feishu_queue_len().await;
                     println!(
                         "[{}-webhook] ack_queued ack_ms={} queue_len={}",

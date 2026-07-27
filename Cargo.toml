@@ -50,6 +50,7 @@ serde_with_macros = "=3.11.0"
 globset = "=0.4.15"
 screenshots = "0.8"
 png = "0.17"
+rusqlite = { version = "0.31", features = ["bundled"] }
 proc-macro-crate = "=3.1.0"
 home = "=0.5.9"
 avif-serialize = "=0.8.2"
