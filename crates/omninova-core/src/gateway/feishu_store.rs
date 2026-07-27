@@ -1467,6 +1467,261 @@ fn redact_secrets_from_value(value: &mut serde_json::Value) {
     }
 }
 
+// ============================================================================
+// CLI Query Methods (for omninova feishu CLI commands)
+// ============================================================================
+
+impl FeishuStore {
+    /// Get a summary of store statistics for CLI status command.
+    pub fn get_store_stats(&self) -> Result<FeishuStoreStats, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        // Get counts
+        let events_total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM feishu_events", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        let jobs_total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM feishu_jobs", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        let outbox_total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM feishu_outbox", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        // Get jobs by status
+        let mut job_status_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM feishu_jobs GROUP BY status")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((status, count)) = row {
+                job_status_counts.insert(status, count);
+            }
+        }
+        
+        // Get outbox by status
+        let mut outbox_status_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM feishu_outbox GROUP BY status")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((status, count)) = row {
+                outbox_status_counts.insert(status, count);
+            }
+        }
+        
+        // Get last event time
+        let last_event_at: Option<i64> = conn.query_row(
+            "SELECT MAX(received_at) FROM feishu_events", [], |row| row.get(0)
+        ).optional()?.flatten();
+        
+        // Get error count (jobs with error_code not null)
+        let error_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM feishu_jobs WHERE error_code IS NOT NULL", [], |row| row.get(0)
+        ).unwrap_or(0);
+        
+        Ok(FeishuStoreStats {
+            events_total,
+            jobs_total,
+            outbox_total,
+            job_status_counts,
+            outbox_status_counts,
+            last_event_at,
+            error_count,
+        })
+    }
+    
+    /// Get recent events for CLI listing.
+    pub fn get_recent_events(&self, limit: usize) -> Result<Vec<FeishuEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, event_key, channel, event_id, message_id, chat_id, user_id_hash,
+                   event_type, sender_type, message_type, text_hash, text_preview, status,
+                   skip_reason, received_at, updated_at, metadata_json
+            FROM feishu_events
+            ORDER BY received_at DESC
+            LIMIT ?
+            "#,
+        )?;
+        
+        let events = stmt.query_map(params![limit as i64], |row| {
+            Ok(FeishuEvent {
+                id: row.get(0)?,
+                event_key: row.get(1)?,
+                channel: row.get(2)?,
+                event_id: row.get(3)?,
+                message_id: row.get(4)?,
+                chat_id: row.get(5)?,
+                user_id_hash: row.get(6)?,
+                event_type: row.get(7)?,
+                sender_type: row.get(8)?,
+                message_type: row.get(9)?,
+                text_hash: row.get(10)?,
+                text_preview: row.get(11)?,
+                status: EventStatus::from_str(&row.get::<_, String>(12)?).unwrap_or(EventStatus::Received),
+                skip_reason: row.get(13)?,
+                received_at: row.get(14)?,
+                updated_at: row.get(15)?,
+                metadata_json: row.get(16)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(events)
+    }
+    
+    /// Get recent jobs for CLI listing.
+    pub fn get_recent_jobs(&self, limit: usize) -> Result<Vec<FeishuJob>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, job_id, event_key, channel, mode, slash_command, status,
+                   attempts, max_attempts, next_attempt_at, locked_at, locked_by,
+                   created_at, updated_at, started_at, completed_at, error_code, 
+                   error_message, payload_json
+            FROM feishu_jobs
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )?;
+        
+        let jobs = stmt.query_map(params![limit as i64], |row| {
+            Ok(FeishuJob {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                event_key: row.get(2)?,
+                channel: row.get(3)?,
+                mode: row.get(4)?,
+                slash_command: row.get(5)?,
+                status: JobStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(JobStatus::Pending),
+                attempts: row.get(7)?,
+                max_attempts: row.get(8)?,
+                next_attempt_at: row.get(9)?,
+                locked_at: row.get(10)?,
+                locked_by: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+                started_at: row.get(14)?,
+                completed_at: row.get(15)?,
+                error_code: row.get(16)?,
+                error_message: row.get(17)?,
+                payload_json: row.get(18)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(jobs)
+    }
+    
+    /// Get recent outbox items for CLI listing.
+    pub fn get_recent_outbox(&self, limit: usize) -> Result<Vec<FeishuOutbox>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, outbound_id, job_id, event_key, channel, chat_id, reply_kind, status,
+                   attempts, max_attempts, next_attempt_at, platform_message_id, reply_hash,
+                   reply_preview, result_json, created_at, updated_at, sent_at, error_code, error_message
+            FROM feishu_outbox
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )?;
+        
+        let outbox_items = stmt.query_map(params![limit as i64], |row| {
+            Ok(FeishuOutbox {
+                id: row.get(0)?,
+                outbound_id: row.get(1)?,
+                job_id: row.get(2)?,
+                event_key: row.get(3)?,
+                channel: row.get(4)?,
+                chat_id: row.get(5)?,
+                reply_kind: row.get(6)?,
+                status: OutboxStatus::from_str(&row.get::<_, String>(7)?).unwrap_or(OutboxStatus::Pending),
+                attempts: row.get(8)?,
+                max_attempts: row.get(9)?,
+                next_attempt_at: row.get(10)?,
+                platform_message_id: row.get(11)?,
+                reply_hash: row.get(12)?,
+                reply_preview: row.get(13)?,
+                result_json: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                sent_at: row.get(17)?,
+                error_code: row.get(18)?,
+                error_message: row.get(19)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(outbox_items)
+    }
+    
+    /// Get event by event_key.
+    pub fn get_event_by_key(&self, event_key: &str) -> Result<Option<FeishuEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let event = conn.query_row(
+            r#"
+            SELECT id, event_key, channel, event_id, message_id, chat_id, user_id_hash,
+                   event_type, sender_type, message_type, text_hash, text_preview, status,
+                   skip_reason, received_at, updated_at, metadata_json
+            FROM feishu_events WHERE event_key = ?
+            "#,
+            params![event_key],
+            |row| {
+                Ok(FeishuEvent {
+                    id: row.get(0)?,
+                    event_key: row.get(1)?,
+                    channel: row.get(2)?,
+                    event_id: row.get(3)?,
+                    message_id: row.get(4)?,
+                    chat_id: row.get(5)?,
+                    user_id_hash: row.get(6)?,
+                    event_type: row.get(7)?,
+                    sender_type: row.get(8)?,
+                    message_type: row.get(9)?,
+                    text_hash: row.get(10)?,
+                    text_preview: row.get(11)?,
+                    status: EventStatus::from_str(&row.get::<_, String>(12)?).unwrap_or(EventStatus::Received),
+                    skip_reason: row.get(13)?,
+                    received_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                    metadata_json: row.get(16)?,
+                })
+            },
+        ).optional()?;
+        
+        Ok(event)
+    }
+    
+    /// Get migration version.
+    pub fn get_migration_version(&self) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let version: i64 = conn.query_row(
+            "SELECT MAX(version) FROM feishu_schema_version", [], |row| row.get(0)
+        ).optional()?.unwrap_or(0);
+        
+        Ok(version)
+    }
+}
+
+/// Statistics summary for CLI status command
+#[derive(Debug, Clone)]
+pub struct FeishuStoreStats {
+    pub events_total: i64,
+    pub jobs_total: i64,
+    pub outbox_total: i64,
+    pub job_status_counts: std::collections::HashMap<String, i64>,
+    pub outbox_status_counts: std::collections::HashMap<String, i64>,
+    pub last_event_at: Option<i64>,
+    pub error_count: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

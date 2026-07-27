@@ -198,6 +198,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<SystemCommands>,
     },
+    /// Feishu persistence store queries: events, jobs, outbox, inspect.
+    Feishu {
+        #[command(subcommand)]
+        command: FeishuCommands,
+    },
     /// Install optional dependencies (agent-browser, etc.).
     SetupDeps {
         #[command(subcommand)]
@@ -535,6 +540,37 @@ pub enum SetupCommands {
     All,
 }
 
+/// Feishu persistence store query commands.
+#[derive(Debug, Subcommand)]
+pub enum FeishuCommands {
+    /// Show store statistics and health.
+    Status,
+    /// List recent events.
+    Events {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// List recent jobs.
+    Jobs {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// List recent outbox items.
+    Outbox {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Inspect a specific record.
+    Inspect {
+        #[arg(long)]
+        job_id: Option<String>,
+        #[arg(long)]
+        event_key: Option<String>,
+        #[arg(long)]
+        outbound_id: Option<String>,
+    },
+}
+
 fn resolve_profile_dir(profile: Option<&str>, dev: bool) -> (PathBuf, PathBuf) {
     let home = home::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let base = if dev {
@@ -705,6 +741,7 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             }
         },
         Commands::System { command } => run_system(command.as_ref(), &config).await,
+        Commands::Feishu { command } => run_feishu(command, &config).await,
         Commands::SetupDeps { command } => run_setup(command).await,
         Commands::Route { channel, text, agent } => {
             let runtime = GatewayRuntime::new(config);
@@ -1110,6 +1147,395 @@ async fn run_system(cmd: Option<&SystemCommands>, _config: &Config) -> Result<St
         Some(SystemCommands::Heartbeat) => Ok("heartbeat not yet implemented".to_string()),
         Some(SystemCommands::Presence) => Ok("presence not yet implemented".to_string()),
         None => Ok("[]".to_string()),
+    }
+}
+
+/// Format a Unix timestamp (milliseconds) as a human-readable string.
+fn format_timestamp(ts: i64) -> String {
+    let secs = ts / 1000;
+    let millis = ts % 1000;
+    
+    // Convert to breakdown
+    let days_since_epoch = secs / 86400;
+    let secs_in_day = secs % 86400;
+    let hours = secs_in_day / 3600;
+    let mins = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    
+    // Calculate year (rough approximation)
+    let mut remaining_days = days_since_epoch;
+    let mut year = 1970;
+    let mut month = 1;
+    let mut day = 1;
+    
+    // This is a simplified version - works for dates after 1970
+    let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+    while remaining_days >= days_in_year {
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+    
+    // Days in each month (non-leap year)
+    let days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let days_per_month_leap = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    
+    let days_in_this_month = if is_leap_year(year) { &days_per_month_leap } else { &days_per_month };
+    
+    for (i, d) in days_in_this_month.iter().enumerate() {
+        if remaining_days < *d as i64 {
+            month = i + 1;
+            day = remaining_days + 1;
+            break;
+        }
+        remaining_days -= *d as i64;
+    }
+    
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", year, month, day, hours, mins, s, millis)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+async fn run_feishu(cmd: &FeishuCommands, config: &Config) -> Result<String> {
+    use crate::gateway::feishu_store::FeishuStore;
+    
+    // Determine config dir for state.sqlite
+    let config_dir = std::env::var("OMNINOVA_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            home::home_dir()
+                .map(|h| h.join(".omninova"))
+                .unwrap_or_else(|| PathBuf::from(".omninova"))
+        });
+    
+    let db_path = config_dir.join("state.sqlite");
+    
+    if !db_path.exists() {
+        anyhow::bail!("state.sqlite not found at {}. Is the Gateway running?", db_path.display());
+    }
+    
+    let store = FeishuStore::open(&config_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open feishu store: {}", e))?;
+    
+    match cmd {
+        FeishuCommands::Status => {
+            let stats = store.get_store_stats()
+                .map_err(|e| anyhow::anyhow!("failed to get stats: {}", e))?;
+            let version = store.get_migration_version()
+                .unwrap_or(0);
+            
+            let mut output = String::new();
+            output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
+            output.push_str("║              OmniNova Feishu Store Status                   ║\n");
+            output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
+            
+            output.push_str(&format!("  Database path : {}\n", db_path.display()));
+            output.push_str(&format!("  Migration    : v{}\n\n", version));
+            
+            output.push_str("  Counts:\n");
+            output.push_str(&format!("    Events      : {}\n", stats.events_total));
+            output.push_str(&format!("    Jobs        : {}\n", stats.jobs_total));
+            output.push_str(&format!("    Outbox      : {}\n\n", stats.outbox_total));
+            
+            output.push_str("  Jobs by status:\n");
+            for (status, count) in &stats.job_status_counts {
+                output.push_str(&format!("    {:16} : {}\n", status, count));
+            }
+            if stats.job_status_counts.is_empty() {
+                output.push_str("    (none)\n");
+            }
+            output.push('\n');
+            
+            output.push_str("  Outbox by status:\n");
+            for (status, count) in &stats.outbox_status_counts {
+                output.push_str(&format!("    {:26} : {}\n", status, count));
+            }
+            if stats.outbox_status_counts.is_empty() {
+                output.push_str("    (none)\n");
+            }
+            output.push('\n');
+            
+            output.push_str("  Errors:\n");
+            output.push_str(&format!("    Job errors  : {}\n", stats.error_count));
+            
+            if let Some(ts) = stats.last_event_at {
+                let datetime = format_timestamp(ts);
+                output.push_str(&format!("    Last event  : {} (ts={})\n", datetime, ts));
+            }
+            
+            Ok(output)
+        }
+        
+        FeishuCommands::Events { limit } => {
+            let events = store.get_recent_events(*limit)
+                .map_err(|e| anyhow::anyhow!("failed to get events: {}", e))?;
+            
+            if events.is_empty() {
+                return Ok("No events found.".to_string());
+            }
+            
+            let mut output = String::new();
+            output.push_str(&format!("{:>4}  {:<22} {:<12} {:<10} {:<15} {:<10} {:<30}\n",
+                "ID", "received_at", "event_type", "status", "message_type", "sender", "text_preview"));
+            output.push_str(&format!("{}\n", "-".repeat(120)));
+            
+            for event in events {
+                let time = format_timestamp(event.received_at);
+                
+                let preview = event.text_preview.as_deref()
+                    .unwrap_or("-")
+                    .chars()
+                    .take(28)
+                    .collect::<String>();
+                
+                output.push_str(&format!(
+                    "{:>4}  {:<22} {:<12} {:<10} {:<15} {:<10} {}\n",
+                    event.id,
+                    time,
+                    event.event_type.as_deref().unwrap_or("-"),
+                    event.status.as_str(),
+                    event.message_type.as_deref().unwrap_or("-"),
+                    event.sender_type.as_deref().unwrap_or("-"),
+                    preview
+                ));
+            }
+            
+            Ok(output)
+        }
+        
+        FeishuCommands::Jobs { limit } => {
+            let jobs = store.get_recent_jobs(*limit)
+                .map_err(|e| anyhow::anyhow!("failed to get jobs: {}", e))?;
+            
+            if jobs.is_empty() {
+                return Ok("No jobs found.".to_string());
+            }
+            
+            let mut output = String::new();
+            output.push_str(&format!("{:>4}  {:<36} {:<20} {:<10} {:<12} {:<8} {:<25}\n",
+                "ID", "job_id", "event_key", "mode", "slash_cmd", "status", "error"));
+            output.push_str(&format!("{}\n", "-".repeat(140)));
+            
+            for job in jobs {
+                let job_id_short = if job.job_id.len() > 36 {
+                    format!("...{}", &job.job_id[job.job_id.len() - 33..])
+                } else {
+                    job.job_id.clone()
+                };
+                
+                let event_key_short = if job.event_key.len() > 20 {
+                    format!("...{}", &job.event_key[job.event_key.len() - 17..])
+                } else {
+                    job.event_key.clone()
+                };
+                
+                let error = job.error_code.as_deref().unwrap_or("-");
+                
+                output.push_str(&format!(
+                    "{:>4}  {:<36} {:<20} {:<10} {:<12} {:<8} {}\n",
+                    job.id,
+                    job_id_short,
+                    event_key_short,
+                    job.mode,
+                    job.slash_command.as_deref().unwrap_or("-"),
+                    job.status.as_str(),
+                    error
+                ));
+            }
+            
+            Ok(output)
+        }
+        
+        FeishuCommands::Outbox { limit } => {
+            let items = store.get_recent_outbox(*limit)
+                .map_err(|e| anyhow::anyhow!("failed to get outbox: {}", e))?;
+            
+            if items.is_empty() {
+                return Ok("No outbox items found.".to_string());
+            }
+            
+            let mut output = String::new();
+            output.push_str(&format!("{:>4}  {:<32} {:<22} {:<10} {:<5} {:<10} {:<35}\n",
+                "ID", "outbound_id", "reply_kind", "status", "att", "error", "reply_preview"));
+            output.push_str(&format!("{}\n", "-".repeat(150)));
+            
+            for item in items {
+                let outbound_short = if item.outbound_id.len() > 32 {
+                    format!("...{}", &item.outbound_id[item.outbound_id.len() - 29..])
+                } else {
+                    item.outbound_id.clone()
+                };
+                
+                let preview = item.reply_preview.as_deref()
+                    .unwrap_or("-")
+                    .chars()
+                    .take(33)
+                    .collect::<String>();
+                
+                output.push_str(&format!(
+                    "{:>4}  {:<32} {:<22} {:<10} {:<5} {:<10} {}\n",
+                    item.id,
+                    outbound_short,
+                    item.reply_kind.as_deref().unwrap_or("-"),
+                    item.status.as_str(),
+                    item.attempts,
+                    item.error_code.as_deref().unwrap_or("-"),
+                    preview
+                ));
+            }
+            
+            Ok(output)
+        }
+        
+        FeishuCommands::Inspect { job_id, event_key, outbound_id } => {
+            // Inspect a specific record by ID type
+            if let Some(ref jid) = job_id {
+                let job = store.get_job(jid)
+                    .map_err(|e| anyhow::anyhow!("failed to get job: {}", e))?;
+                
+                if let Some(job) = job {
+                    // Sanitize payload_json before display
+                    let payload_display = job.payload_json.as_ref()
+                        .map(|p| sanitize_for_display(p, 500));
+                    
+                    let mut output = String::new();
+                    output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
+                    output.push_str("║                        Job Detail                           ║\n");
+                    output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
+                    output.push_str(&format!("  id           : {}\n", job.id));
+                    output.push_str(&format!("  job_id       : {}\n", job.job_id));
+                    output.push_str(&format!("  event_key    : {}\n", job.event_key));
+                    output.push_str(&format!("  mode         : {}\n", job.mode));
+                    output.push_str(&format!("  slash_cmd    : {:?}\n", job.slash_command));
+                    output.push_str(&format!("  status       : {}\n", job.status.as_str()));
+                    output.push_str(&format!("  attempts     : {}/{}\n", job.attempts, job.max_attempts));
+                    output.push_str(&format!("  error_code   : {:?}\n", job.error_code));
+                    output.push_str(&format!("  created_at   : {}\n", job.created_at));
+                    output.push_str(&format!("  updated_at   : {}\n", job.updated_at));
+                    output.push_str(&format!("  payload      : {}\n", payload_display.as_deref().unwrap_or("(none)")));
+                    
+                    Ok(output)
+                } else {
+                    Ok(format!("Job not found: {}", jid))
+                }
+            } else if let Some(ref ek) = event_key {
+                let event = store.get_event_by_key(ek)
+                    .map_err(|e| anyhow::anyhow!("failed to get event: {}", e))?;
+                
+                if let Some(event) = event {
+                    // Sanitize metadata_json before display
+                    let metadata_display = event.metadata_json.as_ref()
+                        .map(|m| sanitize_for_display(m, 500));
+                    
+                    let mut output = String::new();
+                    output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
+                    output.push_str("║                       Event Detail                          ║\n");
+                    output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
+                    output.push_str(&format!("  id           : {}\n", event.id));
+                    output.push_str(&format!("  event_key    : {}\n", event.event_key));
+                    output.push_str(&format!("  event_type   : {:?}\n", event.event_type));
+                    output.push_str(&format!("  status       : {}\n", event.status.as_str()));
+                    output.push_str(&format!("  message_type : {:?}\n", event.message_type));
+                    output.push_str(&format!("  sender_type  : {:?}\n", event.sender_type));
+                    output.push_str(&format!("  text_preview : {:?}\n", event.text_preview));
+                    output.push_str(&format!("  text_hash    : {:?}\n", event.text_hash));
+                    output.push_str(&format!("  received_at  : {}\n", event.received_at));
+                    output.push_str(&format!("  metadata     : {}\n", metadata_display.as_deref().unwrap_or("(none)")));
+                    
+                    Ok(output)
+                } else {
+                    Ok(format!("Event not found: {}", ek))
+                }
+            } else if let Some(ref oid) = outbound_id {
+                let item = store.get_outbox(oid)
+                    .map_err(|e| anyhow::anyhow!("failed to get outbox: {}", e))?;
+                
+                if let Some(item) = item {
+                    // Sanitize result_json before display
+                    let result_display = item.result_json.as_ref()
+                        .map(|r| sanitize_for_display(r, 500));
+                    
+                    let mut output = String::new();
+                    output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
+                    output.push_str("║                       Outbox Detail                         ║\n");
+                    output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
+                    output.push_str(&format!("  id                  : {}\n", item.id));
+                    output.push_str(&format!("  outbound_id         : {}\n", item.outbound_id));
+                    output.push_str(&format!("  job_id              : {:?}\n", item.job_id));
+                    output.push_str(&format!("  reply_kind          : {:?}\n", item.reply_kind));
+                    output.push_str(&format!("  status              : {}\n", item.status.as_str()));
+                    output.push_str(&format!("  attempts            : {}/{}\n", item.attempts, item.max_attempts));
+                    output.push_str(&format!("  platform_message_id : {:?}\n", item.platform_message_id));
+                    output.push_str(&format!("  reply_preview      : {:?}\n", item.reply_preview));
+                    output.push_str(&format!("  reply_hash         : {:?}\n", item.reply_hash));
+                    output.push_str(&format!("  result_json        : {}\n", result_display.as_deref().unwrap_or("(none)")));
+                    output.push_str(&format!("  error_code         : {:?}\n", item.error_code));
+                    output.push_str(&format!("  created_at         : {}\n", item.created_at));
+                    output.push_str(&format!("  updated_at         : {}\n", item.updated_at));
+                    
+                    Ok(output)
+                } else {
+                    Ok(format!("Outbox not found: {}", oid))
+                }
+            } else {
+                Ok("Specify one of: --job-id, --event-key, --outbound-id".to_string())
+            }
+        }
+    }
+}
+
+/// Sanitize a JSON string for safe CLI display.
+/// Removes sensitive keys and truncates long values.
+fn sanitize_for_display(json_str: &str, max_len: usize) -> String {
+    // Parse and re-serialize with sensitive keys redacted
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_str) {
+        sanitize_json_value_recursive(&mut value, 0);
+        let output = serde_json::to_string_pretty(&value).unwrap_or_else(|_| json_str.to_string());
+        if output.len() > max_len {
+            format!("{}...(truncated)", &output[..max_len.saturating_sub(15)])
+        } else {
+            output
+        }
+    } else {
+        // Not valid JSON, just truncate
+        if json_str.len() > max_len {
+            format!("{}...(truncated)", &json_str[..max_len.saturating_sub(15)])
+        } else {
+            json_str.to_string()
+        }
+    }
+}
+
+/// Recursively sanitize JSON values by redacting sensitive keys.
+fn sanitize_json_value_recursive(value: &mut serde_json::Value, depth: usize) {
+    if depth > 10 {
+        return; // Prevent stack overflow
+    }
+    
+    match value {
+        serde_json::Value::Object(map) => {
+            let sensitive_keys = [
+                "app_secret", "tenant_access_token", "app_access_token",
+                "authorization", "Authorization", "bearer", "Bearer",
+                "password", "secret", "token", "api_key", "apiKey",
+            ];
+            
+            for (key, val) in map.iter_mut() {
+                let key_lower = key.to_lowercase();
+                if sensitive_keys.iter().any(|k| key_lower.contains(&k.to_lowercase())) {
+                    *val = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    sanitize_json_value_recursive(val, depth + 1);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_json_value_recursive(item, depth + 1);
+            }
+        }
+        _ => {}
     }
 }
 
