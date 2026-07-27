@@ -1822,6 +1822,26 @@ impl GatewayRuntime {
                 "[config] feishu enabled={} app_id_present={} app_secret_present={} outbound_mode={}",
                 feishu.enabled, app_id_present, app_secret_present, outbound_mode
             );
+            if feishu.enabled {
+                let security = FeishuSecurityConfig::from_entry(Some(feishu));
+                if security.insecure {
+                    let reason = if security.verification_token.is_some() {
+                        "dev_mode_permits_unverified_requests"
+                    } else {
+                        "no_verification_token"
+                    };
+                    println!(
+                        "[feishu-security] mode=dev insecure=true reason={reason}"
+                    );
+                } else {
+                    println!(
+                        "[feishu-security] mode={} verification_token_configured={} encrypt_key_configured={}",
+                        security.mode.as_str(),
+                        security.verification_token.is_some(),
+                        security.encrypt_key.is_some()
+                    );
+                }
+            }
         } else {
             println!(
                 "[config] feishu enabled=false app_id_present=false app_secret_present=false outbound_mode=not_configured"
@@ -2875,12 +2895,212 @@ async fn http_wechat_webhook(
     http_channel_webhook(runtime, headers, raw_body, ChannelKind::Wechat).await
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FeishuWebhookError {
+    error: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeishuTokenSource<'a> {
+    value: &'a str,
+    source: &'static str,
+}
+
+const FEISHU_TOKEN_SOURCES_CHECKED: [&str; 6] = [
+    "top_level",
+    "header",
+    "event",
+    "event_header",
+    "x-feishu-verification-token",
+    "x-lark-verification-token",
+];
+
+fn extract_feishu_verification_token<'a>(
+    payload: &'a serde_json::Value,
+    headers: &'a HeaderMap,
+) -> Option<FeishuTokenSource<'a>> {
+    let payload_sources = [
+        (
+            payload.get("token").and_then(serde_json::Value::as_str),
+            "top_level.token",
+        ),
+        (
+            payload
+                .pointer("/header/token")
+                .and_then(serde_json::Value::as_str),
+            "header.token",
+        ),
+        (
+            payload
+                .pointer("/event/token")
+                .and_then(serde_json::Value::as_str),
+            "event.token",
+        ),
+        (
+            payload
+                .pointer("/event/header/token")
+                .and_then(serde_json::Value::as_str),
+            "event.header.token",
+        ),
+    ];
+    for (value, source) in payload_sources {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            return Some(FeishuTokenSource { value, source });
+        }
+    }
+
+    for (header_name, source) in [
+        (
+            "x-feishu-verification-token",
+            "header.x-feishu-verification-token",
+        ),
+        (
+            "x-lark-verification-token",
+            "header.x-lark-verification-token",
+        ),
+    ] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(FeishuTokenSource { value, source });
+        }
+    }
+
+    None
+}
+
+fn safe_json_object_keys(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut keys = object
+        .keys()
+        .take(32)
+        .map(|key| {
+            key.chars()
+                .take(64)
+                .map(|character| {
+                    if character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '-' | '.')
+                    {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn feishu_request_content_type(headers: &HeaderMap) -> &'static str {
+    match headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if value.to_ascii_lowercase().starts_with("application/json") => {
+            "application/json"
+        }
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
+fn feishu_token_missing_diagnostic_lines(
+    payload: &serde_json::Value,
+    headers: &HeaderMap,
+) -> Vec<String> {
+    let top_keys = safe_json_object_keys(Some(payload));
+    let header_keys = safe_json_object_keys(payload.get("header"));
+    let event_keys = safe_json_object_keys(payload.get("event"));
+    let event_type_present = payload.pointer("/header/event_type").is_some();
+    let event_message_present = payload.pointer("/event/message").is_some();
+    let looks_like_message_event = payload
+        .pointer("/header/event_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("im.message.receive_v1")
+        && event_message_present;
+
+    vec![
+        format!("[feishu-security] payload_shape top_keys={top_keys:?}"),
+        format!("[feishu-security] header_shape keys={header_keys:?}"),
+        format!("[feishu-security] event_shape keys={event_keys:?}"),
+        format!(
+            "[feishu-security] request_shape method=POST path=/webhook/feishu content_type={} type_present={} header_event_type_present={} event_message_present={} looks_like_im_message_receive_v1={}",
+            feishu_request_content_type(headers),
+            payload.get("type").is_some(),
+            event_type_present,
+            event_message_present,
+            looks_like_message_event,
+        ),
+        format!(
+            "[feishu-security] token_extract token_present=false sources_checked={:?}",
+            FEISHU_TOKEN_SOURCES_CHECKED
+        ),
+    ]
+}
+
+fn feishu_webhook_error_code(message: &str) -> &'static str {
+    match message {
+        "invalid_json" => "invalid_json",
+        "token_missing" => "token_missing",
+        "token_mismatch" => "token_mismatch",
+        "decrypt_failed" => "decrypt_failed",
+        "encrypt_key_missing" => "encrypt_key_missing",
+        "missing_challenge" => "missing_challenge",
+        "unsupported_event" => "unsupported_event",
+        "invalid_security_mode" => "invalid_security_mode",
+        "encrypted_payload_required" => "encrypted_payload_required",
+        "channel_disabled" => "channel_disabled",
+        "signature_invalid" => "signature_invalid",
+        "replay_rejected" => "replay_rejected",
+        "internal_error" => "internal_error",
+        _ if message.contains("invalid json") || message.contains("invalid channel webhook payload") => {
+            "invalid_json"
+        }
+        _ if message.contains("verification_token mismatch") => "token_mismatch",
+        _ if message.contains("verification_token missing from request") => "token_missing",
+        _ if message.contains("encrypt_key") && message.contains("not configured") => {
+            "encrypt_key_missing"
+        }
+        _ if message.contains("decrypt") => "decrypt_failed",
+        _ if message.contains("encrypted Feishu payload required")
+            || message.contains("encrypt field missing") =>
+        {
+            "encrypted_payload_required"
+        }
+        _ if message.contains("channel is disabled") => "channel_disabled",
+        _ if message.contains("signature") => "signature_invalid",
+        _ if message.contains("timestamp")
+            || message.contains("nonce")
+            || message.contains("skew") =>
+        {
+            "replay_rejected"
+        }
+        _ if message.contains("does not contain a text message") => "unsupported_event",
+        _ => "internal_error",
+    }
+}
+
 async fn http_feishu_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
-    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Feishu).await
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<FeishuWebhookError>)> {
+    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Feishu)
+        .await
+        .map_err(|(status, Json(error))| {
+            (
+                status,
+                Json(FeishuWebhookError {
+                    error: feishu_webhook_error_code(&error.message).to_string(),
+                }),
+            )
+        })
 }
 
 async fn http_lark_webhook(
@@ -2917,7 +3137,213 @@ async fn http_channel_webhook(
             }),
         ));
     }
+    
+    // === Feishu-specific security checks ===
+    let mut processed_body = raw_body.clone();
+    
+    if channel == ChannelKind::Feishu {
+        let entry = cfg.channels_config.feishu.as_ref();
+        let sec_cfg = FeishuSecurityConfig::from_entry(entry.as_deref());
+        if matches!(sec_cfg.mode, FeishuSecurityMode::Invalid) {
+            println!("[feishu-security] rejected reason=invalid_security_mode");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: "invalid_security_mode".to_string(),
+                }),
+            ));
+        }
+        // Log security mode
+        if !sec_cfg.insecure {
+            println!(
+                "[feishu-security] mode={} verification_token_configured={}",
+                sec_cfg.mode.as_str(),
+                sec_cfg.verification_token.is_some()
+            );
+        }
+        
+        // Parse payload (may need decryption)
+        let payload_for_check: serde_json::Value = match serde_json::from_str(&raw_body) {
+            Ok(p) => p,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(GatewayError {
+                        message: "invalid_json".to_string(),
+                    }),
+                ))
+            }
+        };
+        
+        let encrypted_payload = is_encrypted_payload(&payload_for_check);
+        if matches!(sec_cfg.mode, FeishuSecurityMode::Encrypted) && !encrypted_payload {
+            println!("[feishu-security] rejected reason=encrypted_payload_required");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(GatewayError {
+                    message: "encrypted_payload_required".to_string(),
+                }),
+            ));
+        }
 
+        // Encrypted mode must decrypt before token verification or any queue
+        // interaction. Dev/token modes intentionally do not attempt decryption.
+        if encrypted_payload && matches!(sec_cfg.mode, FeishuSecurityMode::Encrypted) {
+            println!("[feishu-security] encrypted_payload_detected");
+            
+            let encrypt_key = sec_cfg.encrypt_key.as_deref()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(GatewayError {
+                            message: "encrypt_key_missing".to_string(),
+                        }),
+                    )
+                })?;
+            
+            let encrypted_content = payload_for_check.get("encrypt")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(GatewayError {
+                            message: "encrypted_payload_required".to_string(),
+                        }),
+                    )
+                })?;
+            
+            match decrypt_feishu_payload(encrypted_content, encrypt_key) {
+                Ok(decrypted) => {
+                    println!("[feishu-security] decrypt_ok");
+                    processed_body = decrypted;
+                }
+                Err(e) => {
+                    let _ = e;
+                    println!("[feishu-security] decrypt_failed");
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(GatewayError {
+                            message: "decrypt_failed".to_string(),
+                        }),
+                    ));
+                }
+            }
+        }
+
+        let secured_payload: serde_json::Value =
+            serde_json::from_str(&processed_body).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(GatewayError {
+                        message: "invalid_json".to_string(),
+                    }),
+                )
+            })?;
+
+        // Verify verification_token in token/encrypted mode
+        if matches!(sec_cfg.mode, FeishuSecurityMode::Token | FeishuSecurityMode::Encrypted) {
+            let request_token = extract_feishu_verification_token(&secured_payload, &headers);
+            if let Some(source) = request_token {
+                println!(
+                    "[feishu-security] token_extract token_present=true source={}",
+                    source.source
+                );
+            } else {
+                for line in feishu_token_missing_diagnostic_lines(&secured_payload, &headers) {
+                    println!("{line}");
+                }
+            }
+
+            match verify_feishu_verification_token(
+                &sec_cfg,
+                request_token.map(|source| source.value),
+            ) {
+                Ok(true) => {
+                    println!("[feishu-security] token_verified=true");
+                }
+                Ok(false) => {
+                    println!("[feishu-security] token_mismatch");
+                    println!("[feishu-security] rejected reason=token_mismatch");
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(GatewayError {
+                            message: "token_mismatch".to_string(),
+                        }),
+                    ));
+                }
+                Err(msg) => {
+                    let (status, reason) = if msg == "verification_token missing from request" {
+                        println!("[feishu-security] token_missing");
+                        (StatusCode::UNAUTHORIZED, "token_missing")
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal_error",
+                        )
+                    };
+                    println!("[feishu-security] rejected reason={reason}");
+                    return Err((
+                        status,
+                        Json(GatewayError {
+                            message: reason.to_string(),
+                        }),
+                    ));
+                }
+            }
+        }
+        
+        // Dev mode: low frequency warning (every 100th request)
+        if matches!(sec_cfg.mode, FeishuSecurityMode::Dev | FeishuSecurityMode::Default) {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DEV_WARNING_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let count = DEV_WARNING_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if count % 100 == 0 {
+                println!("[feishu-security] insecure_webhook_allowed mode=dev");
+            }
+        }
+
+        if secured_payload.get("type").and_then(serde_json::Value::as_str)
+            == Some("url_verification")
+        {
+            println!("[feishu-security] url_verification_detected");
+            let challenge = secured_payload
+                .get("challenge")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(GatewayError {
+                            message: "missing_challenge".to_string(),
+                        }),
+                    )
+                })?;
+            println!("[feishu-security] url_verification_ok");
+            println!("[feishu-webhook] challenge_response_sent");
+            return Ok(Json(serde_json::json!({ "challenge": challenge })));
+        }
+
+        // The SQLite event_key uniqueness constraint remains the replay
+        // barrier. This warning makes unusually delayed deliveries auditable
+        // without rejecting legitimate Feishu retries.
+        if let Some(created_at) = secured_payload
+            .pointer("/header/create_time")
+            .cloned()
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => value.parse::<i64>().ok(),
+                serde_json::Value::Number(value) => value.as_i64(),
+                _ => None,
+            })
+        {
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                let age_seconds = now.as_secs().saturating_sub(created_at.max(0) as u64);
+                if age_seconds > 600 {
+                    println!("[feishu-security] stale_event_warning age_seconds={age_seconds}");
+                }
+            }
+        }
+    }
+    
     if let Some(secret) = channel_webhook_signing_secret(&cfg, &channel) {
         let allowed_algorithms = cfg
             .gateway
@@ -2982,7 +3408,7 @@ async fn http_channel_webhook(
             )
         })?;
 
-    let payload: serde_json::Value = match serde_json::from_str(&raw_body) {
+    let payload: serde_json::Value = match serde_json::from_str(&processed_body) {
         Ok(p) => p,
         Err(e) => {
             return Err((
@@ -2994,14 +3420,14 @@ async fn http_channel_webhook(
         }
     };
 
-    // Check for challenge (url_verification) - always sync response
-    if let Some(challenge) = verification_response(&payload) {
-        println!(
-            "[{}-webhook] received challenge={}",
-            channel_name,
-            payload.get("challenge").and_then(|v| v.as_str()).unwrap_or("unknown")
-        );
-        return Ok(Json(challenge));
+    // Feishu challenges have already returned after Feishu security checks and
+    // before replay/dedupe. Other platform adapters retain their existing
+    // challenge handling here.
+    if channel != ChannelKind::Feishu {
+        if let Some(challenge) = verification_response(&payload) {
+            println!("[{}-webhook] challenge_response_sent", channel_name);
+            return Ok(Json(challenge));
+        }
     }
 
     // Extract key fields for filtering and logging
@@ -3045,11 +3471,7 @@ async fn http_channel_webhook(
                 if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
                         if let Some(t) = parsed.get("text").and_then(|v| v.as_str()) {
-                            return if t.len() <= 100 {
-                                t.to_string()
-                            } else {
-                                format!("{}...(len={})", &t[..100.min(t.len())], t.len())
-                            };
+                            return truncate_chars_for_log(t, 100);
                         }
                     }
                 }
@@ -3057,11 +3479,7 @@ async fn http_channel_webhook(
         }
         // Try direct text field
         if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
-            return if t.len() <= 100 {
-                t.to_string()
-            } else {
-                format!("{}...(len={})", &t[..100.min(t.len())], t.len())
-            };
+            return truncate_chars_for_log(t, 100);
         }
         "(no text found)".to_string()
     }
@@ -3284,6 +3702,19 @@ async fn http_channel_webhook(
                 if let Some(ref sender) = sender_type {
                     meta.insert("sender_type".to_string(), serde_json::Value::String(sender.clone()));
                 }
+                let feishu_security = FeishuSecurityConfig::from_entry(cfg.channels_config.feishu.as_ref());
+                meta.insert(
+                    "security_mode".to_string(),
+                    serde_json::Value::String(feishu_security.mode.as_str().to_string()),
+                );
+                meta.insert(
+                    "token_verified".to_string(),
+                    serde_json::Value::Bool(matches!(
+                        feishu_security.mode,
+                        FeishuSecurityMode::Token | FeishuSecurityMode::Encrypted
+                    )),
+                );
+                meta.insert("encrypted".to_string(), serde_json::Value::Bool(is_encrypted_payload(&payload_clone)));
                 serde_json::Value::Object(meta)
             };
             let metadata_json_str = serde_json::to_string(&metadata_json).ok();
@@ -3293,7 +3724,6 @@ async fn http_channel_webhook(
             
             // Persist event to SQLite (before enqueuing)
             if let Some(ref store) = runtime.feishu_store() {
-                let text_for_hash = inbound.text.clone();
                 let event_input = crate::gateway::feishu_store::FeishuEventInput {
                     event_key: event_key.clone(),
                     channel: channel_name.clone(),
@@ -3323,7 +3753,12 @@ async fn http_channel_webhook(
                             slash_command: inbound.metadata.get("slash_command")
                                 .and_then(|v| v.as_str())
                                 .map(String::from),
-                            payload_json: Some(serde_json::to_string(&payload_clone).unwrap_or_default()),
+                            // Privacy boundary: the in-memory worker receives the
+                            // event, but SQLite never retains the full inbound
+                            // payload or user message body. Recovery will mark an
+                            // interrupted in-flight job as abandoned instead of
+                            // replaying private content after restart.
+                            payload_json: None,
                         };
                         
                         if let Err(e) = store.insert_job(&job_input) {
@@ -3482,6 +3917,14 @@ async fn http_channel_webhook(
         ),
     };
     Ok(platform_webhook_response_json(webhook_response))
+}
+
+fn truncate_chars_for_log(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str("…");
+    }
+    preview
 }
 
 fn platform_webhook_response_json(response: PlatformWebhookResponse) -> Json<serde_json::Value> {
@@ -3802,6 +4245,271 @@ fn channel_entry_signing_secret(
         return std::env::var(env_key).ok().filter(|v| !v.trim().is_empty());
     }
     None
+}
+
+/// Security mode for Feishu webhook
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeishuSecurityMode {
+    /// Dev mode: no verification, but log warnings
+    Dev,
+    /// Token mode: verify verification_token
+    Token,
+    /// Encrypted mode: decrypt encrypted payload
+    Encrypted,
+    /// Default: dev mode for backwards compatibility
+    Default,
+    /// Explicit but unsupported security mode
+    Invalid,
+}
+
+impl FeishuSecurityMode {
+    pub fn from_str(s: Option<&str>) -> Self {
+        match s.map(|s| s.to_lowercase()).as_deref() {
+            Some("dev") => FeishuSecurityMode::Dev,
+            Some("token") => FeishuSecurityMode::Token,
+            Some("encrypted") => FeishuSecurityMode::Encrypted,
+            None => FeishuSecurityMode::Default,
+            Some(_) => FeishuSecurityMode::Invalid,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeishuSecurityMode::Dev => "dev",
+            FeishuSecurityMode::Token => "token",
+            FeishuSecurityMode::Encrypted => "encrypted",
+            FeishuSecurityMode::Default => "dev",
+            FeishuSecurityMode::Invalid => "invalid",
+        }
+    }
+}
+
+/// Security configuration for Feishu channel
+#[derive(Debug, Clone)]
+pub struct FeishuSecurityConfig {
+    pub mode: FeishuSecurityMode,
+    pub verification_token: Option<String>,
+    pub encrypt_key: Option<String>,
+    pub insecure: bool,
+}
+
+impl FeishuSecurityConfig {
+    fn is_configured_secret(value: &str) -> bool {
+        !value.trim().is_empty() && value != "***SET***"
+    }
+
+    /// Get verification token from channel entry (config or env var)
+    pub fn get_verification_token(entry: Option<&crate::config::schema::ChannelEntry>) -> Option<String> {
+        let entry = entry?;
+        
+        // Direct value
+        if let Some(ref token) = entry.verification_token {
+            if Self::is_configured_secret(token) {
+                return Some(token.clone());
+            }
+        }
+        
+        // Env var reference. Setup transports these references in `extra` so
+        // saving unrelated fields cannot expose or discard the secret.
+        let env_key = entry
+            .verification_token_env
+            .as_deref()
+            .or_else(|| entry.extra.get("verification_token_env").and_then(serde_json::Value::as_str));
+        if let Some(env_key) = env_key {
+            return std::env::var(env_key)
+                .ok()
+                .filter(|value| Self::is_configured_secret(value));
+        }
+        
+        // Legacy: check extra for verification_token
+        if let Some(token) = entry.extra.get("verification_token")
+            .and_then(serde_json::Value::as_str)
+        {
+            if Self::is_configured_secret(token) {
+                return Some(token.to_string());
+            }
+        }
+        
+        None
+    }
+    
+    /// Get encryption key from channel entry (config or env var)
+    pub fn get_encrypt_key(entry: Option<&crate::config::schema::ChannelEntry>) -> Option<String> {
+        let entry = entry?;
+        
+        // Direct value
+        if let Some(ref key) = entry.encrypt_key {
+            if Self::is_configured_secret(key) {
+                return Some(key.clone());
+            }
+        }
+        
+        // See verification_token_env above for why the `extra` fallback is
+        // required for the Tauri setup transport.
+        let env_key = entry
+            .encrypt_key_env
+            .as_deref()
+            .or_else(|| entry.extra.get("encrypt_key_env").and_then(serde_json::Value::as_str));
+        if let Some(env_key) = env_key {
+            return std::env::var(env_key)
+                .ok()
+                .filter(|value| Self::is_configured_secret(value));
+        }
+        
+        // Legacy: check extra for encrypt_key
+        if let Some(key) = entry.extra.get("encrypt_key")
+            .and_then(serde_json::Value::as_str)
+        {
+            if Self::is_configured_secret(key) {
+                return Some(key.to_string());
+            }
+        }
+        
+        None
+    }
+    
+    /// Build security config from channel entry
+    pub fn from_entry(entry: Option<&crate::config::schema::ChannelEntry>) -> Self {
+        let security_mode_str = entry
+            .and_then(|e| e.security_mode.as_deref().or_else(|| {
+                e.extra
+                    .get("security_mode")
+                    .and_then(serde_json::Value::as_str)
+            }));
+        let security_mode = FeishuSecurityMode::from_str(security_mode_str);
+        
+        let verification_token = Self::get_verification_token(entry);
+        let encrypt_key = Self::get_encrypt_key(entry);
+        
+        // dev is deliberately permissive for local integration work, but must
+        // always be reported as insecure even if a token happens to be stored.
+        let insecure = matches!(security_mode, FeishuSecurityMode::Dev | FeishuSecurityMode::Default);
+        
+        Self {
+            mode: security_mode,
+            verification_token,
+            encrypt_key,
+            insecure,
+        }
+    }
+}
+
+/// Verify the verification token from the request
+pub fn verify_feishu_verification_token(
+    security_config: &FeishuSecurityConfig,
+    request_token: Option<&str>,
+) -> Result<bool, &'static str> {
+    match security_config.mode {
+        FeishuSecurityMode::Dev | FeishuSecurityMode::Default => {
+            // Dev mode: allow without token verification
+            Ok(true)
+        }
+        FeishuSecurityMode::Token | FeishuSecurityMode::Encrypted => {
+            // Token mode: require token
+            let expected_token = security_config.verification_token.as_deref()
+                .ok_or("verification_token not configured")?;
+            
+            match request_token {
+                Some(token) if token == expected_token => Ok(true),
+                Some(_) => Ok(false), // Token mismatch
+                None => Err("verification_token missing from request"),
+            }
+        }
+        FeishuSecurityMode::Invalid => Err("invalid security mode"),
+    }
+}
+
+/// Check if payload is encrypted (Feishu encrypt field)
+pub fn is_encrypted_payload(payload: &serde_json::Value) -> bool {
+    // Feishu encrypted event has "encrypt" field with the encrypted content
+    payload.get("encrypt").and_then(|v| v.as_str()).is_some()
+}
+
+/// Decrypt an encrypted Feishu payload using AES-256-CBC
+/// 
+/// Feishu uses AES-256-CBC with:
+/// - Key: first 32 bytes of SHA-256 of the encrypt_key
+/// - IV: first 16 bytes of the decoded encrypted event payload
+/// 
+/// Returns the decrypted JSON string, or error message.
+pub fn decrypt_feishu_payload(
+    encrypted_base64: &str,
+    encrypt_key: &str,
+) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use sha2::{Sha256, Digest};
+    
+    // Decode base64
+    let encrypted_bytes = BASE64.decode(encrypted_base64)
+        .map_err(|e| format!("base64 decode failed: {}", e))?;
+    
+    if encrypted_bytes.len() <= 16 || encrypted_bytes.len() % 16 != 0 {
+        return Err("encrypted payload length invalid".to_string());
+    }
+    
+    // Extract IV (first 16 bytes) and ciphertext
+    let iv = &encrypted_bytes[..16];
+    let ciphertext = &encrypted_bytes[16..];
+    
+    // Derive key: SHA-256 of encrypt_key
+    let mut hasher = Sha256::new();
+    hasher.update(encrypt_key.as_bytes());
+    let key_hash = hasher.finalize();
+    let key: [u8; 32] = key_hash[..32].try_into().unwrap();
+    
+    // Decrypt using AES-256-CBC
+    let result = decrypt_aes256_cbc(ciphertext, &key, iv)
+        .map_err(|e| format!("decrypt failed: {}", e))?;
+    
+    // Remove PKCS7 padding
+    let padding_len = result[result.len() - 1] as usize;
+    if padding_len == 0 || padding_len > 16 {
+        return Err("invalid padding".to_string());
+    }
+    for i in 0..padding_len {
+        if result[result.len() - 1 - i] != padding_len as u8 {
+            return Err("invalid padding".to_string());
+        }
+    }
+    
+    let plaintext = &result[..result.len() - padding_len];
+    String::from_utf8(plaintext.to_vec())
+        .map_err(|e| format!("utf8 decode failed: {}", e))
+}
+
+/// Decrypt AES-256-CBC using raw AES-256 operations
+/// Feishu uses AES-256-CBC with PKCS7 padding
+fn decrypt_aes256_cbc(ciphertext: &[u8], key: &[u8; 32], iv: &[u8]) -> Result<Vec<u8>, String> {
+    use aes::Aes256;
+    use aes::cipher::{Block, BlockDecrypt, KeyInit};
+    
+    let cipher = Aes256::new_from_slice(key)
+        .map_err(|e| format!("cipher init failed: {:?}", e))?;
+    
+    let block_size = 16;
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    let mut previous = iv.to_vec();
+    
+    for chunk in ciphertext.chunks(block_size) {
+        // Create a mutable copy of the chunk
+        let mut block_bytes = [0u8; 16];
+        block_bytes.copy_from_slice(chunk);
+        let mut block = Block::<Aes256>::from(block_bytes);
+        
+        // Decrypt block
+        cipher.decrypt_block(&mut block);
+        
+        // XOR with previous ciphertext block (or IV for first block)
+        let mut xored = [0u8; 16];
+        for i in 0..16 {
+            xored[i] = block[i] ^ previous[i];
+        }
+        plaintext.extend_from_slice(&xored);
+        
+        previous.copy_from_slice(chunk);
+    }
+    
+    Ok(plaintext)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -4863,6 +5571,7 @@ mod tests {
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{Config, DelegateAgentConfig};
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -5479,6 +6188,11 @@ mod tests {
             enabled,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: HashMap::new(),
         };
         match channel {
@@ -5488,6 +6202,561 @@ mod tests {
             _ => {}
         }
         config
+    }
+
+    fn feishu_security_config(
+        mode: &str,
+        verification_token: Option<&str>,
+        encrypt_key: Option<&str>,
+    ) -> Config {
+        let mut config = outbound_test_config(ChannelKind::Feishu, "mock", false);
+        let entry = config
+            .channels_config
+            .feishu
+            .as_mut()
+            .expect("feishu config should exist");
+        entry.security_mode = Some(mode.to_string());
+        entry.verification_token = verification_token.map(ToString::to_string);
+        entry.encrypt_key = encrypt_key.map(ToString::to_string);
+        config
+    }
+
+    fn encrypt_feishu_payload_for_test(plaintext: &str, encrypt_key: &str) -> String {
+        use aes::cipher::{Block, BlockEncrypt, KeyInit};
+        use aes::Aes256;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let key_hash = Sha256::digest(encrypt_key.as_bytes());
+        let cipher = Aes256::new_from_slice(&key_hash).expect("test AES key");
+        let iv = [0x5Au8; 16];
+        let padding = 16 - (plaintext.len() % 16);
+        let mut bytes = plaintext.as_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(padding as u8, padding));
+
+        let mut previous = iv;
+        let mut ciphertext = Vec::with_capacity(bytes.len());
+        for chunk in bytes.chunks_exact(16) {
+            let mut block_bytes = [0u8; 16];
+            for (index, value) in chunk.iter().enumerate() {
+                block_bytes[index] = *value ^ previous[index];
+            }
+            let mut block = Block::<Aes256>::from(block_bytes);
+            cipher.encrypt_block(&mut block);
+            previous.copy_from_slice(&block);
+            ciphertext.extend_from_slice(&block);
+        }
+        let mut combined = iv.to_vec();
+        combined.extend_from_slice(&ciphertext);
+        BASE64.encode(combined)
+    }
+
+    async fn call_feishu_http(
+        runtime: GatewayRuntime,
+        body: String,
+    ) -> (StatusCode, String, serde_json::Value) {
+        let response = super::http_feishu_webhook(
+            axum::extract::State(runtime),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Feishu response body");
+        let value = serde_json::from_slice(&bytes).expect("Feishu response must be JSON");
+        (status, content_type, value)
+    }
+
+    #[test]
+    fn feishu_security_dev_mode_is_explicitly_insecure() {
+        let config = feishu_security_config("dev", None, None);
+        let security = super::FeishuSecurityConfig::from_entry(config.channels_config.feishu.as_ref());
+        assert!(security.insecure);
+        assert_eq!(security.mode.as_str(), "dev");
+    }
+
+    #[test]
+    fn feishu_token_extractor_supports_payload_and_header_locations() {
+        let headers = HeaderMap::new();
+        let cases = [
+            (
+                json!({ "token": "top-token" }),
+                "top-token",
+                "top_level.token",
+            ),
+            (
+                json!({ "header": { "token": "header-token" } }),
+                "header-token",
+                "header.token",
+            ),
+            (
+                json!({ "event": { "token": "event-token" } }),
+                "event-token",
+                "event.token",
+            ),
+            (
+                json!({ "event": { "header": { "token": "event-header-token" } } }),
+                "event-header-token",
+                "event.header.token",
+            ),
+        ];
+
+        for (payload, expected_value, expected_source) in cases {
+            let extracted = super::extract_feishu_verification_token(&payload, &headers)
+                .expect("token should be extracted");
+            assert_eq!(extracted.value, expected_value);
+            assert_eq!(extracted.source, expected_source);
+        }
+
+        let mut feishu_header = HeaderMap::new();
+        feishu_header.insert(
+            "x-feishu-verification-token",
+            "http-header-token".parse().expect("header value"),
+        );
+        let empty_payload = json!({});
+        let extracted =
+            super::extract_feishu_verification_token(&empty_payload, &feishu_header)
+                .expect("HTTP token header should be extracted");
+        assert_eq!(extracted.value, "http-header-token");
+        assert_eq!(
+            extracted.source,
+            "header.x-feishu-verification-token"
+        );
+    }
+
+    #[test]
+    fn feishu_token_missing_diagnostics_only_include_shape_not_values() {
+        let secret_content = "message-body-must-not-appear";
+        let unrelated_secret = "unrelated-secret-must-not-appear";
+        let payload = json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-id-must-not-appear",
+                "event_type": "im.message.receive_v1",
+                "create_time": "timestamp-must-not-appear",
+                "verification_token": unrelated_secret
+            },
+            "event": {
+                "message": {
+                    "content": secret_content
+                },
+                "sender": {
+                    "sender_id": "sender-id-must-not-appear"
+                }
+            }
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8"
+                .parse()
+                .expect("content type"),
+        );
+
+        let diagnostics =
+            super::feishu_token_missing_diagnostic_lines(&payload, &headers).join("\n");
+        assert!(diagnostics.contains(
+            "payload_shape top_keys=[\"event\", \"header\", \"schema\"]"
+        ));
+        assert!(diagnostics.contains(
+            "header_shape keys=[\"create_time\", \"event_id\", \"event_type\", \"verification_token\"]"
+        ));
+        assert!(diagnostics.contains("event_shape keys=[\"message\", \"sender\"]"));
+        assert!(diagnostics.contains("content_type=application/json"));
+        assert!(diagnostics.contains("looks_like_im_message_receive_v1=true"));
+        assert!(diagnostics.contains("token_present=false"));
+        for forbidden in [
+            secret_content,
+            unrelated_secret,
+            "event-id-must-not-appear",
+            "timestamp-must-not-appear",
+            "sender-id-must-not-appear",
+        ] {
+            assert!(!diagnostics.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn feishu_dev_url_verification_returns_json_challenge() {
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (status, content_type, response) = call_feishu_http(
+            runtime,
+            json!({
+                "type": "url_verification",
+                "token": "ignored-in-dev",
+                "challenge": "dev-challenge"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("application/json"));
+        assert_eq!(
+            response.get("challenge").and_then(|value| value.as_str()),
+            Some("dev-challenge")
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_token_url_verification_returns_challenge_or_json_error() {
+        let config = || {
+            feishu_security_config("token", Some("test-verification-token"), None)
+        };
+
+        let (ok_status, ok_content_type, ok_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            json!({
+                "type": "url_verification",
+                "token": "test-verification-token",
+                "challenge": "token-challenge"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::OK);
+        assert!(ok_content_type.starts_with("application/json"));
+        assert_eq!(
+            ok_response
+                .get("challenge")
+                .and_then(|value| value.as_str()),
+            Some("token-challenge")
+        );
+
+        let (missing_status, missing_content_type, missing_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            json!({
+                "type": "url_verification",
+                "challenge": "missing-token"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+        assert!(missing_content_type.starts_with("application/json"));
+        assert_eq!(
+            missing_response.get("error").and_then(|value| value.as_str()),
+            Some("token_missing")
+        );
+
+        let (bad_status, bad_content_type, bad_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            json!({
+                "type": "url_verification",
+                "token": "wrong-token",
+                "challenge": "bad-token"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+        assert!(bad_content_type.starts_with("application/json"));
+        assert_eq!(
+            bad_response.get("error").and_then(|value| value.as_str()),
+            Some("token_mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_url_verification_rejects_missing_challenge_and_invalid_json_as_json() {
+        let (missing_status, missing_content_type, missing_response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            json!({ "type": "url_verification" }).to_string(),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::BAD_REQUEST);
+        assert!(missing_content_type.starts_with("application/json"));
+        assert_eq!(
+            missing_response.get("error").and_then(|value| value.as_str()),
+            Some("missing_challenge")
+        );
+
+        let (invalid_status, invalid_content_type, invalid_response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            "{not-json".to_string(),
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+        assert!(invalid_content_type.starts_with("application/json"));
+        assert_eq!(
+            invalid_response.get("error").and_then(|value| value.as_str()),
+            Some("invalid_json")
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_encrypted_url_verification_returns_challenge_or_json_error() {
+        let encrypt_key = "test-encrypt-key";
+        let plaintext = json!({
+            "type": "url_verification",
+            "challenge": "encrypted-json-challenge",
+            "token": "test-verification-token"
+        })
+        .to_string();
+        let encrypted = encrypt_feishu_payload_for_test(&plaintext, encrypt_key);
+        let (ok_status, ok_content_type, ok_response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config(
+                "encrypted",
+                Some("test-verification-token"),
+                Some(encrypt_key),
+            )),
+            json!({ "encrypt": encrypted }).to_string(),
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::OK);
+        assert!(ok_content_type.starts_with("application/json"));
+        assert_eq!(
+            ok_response
+                .get("challenge")
+                .and_then(|value| value.as_str()),
+            Some("encrypted-json-challenge")
+        );
+
+        let (bad_status, bad_content_type, bad_response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config(
+                "encrypted",
+                Some("test-verification-token"),
+                Some("wrong-key"),
+            )),
+            json!({ "encrypt": "AAAAAAAAAAAAAAAAAAAAAA==" }).to_string(),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::FORBIDDEN);
+        assert!(bad_content_type.starts_with("application/json"));
+        assert_eq!(
+            bad_response.get("error").and_then(|value| value.as_str()),
+            Some("decrypt_failed")
+        );
+
+        let (missing_key_status, missing_key_content_type, missing_key_response) =
+            call_feishu_http(
+                GatewayRuntime::new(feishu_security_config(
+                    "encrypted",
+                    Some("test-verification-token"),
+                    None,
+                )),
+                json!({ "encrypt": "AAAAAAAAAAAAAAAAAAAAAA==" }).to_string(),
+            )
+            .await;
+        assert_eq!(missing_key_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(missing_key_content_type.starts_with("application/json"));
+        assert_eq!(
+            missing_key_response
+                .get("error")
+                .and_then(|value| value.as_str()),
+            Some("encrypt_key_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_invalid_security_mode_returns_json_error() {
+        let (status, content_type, response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config("unsupported-mode", None, None)),
+            json!({
+                "type": "url_verification",
+                "challenge": "must-not-pass"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(content_type.starts_with("application/json"));
+        assert_eq!(
+            response.get("error").and_then(|value| value.as_str()),
+            Some("invalid_security_mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_rejected_token_and_url_verification_do_not_enter_store_or_worker() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "omninova_feishu_verification_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(
+            crate::gateway::feishu_store::FeishuStore::open(&test_dir)
+                .expect("test Feishu store"),
+        );
+        let mut runtime = GatewayRuntime::new(feishu_security_config(
+            "token",
+            Some("test-verification-token"),
+            None,
+        ));
+        runtime.feishu_store = Some(store.clone());
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(4);
+        runtime.init_feishu_worker(sender).await;
+
+        let event_id = format!("evt_{}", uuid::Uuid::new_v4());
+        let message_id = format!("om_{}", uuid::Uuid::new_v4());
+        let normal_payload = |token: Option<&str>| {
+            json!({
+                "header": {
+                    "event_id": event_id,
+                    "event_type": "im.message.receive_v1",
+                    "token": token
+                },
+                "event": {
+                    "sender": {
+                        "sender_type": "user",
+                        "sender_id": { "open_id": "ou_test" }
+                    },
+                    "message": {
+                        "message_id": message_id,
+                        "chat_id": "oc_test",
+                        "message_type": "text",
+                        "content": "{\"text\":\"hello\"}"
+                    }
+                }
+            })
+            .to_string()
+        };
+
+        let (missing_status, _, missing_response) =
+            call_feishu_http(runtime.clone(), normal_payload(None)).await;
+        assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing_response.get("error").and_then(|value| value.as_str()),
+            Some("token_missing")
+        );
+
+        let (bad_status, _, bad_response) =
+            call_feishu_http(runtime.clone(), normal_payload(Some("wrong-token"))).await;
+        assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            bad_response.get("error").and_then(|value| value.as_str()),
+            Some("token_mismatch")
+        );
+        let empty_stats = store.get_store_stats().expect("empty store stats");
+        assert_eq!(empty_stats.events_total, 0);
+        assert_eq!(empty_stats.jobs_total, 0);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let (message_status, _, message_response) =
+            call_feishu_http(
+                runtime.clone(),
+                normal_payload(Some("test-verification-token")),
+            )
+            .await;
+        assert_eq!(message_status, StatusCode::OK);
+        assert_eq!(
+            message_response.get("accepted").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(receiver.try_recv().is_ok());
+        let message_stats = store.get_store_stats().expect("message store stats");
+        assert_eq!(message_stats.events_total, 1);
+        assert_eq!(message_stats.jobs_total, 1);
+
+        let (challenge_status, _, challenge_response) = call_feishu_http(
+            runtime.clone(),
+            json!({
+                "type": "url_verification",
+                "token": "test-verification-token",
+                "challenge": "store-bypass-challenge"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(challenge_status, StatusCode::OK);
+        assert_eq!(
+            challenge_response
+                .get("challenge")
+                .and_then(|value| value.as_str()),
+            Some("store-bypass-challenge")
+        );
+        let challenge_stats = store.get_store_stats().expect("challenge store stats");
+        assert_eq!(challenge_stats.events_total, 1);
+        assert_eq!(challenge_stats.jobs_total, 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(runtime);
+        drop(store);
+        std::fs::remove_dir_all(&test_dir).expect("remove test Feishu store");
+    }
+
+    #[tokio::test]
+    async fn feishu_token_mode_accepts_correct_token_and_rejects_bad_or_missing_tokens() {
+        let body = r#"{"token":"test-verification-token","header":{"event_id":"evt_security_token_ok"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_test"}},"message":{"message_id":"om_security_token_ok","chat_id":"oc_test","message_type":"text","content":"{\"text\":\"hello\"}"}}}"#.to_string();
+        let runtime = GatewayRuntime::new(feishu_security_config("token", Some("test-verification-token"), None));
+        let ok = super::http_channel_webhook(runtime, HeaderMap::new(), body.clone(), ChannelKind::Feishu)
+            .await
+            .expect("correct token should pass")
+            .0;
+        assert_eq!(ok.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let missing = super::http_channel_webhook(
+            GatewayRuntime::new(feishu_security_config("token", Some("test-verification-token"), None)),
+            HeaderMap::new(),
+            body.replacen("\"token\":\"test-verification-token\",", "", 1),
+            ChannelKind::Feishu,
+        )
+        .await;
+        assert!(matches!(missing, Err((StatusCode::UNAUTHORIZED, _))));
+
+        let bad = super::http_channel_webhook(
+            GatewayRuntime::new(feishu_security_config("token", Some("test-verification-token"), None)),
+            HeaderMap::new(),
+            body.replacen("test-verification-token", "wrong-token", 1),
+            ChannelKind::Feishu,
+        )
+        .await;
+        assert!(matches!(bad, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn feishu_encrypted_mode_decrypts_before_token_and_challenge_handling() {
+        let encrypt_key = "test-encrypt-key";
+        let plaintext = r#"{"type":"url_verification","challenge":"encrypted-challenge","token":"test-verification-token"}"#;
+        let encrypted = encrypt_feishu_payload_for_test(plaintext, encrypt_key);
+        let body = serde_json::json!({ "encrypt": encrypted }).to_string();
+        let runtime = GatewayRuntime::new(feishu_security_config(
+            "encrypted",
+            Some("test-verification-token"),
+            Some(encrypt_key),
+        ));
+        let response = super::http_channel_webhook(runtime, HeaderMap::new(), body, ChannelKind::Feishu)
+            .await
+            .expect("encrypted payload should pass")
+            .0;
+        assert_eq!(response.get("challenge").and_then(|v| v.as_str()), Some("encrypted-challenge"));
+    }
+
+    #[tokio::test]
+    async fn feishu_encrypted_mode_rejects_missing_or_invalid_encrypt_key_before_worker() {
+        let body = serde_json::json!({ "encrypt": "AAAAAAAAAAAAAAAAAAAAAA==" }).to_string();
+        let missing_key = super::http_channel_webhook(
+            GatewayRuntime::new(feishu_security_config("encrypted", Some("token"), None)),
+            HeaderMap::new(),
+            body.clone(),
+            ChannelKind::Feishu,
+        )
+        .await;
+        assert!(missing_key.is_err());
+
+        let invalid_key = super::http_channel_webhook(
+            GatewayRuntime::new(feishu_security_config("encrypted", Some("token"), Some("wrong-key"))),
+            HeaderMap::new(),
+            body,
+            ChannelKind::Feishu,
+        )
+        .await;
+        assert!(invalid_key.is_err());
     }
 
     #[test]
