@@ -457,6 +457,7 @@ impl GatewayRuntime {
             payload.clone(),
             is_chat_only,
             job.event_key.clone(),
+            Some(job.job_id.clone()), // Use recovered job_id for consistency
         ))
     }
     
@@ -1862,8 +1863,12 @@ impl GatewayRuntime {
         let queue_len = worker_state.queue_len.clone();
         self.init_feishu_worker(worker_state.sender()).await;
         let runtime = self.clone();
-        let _worker_handle = spawn_worker(receiver, runtime, queue_len);
+        let _worker_handle = spawn_worker(receiver, runtime.clone(), queue_len);
         println!("[gateway] feishu_async_worker started");
+        
+        // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
+        // and to abandon LLM final outbox (cannot be sent without storing full body).
+        crate::gateway::feishu_worker::run_retry_worker_once(&runtime).await;
 
         if self.cron_store.is_none() {
             let cron_path = cfg.workspace_dir.join("cron.json");
@@ -3283,6 +3288,9 @@ async fn http_channel_webhook(
             };
             let metadata_json_str = serde_json::to_string(&metadata_json).ok();
             
+            // Generate job_id upfront so it can be used in both store and worker
+            let job_id = uuid::Uuid::new_v4().to_string();
+            
             // Persist event to SQLite (before enqueuing)
             if let Some(ref store) = runtime.feishu_store() {
                 let text_for_hash = inbound.text.clone();
@@ -3302,12 +3310,14 @@ async fn http_channel_webhook(
                     metadata_json: metadata_json_str,
                 };
                 
+                let event_key_clone = event_key.clone();
+                
                 match store.insert_event(&event_input) {
                     Ok(_event) => {
-                        // Event inserted successfully - now create job
+                        // Event inserted successfully - now create job with SAME job_id
                         let job_input = crate::gateway::feishu_store::FeishuJobInput {
-                            job_id: uuid::Uuid::new_v4().to_string(),
-                            event_key: event_key.clone(),
+                            job_id: job_id.clone(),
+                            event_key: event_key_clone.clone(),
                             channel: channel_name.clone(),
                             mode: if is_chat_only { "chat_only".to_string() } else { "tool".to_string() },
                             slash_command: inbound.metadata.get("slash_command")
@@ -3321,14 +3331,42 @@ async fn http_channel_webhook(
                         }
                     }
                     Err(crate::gateway::feishu_store::StoreError::DuplicateEvent(_)) => {
-                        // Duplicate event - SQLite dedupe worked
+                        // Duplicate event - check job status
                         println!("[{}-store] duplicate event_key={}", channel_name, event_key);
+                        
+                        // Try to get job status to see if it's still in progress
+                        if let Ok(Some(existing_job)) = store.get_job_by_event_key(&event_key) {
+                            let status = existing_job.status.as_str();
+                            println!("[{}-store] duplicate job status job_id={} status={}", channel_name, existing_job.job_id, status);
+                            
+                            // If job is still pending/processing, return duplicate skipped
+                            if matches!(existing_job.status, 
+                                crate::gateway::feishu_store::JobStatus::Pending
+                                | crate::gateway::feishu_store::JobStatus::Queued
+                                | crate::gateway::feishu_store::JobStatus::Processing
+                                | crate::gateway::feishu_store::JobStatus::Failed
+                            ) {
+                                return Ok(Json(serde_json::json!({
+                                    "ok": true,
+                                    "accepted": true,
+                                    "duplicate": true,
+                                    "processing": "in_progress",
+                                    "job_id": existing_job.job_id,
+                                    "status": status
+                                })));
+                            }
+                        }
+                        
+                        // Completed or unknown - return duplicate skipped
                         return Ok(Json(serde_json::json!({
                             "ok": true,
                             "accepted": true,
                             "duplicate": true,
                             "processing": "skipped"
                         })));
+                    }
+                    Err(crate::gateway::feishu_store::StoreError::PoisonedLock) => {
+                        println!("[{}-webhook] store poisoned, continuing without persistence", channel_name);
                     }
                     Err(e) => {
                         println!("[{}-webhook] failed to persist event: {}", channel_name, e);
@@ -3337,12 +3375,14 @@ async fn http_channel_webhook(
                 }
             }
             
+            // Create job with SAME job_id that was used in store (or generate new one if store unavailable)
             let job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
                 inbound_channel,
                 inbound,
                 payload_clone,
                 is_chat_only,
                 event_key.clone(),
+                Some(job_id.clone()),
             );
             
             match runtime.try_send_feishu_job(job).await {

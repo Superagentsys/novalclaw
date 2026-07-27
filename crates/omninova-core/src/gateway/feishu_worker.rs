@@ -55,20 +55,25 @@ pub struct FeishuAsyncJob {
 }
 
 impl FeishuAsyncJob {
-    /// Create a new async job from webhook data
+    /// Create a new async job from webhook data.
+    /// If `job_id` is provided, it will be used (for consistency with persisted store).
+    /// Otherwise, a new job_id is generated.
     pub fn new(
         channel: ChannelKind,
         inbound: crate::channels::InboundMessage,
         raw_payload: serde_json::Value,
         is_chat_only: bool,
         event_key: String,
+        job_id: Option<String>,
     ) -> Self {
         let feishu_mode = if is_chat_only { "chat_only" } else { "tool" };
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let job_id = format!("job_{}_{}", created_at, uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let job_id = job_id.unwrap_or_else(|| {
+            format!("job_{}_{}", created_at, &uuid::Uuid::new_v4().to_string()[..8])
+        });
         
         Self {
             channel,
@@ -1089,6 +1094,216 @@ pub fn spawn_worker(
     })
 }
 
+/// Run the retry/recovery worker once on startup.
+/// Scans retryable outbox and re-sends them.
+/// This is meant to be called once at Gateway startup.
+pub async fn run_retry_worker_once(runtime: &GatewayRuntime) {
+    println!("[feishu-retry] started");
+    
+    let store = match runtime.feishu_store() {
+        Some(s) => s,
+        None => {
+            println!("[feishu-retry] no_store_available");
+            return;
+        }
+    };
+    
+    // Get all recoverable outbox items
+    let recoverable = match store.get_recoverable_outbox() {
+        Ok(items) => items,
+        Err(e) => {
+            println!("[feishu-retry] failed to get recoverable: {}", e);
+            return;
+        }
+    };
+    
+    println!("[feishu-retry] scan count={}", recoverable.len());
+    
+    let mut retryable_count = 0;
+    let mut abandoned_count = 0;
+    let mut failed_count = 0;
+    let mut sent_count = 0;
+    
+    for item in recoverable {
+        let kind = item.reply_kind.as_deref()
+            .and_then(ReplyKind::from_str);
+        
+        match kind {
+            // Audit-only kinds: cannot reconstruct body, mark abandoned
+            Some(ReplyKind::LlmFinal) | None => {
+                println!(
+                    "[feishu-retry] abandoned outbound_id={} reason=privacy_no_full_body",
+                    item.outbound_id
+                );
+                let _ = store.outbox_mark_failed_privacy(
+                    &item.outbound_id,
+                    "llm_reply_not_reconstructible"
+                );
+                abandoned_count += 1;
+            }
+            
+            // Retryable template / restructurable kinds
+            Some(k) => {
+                // Begin retry: increment attempts, set SENDING
+                let can_retry = match store.outbox_begin_retry(&item.outbound_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("[feishu-retry] begin_retry_error outbound_id={} error={}", item.outbound_id, e);
+                        failed_count += 1;
+                        continue;
+                    }
+                };
+                
+                if !can_retry {
+                    // Either already SENT or max attempts exceeded
+                    let _status = store.get_outbox(&item.outbound_id)
+                        .ok()
+                        .flatten()
+                        .map(|o| o.status);
+                    println!("[feishu-retry] skip outbound_id={} reason=cannot_retry_or_sent", item.outbound_id);
+                    continue;
+                }
+                
+                retryable_count += 1;
+                
+                // Try to reconstruct the reply body
+                let reconstructed = reconstruct_reply(k, item.result_json.as_deref(), None);
+                
+                let reply_body = match reconstructed {
+                    Some(s) => s,
+                    None => {
+                        // Cannot reconstruct (missing result_json or required fields)
+                        println!(
+                            "[feishu-retry] reconstruct_incomplete outbound_id={} reply_kind={}",
+                            item.outbound_id,
+                            item.reply_kind.as_deref().unwrap_or("?")
+                        );
+                        let _ = store.outbox_mark_reconstruct_incomplete(
+                            &item.outbound_id,
+                            "missing_result_json_or_required_fields"
+                        );
+                        failed_count += 1;
+                        continue;
+                    }
+                };
+                
+                // Reconstruct inbound from outbox metadata
+                let inbound = match reconstruct_inbound_for_retry(&item) {
+                    Some(i) => i,
+                    None => {
+                        println!("[feishu-retry] cannot_reconstruct_inbound outbound_id={}", item.outbound_id);
+                        let _ = store.outbox_mark_reconstruct_incomplete(
+                            &item.outbound_id,
+                            "missing_chat_id_for_retry"
+                        );
+                        failed_count += 1;
+                        continue;
+                    }
+                };
+                
+                // Send via existing pipeline
+                let channel_name = item.channel.as_str();
+                let send_result = timeout(
+                    Duration::from_secs(OUTBOUND_TIMEOUT_SECS),
+                    deliver_platform_reply_and_record(runtime, &inbound, &reply_body, channel_name)
+                ).await;
+                
+                match send_result {
+                    Ok(Ok(Some(result))) => {
+                        let platform_msg_id = result.platform_message_id.clone().unwrap_or_default();
+                        if let Err(e) = store.outbox_sent(&item.outbound_id, &platform_msg_id) {
+                            println!("[feishu-retry] mark_sent_error outbound_id={} error={}", item.outbound_id, e);
+                        } else {
+                            println!(
+                                "[feishu-retry] sent outbound_id={} platform_message_id_present={}",
+                                item.outbound_id,
+                                !platform_msg_id.is_empty()
+                            );
+                            sent_count += 1;
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        // Disabled / skipped - mark sent as skipped
+                        let _ = store.outbox_sent(&item.outbound_id, "skipped");
+                        println!("[feishu-retry] skipped outbound_id={} reason=disabled_or_skipped", item.outbound_id);
+                    }
+                    Ok(Err(e)) => {
+                        let retryable = store.outbox_failed(
+                            &item.outbound_id,
+                            "send_error",
+                            &e.to_string()
+                        ).unwrap_or(false);
+                        println!(
+                            "[feishu-retry] failed outbound_id={} retryable={} error={}",
+                            item.outbound_id,
+                            retryable,
+                            e
+                        );
+                        failed_count += 1;
+                    }
+                    Err(_) => {
+                        let retryable = store.outbox_failed(
+                            &item.outbound_id,
+                            "timeout",
+                            &format!("Retry send timeout after {}s", OUTBOUND_TIMEOUT_SECS)
+                        ).unwrap_or(false);
+                        println!(
+                            "[feishu-retry] timeout outbound_id={} retryable={}",
+                            item.outbound_id, retryable
+                        );
+                        failed_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    println!(
+        "[feishu-retry] completed sent={} retryable={} abandoned={} failed={}",
+        sent_count, retryable_count, abandoned_count, failed_count
+    );
+}
+
+/// Reconstruct a minimal InboundMessage from a persisted outbox for retry.
+/// Only carries chat_id and channel - enough for `deliver_platform_reply`.
+fn reconstruct_inbound_for_retry(item: &crate::gateway::feishu_store::FeishuOutbox) -> Option<crate::channels::InboundMessage> {
+    use crate::channels::{ChannelKind, InboundMessage};
+    use std::collections::HashMap;
+    
+    let chat_id = item.chat_id.clone()
+        .filter(|s| !s.is_empty())?;
+    
+    let channel = match item.channel.as_str() {
+        "feishu" => ChannelKind::Feishu,
+        "lark" => ChannelKind::Lark,
+        _ => return None,
+    };
+    
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(chat_id.clone()),
+    );
+    metadata.insert(
+        "conversation_id".to_string(),
+        serde_json::Value::String(chat_id.clone()),
+    );
+    if let Some(event_key) = &item.event_key {
+        metadata.insert(
+            "event_key".to_string(),
+            serde_json::Value::String(event_key.clone()),
+        );
+    }
+    
+    Some(InboundMessage {
+        channel,
+        user_id: None,
+        session_id: Some(chat_id),
+        text: String::new(),
+        metadata,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,5 +1382,187 @@ mod tests {
 
         let hello_job = make_test_job("hello", false);
         assert!(!is_monitor_command(&hello_job));
+    }
+    
+    // ========== Retry worker reconstruction tests (v0.8.7.5.2) ==========
+    
+    #[test]
+    fn test_reconstruct_reply_progress() {
+        let result = reconstruct_reply(ReplyKind::Progress, None, None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("已收到监控任务") || s.contains("监控"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_timeout() {
+        let result = reconstruct_reply(ReplyKind::Timeout, None, None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("超时"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_failure() {
+        let result = reconstruct_reply(ReplyKind::Failure, None, None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("失败"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_chat_only_blocked() {
+        let result = reconstruct_reply(ReplyKind::ChatOnlyBlocked, None, None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("/monitor") || s.contains("安全"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_unsupported() {
+        let result = reconstruct_reply(ReplyKind::Unsupported, None, None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("不支持"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_monitor_final_with_full_json() {
+        let json = serde_json::json!({
+            "duration_secs": 30,
+            "changed": true,
+            "start_path": "C:\\start.png",
+            "end_path": "C:\\end.png"
+        });
+        let result = reconstruct_reply(ReplyKind::MonitorFinal, Some(&json.to_string()), None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("桌面监控完成"));
+        assert!(s.contains("30"));
+        assert!(s.contains("有变化"));
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_monitor_final_missing_changed_field() {
+        // Should still reconstruct (use defaults for missing fields)
+        let json = serde_json::json!({
+            "duration_secs": 60,
+            "start_path": "C:\\start.png",
+            "end_path": "C:\\end.png"
+        });
+        let result = reconstruct_reply(ReplyKind::MonitorFinal, Some(&json.to_string()), None);
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains("60"));
+        assert!(s.contains("无明显变化")); // Default when changed missing
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_monitor_final_no_json_returns_none() {
+        // Without result_json, monitor_final CANNOT be reconstructed
+        let result = reconstruct_reply(ReplyKind::MonitorFinal, None, None);
+        assert!(result.is_none());
+    }
+    
+    #[test]
+    fn test_reconstruct_reply_llm_final_returns_none() {
+        // LLM final never reconstructible
+        let result = reconstruct_reply(ReplyKind::LlmFinal, Some("any json"), None);
+        assert!(result.is_none());
+        
+        let result = reconstruct_reply(ReplyKind::LlmFinal, None, None);
+        assert!(result.is_none());
+    }
+    
+    #[test]
+    fn test_reconstruct_inbound_for_retry_uses_chat_id() {
+        let outbox = crate::gateway::feishu_store::FeishuOutbox {
+            id: 1,
+            outbound_id: "out_test".to_string(),
+            job_id: None,
+            event_key: Some("evt_test".to_string()),
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_xyz".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            status: crate::gateway::feishu_store::OutboxStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            next_attempt_at: None,
+            platform_message_id: None,
+            reply_hash: None,
+            reply_preview: None,
+            result_json: None,
+            created_at: 0,
+            updated_at: 0,
+            sent_at: None,
+            error_code: None,
+            error_message: None,
+        };
+        
+        let inbound = reconstruct_inbound_for_retry(&outbox);
+        assert!(inbound.is_some());
+        let inbound = inbound.unwrap();
+        assert_eq!(inbound.session_id, Some("chat_xyz".to_string()));
+        assert!(inbound.metadata.get("chat_id").is_some());
+        assert!(inbound.metadata.get("conversation_id").is_some());
+        assert!(inbound.metadata.get("event_key").is_some());
+    }
+    
+    #[test]
+    fn test_reconstruct_inbound_for_retry_missing_chat_id_returns_none() {
+        let outbox = crate::gateway::feishu_store::FeishuOutbox {
+            id: 1,
+            outbound_id: "out_no_chat".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: None, // Missing!
+            reply_kind: Some("timeout_reply".to_string()),
+            status: crate::gateway::feishu_store::OutboxStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            next_attempt_at: None,
+            platform_message_id: None,
+            reply_hash: None,
+            reply_preview: None,
+            result_json: None,
+            created_at: 0,
+            updated_at: 0,
+            sent_at: None,
+            error_code: None,
+            error_message: None,
+        };
+        
+        let inbound = reconstruct_inbound_for_retry(&outbox);
+        assert!(inbound.is_none());
+    }
+    
+    #[test]
+    fn test_reconstruct_inbound_unsupported_channel_returns_none() {
+        let outbox = crate::gateway::feishu_store::FeishuOutbox {
+            id: 1,
+            outbound_id: "out_other".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "slack".to_string(), // Not supported for retry
+            chat_id: Some("chat_xyz".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            status: crate::gateway::feishu_store::OutboxStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            next_attempt_at: None,
+            platform_message_id: None,
+            reply_hash: None,
+            reply_preview: None,
+            result_json: None,
+            created_at: 0,
+            updated_at: 0,
+            sent_at: None,
+            error_code: None,
+            error_message: None,
+        };
+        
+        let inbound = reconstruct_inbound_for_retry(&outbox);
+        assert!(inbound.is_none());
     }
 }

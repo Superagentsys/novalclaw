@@ -126,6 +126,8 @@ pub enum OutboxStatus {
     Abandoned,
     /// Same as Abandoned but retains recoverable metadata
     FailedPrivacyNoRetry,
+    /// Reconstruction of reply body failed (missing result_json or required fields)
+    FailedReconstructIncomplete,
 }
 
 impl OutboxStatus {
@@ -139,6 +141,7 @@ impl OutboxStatus {
             OutboxStatus::Skipped => "SKIPPED",
             OutboxStatus::Abandoned => "ABANDONED",
             OutboxStatus::FailedPrivacyNoRetry => "FAILED_PRIVACY_NO_RETRY",
+            OutboxStatus::FailedReconstructIncomplete => "FAILED_RECONSTRUCT_INCOMPLETE",
         }
     }
 
@@ -152,6 +155,7 @@ impl OutboxStatus {
             "SKIPPED" => Some(OutboxStatus::Skipped),
             "ABANDONED" => Some(OutboxStatus::Abandoned),
             "FAILED_PRIVACY_NO_RETRY" => Some(OutboxStatus::FailedPrivacyNoRetry),
+            "FAILED_RECONSTRUCT_INCOMPLETE" => Some(OutboxStatus::FailedReconstructIncomplete),
             _ => None,
         }
     }
@@ -233,6 +237,9 @@ pub enum StoreError {
     
     #[error("Database not initialized")]
     NotInitialized,
+    
+    #[error("Store lock poisoned - previous operation panicked")]
+    PoisonedLock,
 }
 
 /// Feishu event record
@@ -337,7 +344,7 @@ impl FeishuStore {
 
     /// Run database migrations
     fn run_migrations(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         
         // Create tables
         conn.execute_batch(
@@ -490,12 +497,14 @@ impl FeishuStore {
         hex::encode(&result[..16]) // First 16 bytes for shorter hash
     }
 
-    /// Truncate text to max length
-    pub fn truncate_preview(text: &str, max_len: usize) -> String {
-        if text.len() <= max_len {
+    /// Truncate text to max CHARACTERS (not bytes) for UTF-8 safety.
+    /// Uses char-based truncation to avoid splitting multi-byte characters.
+    pub fn truncate_preview(text: &str, max_chars: usize) -> String {
+        let chars_count = text.chars().count();
+        if chars_count <= max_chars {
             text.to_string()
         } else {
-            format!("{}...", &text[..max_len.saturating_sub(3)])
+            text.chars().take(max_chars.saturating_sub(3)).collect::<String>() + "..."
         }
     }
 
@@ -511,7 +520,7 @@ impl FeishuStore {
 
     /// Insert a new event, returning Ok(()) if successful or Err(DuplicateEvent) if already exists
     pub fn insert_event(&self, event: &FeishuEventInput) -> Result<FeishuEvent, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         let text_hash = event.text.as_ref().map(|t| Self::hash_text(t));
@@ -572,7 +581,7 @@ impl FeishuStore {
 
     /// Check if event exists (for dedupe)
     pub fn event_exists(&self, event_key: &str) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM feishu_events WHERE event_key = ?",
             params![event_key],
@@ -583,7 +592,7 @@ impl FeishuStore {
 
     /// Update event status
     pub fn update_event_status(&self, event_key: &str, status: EventStatus) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -596,7 +605,7 @@ impl FeishuStore {
 
     /// Insert a new job
     pub fn insert_job(&self, job: &FeishuJobInput) -> Result<FeishuJob, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -647,7 +656,7 @@ impl FeishuStore {
 
     /// Update job status to processing
     pub fn job_start_processing(&self, job_id: &str, instance_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -677,7 +686,7 @@ impl FeishuStore {
 
     /// Mark job as completed
     pub fn job_completed(&self, job_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -702,7 +711,7 @@ impl FeishuStore {
 
     /// Mark job as failed
     pub fn job_failed(&self, job_id: &str, error_code: &str, error_message: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -729,7 +738,7 @@ impl FeishuStore {
 
     /// Get pending jobs for recovery
     pub fn get_recoverable_jobs(&self) -> Result<Vec<FeishuJob>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         let stale_threshold = now - 300; // 5 minutes
         
@@ -776,7 +785,7 @@ impl FeishuStore {
 
     /// Insert outbound message
     pub fn insert_outbox(&self, outbox: &FeishuOutboxInput) -> Result<FeishuOutbox, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         // Privacy guard: truncate reply to preview only (max 120 chars)
@@ -837,7 +846,7 @@ impl FeishuStore {
     /// Insert outbound as abandoned (cannot retry due to privacy)
     /// Used for LLM replies that we cannot reconstruct
     pub fn insert_outbox_abandoned(&self, outbox: &FeishuOutboxInput, reason: &str) -> Result<FeishuOutbox, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         let reply_hash = outbox.reply.as_ref().map(|r| Self::hash_text(r));
@@ -898,7 +907,7 @@ impl FeishuStore {
 
     /// Mark outbound as sent
     pub fn outbox_sent(&self, outbound_id: &str, platform_message_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -925,7 +934,7 @@ impl FeishuStore {
 
     /// Mark outbound as sending
     pub fn outbox_sending(&self, outbound_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -948,7 +957,7 @@ impl FeishuStore {
 
     /// Mark outbound as failed
     pub fn outbox_failed(&self, outbound_id: &str, error_code: &str, error_message: &str) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         // Get current attempts
@@ -1004,7 +1013,7 @@ impl FeishuStore {
     /// Mark outbox as RETRYABLE: this is a template or restructurable reply
     /// that can be sent again on recovery.
     pub fn outbox_mark_retryable(&self, outbound_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -1034,7 +1043,7 @@ impl FeishuStore {
     /// Mark outbox as FAILED_PRIVACY_NO_RETRY: the reply content cannot be reconstructed
     /// due to privacy policy (e.g., free-form LLM reply).
     pub fn outbox_mark_failed_privacy(&self, outbound_id: &str, reason: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -1061,9 +1070,104 @@ impl FeishuStore {
         Ok(())
     }
 
+    /// Mark outbox as FAILED_RECONSTRUCT_INCOMPLETE because reconstruction
+    /// of reply body failed (e.g., result_json missing required fields).
+    /// Never pretend to retry - we cannot send a fake reply.
+    pub fn outbox_mark_reconstruct_incomplete(&self, outbound_id: &str, reason: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        let now = chrono_timestamp();
+        
+        conn.execute(
+            r#"
+            UPDATE feishu_outbox SET 
+                status = ?,
+                attempts = 0,
+                next_attempt_at = NULL,
+                error_code = 'reconstruct_incomplete',
+                error_message = ?,
+                updated_at = ?
+            WHERE outbound_id = ?
+            "#,
+            params![
+                OutboxStatus::FailedReconstructIncomplete.as_str(),
+                reason,
+                now,
+                outbound_id,
+            ],
+        )?;
+        
+        println!("[feishu-outbox] reconstruct_incomplete outbound_id={} reason={}", outbound_id, reason);
+        
+        Ok(())
+    }
+
+    /// Increment attempts and set status to SENDING for a retry attempt.
+    /// Returns true if the retry is allowed (attempts < max_attempts), false otherwise.
+    pub fn outbox_begin_retry(&self, outbound_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        let now = chrono_timestamp();
+        
+        // Read current state
+        let (attempts, max_attempts, status, sent): (i32, i32, String, Option<String>) = conn.query_row(
+            "SELECT attempts, max_attempts, status, platform_message_id FROM feishu_outbox WHERE outbound_id = ?",
+            params![outbound_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        
+        // If already SENT with platform_message_id, do not retry
+        if status == OutboxStatus::Sent.as_str() && sent.is_some() && !sent.as_deref().unwrap_or("").is_empty() && sent.as_deref() != Some(&"skipped".to_string()) {
+            return Ok(false);
+        }
+        
+        let new_attempts = attempts + 1;
+        if new_attempts > max_attempts {
+            // Mark as DEAD
+            conn.execute(
+                r#"
+                UPDATE feishu_outbox SET 
+                    status = ?,
+                    attempts = ?,
+                    next_attempt_at = NULL,
+                    error_code = 'max_attempts_exceeded',
+                    updated_at = ?
+                WHERE outbound_id = ?
+                "#,
+                params![
+                    OutboxStatus::Dead.as_str(),
+                    new_attempts,
+                    now,
+                    outbound_id,
+                ],
+            )?;
+            println!("[feishu-retry] max_attempts_exceeded outbound_id={} attempts={}", outbound_id, new_attempts);
+            return Ok(false);
+        }
+        
+        // Set to SENDING, increment attempts
+        conn.execute(
+            r#"
+            UPDATE feishu_outbox SET 
+                status = ?,
+                attempts = ?,
+                updated_at = ?
+            WHERE outbound_id = ?
+            "#,
+            params![
+                OutboxStatus::Sending.as_str(),
+                new_attempts,
+                now,
+                outbound_id,
+            ],
+        )?;
+        
+        println!("[feishu-retry] sending outbound_id={} attempts={}", outbound_id, new_attempts);
+        
+        Ok(true)
+    }
+
     /// Get outbox by outbound_id
     pub fn get_outbox(&self, outbound_id: &str) -> Result<Option<FeishuOutbox>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let mut stmt = conn.prepare(
             r#"
             SELECT id, outbound_id, job_id, event_key, channel, chat_id, reply_kind, status,
@@ -1104,7 +1208,7 @@ impl FeishuStore {
 
     /// Get pending outbox items for recovery
     pub fn get_recoverable_outbox(&self) -> Result<Vec<FeishuOutbox>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         let mut stmt = conn.prepare(
@@ -1151,7 +1255,7 @@ impl FeishuStore {
 
     /// Get job by job_id
     pub fn get_job(&self, job_id: &str) -> Result<Option<FeishuJob>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         
         let job = conn.query_row(
             r#"
@@ -1189,10 +1293,53 @@ impl FeishuStore {
         
         Ok(job)
     }
+
+    /// Get the latest job for an event_key (most recent one by created_at).
+    /// Used to check job status on duplicate events.
+    pub fn get_job_by_event_key(&self, event_key: &str) -> Result<Option<FeishuJob>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
+        
+        let job = conn.query_row(
+            r#"
+            SELECT id, job_id, event_key, channel, mode, slash_command, status,
+                   attempts, max_attempts, next_attempt_at, locked_at, locked_by,
+                   created_at, updated_at, started_at, completed_at, error_code, 
+                   error_message, payload_json
+            FROM feishu_jobs WHERE event_key = ?
+            ORDER BY created_at DESC LIMIT 1
+            "#,
+            params![event_key],
+            |row| {
+                Ok(FeishuJob {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    event_key: row.get(2)?,
+                    channel: row.get(3)?,
+                    mode: row.get(4)?,
+                    slash_command: row.get(5)?,
+                    status: JobStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(JobStatus::Pending),
+                    attempts: row.get(7)?,
+                    max_attempts: row.get(8)?,
+                    next_attempt_at: row.get(9)?,
+                    locked_at: row.get(10)?,
+                    locked_by: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
+                    started_at: row.get(14)?,
+                    completed_at: row.get(15)?,
+                    error_code: row.get(16)?,
+                    error_message: row.get(17)?,
+                    payload_json: row.get(18)?,
+                })
+            },
+        ).optional()?;
+        
+        Ok(job)
+    }
     
     /// Mark outbound as abandoned during recovery (no reply content to resend)
     pub fn outbox_abandon(&self, outbound_id: &str, reason: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -1219,7 +1366,7 @@ impl FeishuStore {
     
     /// Mark job as dead during recovery
     pub fn job_abandon(&self, job_id: &str, reason: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| StoreError::PoisonedLock)?;
         let now = chrono_timestamp();
         
         conn.execute(
@@ -1538,10 +1685,80 @@ mod tests {
     
     #[test]
     fn test_text_preview_truncation() {
+        // ASCII test
         let long_text = "A".repeat(200);
         let preview = FeishuStore::truncate_preview(&long_text, 80);
         assert_eq!(preview.len(), 80);
         assert!(preview.ends_with("..."));
+    }
+    
+    #[test]
+    fn test_chinese_text_truncation() {
+        // Chinese characters (3 bytes each in UTF-8)
+        let chinese = "你好世界这是一个测试".repeat(10);
+        let preview = FeishuStore::truncate_preview(&chinese, 80);
+        // Should NOT panic and should be at most 80 chars + "..."
+        let char_count = preview.chars().count();
+        assert!(char_count <= 83); // 80 chars + "..."
+        assert!(preview.ends_with("...") || preview.chars().count() <= 80);
+    }
+    
+    #[test]
+    fn test_emoji_truncation() {
+        // Emoji characters (4 bytes each in UTF-8)
+        let emoji = "🎉🎊🎈".repeat(30);
+        let preview = FeishuStore::truncate_preview(&emoji, 80);
+        // Should NOT panic
+        let char_count = preview.chars().count();
+        assert!(char_count <= 83);
+    }
+    
+    #[test]
+    fn test_mixed_cjk_truncation() {
+        // Mixed Chinese + English + Emoji
+        let mixed = "你好hello🎉world世界test123emoji😀中文测试".repeat(10);
+        let preview = FeishuStore::truncate_preview(&mixed, 80);
+        // Should NOT panic
+        let char_count = preview.chars().count();
+        assert!(char_count <= 83);
+        assert!(preview.ends_with("...") || preview.chars().count() <= 80);
+    }
+    
+    #[test]
+    fn test_text_preview_exact_boundary() {
+        // Exactly 80 characters - should not truncate
+        let text = "A".repeat(80);
+        let preview = FeishuStore::truncate_preview(&text, 80);
+        assert_eq!(preview.len(), 80);
+        assert!(!preview.ends_with("..."));
+    }
+    
+    #[test]
+    fn test_text_preview_under_limit() {
+        // Under 80 chars - should not truncate
+        let text = "短文本";
+        let preview = FeishuStore::truncate_preview(&text, 80);
+        assert_eq!(preview, text);
+    }
+    
+    #[test]
+    fn test_reply_preview_120_chars() {
+        // reply_preview should be max 120 chars
+        let long = "A".repeat(200);
+        let preview = FeishuStore::truncate_preview(&long, 120);
+        let char_count = preview.chars().count();
+        assert!(char_count <= 123); // 120 + "..."
+        assert!(preview.ends_with("..."));
+    }
+    
+    #[test]
+    fn test_reply_preview_chinese() {
+        // Chinese text for reply_preview
+        let chinese = "这是一段很长的中文文本用于测试预览截断功能是否正常工作".repeat(5);
+        let preview = FeishuStore::truncate_preview(&chinese, 120);
+        // Should NOT panic
+        let char_count = preview.chars().count();
+        assert!(char_count <= 123);
     }
     
     #[test]
@@ -2063,5 +2280,281 @@ mod tests {
         
         let retrieved = store.get_outbox("out_monitor").unwrap().unwrap();
         assert!(retrieved.result_json.is_some());
+    }
+    
+    // ========== Retry worker integration tests (v0.8.7.5.2) ==========
+    
+    #[test]
+    fn test_outbox_begin_retry_increments_attempts() {
+        let store = create_test_store();
+        
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_retry_attempts".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // Begin retry
+        let can_retry = store.outbox_begin_retry("out_retry_attempts").unwrap();
+        assert!(can_retry);
+        
+        // Should now be SENDING with attempts=1
+        let item = store.get_outbox("out_retry_attempts").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::Sending);
+        assert_eq!(item.attempts, 1);
+    }
+    
+    #[test]
+    fn test_outbox_begin_retry_max_attempts_dead() {
+        let store = create_test_store();
+        
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_max_attempts".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // Simulate 3 attempts (max is 3)
+        for _ in 0..3 {
+            let _ = store.outbox_begin_retry("out_max_attempts").unwrap();
+            let _ = store.outbox_sent("out_max_attempts", "skipped"); // Reset to SENT then back to PENDING
+            let _ = store.outbox_failed("out_max_attempts", "test_error", "fail");
+        }
+        
+        // Next begin_retry should mark as DEAD
+        let can_retry = store.outbox_begin_retry("out_max_attempts").unwrap();
+        assert!(!can_retry);
+        
+        let item = store.get_outbox("out_max_attempts").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::Dead);
+    }
+    
+    #[test]
+    fn test_outbox_begin_retry_skips_already_sent() {
+        let store = create_test_store();
+        
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_already_sent".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // Mark as SENT with valid platform_message_id
+        store.outbox_sent("out_already_sent", "feishu_msg_123").unwrap();
+        
+        // Begin retry should not be allowed
+        let can_retry = store.outbox_begin_retry("out_already_sent").unwrap();
+        assert!(!can_retry);
+    }
+    
+    #[test]
+    fn test_outbox_reconstruct_incomplete_for_missing_result_json() {
+        let store = create_test_store();
+        
+        // monitor_final without result_json
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_monitor_no_json".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("monitor_final".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        store.outbox_mark_reconstruct_incomplete("out_monitor_no_json", "missing_result_json").unwrap();
+        
+        let item = store.get_outbox("out_monitor_no_json").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::FailedReconstructIncomplete);
+        assert_eq!(item.error_code, Some("reconstruct_incomplete".to_string()));
+    }
+    
+    #[test]
+    fn test_retry_classifies_retryable_kinds() {
+        use crate::gateway::feishu_worker;
+        
+        let retryable_kinds = [
+            "progress_reply",
+            "timeout_reply",
+            "failure_reply",
+            "chat_only_blocked_reply",
+            "unsupported_reply",
+            "monitor_final",
+        ];
+        
+        for kind_str in retryable_kinds.iter() {
+            let kind = ReplyKind::from_str(kind_str);
+            assert!(kind.is_some(), "Kind {} should be parseable", kind_str);
+            
+            // Skip monitor_final because it requires result_json
+            if matches!(kind, Some(ReplyKind::MonitorFinal)) {
+                let result = feishu_worker::reconstruct_reply(kind.unwrap(), None, None);
+                assert!(result.is_none(), "monitor_final without json should be None");
+            } else {
+                let result = feishu_worker::reconstruct_reply(kind.unwrap(), None, None);
+                assert!(result.is_some(), "Template kind {} should be reconstructible", kind_str);
+            }
+        }
+    }
+    
+    #[test]
+    fn test_retry_classifies_llm_final_as_audit_only() {
+        let store = create_test_store();
+        
+        // Insert llm_final outbox
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_llm_audit".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("llm_final".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // Get recoverable outbox (should include this PENDING one)
+        let recoverable = store.get_recoverable_outbox().unwrap();
+        let item = recoverable.iter().find(|o| o.outbound_id == "out_llm_audit").unwrap();
+        
+        // LLM final is NOT retryable
+        let kind = item.reply_kind.as_deref()
+            .and_then(ReplyKind::from_str);
+        assert_eq!(kind, Some(ReplyKind::LlmFinal));
+        assert!(!kind.unwrap().is_retryable());
+        
+        // Mark as FAILED_PRIVACY_NO_RETRY
+        store.outbox_mark_failed_privacy("out_llm_audit", "llm_reply_not_reconstructible").unwrap();
+        
+        let item = store.get_outbox("out_llm_audit").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::FailedPrivacyNoRetry);
+    }
+    
+    #[test]
+    fn test_retry_full_state_machine_template_reply() {
+        let store = create_test_store();
+        
+        // Insert timeout_reply as PENDING
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_template_state".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // 1. Begin retry: SENDING
+        assert!(store.outbox_begin_retry("out_template_state").unwrap());
+        assert_eq!(
+            store.get_outbox("out_template_state").unwrap().unwrap().status,
+            OutboxStatus::Sending
+        );
+        
+        // 2. Success: SENT
+        store.outbox_sent("out_template_state", "feishu_msg_456").unwrap();
+        let item = store.get_outbox("out_template_state").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::Sent);
+        assert_eq!(item.platform_message_id, Some("feishu_msg_456".to_string()));
+    }
+    
+    #[test]
+    fn test_retry_failure_transitions_to_failed() {
+        let store = create_test_store();
+        
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_failure_transition".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("timeout_reply".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        store.outbox_begin_retry("out_failure_transition").unwrap();
+        // Simulate send failure
+        let retryable = store.outbox_failed("out_failure_transition", "send_error", "Connection lost").unwrap();
+        assert!(retryable);
+        
+        let item = store.get_outbox("out_failure_transition").unwrap().unwrap();
+        assert_eq!(item.status, OutboxStatus::Failed);
+        assert!(item.next_attempt_at.is_some());
+    }
+    
+    #[test]
+    fn test_retry_does_not_send_audit_only() {
+        let store = create_test_store();
+        
+        // Insert llm_final
+        let outbox_input = FeishuOutboxInput {
+            outbound_id: "out_audit_no_send".to_string(),
+            job_id: None,
+            event_key: None,
+            channel: "feishu".to_string(),
+            chat_id: Some("chat_x".to_string()),
+            reply_kind: Some("llm_final".to_string()),
+            reply: None,
+            result_json: None,
+        };
+        store.insert_outbox(&outbox_input).unwrap();
+        
+        // outbox_begin_retry should still technically work, but the retry worker
+        // should classify LLM final as audit-only BEFORE calling begin_retry.
+        // The classification logic is in run_retry_worker_once which is harder to unit test
+        // without a full runtime. Here we test that the kind classification works.
+        let item = store.get_outbox("out_audit_no_send").unwrap().unwrap();
+        let kind = item.reply_kind.as_deref().and_then(ReplyKind::from_str);
+        assert_eq!(kind, Some(ReplyKind::LlmFinal));
+        assert!(!kind.unwrap().is_retryable());
+    }
+    
+    #[test]
+    fn test_status_enum_string_round_trip_includes_reconstruct_incomplete() {
+        use std::str::FromStr;
+        
+        let statuses = [
+            OutboxStatus::Pending,
+            OutboxStatus::Sending,
+            OutboxStatus::Sent,
+            OutboxStatus::Failed,
+            OutboxStatus::Dead,
+            OutboxStatus::Skipped,
+            OutboxStatus::Abandoned,
+            OutboxStatus::FailedPrivacyNoRetry,
+            OutboxStatus::FailedReconstructIncomplete,
+        ];
+        
+        for status in statuses.iter() {
+            let s = status.as_str();
+            let parsed = OutboxStatus::from_str(s);
+            assert_eq!(parsed, Some(*status), "Round-trip failed for {}", s);
+        }
     }
 }
