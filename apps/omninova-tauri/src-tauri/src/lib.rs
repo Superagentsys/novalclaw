@@ -373,6 +373,26 @@ struct SetupChannelEntry {
     clear_app_secret: bool,
 }
 
+const SETUP_SENSITIVE_VALUE_MARKER: &str = "***SET***";
+const SETUP_CLEAR_SENSITIVE_FIELDS_KEY: &str = "__clear_sensitive_fields";
+const SETUP_SENSITIVE_EXTRA_FIELDS: [&str; 3] = [
+    "app_secret",
+    "verification_token",
+    "encrypt_key",
+];
+
+fn is_real_sensitive_value(value: &str) -> bool {
+    !value.trim().is_empty() && value != SETUP_SENSITIVE_VALUE_MARKER
+}
+
+fn setup_requests_sensitive_clear(extra: &HashMap<String, serde_json::Value>, field: &str) -> bool {
+    extra
+        .get(SETUP_CLEAR_SENSITIVE_FIELDS_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(|fields| fields.split(',').any(|item| item.trim() == field))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct GatewayStatusPayload {
     running: bool,
@@ -524,6 +544,8 @@ async fn open_workspace_dir(
 #[tauri::command]
 async fn save_setup_config(
     config: SetupAppConfig,
+    validate_all_channels: Option<bool>,
+    active_channel_id: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<SaveSetupResult, String> {
     let state_ref = state.inner().clone();
@@ -537,7 +559,12 @@ async fn save_setup_config(
     let current = runtime.get_config().await;
     let current_gateway_url = format!("http://{}:{}", current.gateway.host, current.gateway.port);
     let current_workspace_dir = current.workspace_dir.clone();
-    let mut next = setup_config_to_core(current, config)?;
+    let validation_scope = if validate_all_channels.unwrap_or(false) {
+        ChannelValidationScope::AllEnabled
+    } else {
+        ChannelValidationScope::Current(active_channel_id.as_deref().unwrap_or("feishu"))
+    };
+    let mut next = setup_config_to_core(current, config, validation_scope)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
     let workspace_changed = current_workspace_dir != next.workspace_dir;
 
@@ -983,6 +1010,27 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
     }
 }
 
+fn enabled_channel_names(channels: &ChannelsConfig) -> Vec<&'static str> {
+    [
+        ("telegram", channels.telegram.as_ref()),
+        ("discord", channels.discord.as_ref()),
+        ("slack", channels.slack.as_ref()),
+        ("whatsapp", channels.whatsapp.as_ref()),
+        ("wechat", channels.wechat.as_ref()),
+        ("feishu", channels.feishu.as_ref()),
+        ("lark", channels.lark.as_ref()),
+        ("dingtalk", channels.dingtalk.as_ref()),
+        ("matrix", channels.matrix.as_ref()),
+        ("email", channels.email.as_ref()),
+        ("msteams", channels.msteams.as_ref()),
+        ("irc", channels.irc.as_ref()),
+        ("webhook", channels.webhook.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, entry)| entry.filter(|entry| entry.enabled).map(|_| name))
+    .collect()
+}
+
 /// 启动本机 HTTP 网关（与 `omninova` CLI 使用同一配置与端口，便于后台常驻后命令行调用）。
 async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayStatusPayload, String> {
     sync_gateway_task_state(&state_ref).await;
@@ -1006,6 +1054,12 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
     if cfg.gateway.host.is_empty() {
         return Err("Gateway 启动失败：主机配置无效（host 不能为空）。请检查配置中的 gateway.host。".to_string());
     }
+    validate_persisted_feishu_like_channels(&cfg.channels_config)
+        .map_err(|error| format!("Gateway 启动失败：{error}"))?;
+    eprintln!(
+        "[gateway] enabled_channels={:?}",
+        enabled_channel_names(&cfg.channels_config)
+    );
 
     // Check if already running
     {
@@ -1353,18 +1407,43 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
 
 fn channel_entry_from_core(entry: &Option<ChannelEntry>) -> Option<SetupChannelEntry> {
     let entry = entry.as_ref()?;
-    
-    // Mask sensitive extra fields (app_secret) - don't send to frontend
+
+    // Never send channel secrets to the renderer. Keep a marker so an
+    // unrelated settings save preserves the stored value.
     let mut masked_extra = entry.extra.clone();
-    if masked_extra.contains_key("app_secret") {
-        // Check if it's a non-empty value
-        if masked_extra.get("app_secret")
+    for key in ["app_secret", "verification_token", "encrypt_key"] {
+        if masked_extra
+            .get(key)
             .and_then(|v| v.as_str())
             .map(|s| !s.trim().is_empty())
-            .unwrap_or(false) 
+            .unwrap_or(false)
         {
-            // Replace with a marker indicating it's set
-            masked_extra.insert("app_secret".to_string(), serde_json::Value::String("***SET***".to_string()));
+            masked_extra.insert(
+                key.to_string(),
+                serde_json::Value::String(SETUP_SENSITIVE_VALUE_MARKER.to_string()),
+            );
+        }
+    }
+    // Accept the typed core fields introduced for webhook security as well as
+    // legacy extra fields, while keeping the UI transport backwards compatible.
+    for (key, value) in [
+        ("verification_token", entry.verification_token.as_ref()),
+        ("verification_token_env", entry.verification_token_env.as_ref()),
+        ("encrypt_key", entry.encrypt_key.as_ref()),
+        ("encrypt_key_env", entry.encrypt_key_env.as_ref()),
+    ] {
+        if !masked_extra.contains_key(key) && value.is_some_and(|v| !v.trim().is_empty()) {
+            let value = if key.ends_with("_env") {
+                value.expect("checked above").clone()
+            } else {
+                SETUP_SENSITIVE_VALUE_MARKER.to_string()
+            };
+            masked_extra.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if !masked_extra.contains_key("security_mode") {
+        if let Some(mode) = entry.security_mode.as_ref().filter(|v| !v.trim().is_empty()) {
+            masked_extra.insert("security_mode".to_string(), serde_json::Value::String(mode.clone()));
         }
     }
     
@@ -1445,9 +1524,16 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ChannelValidationScope<'a> {
+    Current(&'a str),
+    AllEnabled,
+}
+
 fn setup_config_to_core(
     mut current: Config,
     setup: SetupAppConfig,
+    channel_validation_scope: ChannelValidationScope<'_>,
 ) -> Result<Config, String> {
     current.api_key = normalize_optional_string(setup.api_key);
     current.api_url = normalize_optional_string(setup.api_url);
@@ -1508,13 +1594,13 @@ fn setup_config_to_core(
         })
         .collect::<HashMap<_, _>>();
 
-    // Validate enabled Feishu/Lark channels have required extra fields
-    if let Some(ref channels) = setup.channels {
-        validate_feishu_like_channels(channels)?;
-    }
-
     if let Some(channels) = setup.channels {
-        current.channels_config = channels_to_core(channels, &current.channels_config);
+        let next_channels = channels_to_core(channels, &current.channels_config);
+        // Validate the merged config, not the renderer DTO. This lets an
+        // unchanged `***SET***` marker safely preserve the real stored value
+        // while still rejecting a marker with no corresponding secret.
+        validate_persisted_channels_for_save(&next_channels, channel_validation_scope)?;
+        current.channels_config = next_channels;
     }
 
     // Persist per-agent workspace_dir to the agents HashMap.
@@ -1755,42 +1841,84 @@ fn channel_entry_to_core(
     let entry = entry?;
     if !entry.enabled && entry.token.is_none() && entry.token_env.is_none() && entry.extra.is_empty()
     {
-        return None;
+        // A disabled channel may still have credentials saved from an earlier
+        // setup. Keep them so “关闭 Lark” never silently deletes them.
+        return existing.cloned().map(|mut existing| {
+            existing.enabled = false;
+            existing
+        });
     }
     
-    // Start with existing extra, then overlay new values
+    // Start with existing extra, then overlay new values. A stale UI marker
+    // from an older config is never a usable secret and must not survive.
     let mut merged_extra = existing
         .as_ref()
         .map(|e| e.extra.clone())
         .unwrap_or_default();
-    
-    for (key, value) in entry.extra {
-        let value_str = value.as_str().unwrap_or("");
-        
-        // Handle app_secret specially:
-        // - If value is ***SET***, keep existing (user didn't modify)
-        // - If value is empty and existing has real secret, keep existing (preservation)
-        // - If value is empty and no existing, remove the key
-        // - If clear_app_secret is true, explicitly remove app_secret
-        if key == "app_secret" {
-            if value_str == "***SET***" {
-                // User didn't modify, keep existing
-                continue;
-            }
-            if value_str.is_empty() {
-                // User cleared or left empty
-                if merged_extra.get("app_secret")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty() && s != "***SET***")
-                    .unwrap_or(false) 
-                {
-                    // Existing has real value and user cleared - preserve it unless clear_app_secret is set
-                    if !entry.clear_app_secret {
-                        continue;
-                    }
-                    // clear_app_secret is set, proceed to remove
+    for key in SETUP_SENSITIVE_EXTRA_FIELDS {
+        if merged_extra
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !is_real_sensitive_value(value))
+        {
+            merged_extra.remove(key);
+        }
+    }
+    if let Some(existing) = existing {
+        for (key, value) in [
+            ("verification_token", existing.verification_token.as_ref()),
+            ("verification_token_env", existing.verification_token_env.as_ref()),
+            ("encrypt_key", existing.encrypt_key.as_ref()),
+            ("encrypt_key_env", existing.encrypt_key_env.as_ref()),
+        ] {
+            if !merged_extra.contains_key(key) {
+                if let Some(value) = value.filter(|value| is_real_sensitive_value(value)) {
+                    merged_extra.insert(key.to_string(), serde_json::Value::String(value.clone()));
                 }
             }
+        }
+        if !merged_extra.contains_key("security_mode") {
+            if let Some(mode) = existing.security_mode.as_ref().filter(|v| !v.trim().is_empty()) {
+                merged_extra.insert("security_mode".to_string(), serde_json::Value::String(mode.clone()));
+            }
+        }
+    }
+    
+    let clear_verification_token = setup_requests_sensitive_clear(&entry.extra, "verification_token");
+    let clear_encrypt_key = setup_requests_sensitive_clear(&entry.extra, "encrypt_key");
+
+    for (key, value) in entry.extra {
+        if key == SETUP_CLEAR_SENSITIVE_FIELDS_KEY {
+            continue;
+        }
+        let value_str = value.as_str().unwrap_or("");
+
+        let explicit_clear = match key.as_str() {
+            "app_secret" => entry.clear_app_secret,
+            "verification_token" => clear_verification_token,
+            "encrypt_key" => clear_encrypt_key,
+            _ => false,
+        };
+        if SETUP_SENSITIVE_EXTRA_FIELDS.contains(&key.as_str()) {
+            if explicit_clear {
+                merged_extra.remove(&key);
+            } else if is_real_sensitive_value(value_str) {
+                merged_extra.insert(key, value);
+            }
+            continue;
+        }
+
+        if key == "public_webhook_base_url" {
+            let normalized = value_str.trim().trim_end_matches('/');
+            let base_url = normalized
+                .strip_suffix("/webhook/feishu")
+                .unwrap_or(normalized);
+            if base_url.is_empty() {
+                merged_extra.remove(&key);
+            } else {
+                merged_extra.insert(key, serde_json::Value::String(base_url.to_string()));
+            }
+            continue;
         }
         
         // For other fields, empty value means "clear this field"
@@ -1805,13 +1933,34 @@ fn channel_entry_to_core(
     if entry.clear_app_secret {
         merged_extra.remove("app_secret");
     }
+    if clear_verification_token {
+        merged_extra.remove("verification_token");
+    }
+    if clear_encrypt_key {
+        merged_extra.remove("encrypt_key");
+    }
     
     Some(ChannelEntry {
         enabled: entry.enabled,
         token: normalize_optional_string(entry.token),
         token_env: normalize_optional_string(entry.token_env),
+        security_mode: None,
+        verification_token: None,
+        verification_token_env: None,
+        encrypt_key: None,
+        encrypt_key_env: None,
         extra: merged_extra,
     })
+}
+
+fn merge_channel_entry(
+    entry: Option<SetupChannelEntry>,
+    existing: Option<&ChannelEntry>,
+) -> Option<ChannelEntry> {
+    match entry {
+        Some(entry) => channel_entry_to_core(Some(entry), existing),
+        None => existing.cloned(),
+    }
 }
 
 /// Validate that enabled Feishu/Lark channels have required extra fields
@@ -1900,19 +2049,19 @@ fn validate_feishu_like_channels(channels: &SetupChannelsConfig) -> Result<(), S
 
 fn channels_to_core(setup: SetupChannelsConfig, current: &ChannelsConfig) -> ChannelsConfig {
     ChannelsConfig {
-        telegram: channel_entry_to_core(setup.telegram, current.telegram.as_ref()),
-        discord: channel_entry_to_core(setup.discord, current.discord.as_ref()),
-        slack: channel_entry_to_core(setup.slack, current.slack.as_ref()),
-        whatsapp: channel_entry_to_core(setup.whatsapp, current.whatsapp.as_ref()),
-        wechat: channel_entry_to_core(setup.wechat, current.wechat.as_ref()),
-        feishu: channel_entry_to_core(setup.feishu, current.feishu.as_ref()),
-        lark: channel_entry_to_core(setup.lark, current.lark.as_ref()),
-        dingtalk: channel_entry_to_core(setup.dingtalk, current.dingtalk.as_ref()),
-        matrix: channel_entry_to_core(setup.matrix, current.matrix.as_ref()),
-        email: channel_entry_to_core(setup.email, current.email.as_ref()),
-        msteams: channel_entry_to_core(setup.msteams, current.msteams.as_ref()),
-        irc: channel_entry_to_core(setup.irc, current.irc.as_ref()),
-        webhook: channel_entry_to_core(setup.webhook, current.webhook.as_ref()),
+        telegram: merge_channel_entry(setup.telegram, current.telegram.as_ref()),
+        discord: merge_channel_entry(setup.discord, current.discord.as_ref()),
+        slack: merge_channel_entry(setup.slack, current.slack.as_ref()),
+        whatsapp: merge_channel_entry(setup.whatsapp, current.whatsapp.as_ref()),
+        wechat: merge_channel_entry(setup.wechat, current.wechat.as_ref()),
+        feishu: merge_channel_entry(setup.feishu, current.feishu.as_ref()),
+        lark: merge_channel_entry(setup.lark, current.lark.as_ref()),
+        dingtalk: merge_channel_entry(setup.dingtalk, current.dingtalk.as_ref()),
+        matrix: merge_channel_entry(setup.matrix, current.matrix.as_ref()),
+        email: merge_channel_entry(setup.email, current.email.as_ref()),
+        msteams: merge_channel_entry(setup.msteams, current.msteams.as_ref()),
+        irc: merge_channel_entry(setup.irc, current.irc.as_ref()),
+        webhook: merge_channel_entry(setup.webhook, current.webhook.as_ref()),
         // Preserve unknown channels that frontend doesn't know about
         google_chat: current.google_chat.clone(),
         signal: current.signal.clone(),
@@ -2304,6 +2453,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("old"));
@@ -2370,6 +2524,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("webhook_url".to_string(), serde_json::json!("https://chat.google.com/webhook"));
@@ -2410,6 +2569,34 @@ mod channel_tests {
         );
     }
 
+    #[test]
+    fn test_saving_feishu_preserves_an_omitted_lark_channel() {
+        let existing = ChannelsConfig {
+            lark: Some(ChannelEntry {
+                enabled: true,
+                extra: HashMap::from([
+                    ("app_id".to_string(), serde_json::json!("lark_app")),
+                    ("app_secret".to_string(), serde_json::json!("saved-secret")),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let setup = SetupChannelsConfig {
+            feishu: Some(setup_feishu_security_entry("dev", None, None, None)),
+            ..Default::default()
+        };
+
+        let saved = channels_to_core(setup, &existing);
+        let lark = saved.lark.expect("omitted Lark must be preserved");
+        assert!(lark.enabled);
+        assert_eq!(lark.extra.get("app_id"), Some(&serde_json::json!("lark_app")));
+        assert_eq!(
+            lark.extra.get("app_secret"),
+            Some(&serde_json::json!("saved-secret"))
+        );
+    }
+
     /// Test 4: Disabled channel with empty fields should return None
     #[test]
     fn test_disabled_empty_channel_returns_none() {
@@ -2423,6 +2610,54 @@ mod channel_tests {
 
         let core_entry = channel_entry_to_core(Some(setup_entry), None);
         assert!(core_entry.is_none());
+    }
+
+    #[test]
+    fn test_disabling_existing_lark_preserves_its_credentials() {
+        let existing = ChannelEntry {
+            enabled: true,
+            extra: HashMap::from([
+                ("app_id".to_string(), serde_json::json!("lark_app")),
+                ("app_secret".to_string(), serde_json::json!("saved-secret")),
+            ]),
+            ..Default::default()
+        };
+        let disabled = SetupChannelEntry {
+            enabled: false,
+            token: None,
+            token_env: None,
+            extra: HashMap::new(),
+            clear_app_secret: false,
+        };
+
+        let saved = channel_entry_to_core(Some(disabled), Some(&existing))
+            .expect("disabled existing channel should remain configured");
+        assert!(!saved.enabled);
+        assert_eq!(saved.extra.get("app_id"), Some(&serde_json::json!("lark_app")));
+        assert_eq!(
+            saved.extra.get("app_secret"),
+            Some(&serde_json::json!("saved-secret"))
+        );
+    }
+
+    #[test]
+    fn test_lark_is_disabled_by_default() {
+        let channels = ChannelsConfig::default();
+        assert!(!channels.lark.as_ref().is_some_and(|entry| entry.enabled));
+        assert!(!enabled_channel_names(&channels).contains(&"lark"));
+    }
+
+    #[test]
+    fn test_feishu_only_enabled_channel_list_does_not_include_lark() {
+        let channels = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("dev", None, None)),
+            lark: Some(ChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(enabled_channel_names(&channels), vec!["feishu"]);
     }
 
     /// Test 5: Enabled channel with only extra should be saved
@@ -2566,6 +2801,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("webhook_path".to_string(), serde_json::json!("/webhook/feishu"));
@@ -2690,6 +2930,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
@@ -2729,6 +2974,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
@@ -2768,6 +3018,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
@@ -2807,6 +3062,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
@@ -2919,6 +3179,11 @@ mod channel_tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("app_id".to_string(), serde_json::json!("cli_test"));
@@ -2942,4 +3207,360 @@ mod channel_tests {
             Some(&serde_json::json!("super_secret_value_123"))
         );
     }
+
+    #[test]
+    fn test_feishu_security_fields_are_masked_and_preserved() {
+        let existing = ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            security_mode: Some("encrypted".to_string()),
+            verification_token: Some("verification-token-must-not-leak".to_string()),
+            verification_token_env: Some("FEISHU_VERIFICATION_TOKEN".to_string()),
+            encrypt_key: Some("encrypt-key-must-not-leak".to_string()),
+            encrypt_key_env: Some("FEISHU_ENCRYPT_KEY".to_string()),
+            extra: HashMap::new(),
+        };
+
+        let setup = channel_entry_from_core(&Some(existing.clone())).expect("setup entry");
+        assert_eq!(setup.extra.get("security_mode"), Some(&serde_json::json!("encrypted")));
+        assert_eq!(setup.extra.get("verification_token"), Some(&serde_json::json!("***SET***")));
+        assert_eq!(setup.extra.get("encrypt_key"), Some(&serde_json::json!("***SET***")));
+        assert_eq!(setup.extra.get("verification_token_env"), Some(&serde_json::json!("FEISHU_VERIFICATION_TOKEN")));
+        assert_eq!(setup.extra.get("encrypt_key_env"), Some(&serde_json::json!("FEISHU_ENCRYPT_KEY")));
+
+        let round_tripped = channel_entry_to_core(Some(setup), Some(&existing)).expect("core entry");
+        assert_eq!(round_tripped.extra.get("verification_token"), Some(&serde_json::json!("verification-token-must-not-leak")));
+        assert_eq!(round_tripped.extra.get("encrypt_key"), Some(&serde_json::json!("encrypt-key-must-not-leak")));
+    }
+
+    fn setup_feishu_security_entry(
+        mode: &str,
+        verification_token: Option<&str>,
+        encrypt_key: Option<&str>,
+        clear_sensitive_fields: Option<&str>,
+    ) -> SetupChannelEntry {
+        let mut extra = HashMap::new();
+        extra.insert("app_id".to_string(), serde_json::json!("test-app"));
+        extra.insert("outbound_mode".to_string(), serde_json::json!("disabled"));
+        extra.insert("security_mode".to_string(), serde_json::json!(mode));
+        if let Some(value) = verification_token {
+            extra.insert("verification_token".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = encrypt_key {
+            extra.insert("encrypt_key".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = clear_sensitive_fields {
+            extra.insert(
+                SETUP_CLEAR_SENSITIVE_FIELDS_KEY.to_string(),
+                serde_json::json!(value),
+            );
+        }
+        SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra,
+            clear_app_secret: false,
+        }
+    }
+
+    fn existing_feishu_security_entry(mode: &str, token: Option<&str>, key: Option<&str>) -> ChannelEntry {
+        let mut extra = HashMap::new();
+        extra.insert("app_id".to_string(), serde_json::json!("test-app"));
+        extra.insert("outbound_mode".to_string(), serde_json::json!("disabled"));
+        extra.insert("security_mode".to_string(), serde_json::json!(mode));
+        if let Some(token) = token {
+            extra.insert("verification_token".to_string(), serde_json::json!(token));
+        }
+        if let Some(key) = key {
+            extra.insert("encrypt_key".to_string(), serde_json::json!(key));
+        }
+        ChannelEntry {
+            enabled: true,
+            extra,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_feishu_verification_token_marker_preserves_old_value() {
+        let existing = existing_feishu_security_entry("token", Some("old-token"), None);
+        let merged = channel_entry_to_core(
+            Some(setup_feishu_security_entry("token", Some(SETUP_SENSITIVE_VALUE_MARKER), None, None)),
+            Some(&existing),
+        )
+        .expect("merged entry");
+
+        assert_eq!(merged.extra.get("verification_token"), Some(&serde_json::json!("old-token")));
+        assert_ne!(merged.extra.get("verification_token"), Some(&serde_json::json!(SETUP_SENSITIVE_VALUE_MARKER)));
+        assert!(validate_persisted_feishu_like_channels(&ChannelsConfig {
+            feishu: Some(merged),
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn test_feishu_encrypt_key_marker_preserves_old_value() {
+        let existing = existing_feishu_security_entry("encrypted", Some("old-token"), Some("old-key"));
+        let merged = channel_entry_to_core(
+            Some(setup_feishu_security_entry(
+                "encrypted",
+                Some(SETUP_SENSITIVE_VALUE_MARKER),
+                Some(SETUP_SENSITIVE_VALUE_MARKER),
+                None,
+            )),
+            Some(&existing),
+        )
+        .expect("merged entry");
+
+        assert_eq!(merged.extra.get("encrypt_key"), Some(&serde_json::json!("old-key")));
+        assert_ne!(merged.extra.get("encrypt_key"), Some(&serde_json::json!(SETUP_SENSITIVE_VALUE_MARKER)));
+    }
+
+    #[test]
+    fn test_feishu_clear_sensitive_fields_removes_old_values() {
+        let existing = existing_feishu_security_entry("encrypted", Some("old-token"), Some("old-key"));
+        let merged = channel_entry_to_core(
+            Some(setup_feishu_security_entry(
+                "dev",
+                Some(SETUP_SENSITIVE_VALUE_MARKER),
+                Some(SETUP_SENSITIVE_VALUE_MARKER),
+                Some("verification_token,encrypt_key"),
+            )),
+            Some(&existing),
+        )
+        .expect("merged entry");
+
+        assert!(!merged.extra.contains_key("verification_token"));
+        assert!(!merged.extra.contains_key("encrypt_key"));
+        assert!(!merged.extra.contains_key(SETUP_CLEAR_SENSITIVE_FIELDS_KEY));
+    }
+
+    #[test]
+    fn test_feishu_security_mode_validation_uses_real_merged_values() {
+        let dev = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("dev", None, None)),
+            ..Default::default()
+        };
+        assert!(validate_persisted_feishu_like_channels(&dev).is_ok());
+
+        let token_missing = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("token", None, None)),
+            ..Default::default()
+        };
+        assert!(validate_persisted_feishu_like_channels(&token_missing).is_err());
+
+        let encrypted_missing_key = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("encrypted", Some("token"), None)),
+            ..Default::default()
+        };
+        assert!(validate_persisted_feishu_like_channels(&encrypted_missing_key).is_err());
+
+        let marker_without_existing = channel_entry_to_core(
+            Some(setup_feishu_security_entry("token", Some(SETUP_SENSITIVE_VALUE_MARKER), None, None)),
+            None,
+        )
+        .expect("entry");
+        assert!(validate_persisted_feishu_like_channels(&ChannelsConfig {
+            feishu: Some(marker_without_existing),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn test_feishu_mode_transitions_do_not_block_dev_startup() {
+        let token_entry = existing_feishu_security_entry("token", Some("saved-token"), None);
+        assert!(validate_persisted_feishu_like_channels(&ChannelsConfig {
+            feishu: Some(token_entry.clone()),
+            ..Default::default()
+        })
+        .is_ok());
+
+        let dev_after_token = channel_entry_to_core(
+            Some(setup_feishu_security_entry("dev", Some(SETUP_SENSITIVE_VALUE_MARKER), None, None)),
+            Some(&token_entry),
+        )
+        .expect("dev entry");
+        assert!(validate_persisted_feishu_like_channels(&ChannelsConfig {
+            feishu: Some(dev_after_token),
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn test_saving_feishu_does_not_validate_another_enabled_lark_channel() {
+        let channels = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("dev", None, None)),
+            lark: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_persisted_channels_for_save(
+            &channels,
+            ChannelValidationScope::Current("feishu"),
+        )
+        .is_ok());
+
+        let error = validate_persisted_channels_for_save(
+            &channels,
+            ChannelValidationScope::AllEnabled,
+        )
+        .expect_err("starting must validate every enabled channel");
+        assert!(error.contains("Lark"));
+        assert!(error.contains("App ID"));
+    }
+
+    #[test]
+    fn test_disabled_lark_does_not_block_feishu_gateway_validation() {
+        let channels = ChannelsConfig {
+            feishu: Some(existing_feishu_security_entry("dev", None, None)),
+            lark: Some(ChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_persisted_feishu_like_channels(&channels).is_ok());
+    }
+
+    #[test]
+    fn test_feishu_missing_app_id_reports_feishu_name() {
+        let channels = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = validate_persisted_feishu_like_channels(&channels)
+            .expect_err("enabled Feishu without an App ID must fail");
+        assert!(error.contains("Feishu"));
+        assert!(error.contains("App ID"));
+    }
+
+    #[test]
+    fn test_public_webhook_base_url_does_not_persist_the_webhook_path() {
+        let entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: HashMap::from([
+                ("app_id".to_string(), serde_json::json!("cli_test")),
+                (
+                    "public_webhook_base_url".to_string(),
+                    serde_json::json!("https://example.test/webhook/feishu"),
+                ),
+            ]),
+            clear_app_secret: false,
+        };
+
+        let saved = channel_entry_to_core(Some(entry), None).expect("channel entry");
+        assert_eq!(
+            saved.extra.get("public_webhook_base_url"),
+            Some(&serde_json::json!("https://example.test")),
+        );
+    }
+}
+
+fn configured_channel_extra(entry: &ChannelEntry, key: &str) -> bool {
+    entry
+        .extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(is_real_sensitive_value)
+        .unwrap_or(false)
+}
+
+fn validate_channel_outbound(entry: &ChannelEntry, name: &str) -> Result<(), String> {
+    let app_id_configured = entry
+        .extra
+        .get("app_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !app_id_configured {
+        return Err(if name == "Lark" {
+            "Lark 已启用但缺少 App ID。请补全 Lark 配置或关闭 Lark。".to_string()
+        } else {
+            format!("启用 {name} 时必须填写 App ID")
+        });
+    }
+
+    let outbound_mode = entry
+        .extra
+        .get("outbound_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("disabled");
+    if matches!(outbound_mode, "real" | "mock")
+        && !configured_channel_extra(entry, "app_secret")
+    {
+        return Err(format!("启用 {name} {outbound_mode} outbound 时必须填写 App Secret"));
+    }
+    Ok(())
+}
+
+fn validate_persisted_channel(channels: &ChannelsConfig, channel_id: &str) -> Result<(), String> {
+    match channel_id {
+        "feishu" => {
+            let Some(feishu) = channels.feishu.as_ref().filter(|entry| entry.enabled) else {
+                return Ok(());
+            };
+            validate_channel_outbound(feishu, "Feishu")?;
+            let mode = feishu
+                .security_mode
+                .as_deref()
+                .or_else(|| {
+                    feishu
+                        .extra
+                        .get("security_mode")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("dev");
+            match mode {
+                "dev" | "" => Ok(()),
+                "token" if configured_channel_extra(feishu, "verification_token") => Ok(()),
+                "token" => Err("Feishu token 模式必须填写 Verification Token".to_string()),
+                "encrypted" if !configured_channel_extra(feishu, "verification_token") => {
+                    Err("Feishu encrypted 模式必须填写 Verification Token".to_string())
+                }
+                "encrypted" if !configured_channel_extra(feishu, "encrypt_key") => {
+                    Err("Feishu encrypted 模式必须填写 Encrypt Key".to_string())
+                }
+                "encrypted" => Ok(()),
+                _ => Err("Feishu security_mode 必须是 dev、token 或 encrypted".to_string()),
+            }
+        }
+        "lark" => {
+            if let Some(lark) = channels.lark.as_ref().filter(|entry| entry.enabled) {
+                validate_channel_outbound(lark, "Lark")?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_persisted_channels_for_save(
+    channels: &ChannelsConfig,
+    scope: ChannelValidationScope<'_>,
+) -> Result<(), String> {
+    match scope {
+        ChannelValidationScope::Current(channel_id) => {
+            validate_persisted_channel(channels, channel_id)
+        }
+        ChannelValidationScope::AllEnabled => validate_persisted_feishu_like_channels(channels),
+    }
+}
+
+fn validate_persisted_feishu_like_channels(channels: &ChannelsConfig) -> Result<(), String> {
+    validate_persisted_channel(channels, "feishu")?;
+    validate_persisted_channel(channels, "lark")
 }

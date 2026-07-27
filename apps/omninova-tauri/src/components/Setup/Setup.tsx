@@ -22,12 +22,30 @@ const SENSITIVE_KEYS = new Set([
   "signing_secret",
   "signing_secret_env",
   "encrypt_key",
+  "encrypt_key_env",
+  "verification_token",
+  "verification_token_env",
+  "authorization",
   "token",
   "token_env",
   "password",
   "api_key",
   "api_key_env",
 ]);
+
+const LARK_BLOCKER_MESSAGE = "Lark 已启用但缺少 App ID。请补全 Lark 配置或关闭 Lark。";
+
+function enabledChannelIds(config: Config): string[] {
+  return Object.entries(config.channels)
+    .filter(([, channel]) => channel?.enabled)
+    .map(([channelId]) => channelId);
+}
+
+function formatGatewayStartError(message: string): string {
+  return message.includes(LARK_BLOCKER_MESSAGE)
+    ? `网关启动被 Lark 配置阻止：${LARK_BLOCKER_MESSAGE}`
+    : message;
+}
 
 /** Redact sensitive values in a JSON object for display */
 function redactSensitiveFields(obj: unknown): unknown {
@@ -73,6 +91,7 @@ const initialConfig: Config = {
     slack: { enabled: false },
     discord: { enabled: false },
     telegram: { enabled: false },
+    lark: { enabled: false },
   },
   skills: {
     open_skills_enabled: true,
@@ -209,6 +228,7 @@ export function Setup({
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
+  const [activeChannelId, setActiveChannelId] = useState("feishu");
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
@@ -336,8 +356,16 @@ export function Setup({
     }
   };
 
-  const saveSetupConfig = async (): Promise<boolean> => {
-    const result = await invokeTauri<{ gateway_restarted: boolean }>("save_setup_config", { config });
+  const saveSetupConfig = async (
+    validateAllChannels: boolean,
+    configToSave = config,
+    channelId = activeChannelId,
+  ): Promise<boolean> => {
+    const result = await invokeTauri<{ gateway_restarted: boolean }>("save_setup_config", {
+      config: configToSave,
+      validateAllChannels,
+      activeChannelId: channelId,
+    });
     const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
     setGatewayStatus(nextGatewayStatus);
     return result?.gateway_restarted ?? false;
@@ -350,7 +378,7 @@ export function Setup({
     }
     setBusyAction("save");
     try {
-      const restarted = await saveSetupConfig();
+      const restarted = await saveSetupConfig(false);
       if (restarted) {
         setActionMessage("Workspace 已切换，网关已重启。");
       } else {
@@ -373,26 +401,27 @@ export function Setup({
     setBusyAction("start");
     setActionMessage(""); // Clear previous errors
     try {
-      const restarted = await saveSetupConfig();
+      const restarted = await saveSetupConfig(true);
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
       if (nextGatewayStatus.running) {
+        const enabledChannels = enabledChannelIds(config);
         const msg = restarted
           ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
           : `网关已启动：${nextGatewayStatus.url}`;
-        setActionMessage(msg);
+        setActionMessage(`${msg}。已启用频道：${enabledChannels.join(", ") || "无"}`);
         if (onConfigSuccess) {
           onConfigSuccess();
         }
       } else {
         // Gateway failed to start - show detailed error
         const errorMsg = nextGatewayStatus.last_error || "网关启动失败，原因未知";
-        setActionMessage(errorMsg);
+        setActionMessage(formatGatewayStartError(errorMsg));
       }
     } catch (error) {
       // Tauri returns the error message as a string
       const errorMsg = error instanceof Error ? error.message : String(error);
-      setActionMessage(errorMsg);
+      setActionMessage(formatGatewayStartError(errorMsg));
       // Refresh status
       try {
         const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
@@ -404,6 +433,57 @@ export function Setup({
       setBusyAction(null);
     }
   };
+
+  const handleGoToLarkConfig = () => {
+    setActiveChannelId("lark");
+  };
+
+  const handleDisableLark = async () => {
+    const existingLark = config.channels.lark ?? { enabled: false };
+    const nextConfig: Config = {
+      ...config,
+      channels: {
+        ...config.channels,
+        // Preserve the existing credentials and extra fields; only disable it.
+        lark: { ...existingLark, enabled: false },
+      },
+    };
+
+    setBusyAction("save");
+    try {
+      await saveSetupConfig(false, nextConfig, "lark");
+      setConfig(nextConfig);
+      setChannelValidationError(undefined);
+      setActionMessage("Lark 已关闭，配置已保存。现在可以再次启动 Feishu Gateway。");
+    } catch (error) {
+      setActionMessage(
+        `关闭 Lark 失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const larkBlockerActions = actionMessage.includes(LARK_BLOCKER_MESSAGE) ? (
+    <div className="setup-embed-buttons" style={{ marginTop: "0.5rem" }}>
+      <button
+        type="button"
+        className="setup-btn setup-btn--secondary"
+        onClick={handleGoToLarkConfig}
+        disabled={busyAction !== null}
+      >
+        前往 Lark 配置
+      </button>
+      <button
+        type="button"
+        className="setup-btn setup-btn--secondary"
+        onClick={() => void handleDisableLark()}
+        disabled={busyAction !== null}
+      >
+        关闭 Lark
+      </button>
+    </div>
+  ) : null;
 
   const handleCliInstall = async () => {
     setCliBusy(true);
@@ -816,6 +896,8 @@ export function Setup({
             onChange={(channels) => setConfig({ ...config, channels })}
             validationError={channelValidationError}
             onValidationChange={setChannelValidationError}
+            selectedChannelId={activeChannelId}
+            onSelectedChannelChange={setActiveChannelId}
             gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
             onHealthCheck={async () => {
               // Health check is done by gateway_status command
@@ -823,7 +905,10 @@ export function Setup({
               if (status.running) {
                 return { ok: true };
               } else {
-                return { ok: false, message: status.last_error || "Gateway 未运行" };
+                return {
+                  ok: false,
+                  message: "Gateway 未运行，请先点击保存并启动网关",
+                };
               }
             }}
             onCopyWebhookUrl={(url) => {
@@ -897,6 +982,7 @@ export function Setup({
         )}
       </div>
       {actionMessage ? <p className="setup-action-hint">{actionMessage}</p> : null}
+      {larkBlockerActions}
     </div>
   );
 
@@ -1028,6 +1114,7 @@ export function Setup({
           {actionMessage ? (
             <p className="setup-action-hint">{actionMessage}</p>
           ) : null}
+          {larkBlockerActions}
         </div>
       </aside>
       <main className="setup-standalone-main">{setupMainInner}</main>

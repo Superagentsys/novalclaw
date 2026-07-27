@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CHANNEL_PRESETS,
+  CLEAR_SENSITIVE_FIELDS_KEY,
   type ChannelEntryConfig,
   type ChannelsConfig,
   type ChannelPreset,
@@ -15,6 +16,8 @@ interface ChannelConfigFormProps {
   gatewayUrl?: string;
   onHealthCheck?: () => Promise<{ ok: boolean; message?: string }>;
   onCopyWebhookUrl?: (url: string) => void;
+  selectedChannelId?: string;
+  onSelectedChannelChange?: (channelId: string) => void;
 }
 
 /** Get webhook path for a channel */
@@ -32,6 +35,14 @@ function getWebhookPath(channelId: string): string {
 /** Check if URL is localhost/127.0.0.1 */
 function isLocalhost(url: string): boolean {
   return url.includes("127.0.0.1") || url.includes("localhost");
+}
+
+/** Store only a public base URL; the webhook path is appended for display. */
+function normalizePublicWebhookBaseUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/webhook\/feishu\/?$/i, "")
+    .replace(/\/$/, "");
 }
 
 const EMPTY_ENTRY: ChannelEntryConfig = {
@@ -52,13 +63,14 @@ export function ChannelConfigForm({
   gatewayUrl,
   onHealthCheck,
   onCopyWebhookUrl,
+  selectedChannelId,
+  onSelectedChannelChange,
 }: ChannelConfigFormProps) {
-  const [selectedId, setSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
+  const [uncontrolledSelectedId, setUncontrolledSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
+  const selectedId = selectedChannelId ?? uncontrolledSelectedId;
   const [healthStatus, setHealthStatus] = useState<"idle" | "checking" | "ok" | "error">("idle");
   const [healthMessage, setHealthMessage] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<string>("");
-  /** Tracks whether the user has clicked "Clear App Secret" for the current channel */
-  const [clearAppSecretRequested, setClearAppSecretRequested] = useState<Record<string, boolean>>({});
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
@@ -66,8 +78,6 @@ export function ChannelConfigForm({
   );
 
   const webhookPath = useMemo(() => getWebhookPath(selectedId), [selectedId]);
-  const fullWebhookUrl = gatewayUrl ? `${gatewayUrl.replace(/\/$/, "")}${webhookPath}` : "";
-  const isLocal = gatewayUrl ? isLocalhost(gatewayUrl) : true;
 
   /** Handle health check button click */
   const handleHealthCheck = async () => {
@@ -101,18 +111,31 @@ export function ChannelConfigForm({
     setTimeout(() => setCopyStatus(""), 2000);
   };
 
-  /** Reset health status when gateway URL changes */
-  useMemo(() => {
+  /** Reset health status when gateway URL changes. */
+  useEffect(() => {
     setHealthStatus("idle");
     setHealthMessage("");
   }, [gatewayUrl]);
 
+  const selectChannel = (channelId: string) => {
+    setUncontrolledSelectedId(channelId);
+    onSelectedChannelChange?.(channelId);
+  };
+
   const visibleFields = useMemo(() => {
     if (!selectedPreset) return [];
-    // Feishu/Lark only show app_id, app_secret, and outbound_mode (all are extra fields)
+    // Lark remains limited to its existing credentials. Feishu alone exposes
+    // webhook security controls because its inbound endpoint is handled here.
     if (FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset.id)) {
-      return selectedPreset.fields.filter(
-        (field) => field.key === "app_id" || field.key === "app_secret" || field.key === "outbound_mode"
+      const base = new Set(["app_id", "app_secret", "outbound_mode"]);
+      return selectedPreset.fields.filter((field) =>
+        selectedPreset.id === "feishu"
+          ? base.has(field.key)
+            || field.key === "security_mode"
+            || field.key === "verification_token"
+            || field.key === "encrypt_key"
+            || field.key === "public_webhook_base_url"
+          : base.has(field.key)
       );
     }
     return selectedPreset.fields;
@@ -136,10 +159,6 @@ export function ChannelConfigForm({
     if (Object.keys(cleanedEntry.extra || {}).length === 0) {
       cleanedEntry.extra = undefined;
     }
-    // Preserve clear_app_secret flag if set
-    if (clearAppSecretRequested[id]) {
-      cleanedEntry.clear_app_secret = true;
-    }
     onChange({ ...value, [id]: cleanedEntry });
   };
 
@@ -148,6 +167,14 @@ export function ChannelConfigForm({
   ).map((preset) => preset.name);
 
   const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
+  const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
+    ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
+    : "";
+  const webhookBaseUrl = publicWebhookBaseUrl || gatewayUrl?.trim() || "";
+  const fullWebhookUrl = webhookBaseUrl
+    ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
+    : "";
+  const isLocal = webhookBaseUrl ? isLocalhost(webhookBaseUrl) : false;
 
   /** Get field value: check extra for extra fields, otherwise direct property */
   const getFieldValue = (field: ChannelField): string => {
@@ -169,14 +196,56 @@ export function ChannelConfigForm({
 
     const updatedEntry = { ...entry };
     if (field.isExtra) {
-      updatedEntry.extra = { ...(updatedEntry.extra ?? {}), [field.key]: fieldValue as string };
+      const normalizedFieldValue = field.key === "public_webhook_base_url" && typeof fieldValue === "string"
+        ? normalizePublicWebhookBaseUrl(fieldValue)
+        : fieldValue as string;
+      updatedEntry.extra = { ...(updatedEntry.extra ?? {}), [field.key]: normalizedFieldValue };
+      if (
+        (field.key === "verification_token" || field.key === "encrypt_key") &&
+        typeof fieldValue === "string" &&
+        fieldValue.trim()
+      ) {
+        const clearFields = (updatedEntry.extra[CLEAR_SENSITIVE_FIELDS_KEY] ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value && value !== field.key);
+        if (clearFields.length) {
+          updatedEntry.extra[CLEAR_SENSITIVE_FIELDS_KEY] = clearFields.join(",");
+        } else {
+          delete updatedEntry.extra[CLEAR_SENSITIVE_FIELDS_KEY];
+        }
+      }
     } else {
       (updatedEntry as unknown as Record<string, unknown>)[field.key] = fieldValue;
+    }
+    if (field.key === "app_secret" && typeof fieldValue === "string" && fieldValue.trim()) {
+      updatedEntry.clear_app_secret = false;
     }
     setEntry(selectedPreset.id, updatedEntry);
   };
 
-  /** Validate Feishu/Lark has required fields when enabled */
+  const clearSensitiveField = (field: "app_secret" | "verification_token" | "encrypt_key") => {
+    if (!selectedPreset) return;
+    const updatedEntry: ChannelEntryConfig = {
+      ...entry,
+      extra: { ...(entry.extra ?? {}), [field]: "" },
+    };
+    if (field === "app_secret") {
+      updatedEntry.clear_app_secret = true;
+    } else {
+      const requested = new Set(
+        (updatedEntry.extra?.[CLEAR_SENSITIVE_FIELDS_KEY] ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean)
+      );
+      requested.add(field);
+      updatedEntry.extra![CLEAR_SENSITIVE_FIELDS_KEY] = [...requested].join(",");
+    }
+    setEntry(selectedPreset.id, updatedEntry);
+  };
+
+  /** Validate only the channel currently being edited. */
   const validateFeishuLike = (): string | undefined => {
     if (!FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset?.id ?? "")) {
       return undefined;
@@ -187,21 +256,34 @@ export function ChannelConfigForm({
     const appId = entry.extra?.["app_id"] ?? "";
     const appSecret = entry.extra?.["app_secret"] ?? "";
     const outboundMode = entry.extra?.["outbound_mode"] ?? "disabled";
+    const channelName = selectedPreset?.id === "lark" ? "Lark" : "Feishu";
     
     if (!appId.trim()) {
-      return "启用飞书时，App ID 不能为空";
+      return `启用 ${channelName} 时必须填写 App ID`;
     }
     
     // Only require app_secret when outbound_mode is "real" or "mock"
     if ((outboundMode === "real" || outboundMode === "mock") && !appSecret.trim()) {
-      return "启用飞书时，App Secret 不能为空";
+      return `启用 ${channelName} ${outboundMode} outbound 时必须填写 App Secret`;
     }
     
+    if (selectedPreset?.id === "feishu") {
+      const securityMode = entry.extra?.["security_mode"] || "dev";
+      const verificationToken = entry.extra?.["verification_token"] || "";
+      const encryptKey = entry.extra?.["encrypt_key"] || "";
+      if ((securityMode === "token" || securityMode === "encrypted") && !verificationToken.trim()) {
+        return "Feishu token / encrypted 模式必须填写 Verification Token";
+      }
+      if (securityMode === "encrypted" && !encryptKey.trim()) {
+        return "Feishu encrypted 模式必须填写 Encrypt Key";
+      }
+    }
+
     return undefined;
   };
 
-  // Trigger validation when entry changes
-  useMemo(() => {
+  // Trigger validation when the currently edited channel changes.
+  useEffect(() => {
     const error = validateFeishuLike();
     if (onValidationChange) {
       onValidationChange(error);
@@ -229,7 +311,7 @@ export function ChannelConfigForm({
           选择渠道
           <select
             value={selectedId}
-            onChange={(event) => setSelectedId(event.target.value)}
+            onChange={(event) => selectChannel(event.target.value)}
             className="channel-selector-select"
           >
             {CHANNEL_PRESETS.map((preset) => {
@@ -282,7 +364,9 @@ export function ChannelConfigForm({
           <div className="channel-webhook-section">
             <div className="webhook-url-row">
               <span className="webhook-url-label">Webhook 地址：</span>
-              <code className="webhook-url-value">{fullWebhookUrl || "未配置 Gateway 地址"}</code>
+              <code className="webhook-url-value">
+                {fullWebhookUrl || "Gateway 未运行，启动后自动生成"}
+              </code>
               <button
                 type="button"
                 className="setup-btn setup-btn--secondary"
@@ -299,6 +383,12 @@ export function ChannelConfigForm({
               >
                 {healthStatus === "checking" ? "检测中..." : "测试连接"}
               </button>
+            </div>
+            <div className="setup-action-hint">
+              自动生成，用于复制到飞书开放平台。
+              {selectedPreset?.id === "feishu"
+                ? " 如需公网回调，请填写下方 Public Webhook Base URL（不要包含 /webhook/feishu）。"
+                : ""}
             </div>
             {healthMessage && (
               <div className={`health-message ${healthStatus}`}>
@@ -338,10 +428,25 @@ export function ChannelConfigForm({
                   </label>
                 );
               }
+              if (field.key === "security_mode") {
+                return (
+                  <label key={field.key}>
+                    {field.label}
+                    <select
+                      value={getFieldValue(field) || "dev"}
+                      onChange={(event) => handleFieldChange(field, event.target.value)}
+                    >
+                      <option value="dev">dev（允许未校验请求，仅限开发）</option>
+                      <option value="token">token（校验 Verification Token）</option>
+                      <option value="encrypted">encrypted（解密并校验 Token）</option>
+                    </select>
+                  </label>
+                );
+              }
               return (
                 <label key={field.key}>
                   {field.label}
-                  {field.key === "app_secret" ? (
+                  {field.key === "app_secret" || field.key === "verification_token" || field.key === "encrypt_key" ? (
                     <div className="app-secret-input-row">
                       <input
                         type={field.type ?? "text"}
@@ -356,15 +461,8 @@ export function ChannelConfigForm({
                       <button
                         type="button"
                         className="setup-btn setup-btn--secondary app-secret-clear-btn"
-                        onClick={() => {
-                          setClearAppSecretRequested((prev) => ({
-                            ...prev,
-                            [selectedPreset!.id]: true,
-                          }));
-                          // Clear the input value to empty, which will be submitted as part of the form
-                          handleFieldChange(field, "");
-                        }}
-                        title="清除 App Secret"
+                        onClick={() => clearSensitiveField(field.key as "app_secret" | "verification_token" | "encrypt_key")}
+                        title={`清除 ${field.label}`}
                       >
                         清除
                       </button>
