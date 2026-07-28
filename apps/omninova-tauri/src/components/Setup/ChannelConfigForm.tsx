@@ -20,6 +20,11 @@ interface ChannelConfigFormProps {
   onSelectedChannelChange?: (channelId: string) => void;
 }
 
+/** Get card callback path for feishu channel (used when channel is feishu) */
+function getCardCallbackPath(_channelId: string): string {
+  return "/webhook/feishu/card";
+}
+
 /** Get webhook path for a channel */
 function getWebhookPath(channelId: string): string {
   switch (channelId) {
@@ -42,6 +47,7 @@ function normalizePublicWebhookBaseUrl(value: string): string {
   return value
     .trim()
     .replace(/\/webhook\/feishu\/?$/i, "")
+    .replace(/\/webhook\/feishu\/card\/?$/i, "")
     .replace(/\/$/, "");
 }
 
@@ -71,6 +77,7 @@ export function ChannelConfigForm({
   const [healthStatus, setHealthStatus] = useState<"idle" | "checking" | "ok" | "error">("idle");
   const [healthMessage, setHealthMessage] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<string>("");
+  const [copyCardStatus, setCopyCardStatus] = useState<string>("");
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
@@ -78,6 +85,10 @@ export function ChannelConfigForm({
   );
 
   const webhookPath = useMemo(() => getWebhookPath(selectedId), [selectedId]);
+  const cardCallbackPath = useMemo(
+    () => selectedId === "feishu" ? getCardCallbackPath(selectedId) : "",
+    [selectedId]
+  );
 
   /** Handle health check button click */
   const handleHealthCheck = async () => {
@@ -109,6 +120,14 @@ export function ChannelConfigForm({
     }
     setCopyStatus("已复制");
     setTimeout(() => setCopyStatus(""), 2000);
+  };
+
+  /** Handle copy card callback URL */
+  const handleCopyCardCallbackUrl = () => {
+    if (!fullCardCallbackUrl) return;
+    void navigator.clipboard.writeText(fullCardCallbackUrl);
+    setCopyCardStatus("已复制");
+    setTimeout(() => setCopyCardStatus(""), 2000);
   };
 
   /** Reset health status when gateway URL changes. */
@@ -173,6 +192,9 @@ export function ChannelConfigForm({
   const webhookBaseUrl = publicWebhookBaseUrl || gatewayUrl?.trim() || "";
   const fullWebhookUrl = webhookBaseUrl
     ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
+    : "";
+  const fullCardCallbackUrl = webhookBaseUrl
+    ? `${webhookBaseUrl.replace(/\/$/, "")}${cardCallbackPath}`
     : "";
   const isLocal = webhookBaseUrl ? isLocalhost(webhookBaseUrl) : false;
 
@@ -362,8 +384,9 @@ export function ChannelConfigForm({
 
           {/* Webhook URL section */}
           <div className="channel-webhook-section">
+            {/* Primary webhook URL (for normal message events) */}
             <div className="webhook-url-row">
-              <span className="webhook-url-label">Webhook 地址：</span>
+              <span className="webhook-url-label">普通事件回调地址：</span>
               <code className="webhook-url-value">
                 {fullWebhookUrl || "Gateway 未运行，启动后自动生成"}
               </code>
@@ -384,11 +407,34 @@ export function ChannelConfigForm({
                 {healthStatus === "checking" ? "检测中..." : "测试连接"}
               </button>
             </div>
+            {/* Card callback URL (for interactive card button clicks) — Feishu only */}
+            {selectedPreset?.id === "feishu" && (
+              <div className="webhook-url-row webhook-url-row--card">
+                <span className="webhook-url-label">卡片交互回调地址：</span>
+                <code className="webhook-url-value">
+                  {fullCardCallbackUrl || "Gateway 未运行，启动后自动生成"}
+                </code>
+                <button
+                  type="button"
+                  className="setup-btn setup-btn--secondary"
+                  onClick={handleCopyCardCallbackUrl}
+                  disabled={!fullCardCallbackUrl}
+                >
+                  {copyCardStatus || "复制"}
+                </button>
+              </div>
+            )}
             <div className="setup-action-hint">
-              自动生成，用于复制到飞书开放平台。
-              {selectedPreset?.id === "feishu"
-                ? " 如需公网回调，请填写下方 Public Webhook Base URL（不要包含 /webhook/feishu）。"
-                : ""}
+              {selectedPreset?.id === "feishu" ? (
+                <>
+                  <strong>普通事件</strong>（普通消息、@机器人）：使用<strong>普通事件回调地址</strong>。
+                  <strong>卡片按钮点击</strong>（功能菜单按钮）：使用<strong>卡片交互回调地址</strong>。
+                  请分别在飞书开放平台的「事件与回调」页面配置这两个地址。
+                  如需公网回调，请填写下方 Public Webhook Base URL（不要包含 /webhook/feishu 路径）。
+                </>
+              ) : (
+                <>自动生成，用于复制到飞书开放平台。</>
+              )}
             </div>
             {healthMessage && (
               <div className={`health-message ${healthStatus}`}>
