@@ -1003,6 +1003,108 @@
   color: #4a5aaa;
 }
 
+.gateway-runtime-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.gateway-runtime-heading {
+  align-items: flex-start;
+}
+
+.gateway-runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.gateway-runtime-grid > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid rgba(80, 100, 180, 0.14);
+  border-radius: 10px;
+  background: rgba(80, 100, 220, 0.035);
+}
+
+.gateway-runtime-grid span,
+.gateway-runtime-url-list span {
+  color: rgba(60, 70, 100, 0.65);
+  font-size: 12px;
+}
+
+.gateway-runtime-grid strong,
+.gateway-runtime-grid code {
+  overflow: hidden;
+  color: #2a2a3e;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-runtime-url-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gateway-runtime-url-list > div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.gateway-runtime-url-list code {
+  overflow: hidden;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(80, 100, 220, 0.06);
+  color: #4a5aaa;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-runtime-meta {
+  overflow-wrap: anywhere;
+  color: rgba(60, 70, 100, 0.7);
+  font-size: 12px;
+}
+
+.gateway-runtime-warning {
+  padding: 9px 11px;
+  border: 1px solid rgba(210, 150, 30, 0.28);
+  border-radius: 9px;
+  background: rgba(245, 180, 40, 0.08);
+  color: #8a6117;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .gateway-runtime-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .gateway-runtime-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .gateway-runtime-url-list > div {
+    grid-template-columns: 1fr auto;
+  }
+
+  .gateway-runtime-url-list code {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
 .empty-state {
   padding: 18px;
   border-radius: 14px;

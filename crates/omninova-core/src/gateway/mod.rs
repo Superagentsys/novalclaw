@@ -2269,6 +2269,178 @@ pub struct GatewayHealth {
     pub memory_healthy: bool,
 }
 
+/// Normalize a user-entered public webhook URL to the configured base URL.
+///
+/// The persisted value never contains a Feishu endpoint path. This keeps one
+/// source of truth for both the normal event and card callback URLs.
+pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_endpoint = trimmed
+        .strip_suffix("/webhook/feishu/card")
+        .or_else(|| trimmed.strip_suffix("/webhook/feishu"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+
+    if without_endpoint.is_empty() {
+        None
+    } else {
+        Some(without_endpoint.to_string())
+    }
+}
+
+/// Productized runtime status — safe to return to UI/CLI without leaking secrets.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GatewayRuntimeStatus {
+    pub running: bool,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub local_base_url: String,
+    /// The configured public webhook base URL, if any.
+    pub public_webhook_base_url: Option<String>,
+    /// The auto-generated feishu normal event callback URL.
+    pub feishu_webhook_url: Option<String>,
+    /// The auto-generated feishu card interaction callback URL.
+    pub feishu_card_callback_url: Option<String>,
+    pub enabled_channels: Vec<String>,
+    pub security_mode: Option<String>,
+    pub outbound_mode: Option<String>,
+    pub store_opened: bool,
+    /// Sanitized store path (never contains secrets).
+    pub store_path: Option<String>,
+    pub retry_worker_enabled: bool,
+    /// Human-readable timestamp of last successful start.
+    pub last_started_at: Option<i64>,
+    /// Human-readable last error message.
+    pub last_error: Option<String>,
+    pub health_ok: bool,
+}
+
+impl GatewayRuntimeStatus {
+    /// Build a status snapshot from the current config and runtime internals.
+    /// Does NOT include any secrets, tokens, or full payloads.
+    pub async fn from_runtime(
+        running: bool,
+        runtime: &GatewayRuntime,
+        last_started_at: Option<i64>,
+        last_error: Option<String>,
+    ) -> Self {
+        let cfg = runtime.get_config().await;
+        let store = runtime.feishu_store();
+
+        let feishu_cfg = cfg.channels_config.feishu.as_ref();
+        let security_mode = feishu_cfg
+            .and_then(|e| e.extra.get("security_mode"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let outbound_mode = feishu_cfg
+            .and_then(|e| e.extra.get("outbound_mode"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let public_webhook_base = feishu_cfg
+            .and_then(|e| e.extra.get("public_webhook_base_url"))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_public_webhook_base_url);
+        let local_base_url = format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port);
+        let callback_base = public_webhook_base
+            .as_deref()
+            .unwrap_or(local_base_url.as_str());
+        let feishu_webhook_url = Some(format!("{callback_base}/webhook/feishu"));
+        let feishu_card_callback_url =
+            Some(format!("{callback_base}/webhook/feishu/card"));
+
+        let enabled_channels = {
+            let mut list = Vec::new();
+            let c = &cfg.channels_config;
+            if c.feishu.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("feishu".to_string()); }
+            if c.lark.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("lark".to_string()); }
+            if c.slack.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("slack".to_string()); }
+            if c.telegram.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("telegram".to_string()); }
+            if c.discord.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("discord".to_string()); }
+            if c.whatsapp.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("whatsapp".to_string()); }
+            if c.msteams.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("msteams".to_string()); }
+            if c.email.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("email".to_string()); }
+            if c.webhook.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("webhook".to_string()); }
+            if c.wechat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("wechat".to_string()); }
+            if c.dingtalk.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("dingtalk".to_string()); }
+            if c.google_chat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("google_chat".to_string()); }
+            if c.matrix.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("matrix".to_string()); }
+            if c.signal.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("signal".to_string()); }
+            if c.irc.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("irc".to_string()); }
+            if c.synology_chat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("synology_chat".to_string()); }
+            if c.mattermost.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("mattermost".to_string()); }
+            if c.nextcloud_talk.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("nextcloud_talk".to_string()); }
+            if c.nostr.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("nostr".to_string()); }
+            if c.twitch.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("twitch".to_string()); }
+            if c.webchat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("webchat".to_string()); }
+            if c.line.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("line".to_string()); }
+            if c.bluebubbles.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("bluebubbles".to_string()); }
+            if c.imessage.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("imessage".to_string()); }
+            if c.tlon.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("tlon".to_string()); }
+            if c.zalo.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("zalo".to_string()); }
+            if c.zalo_personal.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("zalo_personal".to_string()); }
+            list
+        };
+
+        let config_dir = cfg
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| cfg.workspace_dir.clone());
+        let expected_store_path = config_dir.join("state.sqlite");
+        let store_path = Some(
+            store
+                .as_ref()
+                .map(|s| s.db_path().to_path_buf())
+                .unwrap_or(expected_store_path)
+                .to_string_lossy()
+                .to_string(),
+        );
+        // `serve_http` owns a cloned runtime. If the caller keeps the original
+        // runtime (as the desktop app does), the presence of the initialized
+        // SQLite file is the safe non-mutating fallback. `gateway doctor`
+        // performs the authoritative openability check.
+        let store_opened = running
+            && (store.is_some()
+                || store_path
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .is_some_and(std::path::Path::exists));
+
+        let health = runtime.health().await;
+        let retry_worker_enabled = running
+            && store_opened
+            && feishu_cfg.map(|entry| entry.enabled).unwrap_or(false);
+
+        Self {
+            running,
+            bind_host: cfg.gateway.host.clone(),
+            bind_port: cfg.gateway.port,
+            local_base_url,
+            public_webhook_base_url: public_webhook_base,
+            feishu_webhook_url,
+            feishu_card_callback_url,
+            enabled_channels,
+            security_mode,
+            outbound_mode,
+            store_opened,
+            store_path,
+            retry_worker_enabled,
+            last_started_at,
+            last_error,
+            health_ok: running && health.ok,
+        }
+    }
+
+    /// Returns true when dev mode is active without any secrets configured.
+    pub fn is_insecure_dev(&self) -> bool {
+        self.security_mode.as_deref() == Some("dev")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayChatRequest {
     pub message: String,
@@ -5922,8 +6094,8 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 mod tests {
     use super::{
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        resolve_agent_max_tool_iterations, split_session_key, GatewayRuntime,
-        GatewaySessionTreeQuery, SessionLineageMeta,
+        normalize_public_webhook_base_url, resolve_agent_max_tool_iterations, split_session_key,
+        GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{Config, DelegateAgentConfig};
@@ -8013,5 +8185,60 @@ mod tests {
         assert!(ts > 1_000_000_000_000);
         // Should not be absurdly large
         assert!(ts < 2_000_000_000_000);
+    }
+
+    #[test]
+    fn public_webhook_base_url_normalizes_event_and_card_paths() {
+        assert_eq!(
+            normalize_public_webhook_base_url(
+                " https://example.test/webhook/feishu/card/ "
+            ),
+            Some("https://example.test".to_string())
+        );
+        assert_eq!(
+            normalize_public_webhook_base_url("https://example.test/webhook/feishu"),
+            Some("https://example.test".to_string())
+        );
+        assert_eq!(normalize_public_webhook_base_url("   "), None);
+    }
+
+    #[tokio::test]
+    async fn gateway_runtime_status_is_stopped_and_never_serializes_secrets() {
+        let mut config = make_config_with_channel(ChannelKind::Feishu, true);
+        let feishu = config.channels_config.feishu.as_mut().unwrap();
+        feishu.extra.insert(
+            "security_mode".to_string(),
+            json!("token"),
+        );
+        feishu.extra.insert(
+            "verification_token".to_string(),
+            json!("verification-token-must-not-leak"),
+        );
+        feishu.extra.insert(
+            "app_secret".to_string(),
+            json!("app-secret-must-not-leak"),
+        );
+        feishu.extra.insert(
+            "public_webhook_base_url".to_string(),
+            json!("https://example.test/webhook/feishu/card"),
+        );
+        let runtime = GatewayRuntime::new(config);
+        let status =
+            GatewayRuntimeStatus::from_runtime(false, &runtime, None, None).await;
+        let serialized = serde_json::to_string(&status).unwrap();
+
+        assert!(!status.running);
+        assert!(!status.health_ok);
+        assert!(!status.store_opened);
+        assert_eq!(
+            status.public_webhook_base_url.as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(
+            status.feishu_card_callback_url.as_deref(),
+            Some("https://example.test/webhook/feishu/card")
+        );
+        assert!(!serialized.contains("verification-token-must-not-leak"));
+        assert!(!serialized.contains("app-secret-must-not-leak"));
     }
 }

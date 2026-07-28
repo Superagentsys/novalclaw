@@ -221,10 +221,16 @@ export function Setup({
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
     url: "http://127.0.0.1:10809",
+    gateway_host: "127.0.0.1",
+    gateway_port: 10809,
+    enabled_channels: [],
+    store_opened: false,
+    retry_worker_enabled: false,
+    health_ok: false,
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
-    "load" | "save" | "start" | "stop" | null
+    "load" | "save" | "start" | "stop" | "restart" | "health" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
@@ -317,6 +323,29 @@ export function Setup({
       void refreshCliInstall();
     }
   }, [activeTab, refreshCliInstall]);
+
+  useEffect(() => {
+    if (activeTab !== "channels") {
+      return;
+    }
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const status = await invokeTauri<GatewayStatus>("gateway_status");
+        if (!disposed) {
+          setGatewayStatus(status);
+        }
+      } catch {
+        // Keep the most recent snapshot. Explicit actions surface errors.
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [activeTab]);
 
   const loadSetupState = async () => {
     setBusyAction("load");
@@ -528,6 +557,60 @@ export function Setup({
     }
   };
 
+  const handleRestartGateway = async () => {
+    setBusyAction("restart");
+    setActionMessage("");
+    try {
+      await saveSetupConfig(true);
+      const nextGatewayStatus = await invokeTauri<GatewayStatus>("restart_gateway");
+      setGatewayStatus(nextGatewayStatus);
+      setActionMessage(
+        nextGatewayStatus.running
+          ? `Gateway 已重启：${nextGatewayStatus.url}`
+          : nextGatewayStatus.last_error || "Gateway 重启失败。"
+      );
+    } catch (error) {
+      setActionMessage(
+        formatGatewayStartError(error instanceof Error ? error.message : String(error))
+      );
+      try {
+        setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+      } catch {
+        // Keep the last known status.
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleTestGatewayHealth = async () => {
+    setBusyAction("health");
+    try {
+      const result = await invokeTauri<{
+        ok: boolean;
+        status_code?: number | null;
+        message: string;
+      }>("test_gateway_health");
+      setActionMessage(result.message);
+      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+    } catch (error) {
+      setActionMessage(
+        `Gateway 健康检查失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const copyGatewayUrl = (url: string | null | undefined, label: string) => {
+    if (!url) {
+      setActionMessage(`${label}尚未生成。`);
+      return;
+    }
+    void navigator.clipboard.writeText(url);
+    setActionMessage(`${label}已复制。`);
+  };
+
   const handlePickWorkspaceDir = async () => {
     try {
       const selected = await open({
@@ -550,6 +633,18 @@ export function Setup({
     setConfig({ ...config, workspace_dir: undefined });
     setActionMessage("Workspace 目录已清空。保存后 Agent 会要求先选择真实工作目录。");
   };
+
+  const runtimeWebhookUrl =
+    gatewayStatus.feishu_webhook_url ??
+    (gatewayStatus.url ? `${gatewayStatus.url.replace(/\/$/, "")}/webhook/feishu` : null);
+  const runtimeCardCallbackUrl =
+    gatewayStatus.feishu_card_callback_url ??
+    (gatewayStatus.url
+      ? `${gatewayStatus.url.replace(/\/$/, "")}/webhook/feishu/card`
+      : null);
+  const lastStartedLabel = gatewayStatus.last_started_at
+    ? new Date(gatewayStatus.last_started_at * 1000).toLocaleString()
+    : "尚未记录";
 
   const renderTabContent = () => {
     switch (activeTab) {
@@ -891,30 +986,98 @@ export function Setup({
         return <ProviderConfigForm value={config.providers} onChange={handleProvidersChange} />;
       case "channels":
         return (
-          <ChannelConfigForm
-            value={config.channels}
-            onChange={(channels) => setConfig({ ...config, channels })}
-            validationError={channelValidationError}
-            onValidationChange={setChannelValidationError}
-            selectedChannelId={activeChannelId}
-            onSelectedChannelChange={setActiveChannelId}
-            gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
-            onHealthCheck={async () => {
-              // Health check is done by gateway_status command
-              const status = await invokeTauri<GatewayStatus>("gateway_status");
-              if (status.running) {
-                return { ok: true };
-              } else {
-                return {
-                  ok: false,
-                  message: "Gateway 未运行，请先点击保存并启动网关",
-                };
-              }
-            }}
-            onCopyWebhookUrl={(url) => {
-              void navigator.clipboard.writeText(url);
-            }}
-          />
+          <>
+            <section className="setup-section gateway-runtime-panel">
+              <div className="section-heading gateway-runtime-heading">
+                <div>
+                  <h2>Gateway 运行状态</h2>
+                  <div className="section-subtitle">
+                    运行态、回调地址和隐私安全信息均来自当前 Gateway 配置。
+                  </div>
+                </div>
+                <span
+                  className={`gateway-status-chip ${
+                    gatewayStatus.running ? "is-running" : "is-stopped"
+                  }`}
+                >
+                  {gatewayStatus.running ? "运行中" : "已停止"}
+                </span>
+              </div>
+              <div className="gateway-runtime-grid">
+                <div><span>本地地址</span><code>{gatewayStatus.url}</code></div>
+                <div>
+                  <span>Public Base URL</span>
+                  <code>{gatewayStatus.public_webhook_base_url || "未配置"}</code>
+                </div>
+                <div><span>安全模式</span><strong>{gatewayStatus.security_mode || "dev"}</strong></div>
+                <div><span>出站模式</span><strong>{gatewayStatus.outbound_mode || "disabled"}</strong></div>
+                <div><span>Store</span><strong>{gatewayStatus.store_opened ? "已打开" : "未打开"}</strong></div>
+                <div>
+                  <span>Retry worker</span>
+                  <strong>{gatewayStatus.retry_worker_enabled ? "已启动" : "未启动"}</strong>
+                </div>
+                <div><span>Health</span><strong>{gatewayStatus.health_ok ? "正常" : "未就绪"}</strong></div>
+                <div><span>上次启动</span><strong>{lastStartedLabel}</strong></div>
+              </div>
+              <div className="gateway-runtime-url-list">
+                <div>
+                  <span>普通事件回调</span>
+                  <code>{runtimeWebhookUrl || "未生成"}</code>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => copyGatewayUrl(runtimeWebhookUrl, "普通事件回调 URL")}
+                    disabled={!runtimeWebhookUrl}
+                  >
+                    复制
+                  </button>
+                </div>
+                <div>
+                  <span>卡片交互回调</span>
+                  <code>{runtimeCardCallbackUrl || "未生成"}</code>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => copyGatewayUrl(runtimeCardCallbackUrl, "卡片交互回调 URL")}
+                    disabled={!runtimeCardCallbackUrl}
+                  >
+                    复制
+                  </button>
+                </div>
+              </div>
+              <div className="gateway-runtime-meta">
+                已启用频道：{gatewayStatus.enabled_channels?.join("、") || "无"}
+                {gatewayStatus.store_path ? ` · Store：${gatewayStatus.store_path}` : ""}
+              </div>
+              {(gatewayStatus.security_mode || "dev") === "dev" ? (
+                <div className="gateway-runtime-warning">
+                  dev 模式允许未校验 webhook，仅适合本地开发，不适合生产环境。
+                </div>
+              ) : null}
+              {gatewayStatus.last_error ? (
+                <div className="gateway-status-error">最近错误：{gatewayStatus.last_error}</div>
+              ) : null}
+            </section>
+            <ChannelConfigForm
+              value={config.channels}
+              onChange={(channels) => setConfig({ ...config, channels })}
+              validationError={channelValidationError}
+              onValidationChange={setChannelValidationError}
+              selectedChannelId={activeChannelId}
+              onSelectedChannelChange={setActiveChannelId}
+              gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
+              onHealthCheck={async () => {
+                const result = await invokeTauri<{
+                  ok: boolean;
+                  message: string;
+                }>("test_gateway_health");
+                return result;
+              }}
+              onCopyWebhookUrl={(url) => {
+                void navigator.clipboard.writeText(url);
+              }}
+            />
+          </>
         );
       case "skills":
         return (
@@ -971,15 +1134,33 @@ export function Setup({
             {busyAction === "start" ? "启动中…" : "保存并启动网关"}
           </button>
         ) : (
-          <button
-            type="button"
-            className="setup-btn setup-btn--danger"
-            onClick={handleStopGateway}
-            disabled={busyAction !== null}
-          >
-            {busyAction === "stop" ? "停止中…" : "停止网关"}
-          </button>
+          <>
+            <button
+              type="button"
+              className="setup-btn setup-btn--secondary"
+              onClick={handleRestartGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "restart" ? "重启中…" : "重启网关"}
+            </button>
+            <button
+              type="button"
+              className="setup-btn setup-btn--danger"
+              onClick={handleStopGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "stop" ? "停止中…" : "停止网关"}
+            </button>
+          </>
         )}
+        <button
+          type="button"
+          className="setup-btn setup-btn--secondary"
+          onClick={handleTestGatewayHealth}
+          disabled={busyAction !== null || !gatewayStatus.running}
+        >
+          {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+        </button>
       </div>
       {actionMessage ? <p className="setup-action-hint">{actionMessage}</p> : null}
       {larkBlockerActions}
@@ -1102,15 +1283,33 @@ export function Setup({
               {busyAction === "start" ? "启动中…" : "保存并启动网关"}
             </button>
           ) : (
-            <button
-              type="button"
-              className="setup-btn setup-btn--danger setup-btn--block"
-              onClick={handleStopGateway}
-              disabled={busyAction !== null}
-            >
-              {busyAction === "stop" ? "停止中…" : "停止网关"}
-            </button>
+            <>
+              <button
+                type="button"
+                className="setup-btn setup-btn--secondary setup-btn--block"
+                onClick={handleRestartGateway}
+                disabled={busyAction !== null}
+              >
+                {busyAction === "restart" ? "重启中…" : "重启网关"}
+              </button>
+              <button
+                type="button"
+                className="setup-btn setup-btn--danger setup-btn--block"
+                onClick={handleStopGateway}
+                disabled={busyAction !== null}
+              >
+                {busyAction === "stop" ? "停止中…" : "停止网关"}
+              </button>
+            </>
           )}
+          <button
+            type="button"
+            className="setup-btn setup-btn--secondary setup-btn--block"
+            onClick={handleTestGatewayHealth}
+            disabled={busyAction !== null || !gatewayStatus.running}
+          >
+            {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+          </button>
           {actionMessage ? (
             <p className="setup-action-hint">{actionMessage}</p>
           ) : null}

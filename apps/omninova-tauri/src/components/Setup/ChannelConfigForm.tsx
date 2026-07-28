@@ -46,8 +46,8 @@ function isLocalhost(url: string): boolean {
 function normalizePublicWebhookBaseUrl(value: string): string {
   return value
     .trim()
-    .replace(/\/webhook\/feishu\/?$/i, "")
     .replace(/\/webhook\/feishu\/card\/?$/i, "")
+    .replace(/\/webhook\/feishu\/?$/i, "")
     .replace(/\/$/, "");
 }
 
@@ -78,6 +78,7 @@ export function ChannelConfigForm({
   const [healthMessage, setHealthMessage] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<string>("");
   const [copyCardStatus, setCopyCardStatus] = useState<string>("");
+  const [publicUrlNormalizationNotice, setPublicUrlNormalizationNotice] = useState("");
 
   const selectedPreset: ChannelPreset | undefined = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedId),
@@ -218,9 +219,15 @@ export function ChannelConfigForm({
 
     const updatedEntry = { ...entry };
     if (field.isExtra) {
-      const normalizedFieldValue = field.key === "public_webhook_base_url" && typeof fieldValue === "string"
-        ? normalizePublicWebhookBaseUrl(fieldValue)
-        : fieldValue as string;
+      let normalizedFieldValue = fieldValue as string;
+      if (field.key === "public_webhook_base_url" && typeof fieldValue === "string") {
+        normalizedFieldValue = normalizePublicWebhookBaseUrl(fieldValue);
+        setPublicUrlNormalizationNotice(
+          normalizedFieldValue !== fieldValue.trim().replace(/\/$/, "")
+            ? "已自动移除 /webhook/feishu 或 /webhook/feishu/card，仅保存 Public Base URL。"
+            : ""
+        );
+      }
       updatedEntry.extra = { ...(updatedEntry.extra ?? {}), [field.key]: normalizedFieldValue };
       if (
         (field.key === "verification_token" || field.key === "encrypt_key") &&
@@ -436,6 +443,9 @@ export function ChannelConfigForm({
                 <>自动生成，用于复制到飞书开放平台。</>
               )}
             </div>
+            {publicUrlNormalizationNotice ? (
+              <div className="setup-action-hint">{publicUrlNormalizationNotice}</div>
+            ) : null}
             {healthMessage && (
               <div className={`health-message ${healthStatus}`}>
                 {healthMessage}

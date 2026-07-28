@@ -5,8 +5,9 @@ mod desktop_capture;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig, ChannelsConfig, ChannelEntry};
 use omninova_core::gateway::{
-    GatewayHealth, GatewayInboundResponse, GatewayRuntime, GatewaySessionHistoryResponse,
-    GatewaySessionTreeQuery, GatewaySessionTreeResponse,
+    normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse, GatewayRuntime,
+    GatewayRuntimeStatus, GatewaySessionHistoryResponse, GatewaySessionTreeQuery,
+    GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -121,6 +123,7 @@ pub struct RunDiffStats {
 struct AppState {
     runtime: GatewayRuntime,
     gateway_task: Option<JoinHandle<Result<(), String>>>,
+    last_gateway_started_at: Option<i64>,
     last_gateway_error: Option<String>,
     /// Error code for the last gateway error (e.g., "port_in_use", "already_running")
     last_gateway_error_code: Option<String>,
@@ -396,10 +399,31 @@ fn setup_requests_sensitive_clear(extra: &HashMap<String, serde_json::Value>, fi
 #[derive(Debug, Clone, Serialize)]
 struct GatewayStatusPayload {
     running: bool,
+    /// Local gateway base URL.
     url: String,
+    /// Sanitized gateway status (never contains secrets).
+    gateway_host: String,
+    gateway_port: u16,
+    feishu_webhook_url: Option<String>,
+    feishu_card_callback_url: Option<String>,
+    public_webhook_base_url: Option<String>,
+    enabled_channels: Vec<String>,
+    security_mode: Option<String>,
+    outbound_mode: Option<String>,
+    store_opened: bool,
+    store_path: Option<String>,
+    retry_worker_enabled: bool,
+    last_started_at: Option<i64>,
+    health_ok: bool,
     last_error: Option<String>,
-    /// Error code for programmatic error handling
     error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayLocalHealthPayload {
+    ok: bool,
+    status_code: Option<u16>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1031,6 +1055,27 @@ fn enabled_channel_names(channels: &ChannelsConfig) -> Vec<&'static str> {
     .collect()
 }
 
+async fn preflight_gateway_bind(host: &str, port: u16) -> Result<(), (String, String)> {
+    match tokio::net::TcpListener::bind((host, port)).await {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Err((
+            format!("Gateway 启动失败：端口 {port} 已被占用。"),
+            "port_in_use".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err((
+            "Gateway 启动失败：权限不足，无法绑定监听地址。".to_string(),
+            "permission_denied".to_string(),
+        )),
+        Err(error) => Err((
+            format!("Gateway 启动失败：无法绑定监听地址：{error}"),
+            "bind_failed".to_string(),
+        )),
+    }
+}
+
 /// 启动本机 HTTP 网关（与 `omninova` CLI 使用同一配置与端口，便于后台常驻后命令行调用）。
 async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayStatusPayload, String> {
     sync_gateway_task_state(&state_ref).await;
@@ -1061,15 +1106,26 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
         enabled_channel_names(&cfg.channels_config)
     );
 
-    // Check if already running
-    {
+    // Check if already running without holding the state lock across another
+    // status lookup.
+    let already_running = {
         let app_state = state_ref.lock().await;
-        if app_state.gateway_task.is_some() {
-            let status = gateway_status_from_state(&state_ref).await;
-            if status.running {
-                return Err("Gateway 已经在运行中，请先停止后再启动。".to_string());
-            }
-        }
+        app_state.gateway_task.is_some()
+    };
+    if already_running {
+        return Err("Gateway 已经在运行中，请先停止后再启动。".to_string());
+    }
+
+    // Fail fast with a stable, user-facing port error before spawning the
+    // long-lived server task. The listener is immediately released and the
+    // runtime performs the authoritative bind next.
+    if let Err((message, code)) =
+        preflight_gateway_bind(cfg.gateway.host.as_str(), cfg.gateway.port).await
+    {
+        let mut app_state = state_ref.lock().await;
+        app_state.last_gateway_error = Some(message.clone());
+        app_state.last_gateway_error_code = Some(code);
+        return Err(message);
     }
 
     {
@@ -1094,7 +1150,17 @@ async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayS
         return Err(enhanced_msg);
     }
 
-    Ok(status)
+    {
+        let mut app_state = state_ref.lock().await;
+        app_state.last_gateway_started_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        );
+    }
+
+    Ok(gateway_status_from_state(&state_ref).await)
 }
 
 /// Enhance error message with user-friendly suggestions
@@ -1154,6 +1220,93 @@ async fn stop_gateway(
     let state_ref = state.inner().clone();
     stop_gateway_inner(&state_ref).await;
     Ok(gateway_status_from_state(&state_ref).await)
+}
+
+#[tauri::command]
+async fn restart_gateway(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayStatusPayload, String> {
+    let state_ref = state.inner().clone();
+    stop_gateway_inner(&state_ref).await;
+    sleep(Duration::from_millis(100)).await;
+    start_gateway_inner(state_ref).await
+}
+
+#[tauri::command]
+async fn test_gateway_health(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayLocalHealthPayload, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let status = gateway_status_from_state(&state_ref).await;
+    if !status.running {
+        return Ok(GatewayLocalHealthPayload {
+            ok: false,
+            status_code: None,
+            message: "Gateway 未运行，请先启动 Gateway。".to_string(),
+        });
+    }
+
+    let connect_host = match status.gateway_host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        host => host,
+    };
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect((connect_host, status.gateway_port))
+            .await
+            .map_err(|error| format!("连接本地 Gateway 失败：{error}"))?;
+        let request = format!(
+            "GET /health HTTP/1.1\r\nHost: {connect_host}:{}\r\nConnection: close\r\n\r\n",
+            status.gateway_port
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("发送健康检查失败：{error}"))?;
+        let mut response = vec![0_u8; 4096];
+        let read = stream
+            .read(&mut response)
+            .await
+            .map_err(|error| format!("读取健康检查失败：{error}"))?;
+        let first_line = String::from_utf8_lossy(&response[..read])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let status_code = first_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok());
+        Ok::<Option<u16>, String>(status_code)
+    };
+
+    match tokio::time::timeout(Duration::from_secs(3), probe).await {
+        Ok(Ok(Some(200))) => Ok(GatewayLocalHealthPayload {
+            ok: true,
+            status_code: Some(200),
+            message: "Gateway 本地健康检查通过（HTTP 200）。".to_string(),
+        }),
+        Ok(Ok(status_code)) => Ok(GatewayLocalHealthPayload {
+            ok: false,
+            status_code,
+            message: format!(
+                "Gateway 本地健康检查失败{}。",
+                status_code
+                    .map(|code| format!("（HTTP {code}）"))
+                    .unwrap_or_default()
+            ),
+        }),
+        Ok(Err(message)) => Ok(GatewayLocalHealthPayload {
+            ok: false,
+            status_code: None,
+            message,
+        }),
+        Err(_) => Ok(GatewayLocalHealthPayload {
+            ok: false,
+            status_code: None,
+            message: "Gateway 本地健康检查超时。".to_string(),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -1240,20 +1393,46 @@ async fn skills_package_summary(
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
-    let (runtime, running, last_error, error_code): (GatewayRuntime, bool, Option<String>, Option<String>) = {
+    let (runtime, running, last_started_at, last_error, error_code): (
+        GatewayRuntime,
+        bool,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = {
         let app_state = state.lock().await;
         (
             app_state.runtime.clone(),
             app_state.gateway_task.is_some(),
+            app_state.last_gateway_started_at,
             app_state.last_gateway_error.clone(),
             app_state.last_gateway_error_code.clone(),
         )
     };
-    let cfg = runtime.get_config().await;
+
+    let status = GatewayRuntimeStatus::from_runtime(
+        running,
+        &runtime,
+        last_started_at,
+        last_error.clone(),
+    ).await;
 
     GatewayStatusPayload {
         running,
-        url: format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+        url: status.local_base_url.clone(),
+        gateway_host: status.bind_host.clone(),
+        gateway_port: status.bind_port,
+        feishu_webhook_url: status.feishu_webhook_url,
+        feishu_card_callback_url: status.feishu_card_callback_url,
+        public_webhook_base_url: status.public_webhook_base_url,
+        enabled_channels: status.enabled_channels,
+        security_mode: status.security_mode,
+        outbound_mode: status.outbound_mode,
+        store_opened: status.store_opened,
+        store_path: status.store_path,
+        retry_worker_enabled: status.retry_worker_enabled,
+        last_started_at: status.last_started_at,
+        health_ok: status.health_ok,
         last_error,
         error_code,
     }
@@ -1318,12 +1497,17 @@ fn extract_error_code(error: &str) -> Option<String> {
 }
 
 async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
-    let mut app_state = state.lock().await;
-    if let Some(task) = app_state.gateway_task.take() {
+    let task = {
+        let mut app_state = state.lock().await;
+        let task = app_state.gateway_task.take();
+        app_state.last_gateway_error = None;
+        app_state.last_gateway_error_code = None;
+        task
+    };
+    if let Some(task) = task {
         task.abort();
+        let _ = task.await;
     }
-    app_state.last_gateway_error = None;
-    app_state.last_gateway_error_code = None;
 }
 
 fn setup_config_from_core(config: &Config) -> SetupAppConfig {
@@ -1909,14 +2093,13 @@ fn channel_entry_to_core(
         }
 
         if key == "public_webhook_base_url" {
-            let normalized = value_str.trim().trim_end_matches('/');
-            let base_url = normalized
-                .strip_suffix("/webhook/feishu")
-                .unwrap_or(normalized);
-            if base_url.is_empty() {
-                merged_extra.remove(&key);
-            } else {
-                merged_extra.insert(key, serde_json::Value::String(base_url.to_string()));
+            match normalize_public_webhook_base_url(value_str) {
+                Some(base_url) => {
+                    merged_extra.insert(key, serde_json::Value::String(base_url));
+                }
+                None => {
+                    merged_extra.remove(&key);
+                }
             }
             continue;
         }
@@ -2277,6 +2460,7 @@ pub fn run() {
     let state = Arc::new(Mutex::new(AppState {
         runtime: GatewayRuntime::new(config),
         gateway_task: None,
+        last_gateway_started_at: None,
         last_gateway_error: None,
         last_gateway_error_code: None,
     }));
@@ -2314,6 +2498,8 @@ pub fn run() {
             skills_package_summary,
             composer_attachments::read_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
+            restart_gateway,
+            test_gateway_health,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -3467,6 +3653,44 @@ mod channel_tests {
         assert_eq!(
             saved.extra.get("public_webhook_base_url"),
             Some(&serde_json::json!("https://example.test")),
+        );
+    }
+
+    #[test]
+    fn test_public_webhook_base_url_removes_card_callback_path() {
+        let entry = SetupChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            extra: HashMap::from([
+                ("app_id".to_string(), serde_json::json!("cli_test")),
+                (
+                    "public_webhook_base_url".to_string(),
+                    serde_json::json!("https://example.test/webhook/feishu/card/"),
+                ),
+            ]),
+            clear_app_secret: false,
+        };
+
+        let saved = channel_entry_to_core(Some(entry), None).expect("channel entry");
+        assert_eq!(
+            saved.extra.get("public_webhook_base_url"),
+            Some(&serde_json::json!("https://example.test")),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_bind_preflight_reports_occupied_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (message, code) = preflight_gateway_bind("127.0.0.1", port)
+            .await
+            .expect_err("occupied port must fail");
+
+        assert_eq!(code, "port_in_use");
+        assert_eq!(
+            message,
+            format!("Gateway 启动失败：端口 {port} 已被占用。")
         );
     }
 }

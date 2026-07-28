@@ -71,6 +71,12 @@ export interface ChannelEntryConfig {
   clear_app_secret?: boolean;
 }
 
+/**
+ * Transient channel.extra key used only while saving Setup. It is consumed by
+ * the backend and is never persisted to config.toml.
+ */
+export const CLEAR_SENSITIVE_FIELDS_KEY = "__clear_sensitive_fields";
+
 export interface ChannelsConfig {
   telegram?: ChannelEntryConfig;
   discord?: ChannelEntryConfig;
@@ -117,6 +123,20 @@ const FEISHU_LIKE_FIELDS: ChannelField[] = [
   { key: "outbound_mode", label: "Outbound Mode", placeholder: "real/mock/disabled", type: "text", isExtra: true },
 ];
 
+/** Feishu webhook security only. These values are persisted in channel.extra. */
+const FEISHU_SECURITY_FIELDS: ChannelField[] = [
+  { key: "security_mode", label: "Webhook Security Mode", placeholder: "dev/token/encrypted", isExtra: true },
+  { key: "verification_token", label: "Verification Token", placeholder: "Feishu Verification Token", type: "password", isExtra: true },
+  { key: "encrypt_key", label: "Encrypt Key", placeholder: "Feishu Encrypt Key", type: "password", isExtra: true },
+  {
+    key: "public_webhook_base_url",
+    label: "Public Webhook Base URL",
+    placeholder: "https://your-tunnel.example",
+    type: "text",
+    isExtra: true,
+  },
+];
+
 export const CHANNEL_PRESETS: ChannelPreset[] = [
   {
     id: "feishu",
@@ -124,7 +144,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "FEISHU_APP_SECRET",
     isDefault: true,
-    fields: FEISHU_LIKE_FIELDS,
+    fields: [...FEISHU_LIKE_FIELDS, ...FEISHU_SECURITY_FIELDS],
   },
   {
     id: "telegram",
@@ -290,6 +310,19 @@ export interface Config {
 export interface GatewayStatus {
   running: boolean;
   url: string;
+  gateway_host: string;
+  gateway_port: number;
+  feishu_webhook_url?: string | null;
+  feishu_card_callback_url?: string | null;
+  public_webhook_base_url?: string | null;
+  enabled_channels: string[];
+  security_mode?: string | null;
+  outbound_mode?: string | null;
+  store_opened: boolean;
+  store_path?: string | null;
+  retry_worker_enabled: boolean;
+  last_started_at?: number | null;
+  health_ok: boolean;
   last_error?: string | null;
   /** Error code for programmatic error handling */
   error_code?: string | null;

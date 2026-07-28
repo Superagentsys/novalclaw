@@ -5,7 +5,9 @@ use crate::daemon::service::{
     GatewayServiceCheckLevel, GatewayServiceCheckReport, GatewayServiceOperation,
     resolve_gateway_service,
 };
-use crate::gateway::GatewayRuntime;
+use crate::gateway::{
+    normalize_public_webhook_base_url, GatewayRuntime, GatewayRuntimeStatus,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::ToSocketAddrs;
@@ -100,6 +102,11 @@ pub enum Commands {
     Health,
     /// Run diagnostics on environment and dependencies.
     Doctor,
+    /// Manage sanitized diagnostics packages for support.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommands,
+    },
     /// Manage cron jobs via the Gateway scheduler.
     Cron {
         #[command(subcommand)]
@@ -264,6 +271,18 @@ pub enum GatewayCommands {
     Status,
     /// Reload gateway configuration.
     Reload,
+    /// Run gateway pre-flight diagnostic checks.
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticsCommands {
+    /// Export a privacy-safe diagnostics ZIP.
+    Export {
+        /// Output ZIP file or directory. Defaults to the config diagnostics directory.
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -658,12 +677,13 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 Ok("gateway stopped".to_string())
             }
             Some(GatewayCommands::Status) => {
-                let runtime = GatewayRuntime::new(config);
-                let health = runtime.health().await;
-                Ok(serde_json::to_string_pretty(&health)?)
+                run_gateway_status(&config).await
             }
             Some(GatewayCommands::Reload) => {
                 Ok("reload not yet implemented via runtime".to_string())
+            }
+            Some(GatewayCommands::Doctor) => {
+                run_gateway_doctor(&config).await
             }
             None => {
                 let runtime = GatewayRuntime::new(config);
@@ -690,6 +710,11 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             Ok(serde_json::to_string_pretty(&health)?)
         }
         Commands::Doctor => run_doctor(&config).await,
+        Commands::Diagnostics { command } => match command {
+            DiagnosticsCommands::Export { output } => {
+                run_diagnostics(&config, output.as_deref()).await
+            }
+        },
         Commands::Cron { command } => run_cron(command, &config).await,
         Commands::Channels { command } => run_channels(command, &config).await,
         Commands::Message { command } => run_message(command, &config).await,
@@ -1197,6 +1222,79 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+fn feishu_security_status_report(config: &Config) -> String {
+    let security = crate::gateway::FeishuSecurityConfig::from_entry(
+        config.channels_config.feishu.as_ref(),
+    );
+    format!(
+        "Feishu webhook security:\n  security_mode                 : {}\n  verification_token_configured : {}\n  encrypt_key_configured        : {}\n  insecure_dev_mode             : {}\n",
+        security.mode.as_str(),
+        security.verification_token.is_some(),
+        security.encrypt_key.is_some(),
+        security.insecure,
+    )
+}
+
+#[cfg(test)]
+mod feishu_security_status_tests {
+    use super::*;
+    use crate::config::schema::ChannelEntry;
+    use std::collections::HashMap;
+
+    #[test]
+    fn status_report_exposes_configuration_state_without_secret_values() {
+        let mut config = Config::default();
+        config.channels_config.feishu = Some(ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            security_mode: Some("encrypted".to_string()),
+            verification_token: Some("verification-token-must-not-leak".to_string()),
+            verification_token_env: None,
+            encrypt_key: Some("encrypt-key-must-not-leak".to_string()),
+            encrypt_key_env: None,
+            extra: HashMap::new(),
+        });
+
+        let report = feishu_security_status_report(&config);
+        assert!(report.contains("security_mode                 : encrypted"));
+        assert!(report.contains("verification_token_configured : true"));
+        assert!(report.contains("encrypt_key_configured        : true"));
+        assert!(!report.contains("verification-token-must-not-leak"));
+        assert!(!report.contains("encrypt-key-must-not-leak"));
+    }
+
+    #[test]
+    fn status_report_does_not_treat_setup_marker_as_a_configured_secret() {
+        let mut config = Config::default();
+        let mut extra = HashMap::new();
+        extra.insert(
+            "verification_token".to_string(),
+            serde_json::Value::String("***SET***".to_string()),
+        );
+        extra.insert(
+            "encrypt_key".to_string(),
+            serde_json::Value::String("***SET***".to_string()),
+        );
+        config.channels_config.feishu = Some(ChannelEntry {
+            enabled: true,
+            token: None,
+            token_env: None,
+            security_mode: Some("dev".to_string()),
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
+            extra,
+        });
+
+        let report = feishu_security_status_report(&config);
+        assert!(report.contains("verification_token_configured : false"));
+        assert!(report.contains("encrypt_key_configured        : false"));
+        assert!(!report.contains("***SET***"));
+    }
+}
+
 async fn run_feishu(cmd: &FeishuCommands, config: &Config) -> Result<String> {
     use crate::gateway::feishu_store::FeishuStore;
     
@@ -1210,8 +1308,15 @@ async fn run_feishu(cmd: &FeishuCommands, config: &Config) -> Result<String> {
         });
     
     let db_path = config_dir.join("state.sqlite");
+    let security_report = feishu_security_status_report(config);
     
     if !db_path.exists() {
+        if matches!(cmd, FeishuCommands::Status) {
+            return Ok(format!(
+                "{security_report}\nFeishu store: unavailable (state.sqlite not found at {})\n",
+                db_path.display()
+            ));
+        }
         anyhow::bail!("state.sqlite not found at {}. Is the Gateway running?", db_path.display());
     }
     
@@ -1226,6 +1331,8 @@ async fn run_feishu(cmd: &FeishuCommands, config: &Config) -> Result<String> {
                 .unwrap_or(0);
             
             let mut output = String::new();
+            output.push_str(&security_report);
+            output.push('\n');
             output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
             output.push_str("║              OmniNova Feishu Store Status                   ║\n");
             output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
@@ -1877,6 +1984,487 @@ async fn run_doctor(config: &Config) -> Result<String> {
         "checks": checks,
         "penetration_assessment": crate::security::penetration_playbook::build_playbook_payload(),
     }))?)
+}
+
+fn gateway_probe_url(config: &Config) -> String {
+    let host = match config.gateway.host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        host => host,
+    };
+    format!("http://{}:{}/health", host, config.gateway.port)
+}
+
+async fn probe_gateway_http(config: &Config) -> (bool, Option<u16>, Option<String>) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return (false, None, Some(format!("health client error: {error}"))),
+    };
+
+    match client.get(gateway_probe_url(config)).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            (true, Some(status), None)
+        }
+        Err(error) => (false, None, Some(format!("gateway is not reachable: {error}"))),
+    }
+}
+
+async fn run_gateway_status(config: &Config) -> Result<String> {
+    let (running, status_code, probe_error) = probe_gateway_http(config).await;
+    let runtime = GatewayRuntime::new(config.clone());
+    let mut status =
+        GatewayRuntimeStatus::from_runtime(running, &runtime, None, probe_error).await;
+    status.health_ok = status_code == Some(200);
+    Ok(serde_json::to_string_pretty(&status)?)
+}
+
+async fn run_gateway_doctor(config: &Config) -> Result<String> {
+    use crate::gateway::FeishuSecurityConfig;
+
+    let mut checks = Vec::new();
+
+    // 1. Config file exists
+    checks.push(serde_json::json!({
+        "check": "config_file",
+        "ok": config.config_path.exists(),
+        "path": config.config_path.display().to_string(),
+        "detail": if config.config_path.exists() {
+            "found".to_string()
+        } else {
+            "not found".to_string()
+        }
+    }));
+
+    // 2. Feishu enabled
+    let feishu_enabled = config.channels_config.feishu.as_ref().map(|e| e.enabled).unwrap_or(false);
+    checks.push(serde_json::json!({
+        "check": "feishu_enabled",
+        "ok": true, // Not an error, just informational
+        "enabled": feishu_enabled,
+    }));
+
+    // 3. Feishu security: app_id/app_secret present (never print the values)
+    let feishu_entry = config.channels_config.feishu.as_ref();
+    let app_id_present = feishu_entry
+        .and_then(|e| e.extra.get("app_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let app_secret_present = feishu_entry
+        .and_then(|e| e.extra.get("app_secret"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let outbound_mode = feishu_entry
+        .and_then(|e| e.extra.get("outbound_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("disabled");
+    let credentials_ok = !feishu_enabled
+        || (app_id_present
+            && (!matches!(outbound_mode, "real" | "mock") || app_secret_present));
+    checks.push(serde_json::json!({
+        "check": "feishu_credentials",
+        "ok": credentials_ok,
+        "app_id_present": app_id_present,
+        "app_secret_present": app_secret_present,
+        "outbound_mode": outbound_mode,
+        "detail": format!(
+            "app_id={} app_secret={}",
+            if app_id_present { "present" } else { "absent" },
+            if app_secret_present { "present" } else { "absent" }
+        )
+    }));
+
+    // 4. Feishu security mode + token/encrypt_key presence
+    let sec_cfg = FeishuSecurityConfig::from_entry(feishu_entry);
+    let token_present = sec_cfg.verification_token.is_some();
+    let encrypt_key_present = sec_cfg.encrypt_key.is_some();
+    let security_ok = !feishu_enabled
+        || match sec_cfg.mode.as_str() {
+            "dev" | "default" => true,
+            "token" => token_present,
+            "encrypted" => token_present && encrypt_key_present,
+            _ => false,
+        };
+    checks.push(serde_json::json!({
+        "check": "feishu_security",
+        "ok": security_ok,
+        "security_mode": sec_cfg.mode.as_str(),
+        "verification_token_present": token_present,
+        "encrypt_key_present": encrypt_key_present,
+        "insecure_dev": sec_cfg.insecure,
+    }));
+
+    // 5. Store can open
+    let config_dir = config.config_path.parent().unwrap_or(&config.workspace_dir);
+    let store_path = config_dir.join("state.sqlite");
+    let store_open_result = rusqlite::Connection::open(&store_path);
+    let store_opened = store_open_result.is_ok();
+    checks.push(serde_json::json!({
+        "check": "feishu_store",
+        "ok": store_opened,
+        "store_path": store_path.display().to_string(),
+        "detail": if store_opened {
+            "opened successfully".to_string()
+        } else {
+            format!("failed to open: {:?}", store_open_result.err())
+        }
+    }));
+
+    // 6. Port bindability. A healthy running Gateway legitimately owns the
+    // port, so distinguish it from an unknown conflicting process.
+    let port = config.gateway.port;
+    let port_bindable =
+        std::net::TcpListener::bind((config.gateway.host.as_str(), port)).is_ok();
+    let (gateway_reachable, gateway_status_code, _) = probe_gateway_http(config).await;
+    let healthy_gateway_owns_port = gateway_reachable && gateway_status_code == Some(200);
+    checks.push(serde_json::json!({
+        "check": "gateway_port",
+        "ok": port_bindable || healthy_gateway_owns_port,
+        "port": port,
+        "bindable": port_bindable,
+        "gateway_running": healthy_gateway_owns_port,
+        "detail": if port_bindable {
+            format!("port {} is available", port)
+        } else if healthy_gateway_owns_port {
+            format!("port {} is owned by a healthy Gateway", port)
+        } else {
+            format!("port {} is occupied by another process or cannot be bound", port)
+        }
+    }));
+
+    // 7. public_webhook_base_url configured
+    let public_base = feishu_entry
+        .and_then(|e| e.extra.get("public_webhook_base_url"))
+        .and_then(|v| v.as_str())
+        .and_then(normalize_public_webhook_base_url);
+    let public_base_configured = public_base.is_some();
+    let (feishu_webhook_url, card_callback_url) = if let Some(base) = public_base.as_deref() {
+        (Some(format!("{}/webhook/feishu", base)), Some(format!("{}/webhook/feishu/card", base)))
+    } else {
+        (None, None)
+    };
+    checks.push(serde_json::json!({
+        "check": "public_webhook_base_url",
+        "ok": true,
+        "configured": public_base_configured,
+        "public_base": public_base,
+        "feishu_webhook_url": feishu_webhook_url,
+        "feishu_card_callback_url": card_callback_url,
+        "detail": if public_base_configured {
+            "configured".to_string()
+        } else {
+            "not configured (webhook URLs will only show local address)".to_string()
+        }
+    }));
+
+    let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(true));
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": all_ok,
+        "gateway_bind": format!("{}:{}", config.gateway.host, config.gateway.port),
+        "checks": checks,
+    }))?)
+}
+
+async fn run_diagnostics(config: &Config, output_path: Option<&str>) -> Result<String> {
+    use crate::gateway::feishu_store::FeishuStore;
+    use crate::gateway::FeishuSecurityConfig;
+
+    let config_dir = config.config_path.parent().unwrap_or(&config.workspace_dir);
+    let timestamp = chrono_lite_timestamp();
+    let default_name = format!("diagnostics_{timestamp}.zip");
+    let requested = output_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config_dir.join("diagnostics"));
+    let zip_path = if requested
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        requested
+    } else {
+        requested.join(default_name)
+    };
+    let diag_dir = zip_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("diagnostics output has no parent directory"))?;
+    std::fs::create_dir_all(diag_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create diagnostics dir: {e}"))?;
+    let staging_dir = diag_dir.join(format!(
+        ".omninova-diagnostics-{timestamp}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create diagnostics staging dir: {e}"))?;
+
+    // Gather data
+    let sanitized_config = sanitize_config_for_export(config);
+
+    let feishu_status = gather_feishu_status(config);
+    let feishu_sec = FeishuSecurityConfig::from_entry(config.channels_config.feishu.as_ref());
+    let feishu_sec_report = serde_json::json!({
+        "security_mode": feishu_sec.mode.as_str(),
+        "verification_token_configured": feishu_sec.verification_token.is_some(),
+        "encrypt_key_configured": feishu_sec.encrypt_key.is_some(),
+        "insecure_dev_mode": feishu_sec.insecure,
+    });
+
+    let (recent_jobs_summary, recent_outbox_summary, recent_errors) =
+        if let Ok(store) = FeishuStore::open(config_dir) {
+        let jobs = store.get_recent_jobs(20).unwrap_or_default();
+        let outbox = store.get_recent_outbox(20).unwrap_or_default();
+        let job_errors = jobs
+            .iter()
+            .filter_map(|job| {
+                job.error_code.as_ref().map(|error_code| {
+                    serde_json::json!({
+                        "source": "job",
+                        "status": job.status.as_str(),
+                        "error_code": error_code,
+                        "updated_at": job.updated_at,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let outbox_errors = outbox
+            .iter()
+            .filter_map(|item| {
+                item.error_code.as_ref().map(|error_code| {
+                    serde_json::json!({
+                        "source": "outbox",
+                        "status": item.status.as_str(),
+                        "error_code": error_code,
+                        "updated_at": item.updated_at,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let jobs_summary: Vec<serde_json::Value> = jobs.into_iter().map(|j| {
+            serde_json::json!({
+                "job_id": truncate_for_export(&j.job_id, 40),
+                "status": j.status.as_str(),
+                "mode": j.mode,
+                "created_at": j.created_at,
+                "completed_at": j.completed_at,
+                "error_code": j.error_code,
+            })
+        }).collect();
+        let outbox_summary: Vec<serde_json::Value> = outbox.into_iter().map(|o| {
+            serde_json::json!({
+                "outbound_id": truncate_for_export(&o.outbound_id, 40),
+                "reply_kind": o.reply_kind,
+                "status": o.status.as_str(),
+                "reply_preview_present": o.reply_preview.is_some(),
+                "created_at": o.created_at,
+                "sent_at": o.sent_at,
+                "error_code": o.error_code,
+            })
+        }).collect();
+        (
+            jobs_summary,
+            outbox_summary,
+            job_errors
+                .into_iter()
+                .chain(outbox_errors)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    let build_info = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "name": env!("CARGO_PKG_NAME"),
+        "timestamp": timestamp,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+    });
+
+    let gateway_status: serde_json::Value =
+        serde_json::from_str(&run_gateway_status(config).await?)?;
+
+    // Write JSON files
+    let write_json = |name: &str, value: &serde_json::Value| -> Result<()> {
+        let path = staging_dir.join(format!("{name}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(value)?)?;
+        Ok(())
+    };
+
+    write_json("config", &sanitized_config)?;
+    write_json("gateway_status", &gateway_status)?;
+    write_json("feishu_status", &feishu_status)?;
+    write_json("feishu_security", &feishu_sec_report)?;
+    write_json("build_info", &build_info)?;
+    write_json("recent_jobs", &serde_json::json!({ "jobs": recent_jobs_summary }))?;
+    write_json("recent_outbox", &serde_json::json!({ "outbox": recent_outbox_summary }))?;
+    write_json("recent_errors", &serde_json::json!({ "errors": recent_errors }))?;
+
+    // Create zip
+    let zip_file = std::fs::File::create(&zip_path)
+        .map_err(|e| anyhow::anyhow!("failed to create zip: {}", e))?;
+    let mut zip = zip::ZipWriter::new(zip_file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for entry in std::fs::read_dir(&staging_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            let name = path.file_name().unwrap().to_string_lossy();
+            zip.start_file(name.as_ref(), options)?;
+            std::io::Write::write_all(&mut zip, &std::fs::read(&path)?)?;
+        }
+    }
+    zip.finish()?;
+    std::fs::remove_dir_all(&staging_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "diagnostics ZIP was created but staging cleanup failed: {error}"
+        )
+    })?;
+
+    Ok(format!(
+        "Diagnostics exported to: {}\n\
+         Contains: config, gateway_status, feishu_status, feishu_security, recent_jobs, recent_outbox, recent_errors, build_info\n\
+         Secrets stripped: app_secret, verification_token, encrypt_key, tokens redacted",
+        zip_path.display()
+    ))
+}
+
+fn sanitize_config_for_export(config: &Config) -> serde_json::Value {
+    let json = serde_json::to_value(config).unwrap_or_default();
+    sanitize_json_value(json)
+}
+
+fn sanitize_json_value(val: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => val,
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sanitize_json_value).collect()),
+        Value::Object(map) => {
+            let is_secret_key = |key: &str| {
+                let k = key.to_ascii_lowercase();
+                matches!(
+                    k.as_str(),
+                    "app_secret" | "verification_token" | "encrypt_key"
+                        | "tenant_access_token" | "authorization" | "token"
+                        | "password" | "secret" | "key"
+                )
+            };
+            let is_sensitive_path = |key: &str| {
+                let k = key.to_ascii_lowercase();
+                k.contains("secret")
+                    || k.contains("token")
+                    || k.contains("authorization")
+                    || matches!(
+                        k.as_str(),
+                        "payload" | "payload_json" | "body" | "message" | "reply" | "content"
+                    )
+            };
+            Value::Object(serde_json::Map::from_iter(
+                map.into_iter().map(|(k, v)| {
+                    let redacted = if is_secret_key(&k) || is_sensitive_path(&k) {
+                        Value::String("[REDACTED]".to_string())
+                    } else {
+                        sanitize_json_value(v)
+                    };
+                    (k, redacted)
+                }),
+            ))
+        }
+    }
+}
+
+fn truncate_for_export(s: &str, max_len: usize) -> String {
+    let mut chars = s.chars();
+    let truncated = chars.by_ref().take(max_len).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn chrono_lite_timestamp() -> String {
+    let format = time::format_description::parse(
+        "[year][month][day]_[hour][minute][second]",
+    )
+    .expect("valid diagnostics timestamp format");
+    time::OffsetDateTime::now_utc()
+        .format(&format)
+        .unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string()
+        })
+}
+
+fn gather_feishu_status(config: &Config) -> serde_json::Value {
+    let feishu = config.channels_config.feishu.as_ref();
+    let security = crate::gateway::FeishuSecurityConfig::from_entry(feishu);
+    serde_json::json!({
+        "enabled": feishu.map(|e| e.enabled).unwrap_or(false),
+        "security_mode": security.mode.as_str(),
+        "verification_token_configured": security.verification_token.is_some(),
+        "encrypt_key_configured": security.encrypt_key.is_some(),
+        "insecure_dev_mode": security.insecure,
+        "outbound_mode": feishu
+            .and_then(|e| e.extra.get("outbound_mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("disabled"),
+        "public_webhook_base_url": feishu
+            .and_then(|e| e.extra.get("public_webhook_base_url"))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_public_webhook_base_url),
+    })
+}
+
+#[cfg(test)]
+mod productized_gateway_tests {
+    use super::*;
+    use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn diagnostics_export_command_shape_is_supported() {
+        let cli = Cli::try_parse_from(["omninova", "diagnostics", "export"])
+            .expect("diagnostics export should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Diagnostics {
+                command: DiagnosticsCommands::Export { output: None }
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnostics_sanitizer_removes_secrets_and_full_payloads() {
+        let sanitized = sanitize_json_value(json!({
+            "app_secret": "secret-value",
+            "verification_token": "verification-value",
+            "encrypt_key": "encrypt-value",
+            "Authorization": "Bearer token-value",
+            "payload_json": "{\"message\":\"full user message\"}",
+            "reply": "full model reply",
+            "safe": "kept"
+        }));
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+        assert!(!serialized.contains("secret-value"));
+        assert!(!serialized.contains("verification-value"));
+        assert!(!serialized.contains("encrypt-value"));
+        assert!(!serialized.contains("Bearer token-value"));
+        assert!(!serialized.contains("full user message"));
+        assert!(!serialized.contains("full model reply"));
+        assert!(serialized.contains("\"safe\":\"kept\""));
+    }
+
+    #[test]
+    fn diagnostics_preview_truncation_is_utf8_safe() {
+        assert_eq!(truncate_for_export("飞书网关状态", 3), "飞书网...");
+    }
 }
 
 fn build_generic_daemon_checks(config: &Config) -> Vec<GatewayServiceCheckReport> {
