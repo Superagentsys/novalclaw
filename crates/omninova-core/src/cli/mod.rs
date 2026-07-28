@@ -6,7 +6,8 @@ use crate::daemon::service::{
     resolve_gateway_service,
 };
 use crate::gateway::{
-    normalize_public_webhook_base_url, GatewayRuntime, GatewayRuntimeStatus,
+    check_gateway_public_health, feishu_public_callback_urls,
+    resolve_public_webhook_base_url, GatewayRuntime, GatewayRuntimeStatus,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -2018,13 +2019,43 @@ async fn run_gateway_status(config: &Config) -> Result<String> {
     let mut status =
         GatewayRuntimeStatus::from_runtime(running, &runtime, None, probe_error).await;
     status.health_ok = status_code == Some(200);
+    status.public_health = check_gateway_public_health(config).await;
     Ok(serde_json::to_string_pretty(&status)?)
+}
+
+fn executable_exists_on_path(name: &str) -> bool {
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates = if cfg!(windows) {
+        vec![name.to_string(), format!("{name}.exe")]
+    } else {
+        vec![name.to_string()]
+    };
+    std::env::split_paths(&path_value).any(|directory| {
+        candidates
+            .iter()
+            .any(|candidate| directory.join(candidate).is_file())
+    })
+}
+
+fn cloudflared_found(config: &Config) -> bool {
+    config
+        .gateway_public
+        .cloudflared_path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+        .is_some_and(|path| path.is_file())
+        || executable_exists_on_path("cloudflared")
 }
 
 async fn run_gateway_doctor(config: &Config) -> Result<String> {
     use crate::gateway::FeishuSecurityConfig;
 
     let mut checks = Vec::new();
+    let (gateway_reachable, gateway_status_code, gateway_probe_error) =
+        probe_gateway_http(config).await;
+    let local_health_ok = gateway_reachable && gateway_status_code == Some(200);
 
     // 1. Config file exists
     checks.push(serde_json::json!({
@@ -2119,7 +2150,6 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
     let port = config.gateway.port;
     let port_bindable =
         std::net::TcpListener::bind((config.gateway.host.as_str(), port)).is_ok();
-    let (gateway_reachable, gateway_status_code, _) = probe_gateway_http(config).await;
     let healthy_gateway_owns_port = gateway_reachable && gateway_status_code == Some(200);
     checks.push(serde_json::json!({
         "check": "gateway_port",
@@ -2136,20 +2166,27 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
         }
     }));
 
-    // 7. public_webhook_base_url configured
-    let public_base = feishu_entry
-        .and_then(|e| e.extra.get("public_webhook_base_url"))
-        .and_then(|v| v.as_str())
-        .and_then(normalize_public_webhook_base_url);
+    checks.push(serde_json::json!({
+        "check": "local_health",
+        "ok": local_health_ok,
+        "running": local_health_ok,
+        "status_code": gateway_status_code,
+        "url": gateway_probe_url(config),
+        "detail": if local_health_ok {
+            "local Gateway health is OK".to_string()
+        } else {
+            gateway_probe_error.unwrap_or_else(|| "local Gateway health check failed".to_string())
+        }
+    }));
+
+    // 7. Stable public ingress configuration and real public health probe.
+    let public_base = resolve_public_webhook_base_url(config);
     let public_base_configured = public_base.is_some();
-    let (feishu_webhook_url, card_callback_url) = if let Some(base) = public_base.as_deref() {
-        (Some(format!("{}/webhook/feishu", base)), Some(format!("{}/webhook/feishu/card", base)))
-    } else {
-        (None, None)
-    };
+    let (feishu_webhook_url, card_callback_url) = feishu_public_callback_urls(config);
     checks.push(serde_json::json!({
         "check": "public_webhook_base_url",
         "ok": true,
+        "mode": config.gateway_public.mode.as_str(),
         "configured": public_base_configured,
         "public_base": public_base,
         "feishu_webhook_url": feishu_webhook_url,
@@ -2159,6 +2196,41 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
         } else {
             "not configured (webhook URLs will only show local address)".to_string()
         }
+    }));
+
+    let public_health = check_gateway_public_health(config).await;
+    checks.push(serde_json::json!({
+        "check": "public_health",
+        "ok": public_health.ok,
+        "configured": public_health.configured,
+        "status_code": public_health.status_code,
+        "checked_url": public_health.checked_url,
+        "error_kind": public_health.error_kind,
+        "detail": public_health.error.unwrap_or_else(|| "public Gateway health is OK".to_string()),
+    }));
+
+    let cloudflared_available = cloudflared_found(config);
+    checks.push(serde_json::json!({
+        "check": "cloudflared",
+        "ok": true,
+        "found": cloudflared_available,
+        "configured_path_present": config.gateway_public.cloudflared_path.is_some(),
+        "quick_tunnel_non_production": matches!(
+            config.gateway_public.mode,
+            crate::config::schema::GatewayPublicMode::QuickTunnel
+        ),
+        "detail": if cloudflared_available {
+            "cloudflared is available".to_string()
+        } else {
+            "cloudflared was not found; external_public_url mode remains available".to_string()
+        }
+    }));
+
+    checks.push(serde_json::json!({
+        "check": "runtime_workers",
+        "ok": true,
+        "store_opened": store_opened,
+        "retry_worker_enabled": local_health_ok && store_opened && feishu_enabled,
     }));
 
     let all_ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(true));
@@ -2415,10 +2487,8 @@ fn gather_feishu_status(config: &Config) -> serde_json::Value {
             .and_then(|e| e.extra.get("outbound_mode"))
             .and_then(|v| v.as_str())
             .unwrap_or("disabled"),
-        "public_webhook_base_url": feishu
-            .and_then(|e| e.extra.get("public_webhook_base_url"))
-            .and_then(|v| v.as_str())
-            .and_then(normalize_public_webhook_base_url),
+        "gateway_public_mode": config.gateway_public.mode.as_str(),
+        "public_webhook_base_url": resolve_public_webhook_base_url(config),
     })
 }
 
@@ -2464,6 +2534,51 @@ mod productized_gateway_tests {
     #[test]
     fn diagnostics_preview_truncation_is_utf8_safe() {
         assert_eq!(truncate_for_export("飞书网关状态", 3), "飞书网...");
+    }
+
+    #[tokio::test]
+    async fn gateway_doctor_reports_public_ingress_without_leaking_secrets() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "omninova-gateway-doctor-public-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let mut config = Config::default();
+        config.config_path = temp_root.join("config.toml");
+        std::fs::write(&config.config_path, "# test").unwrap();
+        config.gateway.host = "127.0.0.1".to_string();
+        config.gateway.port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        config.channels_config.feishu = Some(crate::config::ChannelEntry {
+            enabled: true,
+            extra: std::collections::HashMap::from([
+                ("app_id".to_string(), json!("cli_test")),
+                (
+                    "app_secret".to_string(),
+                    json!("doctor-app-secret-must-not-leak"),
+                ),
+                ("outbound_mode".to_string(), json!("real")),
+                ("security_mode".to_string(), json!("token")),
+                (
+                    "verification_token".to_string(),
+                    json!("doctor-token-must-not-leak"),
+                ),
+            ]),
+            ..Default::default()
+        });
+
+        let output = run_gateway_doctor(&config).await.unwrap();
+        assert!(output.contains("\"check\": \"public_health\""));
+        assert!(output.contains("\"check\": \"cloudflared\""));
+        assert!(output.contains("external_public_url"));
+        assert!(!output.contains("doctor-app-secret-must-not-leak"));
+        assert!(!output.contains("doctor-token-must-not-leak"));
+        assert!(!output.to_ascii_lowercase().contains("authorization: bearer"));
+
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 }
 

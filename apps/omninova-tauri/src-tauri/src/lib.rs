@@ -3,11 +3,14 @@ mod composer_attachments;
 mod desktop_capture;
 
 use omninova_core::channels::{ChannelKind, InboundMessage};
-use omninova_core::config::{Config, ModelProviderConfig, ProviderConfig, RobotConfig, ChannelsConfig, ChannelEntry};
+use omninova_core::config::{
+    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, ModelProviderConfig,
+    ProviderConfig, RobotConfig,
+};
 use omninova_core::gateway::{
-    normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse, GatewayRuntime,
-    GatewayRuntimeStatus, GatewaySessionHistoryResponse, GatewaySessionTreeQuery,
-    GatewaySessionTreeResponse,
+    check_gateway_public_health, normalize_public_webhook_base_url, GatewayHealth,
+    GatewayInboundResponse, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
+    GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
@@ -15,13 +18,13 @@ use omninova_core::skills::{import_skills_from_dir, load_skills_from_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindowBuilder, WindowEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -127,9 +130,181 @@ struct AppState {
     last_gateway_error: Option<String>,
     /// Error code for the last gateway error (e.g., "port_in_use", "already_running")
     last_gateway_error_code: Option<String>,
+    last_public_health: Option<GatewayPublicHealthStatus>,
 }
 
 const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
+const WEBVIEW2_DATA_DIR_ENV: &str = "OMNINOVA_WEBVIEW2_DATA_DIR";
+const WEBVIEW2_LOCK_SCAN_MAX_DEPTH: usize = 4;
+const WEBVIEW2_LOCK_SCAN_MAX_RESULTS: usize = 32;
+
+#[derive(Debug)]
+struct WebviewStartupDiagnostics {
+    app_data_dir: PathBuf,
+    user_data_dir: PathBuf,
+    process_id: u32,
+    other_omninova_processes: usize,
+    webview2_processes: usize,
+    gateway_port_in_use: bool,
+    dev_server_port_in_use: bool,
+    lock_like_files: Vec<PathBuf>,
+}
+
+fn resolve_webview_user_data_dir_with(
+    home_dir: Option<&Path>,
+    configured_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(configured_dir) = configured_dir.filter(|path| !path.as_os_str().is_empty()) {
+        return configured_dir.to_path_buf();
+    }
+
+    home_dir
+        .map(|home| home.join(".omninova").join("webview2"))
+        .unwrap_or_else(|| PathBuf::from(".omninova").join("webview2"))
+}
+
+fn resolve_webview_user_data_dir() -> PathBuf {
+    let configured = std::env::var_os(WEBVIEW2_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    resolve_webview_user_data_dir_with(user_home_dir().as_deref(), configured.as_deref())
+}
+
+fn is_webview_lock_like_file(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized == "lock"
+        || normalized == "lockfile"
+        || normalized.starts_with("singleton")
+        || normalized.ends_with(".lock")
+}
+
+fn collect_webview_lock_like_files(root: &Path) -> Vec<PathBuf> {
+    fn visit(root: &Path, current: &Path, depth: usize, results: &mut Vec<PathBuf>) {
+        if depth > WEBVIEW2_LOCK_SCAN_MAX_DEPTH
+            || results.len() >= WEBVIEW2_LOCK_SCAN_MAX_RESULTS
+        {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if results.len() >= WEBVIEW2_LOCK_SCAN_MAX_RESULTS {
+                break;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                visit(root, &path, depth + 1, results);
+            } else if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_webview_lock_like_file)
+            {
+                results.push(
+                    path.strip_prefix(root)
+                        .map(Path::to_path_buf)
+                        .unwrap_or(path),
+                );
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    visit(root, root, 0, &mut results);
+    results
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_counts(current_pid: u32) -> (usize, usize) {
+    let Ok(output) = StdCommand::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return (0, 0);
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut omninova = 0;
+    let mut webview2 = 0;
+    for line in listing.lines() {
+        let mut fields = line
+            .trim()
+            .trim_matches('"')
+            .split("\",\"")
+            .map(str::trim);
+        let Some(image_name) = fields.next() else {
+            continue;
+        };
+        let pid = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_default();
+        if image_name.eq_ignore_ascii_case("omninova-tauri.exe") && pid != current_pid {
+            omninova += 1;
+        } else if image_name.eq_ignore_ascii_case("msedgewebview2.exe") {
+            webview2 += 1;
+        }
+    }
+    (omninova, webview2)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_process_counts(_current_pid: u32) -> (usize, usize) {
+    (0, 0)
+}
+
+fn tcp_port_in_use(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+fn collect_webview_startup_diagnostics(
+    app_data_dir: PathBuf,
+    user_data_dir: PathBuf,
+) -> WebviewStartupDiagnostics {
+    let process_id = std::process::id();
+    let (other_omninova_processes, webview2_processes) = windows_process_counts(process_id);
+    let lock_like_files = collect_webview_lock_like_files(&user_data_dir);
+    WebviewStartupDiagnostics {
+        app_data_dir,
+        user_data_dir,
+        process_id,
+        other_omninova_processes,
+        webview2_processes,
+        gateway_port_in_use: tcp_port_in_use(10809),
+        dev_server_port_in_use: tcp_port_in_use(5173),
+        lock_like_files,
+    }
+}
+
+fn log_webview_startup_diagnostics(diagnostics: &WebviewStartupDiagnostics) {
+    eprintln!(
+        "[webview-startup] app_data_dir={} user_data_dir={} process_id={}",
+        diagnostics.app_data_dir.display(),
+        diagnostics.user_data_dir.display(),
+        diagnostics.process_id
+    );
+    eprintln!(
+        "[webview-startup] other_omninova_processes={} webview2_processes={} port_10809_in_use={} port_5173_in_use={}",
+        diagnostics.other_omninova_processes,
+        diagnostics.webview2_processes,
+        diagnostics.gateway_port_in_use,
+        diagnostics.dev_server_port_in_use
+    );
+    let lock_names = diagnostics
+        .lock_like_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    eprintln!(
+        "[webview-startup] lock_like_files_present={} lock_like_files={lock_names:?}",
+        !lock_names.is_empty()
+    );
+}
 
 fn resolve_embedded_agent_browser_relative_path() -> Option<&'static str> {
     match std::env::consts::OS {
@@ -305,6 +480,8 @@ struct SetupAppConfig {
     workspace_status: SetupWorkspaceStatus,
     omninoval_gateway_url: Option<String>,
     omninoval_config_dir: Option<String>,
+    #[serde(default)]
+    gateway_public: GatewayPublicConfig,
     robot: Option<RobotConfig>,
     #[serde(default)]
     providers: Vec<SetupProviderConfig>,
@@ -407,6 +584,9 @@ struct GatewayStatusPayload {
     feishu_webhook_url: Option<String>,
     feishu_card_callback_url: Option<String>,
     public_webhook_base_url: Option<String>,
+    gateway_public_mode: String,
+    quick_tunnel_non_production: bool,
+    cloudflared_configured: bool,
     enabled_channels: Vec<String>,
     security_mode: Option<String>,
     outbound_mode: Option<String>,
@@ -415,6 +595,7 @@ struct GatewayStatusPayload {
     retry_worker_enabled: bool,
     last_started_at: Option<i64>,
     health_ok: bool,
+    public_health: GatewayPublicHealthStatus,
     last_error: Option<String>,
     error_code: Option<String>,
 }
@@ -1310,6 +1491,52 @@ async fn test_gateway_health(
 }
 
 #[tauri::command]
+async fn test_gateway_public_health(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayPublicHealthStatus, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let (runtime, running) = {
+        let app_state = state_ref.lock().await;
+        (app_state.runtime.clone(), app_state.gateway_task.is_some())
+    };
+    let config = runtime.get_config().await;
+    let mut result = if running {
+        check_gateway_public_health(&config).await
+    } else if let Some(base_url) =
+        omninova_core::gateway::resolve_public_webhook_base_url(&config)
+    {
+        GatewayPublicHealthStatus {
+            configured: true,
+            ok: false,
+            base_url: Some(base_url),
+            checked_url: None,
+            checked_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            ),
+            status_code: None,
+            error_kind: Some("gateway_not_running".to_string()),
+            error: Some("Gateway 未启动，无法检查公网入口。".to_string()),
+        }
+    } else {
+        GatewayPublicHealthStatus::not_configured()
+    };
+
+    // Keep the configured base in the cached snapshot so stale results are
+    // discarded automatically after the user changes Public Base URL.
+    if result.base_url.is_none() {
+        result.base_url =
+            omninova_core::gateway::resolve_public_webhook_base_url(&config);
+    }
+    let mut app_state = state_ref.lock().await;
+    app_state.last_public_health = Some(result.clone());
+    Ok(result)
+}
+
+#[tauri::command]
 fn cli_install_status(app: AppHandle) -> Result<cli_install::CliInstallStatus, String> {
     cli_install::cli_install_status(&app)
 }
@@ -1393,12 +1620,13 @@ async fn skills_package_summary(
 }
 
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
-    let (runtime, running, last_started_at, last_error, error_code): (
+    let (runtime, running, last_started_at, last_error, error_code, last_public_health): (
         GatewayRuntime,
         bool,
         Option<i64>,
         Option<String>,
         Option<String>,
+        Option<GatewayPublicHealthStatus>,
     ) = {
         let app_state = state.lock().await;
         (
@@ -1407,15 +1635,21 @@ async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatu
             app_state.last_gateway_started_at,
             app_state.last_gateway_error.clone(),
             app_state.last_gateway_error_code.clone(),
+            app_state.last_public_health.clone(),
         )
     };
 
-    let status = GatewayRuntimeStatus::from_runtime(
+    let mut status = GatewayRuntimeStatus::from_runtime(
         running,
         &runtime,
         last_started_at,
         last_error.clone(),
     ).await;
+    if let Some(public_health) = last_public_health {
+        if public_health.base_url == status.public_webhook_base_url {
+            status.public_health = public_health;
+        }
+    }
 
     GatewayStatusPayload {
         running,
@@ -1425,6 +1659,9 @@ async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatu
         feishu_webhook_url: status.feishu_webhook_url,
         feishu_card_callback_url: status.feishu_card_callback_url,
         public_webhook_base_url: status.public_webhook_base_url,
+        gateway_public_mode: status.gateway_public_mode,
+        quick_tunnel_non_production: status.quick_tunnel_non_production,
+        cloudflared_configured: status.cloudflared_configured,
         enabled_channels: status.enabled_channels,
         security_mode: status.security_mode,
         outbound_mode: status.outbound_mode,
@@ -1433,6 +1670,7 @@ async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatu
         retry_worker_enabled: status.retry_worker_enabled,
         last_started_at: status.last_started_at,
         health_ok: status.health_ok,
+        public_health: status.public_health,
         last_error,
         error_code,
     }
@@ -1543,6 +1781,17 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
 
     providers.sort_by(|left, right| left.name.cmp(&right.name));
 
+    let mut gateway_public = config.gateway_public.clone();
+    if gateway_public.public_webhook_base_url.is_none() {
+        gateway_public.public_webhook_base_url = config
+            .channels_config
+            .feishu
+            .as_ref()
+            .and_then(|entry| entry.extra.get("public_webhook_base_url"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_public_webhook_base_url);
+    }
+
     SetupAppConfig {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
@@ -1558,6 +1807,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             .config_path
             .parent()
             .map(|path| path.to_string_lossy().to_string()),
+        gateway_public,
         robot: config.robot.clone(),
         providers,
         channels: Some(channels_from_core(&config.channels_config)),
@@ -1738,6 +1988,29 @@ fn setup_config_to_core(
         current.gateway.port = port;
     }
 
+    let mut gateway_public = setup.gateway_public;
+    if gateway_public.public_webhook_base_url.is_none() {
+        gateway_public.public_webhook_base_url = current
+            .channels_config
+            .feishu
+            .as_ref()
+            .and_then(|entry| entry.extra.get("public_webhook_base_url"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_public_webhook_base_url);
+    }
+    gateway_public.public_webhook_base_url = gateway_public
+        .public_webhook_base_url
+        .as_deref()
+        .and_then(normalize_public_webhook_base_url);
+    gateway_public.cloudflared_path = gateway_public
+        .cloudflared_path
+        .filter(|path| !path.as_os_str().is_empty());
+    gateway_public.named_tunnel_name =
+        normalize_optional_string(gateway_public.named_tunnel_name);
+    gateway_public.named_tunnel_hostname =
+        normalize_optional_string(gateway_public.named_tunnel_hostname);
+    current.gateway_public = gateway_public;
+
     current.robot = setup.robot;
     current.providers = setup
         .providers
@@ -1779,7 +2052,16 @@ fn setup_config_to_core(
         .collect::<HashMap<_, _>>();
 
     if let Some(channels) = setup.channels {
-        let next_channels = channels_to_core(channels, &current.channels_config);
+        let mut next_channels = channels_to_core(channels, &current.channels_config);
+        if current
+            .gateway_public
+            .public_webhook_base_url
+            .is_some()
+        {
+            if let Some(feishu) = next_channels.feishu.as_mut() {
+                feishu.extra.remove("public_webhook_base_url");
+            }
+        }
         // Validate the merged config, not the renderer DTO. This lets an
         // unchanged `***SET***` marker safely preserve the real stored value
         // while still rejecting a marker with no corresponding secret.
@@ -2463,6 +2745,7 @@ pub fn run() {
         last_gateway_started_at: None,
         last_gateway_error: None,
         last_gateway_error_code: None,
+        last_public_health: None,
     }));
 
     let app = tauri::Builder::default()
@@ -2500,6 +2783,7 @@ pub fn run() {
             desktop_capture::capture_desktop_screenshot,
             restart_gateway,
             test_gateway_health,
+            test_gateway_public_health,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -2509,6 +2793,56 @@ pub fn run() {
         })
         .setup(|app| {
             configure_embedded_agent_browser_env(app.handle());
+
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from(".omninova"));
+            let webview_user_data_dir = resolve_webview_user_data_dir();
+            std::fs::create_dir_all(&webview_user_data_dir).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "无法创建 WebView2 用户数据目录 {}：{error}",
+                        webview_user_data_dir.display()
+                    ),
+                )
+            })?;
+            let diagnostics = collect_webview_startup_diagnostics(
+                app_data_dir,
+                webview_user_data_dir.clone(),
+            );
+            log_webview_startup_diagnostics(&diagnostics);
+            if diagnostics.other_omninova_processes > 0 {
+                let message =
+                    "检测到 OmniNova/WebView2 可能仍在运行，请关闭旧实例后重试。";
+                eprintln!("[webview-startup] rejected reason=existing_omninova_instance");
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, message).into(),
+                );
+            }
+
+            let window_config = app.config().app.windows.first().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "缺少主窗口配置，无法创建 OmniNova 窗口。",
+                )
+            })?;
+            let window = WebviewWindowBuilder::from_config(app.handle(), window_config)?
+                .data_directory(webview_user_data_dir.clone())
+                .build()
+                .map_err(|error| {
+                    let message = format!(
+                        "无法创建 OmniNova 窗口。WebView2 用户数据目录可能正在使用中：{}。请关闭旧实例后重试。原始错误：{error}",
+                        webview_user_data_dir.display()
+                    );
+                    eprintln!("[webview-startup] window_create_failed resource_may_be_in_use=true");
+                    std::io::Error::new(std::io::ErrorKind::Other, message)
+                })?;
+            eprintln!(
+                "[webview-startup] window_created=true user_data_dir={}",
+                webview_user_data_dir.display()
+            );
 
             let state = app.state::<Arc<Mutex<AppState>>>().inner().clone();
 
@@ -2550,7 +2884,6 @@ pub fn run() {
 
             #[cfg(debug_assertions)]
             {
-                let window = app.get_webview_window("main").unwrap();
                 window.open_devtools();
             }
             Ok(())
@@ -2570,9 +2903,113 @@ pub fn run() {
 }
 
 #[cfg(test)]
+mod webview_startup_tests {
+    use super::*;
+
+    #[test]
+    fn webview_user_data_dir_is_stable_under_omninova_home() {
+        let home = PathBuf::from(r"C:\Users\Hero");
+        let resolved = resolve_webview_user_data_dir_with(Some(&home), None);
+        assert_eq!(resolved, home.join(".omninova").join("webview2"));
+    }
+
+    #[test]
+    fn configured_webview_user_data_dir_is_preserved() {
+        let home = PathBuf::from(r"C:\Users\Hero");
+        let configured = PathBuf::from(r"D:\OmniNovaData\webview2");
+        let resolved =
+            resolve_webview_user_data_dir_with(Some(&home), Some(&configured));
+        assert_eq!(resolved, configured);
+    }
+
+    #[test]
+    fn lock_scan_only_returns_lock_like_relative_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "omninova-webview-lock-test-{}",
+            std::process::id()
+        ));
+        let nested = root.join("EBWebView").join("Default");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("LOCK"), b"").unwrap();
+        std::fs::write(nested.join("Preferences"), b"{}").unwrap();
+
+        let found = collect_webview_lock_like_files(&root);
+        assert_eq!(
+            found,
+            vec![PathBuf::from("EBWebView").join("Default").join("LOCK")]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn webview_diagnostics_shape_contains_no_secret_fields() {
+        let diagnostics = WebviewStartupDiagnostics {
+            app_data_dir: PathBuf::from(r"C:\Users\Hero\AppData\Local\com.omninova.claw"),
+            user_data_dir: PathBuf::from(r"C:\Users\Hero\.omninova\webview2"),
+            process_id: 42,
+            other_omninova_processes: 0,
+            webview2_processes: 3,
+            gateway_port_in_use: false,
+            dev_server_port_in_use: true,
+            lock_like_files: vec![PathBuf::from("EBWebView").join("Default").join("LOCK")],
+        };
+        let rendered = format!("{diagnostics:?}").to_ascii_lowercase();
+        for forbidden in [
+            "app_secret",
+            "verification_token",
+            "encrypt_key",
+            "tenant_access_token",
+            "authorization",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+}
+
+#[cfg(test)]
 mod channel_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn setup_migrates_legacy_public_webhook_url_to_gateway_public() {
+        let mut core = Config::default();
+        core.channels_config.feishu = Some(ChannelEntry {
+            enabled: false,
+            extra: HashMap::from([(
+                "public_webhook_base_url".to_string(),
+                serde_json::json!("https://example.test/webhook/feishu/card"),
+            )]),
+            ..Default::default()
+        });
+
+        let mut setup = setup_config_from_core(&core);
+        assert_eq!(
+            setup.gateway_public.public_webhook_base_url.as_deref(),
+            Some("https://example.test")
+        );
+        setup.gateway_public.mode =
+            omninova_core::config::GatewayPublicMode::ExternalPublicUrl;
+
+        let saved =
+            setup_config_to_core(core, setup, ChannelValidationScope::Current("feishu"))
+                .unwrap();
+        assert_eq!(
+            saved
+                .gateway_public
+                .public_webhook_base_url
+                .as_deref(),
+            Some("https://example.test")
+        );
+        assert!(!saved
+            .channels_config
+            .feishu
+            .as_ref()
+            .unwrap()
+            .extra
+            .contains_key("public_webhook_base_url"));
+    }
 
     /// Test 1: Feishu extra roundtrip
     /// Input: enabled = true, extra.app_id = "cli_test", extra.app_secret = "secret_test"

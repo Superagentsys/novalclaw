@@ -128,13 +128,6 @@ const FEISHU_SECURITY_FIELDS: ChannelField[] = [
   { key: "security_mode", label: "Webhook Security Mode", placeholder: "dev/token/encrypted", isExtra: true },
   { key: "verification_token", label: "Verification Token", placeholder: "Feishu Verification Token", type: "password", isExtra: true },
   { key: "encrypt_key", label: "Encrypt Key", placeholder: "Feishu Encrypt Key", type: "password", isExtra: true },
-  {
-    key: "public_webhook_base_url",
-    label: "Public Webhook Base URL",
-    placeholder: "https://your-tunnel.example",
-    type: "text",
-    isExtra: true,
-  },
 ];
 
 export const CHANNEL_PRESETS: ChannelPreset[] = [
@@ -286,6 +279,30 @@ export interface WorkspaceStatus {
   message: string;
 }
 
+export type GatewayPublicMode =
+  | "quick_tunnel"
+  | "named_cloudflare_tunnel"
+  | "external_public_url";
+
+export interface GatewayPublicConfig {
+  mode: GatewayPublicMode;
+  public_webhook_base_url?: string | null;
+  cloudflared_path?: string | null;
+  named_tunnel_name?: string | null;
+  named_tunnel_hostname?: string | null;
+}
+
+export interface GatewayPublicHealthStatus {
+  configured: boolean;
+  ok: boolean;
+  base_url?: string | null;
+  checked_url?: string | null;
+  checked_at?: number | null;
+  status_code?: number | null;
+  error_kind?: string | null;
+  error?: string | null;
+}
+
 export interface Config {
   api_key?: string;
   api_url?: string;
@@ -305,6 +322,7 @@ export interface Config {
   multimodal?: MultimodalConfig;
   observability?: ObservabilityConfig;
   audit?: AuditConfig;
+  gateway_public?: GatewayPublicConfig;
 }
 
 export interface GatewayStatus {
@@ -315,6 +333,10 @@ export interface GatewayStatus {
   feishu_webhook_url?: string | null;
   feishu_card_callback_url?: string | null;
   public_webhook_base_url?: string | null;
+  gateway_public_mode: GatewayPublicMode;
+  quick_tunnel_non_production: boolean;
+  cloudflared_configured: boolean;
+  public_health: GatewayPublicHealthStatus;
   enabled_channels: string[];
   security_mode?: string | null;
   outbound_mode?: string | null;

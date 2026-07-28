@@ -3,6 +3,7 @@ import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type Config,
+  type GatewayPublicMode,
   type GatewayStatus,
 } from "../../types/config";
 import { ChannelConfigForm } from "./ChannelConfigForm";
@@ -45,6 +46,15 @@ function formatGatewayStartError(message: string): string {
   return message.includes(LARK_BLOCKER_MESSAGE)
     ? `网关启动被 Lark 配置阻止：${LARK_BLOCKER_MESSAGE}`
     : message;
+}
+
+function normalizePublicBaseUrl(value: string | null | undefined): string | null {
+  const trimmed = value?.trim().replace(/\/+$/, "") ?? "";
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.replace(/\/webhook\/feishu(?:\/card)?$/i, "");
+  return normalized.replace(/\/+$/, "") || null;
 }
 
 /** Redact sensitive values in a JSON object for display */
@@ -92,6 +102,13 @@ const initialConfig: Config = {
     discord: { enabled: false },
     telegram: { enabled: false },
     lark: { enabled: false },
+  },
+  gateway_public: {
+    mode: "external_public_url",
+    public_webhook_base_url: null,
+    cloudflared_path: null,
+    named_tunnel_name: null,
+    named_tunnel_hostname: null,
   },
   skills: {
     open_skills_enabled: true,
@@ -223,6 +240,16 @@ export function Setup({
     url: "http://127.0.0.1:10809",
     gateway_host: "127.0.0.1",
     gateway_port: 10809,
+    gateway_public_mode: "external_public_url",
+    quick_tunnel_non_production: false,
+    cloudflared_configured: false,
+    public_health: {
+      configured: false,
+      ok: false,
+      checked_at: null,
+      error_kind: "not_configured",
+      error: "Public Base URL 未配置。",
+    },
     enabled_channels: [],
     store_opened: false,
     retry_worker_enabled: false,
@@ -230,7 +257,7 @@ export function Setup({
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
-    "load" | "save" | "start" | "stop" | "restart" | "health" | null
+    "load" | "save" | "start" | "stop" | "restart" | "health" | "public-health" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
@@ -362,6 +389,10 @@ export function Setup({
         providers: nextConfig.providers ?? DEFAULT_PROVIDERS,
         skills: nextConfig.skills ?? initialConfig.skills,
         agent: nextConfig.agent ?? initialConfig.agent,
+        gateway_public: {
+          ...initialConfig.gateway_public!,
+          ...nextConfig.gateway_public,
+        },
       };
       const { default_provider, default_model } = resolveDefaultProviderSelection(
         merged.providers,
@@ -602,6 +633,27 @@ export function Setup({
     }
   };
 
+  const handleTestGatewayPublicHealth = async () => {
+    setBusyAction("public-health");
+    try {
+      const result = await invokeTauri<GatewayStatus["public_health"]>(
+        "test_gateway_public_health"
+      );
+      setActionMessage(
+        result.ok
+          ? `公网 Health 检查通过：${result.checked_url ?? result.base_url ?? ""}`
+          : `公网 Health 检查失败：${result.error ?? "未知错误"}`
+      );
+      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+    } catch (error) {
+      setActionMessage(
+        `公网 Health 检查失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const copyGatewayUrl = (url: string | null | undefined, label: string) => {
     if (!url) {
       setActionMessage(`${label}尚未生成。`);
@@ -634,17 +686,29 @@ export function Setup({
     setActionMessage("Workspace 目录已清空。保存后 Agent 会要求先选择真实工作目录。");
   };
 
-  const runtimeWebhookUrl =
-    gatewayStatus.feishu_webhook_url ??
-    (gatewayStatus.url ? `${gatewayStatus.url.replace(/\/$/, "")}/webhook/feishu` : null);
-  const runtimeCardCallbackUrl =
-    gatewayStatus.feishu_card_callback_url ??
-    (gatewayStatus.url
-      ? `${gatewayStatus.url.replace(/\/$/, "")}/webhook/feishu/card`
-      : null);
+  const draftNamedTunnelBase =
+    config.gateway_public?.mode === "named_cloudflare_tunnel" &&
+    config.gateway_public.named_tunnel_hostname
+      ? normalizePublicBaseUrl(
+          /^https?:\/\//i.test(config.gateway_public.named_tunnel_hostname)
+            ? config.gateway_public.named_tunnel_hostname
+            : `https://${config.gateway_public.named_tunnel_hostname}`
+        )
+      : null;
+  const draftPublicBase =
+    normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url) ??
+    draftNamedTunnelBase;
+  const callbackBase = draftPublicBase ?? gatewayStatus.url?.replace(/\/$/, "") ?? null;
+  const runtimeWebhookUrl = callbackBase ? `${callbackBase}/webhook/feishu` : null;
+  const runtimeCardCallbackUrl = callbackBase
+    ? `${callbackBase}/webhook/feishu/card`
+    : null;
   const lastStartedLabel = gatewayStatus.last_started_at
     ? new Date(gatewayStatus.last_started_at * 1000).toLocaleString()
     : "尚未记录";
+  const publicHealthCheckedLabel = gatewayStatus.public_health?.checked_at
+    ? new Date(gatewayStatus.public_health.checked_at * 1000).toLocaleString()
+    : "尚未检测";
 
   const renderTabContent = () => {
     switch (activeTab) {
@@ -1003,11 +1067,115 @@ export function Setup({
                   {gatewayStatus.running ? "运行中" : "已停止"}
                 </span>
               </div>
+              <div className="gateway-public-config">
+                <label>
+                  公网入口模式
+                  <select
+                    value={config.gateway_public?.mode ?? "external_public_url"}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        gateway_public: {
+                          ...initialConfig.gateway_public!,
+                          ...config.gateway_public,
+                          mode: event.target.value as GatewayPublicMode,
+                        },
+                      })
+                    }
+                  >
+                    <option value="external_public_url">外部 Public URL</option>
+                    <option value="named_cloudflare_tunnel">Cloudflare Named Tunnel</option>
+                    <option value="quick_tunnel">Cloudflare Quick Tunnel（临时）</option>
+                  </select>
+                </label>
+                <label>
+                  Public Base URL
+                  <input
+                    value={config.gateway_public?.public_webhook_base_url ?? ""}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        gateway_public: {
+                          ...initialConfig.gateway_public!,
+                          ...config.gateway_public,
+                          public_webhook_base_url: event.target.value,
+                        },
+                      })
+                    }
+                    placeholder="https://gateway.example.com"
+                  />
+                  <small>只填写域名 Base；保存时会自动移除 webhook 路径后缀。</small>
+                </label>
+                {config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
+                  <>
+                    <label>
+                      Named Tunnel 名称
+                      <input
+                        value={config.gateway_public.named_tunnel_name ?? ""}
+                        onChange={(event) =>
+                          setConfig({
+                            ...config,
+                            gateway_public: {
+                              ...initialConfig.gateway_public!,
+                              ...config.gateway_public,
+                              named_tunnel_name: event.target.value,
+                            },
+                          })
+                        }
+                        placeholder="omninova-gateway"
+                      />
+                    </label>
+                    <label>
+                      Named Tunnel Hostname
+                      <input
+                        value={config.gateway_public.named_tunnel_hostname ?? ""}
+                        onChange={(event) =>
+                          setConfig({
+                            ...config,
+                            gateway_public: {
+                              ...initialConfig.gateway_public!,
+                              ...config.gateway_public,
+                              named_tunnel_hostname: event.target.value,
+                            },
+                          })
+                        }
+                        placeholder="gateway.example.com"
+                      />
+                    </label>
+                  </>
+                ) : null}
+                {config.gateway_public?.mode === "quick_tunnel" ? (
+                  <label>
+                    cloudflared 路径
+                    <input
+                      value={config.gateway_public.cloudflared_path ?? ""}
+                      onChange={(event) =>
+                        setConfig({
+                          ...config,
+                          gateway_public: {
+                            ...initialConfig.gateway_public!,
+                            ...config.gateway_public,
+                            cloudflared_path: event.target.value,
+                          },
+                        })
+                      }
+                      placeholder="C:\Program Files\cloudflared\cloudflared.exe"
+                    />
+                    <small>本版本只检测 cloudflared，不负责启动或停止隧道。</small>
+                  </label>
+                ) : null}
+              </div>
               <div className="gateway-runtime-grid">
                 <div><span>本地地址</span><code>{gatewayStatus.url}</code></div>
                 <div>
                   <span>Public Base URL</span>
-                  <code>{gatewayStatus.public_webhook_base_url || "未配置"}</code>
+                  <code>{draftPublicBase || "未配置"}</code>
+                </div>
+                <div>
+                  <span>公网入口模式</span>
+                  <strong>
+                    {config.gateway_public?.mode ?? gatewayStatus.gateway_public_mode}
+                  </strong>
                 </div>
                 <div><span>安全模式</span><strong>{gatewayStatus.security_mode || "dev"}</strong></div>
                 <div><span>出站模式</span><strong>{gatewayStatus.outbound_mode || "disabled"}</strong></div>
@@ -1016,7 +1184,18 @@ export function Setup({
                   <span>Retry worker</span>
                   <strong>{gatewayStatus.retry_worker_enabled ? "已启动" : "未启动"}</strong>
                 </div>
-                <div><span>Health</span><strong>{gatewayStatus.health_ok ? "正常" : "未就绪"}</strong></div>
+                <div><span>本地 Health</span><strong>{gatewayStatus.health_ok ? "正常" : "未就绪"}</strong></div>
+                <div>
+                  <span>公网 Health</span>
+                  <strong>
+                    {!gatewayStatus.public_health?.configured
+                      ? "未配置"
+                      : gatewayStatus.public_health.ok
+                        ? "正常"
+                        : "异常"}
+                  </strong>
+                </div>
+                <div><span>公网检测时间</span><strong>{publicHealthCheckedLabel}</strong></div>
                 <div><span>上次启动</span><strong>{lastStartedLabel}</strong></div>
               </div>
               <div className="gateway-runtime-url-list">
@@ -1048,7 +1227,32 @@ export function Setup({
               <div className="gateway-runtime-meta">
                 已启用频道：{gatewayStatus.enabled_channels?.join("、") || "无"}
                 {gatewayStatus.store_path ? ` · Store：${gatewayStatus.store_path}` : ""}
+                {` · cloudflared：${gatewayStatus.cloudflared_configured ? "已配置" : "未配置"}`}
               </div>
+              <div className="gateway-runtime-health-actions">
+                <button
+                  type="button"
+                  className="setup-btn setup-btn--secondary"
+                  onClick={handleTestGatewayPublicHealth}
+                  disabled={busyAction !== null}
+                >
+                  {busyAction === "public-health" ? "检测中…" : "测试公网 Health"}
+                </button>
+                {gatewayStatus.public_health?.error &&
+                !["not_checked", "url_not_configured"].includes(
+                  gatewayStatus.public_health.error_kind ?? ""
+                ) ? (
+                  <span className="gateway-public-error">
+                    公网检测：{gatewayStatus.public_health.error}
+                  </span>
+                ) : null}
+              </div>
+              {(config.gateway_public?.mode === "quick_tunnel" ||
+                gatewayStatus.quick_tunnel_non_production) ? (
+                <div className="gateway-runtime-warning">
+                  Quick Tunnel 地址会变化，只适合临时开发测试，不适合正式环境。
+                </div>
+              ) : null}
               {(gatewayStatus.security_mode || "dev") === "dev" ? (
                 <div className="gateway-runtime-warning">
                   dev 模式允许未校验 webhook，仅适合本地开发，不适合生产环境。

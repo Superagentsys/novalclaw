@@ -2292,6 +2292,212 @@ pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
     }
 }
 
+pub fn resolve_public_webhook_base_url(config: &Config) -> Option<String> {
+    let configured = config
+        .gateway_public
+        .public_webhook_base_url
+        .as_deref()
+        .and_then(normalize_public_webhook_base_url);
+    if configured.is_some() {
+        return configured;
+    }
+
+    if matches!(
+        config.gateway_public.mode,
+        crate::config::schema::GatewayPublicMode::NamedCloudflareTunnel
+    ) {
+        if let Some(hostname) = config
+            .gateway_public
+            .named_tunnel_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let base = if hostname.starts_with("http://") || hostname.starts_with("https://") {
+                hostname.to_string()
+            } else {
+                format!("https://{hostname}")
+            };
+            if let Some(base) = normalize_public_webhook_base_url(&base) {
+                return Some(base);
+            }
+        }
+    }
+
+    config
+        .channels_config
+        .feishu
+        .as_ref()
+        .and_then(|entry| entry.extra.get("public_webhook_base_url"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_public_webhook_base_url)
+}
+
+pub fn feishu_public_callback_urls(config: &Config) -> (Option<String>, Option<String>) {
+    let Some(base) = resolve_public_webhook_base_url(config) else {
+        return (None, None);
+    };
+    (
+        Some(format!("{base}/webhook/feishu")),
+        Some(format!("{base}/webhook/feishu/card")),
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicHealthStatus {
+    pub configured: bool,
+    pub ok: bool,
+    pub base_url: Option<String>,
+    pub checked_url: Option<String>,
+    pub checked_at: Option<i64>,
+    pub status_code: Option<u16>,
+    pub error_kind: Option<String>,
+    pub error: Option<String>,
+}
+
+impl GatewayPublicHealthStatus {
+    pub fn not_configured() -> Self {
+        Self {
+            configured: false,
+            ok: false,
+            base_url: None,
+            checked_url: None,
+            checked_at: None,
+            status_code: None,
+            error_kind: Some("url_not_configured".to_string()),
+            error: Some("Public Base URL 未配置。".to_string()),
+        }
+    }
+
+    pub fn not_checked(base_url: String) -> Self {
+        Self {
+            configured: true,
+            ok: false,
+            base_url: Some(base_url),
+            checked_url: None,
+            checked_at: None,
+            status_code: None,
+            error_kind: Some("not_checked".to_string()),
+            error: Some("公网 Health 尚未检测。".to_string()),
+        }
+    }
+}
+
+fn classify_public_health_error(error: &reqwest::Error) -> (&'static str, String) {
+    let lower = error.to_string().to_ascii_lowercase();
+    if error.is_timeout() {
+        ("timeout", "公网 Health 检查连接超时。".to_string())
+    } else if lower.contains("dns")
+        || lower.contains("name resolution")
+        || lower.contains("failed to lookup")
+    {
+        ("dns_error", "公网域名 DNS 解析失败。".to_string())
+    } else if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
+        ("tls_error", "公网入口 TLS 校验失败。".to_string())
+    } else if error.is_connect() {
+        (
+            "connection_error",
+            "无法连接公网入口，请确认隧道和 Gateway 已启动。".to_string(),
+        )
+    } else {
+        ("request_error", "公网 Health 检查请求失败。".to_string())
+    }
+}
+
+pub async fn check_gateway_public_health(config: &Config) -> GatewayPublicHealthStatus {
+    let Some(base_url) = resolve_public_webhook_base_url(config) else {
+        return GatewayPublicHealthStatus::not_configured();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return GatewayPublicHealthStatus {
+                configured: true,
+                ok: false,
+                base_url: Some(base_url),
+                checked_url: None,
+                checked_at: Some(now_unix_ts()),
+                status_code: None,
+                error_kind: Some("client_error".to_string()),
+                error: Some("无法创建公网 Health 检查客户端。".to_string()),
+            };
+        }
+    };
+
+    let mut last_status = None;
+    for suffix in ["/health", "/api/health"] {
+        let checked_url = format!("{base_url}{suffix}");
+        match client.get(&checked_url).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                last_status = Some(status);
+                if status == 200 {
+                    return GatewayPublicHealthStatus {
+                        configured: true,
+                        ok: true,
+                        base_url: Some(base_url),
+                        checked_url: Some(checked_url),
+                        checked_at: Some(now_unix_ts()),
+                        status_code: Some(status),
+                        error_kind: None,
+                        error: None,
+                    };
+                }
+                if status != 404 {
+                    let (kind, message) = if matches!(status, 502 | 503 | 504) {
+                        (
+                            "cloudflare_origin_error",
+                            "公网入口可达，但 Cloudflare 无法连接本地 Gateway。".to_string(),
+                        )
+                    } else {
+                        (
+                            "http_error",
+                            format!("公网 Health 检查返回 HTTP {status}。"),
+                        )
+                    };
+                    return GatewayPublicHealthStatus {
+                        configured: true,
+                        ok: false,
+                        base_url: Some(base_url),
+                        checked_url: Some(checked_url),
+                        checked_at: Some(now_unix_ts()),
+                        status_code: Some(status),
+                        error_kind: Some(kind.to_string()),
+                        error: Some(message),
+                    };
+                }
+            }
+            Err(error) => {
+                let (kind, message) = classify_public_health_error(&error);
+                return GatewayPublicHealthStatus {
+                    configured: true,
+                    ok: false,
+                    base_url: Some(base_url),
+                    checked_url: Some(checked_url),
+                    checked_at: Some(now_unix_ts()),
+                    status_code: None,
+                    error_kind: Some(kind.to_string()),
+                    error: Some(message),
+                };
+            }
+        }
+    }
+
+    GatewayPublicHealthStatus {
+        configured: true,
+        ok: false,
+        base_url: Some(base_url.clone()),
+        checked_url: Some(format!("{base_url}/api/health")),
+        checked_at: Some(now_unix_ts()),
+        status_code: last_status,
+        error_kind: Some("health_endpoint_not_found".to_string()),
+        error: Some("公网入口可达，但未找到 Health 接口。".to_string()),
+    }
+}
+
 /// Productized runtime status — safe to return to UI/CLI without leaking secrets.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayRuntimeStatus {
@@ -2301,6 +2507,9 @@ pub struct GatewayRuntimeStatus {
     pub local_base_url: String,
     /// The configured public webhook base URL, if any.
     pub public_webhook_base_url: Option<String>,
+    pub gateway_public_mode: String,
+    pub quick_tunnel_non_production: bool,
+    pub cloudflared_configured: bool,
     /// The auto-generated feishu normal event callback URL.
     pub feishu_webhook_url: Option<String>,
     /// The auto-generated feishu card interaction callback URL.
@@ -2317,6 +2526,7 @@ pub struct GatewayRuntimeStatus {
     /// Human-readable last error message.
     pub last_error: Option<String>,
     pub health_ok: bool,
+    pub public_health: GatewayPublicHealthStatus,
 }
 
 impl GatewayRuntimeStatus {
@@ -2340,10 +2550,11 @@ impl GatewayRuntimeStatus {
             .and_then(|e| e.extra.get("outbound_mode"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        let public_webhook_base = feishu_cfg
-            .and_then(|e| e.extra.get("public_webhook_base_url"))
-            .and_then(|v| v.as_str())
-            .and_then(normalize_public_webhook_base_url);
+        let public_webhook_base = resolve_public_webhook_base_url(&cfg);
+        let public_health = public_webhook_base
+            .clone()
+            .map(GatewayPublicHealthStatus::not_checked)
+            .unwrap_or_else(GatewayPublicHealthStatus::not_configured);
         let local_base_url = format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port);
         let callback_base = public_webhook_base
             .as_deref()
@@ -2421,6 +2632,16 @@ impl GatewayRuntimeStatus {
             bind_port: cfg.gateway.port,
             local_base_url,
             public_webhook_base_url: public_webhook_base,
+            gateway_public_mode: cfg.gateway_public.mode.as_str().to_string(),
+            quick_tunnel_non_production: matches!(
+                cfg.gateway_public.mode,
+                crate::config::schema::GatewayPublicMode::QuickTunnel
+            ),
+            cloudflared_configured: cfg
+                .gateway_public
+                .cloudflared_path
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty()),
             feishu_webhook_url,
             feishu_card_callback_url,
             enabled_channels,
@@ -2432,6 +2653,7 @@ impl GatewayRuntimeStatus {
             last_started_at,
             last_error,
             health_ok: running && health.ok,
+            public_health,
         }
     }
 
@@ -6257,11 +6479,12 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 mod tests {
     use super::{
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        normalize_public_webhook_base_url, resolve_agent_max_tool_iterations, split_session_key,
+        check_gateway_public_health, feishu_public_callback_urls, normalize_public_webhook_base_url,
+        resolve_agent_max_tool_iterations, resolve_public_webhook_base_url, split_session_key,
         GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
-    use crate::config::{Config, DelegateAgentConfig};
+    use crate::config::{Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use serde_json::json;
@@ -8606,6 +8829,85 @@ mod tests {
             Some("https://example.test".to_string())
         );
         assert_eq!(normalize_public_webhook_base_url("   "), None);
+    }
+
+    #[test]
+    fn external_public_url_generates_both_feishu_callbacks() {
+        let mut config = Config::default();
+        config.gateway_public = GatewayPublicConfig {
+            mode: GatewayPublicMode::ExternalPublicUrl,
+            public_webhook_base_url: Some(
+                "https://gateway.example.test/webhook/feishu/card/".to_string(),
+            ),
+            ..GatewayPublicConfig::default()
+        };
+
+        assert_eq!(
+            resolve_public_webhook_base_url(&config).as_deref(),
+            Some("https://gateway.example.test")
+        );
+        let (event_url, card_url) = feishu_public_callback_urls(&config);
+        assert_eq!(
+            event_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu")
+        );
+        assert_eq!(
+            card_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu/card")
+        );
+    }
+
+    #[test]
+    fn named_tunnel_hostname_is_used_when_public_base_is_empty() {
+        let mut config = Config::default();
+        config.gateway_public = GatewayPublicConfig {
+            mode: GatewayPublicMode::NamedCloudflareTunnel,
+            named_tunnel_hostname: Some("gateway.example.test".to_string()),
+            ..GatewayPublicConfig::default()
+        };
+
+        assert_eq!(
+            resolve_public_webhook_base_url(&config).as_deref(),
+            Some("https://gateway.example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_health_without_url_returns_structured_not_configured_status() {
+        let status = check_gateway_public_health(&Config::default()).await;
+        assert!(!status.configured);
+        assert!(!status.ok);
+        assert_eq!(status.error_kind.as_deref(), Some("url_not_configured"));
+    }
+
+    #[tokio::test]
+    async fn public_health_connection_failure_is_structured() {
+        let mut config = Config::default();
+        config.gateway_public.public_webhook_base_url =
+            Some("http://127.0.0.1:1".to_string());
+        let status = check_gateway_public_health(&config).await;
+
+        assert!(status.configured);
+        assert!(!status.ok);
+        assert!(matches!(
+            status.error_kind.as_deref(),
+            Some("connection_error" | "request_error" | "timeout")
+        ));
+        assert!(!status.error.as_deref().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quick_tunnel_status_is_marked_non_production() {
+        let mut config = Config::default();
+        config.gateway_public.mode = GatewayPublicMode::QuickTunnel;
+        config.gateway_public.cloudflared_path =
+            Some(PathBuf::from("C:\\tools\\cloudflared.exe"));
+        let runtime = GatewayRuntime::new(config);
+        let status = GatewayRuntimeStatus::from_runtime(false, &runtime, None, None).await;
+
+        assert_eq!(status.gateway_public_mode, "quick_tunnel");
+        assert!(status.quick_tunnel_non_production);
+        assert!(status.cloudflared_configured);
     }
 
     #[tokio::test]
