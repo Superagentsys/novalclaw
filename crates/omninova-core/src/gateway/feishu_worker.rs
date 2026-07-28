@@ -1064,7 +1064,7 @@ async fn send_command_palette_card(
 
 /// Send a card action result reply (e.g. status text, jobs list).
 /// Persists a short reply_preview; never stores full payload.
-async fn send_card_action_result(
+pub(crate) async fn send_card_action_result(
     runtime: &GatewayRuntime,
     inbound: &crate::channels::InboundMessage,
     text: &str,

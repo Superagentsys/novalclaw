@@ -3280,9 +3280,18 @@ async fn http_feishu_webhook(
 /// Feishu sends card interactions as JSON with a `action.value.action` field.
 /// Security: uses the same security_mode as the main Feishu webhook.
 async fn http_feishu_card_callback(
+    state: State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
+    process_feishu_card_action_callback(state, headers, raw_body, "card_endpoint").await
+}
+
+async fn process_feishu_card_action_callback(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
     raw_body: String,
+    source: &'static str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
     use crate::gateway::feishu_worker::{
         canonical_card_action, gateway_status_reply, help_reply,
@@ -3291,6 +3300,7 @@ async fn http_feishu_card_callback(
 
     let channel_name = "feishu";
     let cfg = runtime.get_config().await;
+    println!("[feishu-card] callback_received source={source}");
 
     if !is_channel_enabled(&cfg, &ChannelKind::Feishu) {
         return Err((
@@ -3360,48 +3370,58 @@ async fn http_feishu_card_callback(
         }
     };
 
-    let payload_shape_keys: Vec<&str> = payload
-        .as_object()
-        .map(|o| o.keys().map(|k| k.as_str()).collect())
-        .unwrap_or_default();
-    println!("[feishu-card] payload_shape keys={:?}", payload_shape_keys);
+    println!(
+        "[feishu-card] payload_shape top_keys={:?} event_keys={:?}",
+        safe_json_object_keys(Some(&payload)),
+        safe_json_object_keys(payload.get("event"))
+    );
 
-    let action_opt = payload
-        .pointer("/event/action/value/action")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| payload.pointer("/action/value/action").and_then(|v| v.as_str()).map(String::from));
-
-    let Some(action) = action_opt else {
-        let top_keys = payload_keys_summary(&raw_body);
-        println!("[feishu-card] no_action_key top_keys={:?}", top_keys);
+    let Some((action, action_source)) = extract_feishu_card_action(&payload) else {
+        println!("[feishu-card] action_missing");
         return Ok(Json(serde_json::json!({
-            "toast": { "type": "error", "content": "未识别操作" },
+            "toast": { "type": "warning", "content": "未识别卡片操作，请重新打开功能菜单。" },
             "ok": false
         })));
     };
-
-    println!(
-        "[feishu-card] action_received action_present={} action_chars={}",
-        !action.is_empty(),
-        action.chars().count()
-    );
 
     let canonical = match canonical_card_action(&action) {
         Some(c) => c,
         None => {
             println!(
-                "[feishu-security] unknown_action_rejected action_chars={}",
+                "[feishu-card] action_extract action_present=true action=unknown source={} action_chars={}",
+                action_source,
                 action.chars().count()
             );
+            println!("[feishu-security] unknown_action_rejected");
             return Ok(Json(serde_json::json!({
-                "toast": { "type": "warning", "content": "未知操作，已忽略。请发送 / 打开功能菜单。" },
+                "toast": { "type": "warning", "content": "未知操作，已安全忽略。请发送 / 重新打开功能菜单。" },
                 "ok": false
             })));
         }
     };
 
-    println!("[feishu-card] action_allowed action={}", canonical);
+    println!(
+        "[feishu-card] action_extract action_present=true action={} source={}",
+        canonical, action_source
+    );
+    println!("[feishu-card] action_resolved action={}", canonical);
+
+    let reply_context = extract_feishu_card_reply_context(&payload);
+    println!(
+        "[feishu-card] reply_context chat_id_present={} chat_id_source={} open_message_id_present={} open_message_id_source={}",
+        reply_context.chat_id.is_some(),
+        reply_context.chat_id_source.unwrap_or("none"),
+        reply_context.open_message_id.is_some(),
+        reply_context.open_message_id_source.unwrap_or("none"),
+    );
+    let Some(chat_id) = reply_context.chat_id.clone() else {
+        println!("[feishu-card] missing_chat_id");
+        return Ok(Json(serde_json::json!({
+            "toast": { "type": "warning", "content": "未找到会话信息，操作未执行。请重新打开功能菜单。" },
+            "ok": false,
+            "action": canonical
+        })));
+    };
 
     let store = runtime.feishu_store();
 
@@ -3475,64 +3495,89 @@ async fn http_feishu_card_callback(
     };
 
     let reply_preview: String = reply_text.chars().take(120).collect();
+    let timestamp = chrono_timestamp_simple();
+    let event_key = payload
+        .pointer("/header/event_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("card_event_{value}_{canonical}"))
+        .unwrap_or_else(|| format!("card_{timestamp}_{canonical}"));
+    let job_id = format!("card_{timestamp}_{canonical}");
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "card_action".to_string(),
+        serde_json::Value::String(canonical.to_string()),
+    );
+    if let Some(message_id) = reply_context.open_message_id.clone() {
+        metadata.insert(
+            "message_id".to_string(),
+            serde_json::Value::String(message_id),
+        );
+    }
+    let inbound = crate::channels::InboundMessage {
+        text: match canonical {
+            "monitor_30s" => "/monitor 桌面 30秒".to_string(),
+            "monitor_60s" => "/monitor 桌面 60秒".to_string(),
+            _ => format!("/card-action {canonical}"),
+        },
+        channel: ChannelKind::Feishu,
+        user_id: None,
+        session_id: Some(chat_id.clone()),
+        metadata,
+    };
 
     if matches!(canonical, "monitor_30s" | "monitor_60s") {
-        let text = if canonical == "monitor_30s" {
-            "/monitor 桌面 30秒"
-        } else {
-            "/monitor 桌面 60秒"
-        };
-        if let Some(chat_id) = payload
-            .pointer("/event/chat_id")
-            .and_then(|v| v.as_str())
-        {
-            let event_key = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
-            let job_id = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
-            let monitor_job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
-                ChannelKind::Feishu,
-                crate::channels::InboundMessage {
-                    text: text.to_string(),
-                    channel: ChannelKind::Feishu,
-                    user_id: payload
-                        .pointer("/event/user/open_id")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    session_id: Some(chat_id.to_string()),
-                    metadata: {
-                        let mut m = std::collections::HashMap::new();
-                        m.insert("card_action".to_string(), serde_json::Value::String(canonical.to_string()));
-                        m
-                    },
-                },
-                serde_json::json!({ "card_action": canonical }),
-                false,
-                event_key,
-                Some(job_id),
-            );
-            let _ = runtime.try_send_feishu_job(monitor_job).await;
+        let monitor_job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
+            ChannelKind::Feishu,
+            inbound.clone(),
+            serde_json::json!({ "card_action": canonical }),
+            false,
+            event_key.clone(),
+            Some(job_id.clone()),
+        );
+        match runtime.try_send_feishu_job(monitor_job).await {
+            Ok(()) => println!("[feishu-card] monitor_queued action={canonical}"),
+            Err(_) => println!("[feishu-card] monitor_queue_failed action={canonical}"),
         }
-    }
-
-    if let Some(ref s) = store {
-        if let Some(chat_id) = payload
-            .pointer("/event/chat_id")
-            .and_then(|v| v.as_str())
-        {
-            let job_id = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
-            let event_key = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
-            let outbound_id = format!("{}_{}", job_id, chrono_timestamp_simple());
+        if let Some(ref s) = store {
+            let outbound_id = format!("{}_{}", job_id, timestamp);
             let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
                 outbound_id,
-                job_id: Some(job_id),
-                event_key: Some(event_key),
+                job_id: Some(job_id.clone()),
+                event_key: Some(event_key.clone()),
                 channel: channel_name.to_string(),
-                chat_id: Some(chat_id.to_string()),
+                chat_id: Some(chat_id),
                 reply_kind: Some("card_action_result".to_string()),
                 reply: None,
                 result_json: None,
             };
             let _ = s.insert_outbox(&outbox_input);
         }
+    } else {
+        // Return the callback ACK immediately. The text response is sent in a
+        // detached task and never enters the LLM/chat/tool runtime.
+        let runtime_for_reply = runtime.clone();
+        let inbound_for_reply = inbound.clone();
+        let reply_for_send = reply_text.clone();
+        let job_id_for_send = job_id.clone();
+        let event_key_for_send = event_key.clone();
+        let reply_kind = match canonical {
+            "gateway_status" => crate::gateway::feishu_store::ReplyKind::GatewayStatusReply,
+            "recent_jobs" => crate::gateway::feishu_store::ReplyKind::RecentJobsReply,
+            _ => crate::gateway::feishu_store::ReplyKind::CardActionResult,
+        };
+        tokio::spawn(async move {
+            crate::gateway::feishu_worker::send_card_action_result(
+                &runtime_for_reply,
+                &inbound_for_reply,
+                &reply_for_send,
+                reply_kind,
+                channel_name,
+                &job_id_for_send,
+                &event_key_for_send,
+            )
+            .await;
+        });
     }
 
     Ok(Json(serde_json::json!({
@@ -3557,9 +3602,111 @@ fn extract_token_from_payload(raw: &str) -> Option<String> {
     let s = v
         .pointer("/payload/verification_token")
         .or_else(|| v.pointer("/verification_token"))
+        .or_else(|| v.pointer("/token"))
+        .or_else(|| v.pointer("/header/token"))
+        .or_else(|| v.pointer("/event/token"))
+        .or_else(|| v.pointer("/event/header/token"))
         .and_then(|val| val.as_str())
         .filter(|s| !s.is_empty())?;
     Some(s.to_string())
+}
+
+fn is_feishu_card_action_event(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/header/event_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("card.action.trigger")
+        || payload
+            .pointer("/event/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("card.action.trigger")
+        || payload.get("type").and_then(serde_json::Value::as_str)
+            == Some("card.action.trigger")
+}
+
+fn extract_feishu_card_action(payload: &serde_json::Value) -> Option<(String, &'static str)> {
+    [
+        ("/event/action/value/action", "event.action.value.action"),
+        ("/event/action/value/key", "event.action.value.key"),
+        ("/event/action/value", "event.action.value"),
+        ("/event/action/tag", "event.action.tag"),
+        ("/action/value/action", "action.value.action"),
+        ("/action/value/key", "action.value.key"),
+        ("/action/value", "action.value"),
+    ]
+    .into_iter()
+    .find_map(|(path, source)| {
+        payload
+            .pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (value.trim().to_string(), source))
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FeishuCardReplyContext {
+    chat_id: Option<String>,
+    chat_id_source: Option<&'static str>,
+    open_message_id: Option<String>,
+    open_message_id_source: Option<&'static str>,
+}
+
+fn first_feishu_card_string(
+    payload: &serde_json::Value,
+    candidates: &[(&'static str, &'static str)],
+) -> Option<(String, &'static str)> {
+    candidates.iter().find_map(|(path, source)| {
+        payload
+            .pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (value.trim().to_string(), *source))
+    })
+}
+
+fn extract_feishu_card_reply_context(payload: &serde_json::Value) -> FeishuCardReplyContext {
+    let chat_id = first_feishu_card_string(
+        payload,
+        &[
+            ("/event/context/open_chat_id", "event.context.open_chat_id"),
+            ("/event/open_chat_id", "event.open_chat_id"),
+            ("/event/chat_id", "event.chat_id"),
+            ("/event/context/chat_id", "event.context.chat_id"),
+            ("/event/message/chat_id", "event.message.chat_id"),
+            ("/event/action/value/open_chat_id", "event.action.value.open_chat_id"),
+            ("/event/action/value/chat_id", "event.action.value.chat_id"),
+            ("/open_chat_id", "open_chat_id"),
+            ("/chat_id", "chat_id"),
+            ("/action/value/open_chat_id", "action.value.open_chat_id"),
+            ("/action/value/chat_id", "action.value.chat_id"),
+        ],
+    );
+    let open_message_id = first_feishu_card_string(
+        payload,
+        &[
+            (
+                "/event/context/open_message_id",
+                "event.context.open_message_id",
+            ),
+            ("/event/open_message_id", "event.open_message_id"),
+            ("/event/message/message_id", "event.message.message_id"),
+            (
+                "/event/action/value/open_message_id",
+                "event.action.value.open_message_id",
+            ),
+            ("/open_message_id", "open_message_id"),
+            ("/action/value/open_message_id", "action.value.open_message_id"),
+        ],
+    );
+    FeishuCardReplyContext {
+        chat_id: chat_id.as_ref().map(|(value, _)| value.clone()),
+        chat_id_source: chat_id.map(|(_, source)| source),
+        open_message_id: open_message_id
+            .as_ref()
+            .map(|(value, _)| value.clone()),
+        open_message_id_source: open_message_id.map(|(_, source)| source),
+    }
 }
 
 fn chrono_timestamp_simple() -> i64 {
@@ -3888,6 +4035,22 @@ async fn http_channel_webhook(
             ))
         }
     };
+
+    // Feishu's unified callback URL delivers card.action.trigger to the main
+    // webhook. Route it before the ordinary message_type filter; the dedicated
+    // /webhook/feishu/card endpoint remains supported by the same handler.
+    if channel == ChannelKind::Feishu && is_feishu_card_action_event(&payload) {
+        println!(
+            "[feishu-webhook] route_card_action source=main_webhook event_type=card.action.trigger"
+        );
+        return process_feishu_card_action_callback(
+            State(runtime),
+            headers,
+            processed_body,
+            "main_webhook",
+        )
+        .await;
+    }
 
     // Feishu challenges have already returned after Feishu security checks and
     // before replay/dedupe. Other platform adapters retain their existing
@@ -6805,6 +6968,25 @@ mod tests {
         (status, content_type, value)
     }
 
+    async fn call_feishu_card_http(
+        runtime: GatewayRuntime,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = super::http_feishu_card_callback(
+            axum::extract::State(runtime),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Feishu card response body");
+        let value = serde_json::from_slice(&bytes).expect("Feishu card response must be JSON");
+        (status, value)
+    }
+
     #[test]
     fn feishu_security_dev_mode_is_explicitly_insecure() {
         let config = feishu_security_config("dev", None, None);
@@ -6860,6 +7042,230 @@ mod tests {
             extracted.source,
             "header.x-feishu-verification-token"
         );
+    }
+
+    #[test]
+    fn feishu_card_action_extractor_supports_unified_and_legacy_shapes() {
+        let cases = [
+            (
+                json!({"event":{"action":{"value":{"action":"monitor_30s"}}}}),
+                "monitor_30s",
+                "event.action.value.action",
+            ),
+            (
+                json!({"event":{"action":{"value":{"key":"gateway_status"}}}}),
+                "gateway_status",
+                "event.action.value.key",
+            ),
+            (
+                json!({"event":{"action":{"value":"recent_jobs"}}}),
+                "recent_jobs",
+                "event.action.value",
+            ),
+            (
+                json!({"action":{"value":{"action":"help"}}}),
+                "help",
+                "action.value.action",
+            ),
+        ];
+        for (payload, expected_action, expected_source) in cases {
+            let (action, source) =
+                super::extract_feishu_card_action(&payload).expect("card action");
+            assert_eq!(action, expected_action);
+            assert_eq!(source, expected_source);
+        }
+    }
+
+    #[test]
+    fn feishu_card_context_extracts_real_unified_callback_paths() {
+        let payload = json!({
+            "event": {
+                "context": {
+                    "open_chat_id": "oc_private_value",
+                    "open_message_id": "om_private_value"
+                },
+                "operator": { "open_id": "ou_must_not_be_used_as_chat_id" }
+            }
+        });
+        let context = super::extract_feishu_card_reply_context(&payload);
+        assert_eq!(context.chat_id.as_deref(), Some("oc_private_value"));
+        assert_eq!(
+            context.chat_id_source,
+            Some("event.context.open_chat_id")
+        );
+        assert_eq!(
+            context.open_message_id.as_deref(),
+            Some("om_private_value")
+        );
+        assert_eq!(
+            context.open_message_id_source,
+            Some("event.context.open_message_id")
+        );
+    }
+
+    fn unified_card_payload(token: Option<&str>, action: &str, with_chat: bool) -> String {
+        let mut event = json!({
+            "action": { "value": { "action": action } },
+            "operator": { "open_id": "ou_private" }
+        });
+        if with_chat {
+            event["context"] = json!({
+                "open_chat_id": "oc_private",
+                "open_message_id": "om_private"
+            });
+        }
+        json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": format!("evt_{}", uuid::Uuid::new_v4()),
+                "event_type": "card.action.trigger",
+                "token": token
+            },
+            "event": event
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn unified_feishu_webhook_routes_card_action_before_message_filter() {
+        let (status, _, response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            unified_card_payload(None, "gateway_status", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("action").and_then(serde_json::Value::as_str),
+            Some("gateway_status")
+        );
+        assert_eq!(
+            response.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_feishu_card_endpoint_remains_available() {
+        let (status, response) = call_feishu_card_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            unified_card_payload(None, "help", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("action").and_then(serde_json::Value::as_str),
+            Some("help")
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_card_action_enforces_token_before_dispatch() {
+        let config = || {
+            feishu_security_config("token", Some("test-verification-token"), None)
+        };
+        let (ok_status, _, ok_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            unified_card_payload(
+                Some("test-verification-token"),
+                "gateway_status",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::OK);
+        assert_eq!(
+            ok_response.get("action").and_then(serde_json::Value::as_str),
+            Some("gateway_status")
+        );
+
+        let (missing_status, _, missing_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            unified_card_payload(None, "gateway_status", true),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing_response
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("token_missing")
+        );
+
+        let (bad_status, _, bad_response) = call_feishu_http(
+            GatewayRuntime::new(config()),
+            unified_card_payload(Some("wrong-token"), "gateway_status", true),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            bad_response
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("token_mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_card_monitor_queues_direct_monitor_with_context_chat_id() {
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(2);
+        runtime.init_feishu_worker(sender).await;
+
+        let (status, _, response) = call_feishu_http(
+            runtime,
+            unified_card_payload(None, "monitor_30s", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("action").and_then(serde_json::Value::as_str),
+            Some("monitor_30s")
+        );
+        let job = receiver.try_recv().expect("monitor job should be queued");
+        assert_eq!(job.inbound.session_id.as_deref(), Some("oc_private"));
+        assert_eq!(job.inbound.text, "/monitor 桌面 30秒");
+        assert_eq!(
+            job.inbound
+                .metadata
+                .get("message_id")
+                .and_then(serde_json::Value::as_str),
+            Some("om_private")
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_card_missing_chat_id_acks_without_queue_or_panic() {
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(2);
+        runtime.init_feishu_worker(sender).await;
+        let (status, _, response) = call_feishu_http(
+            runtime,
+            unified_card_payload(None, "monitor_30s", false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unified_card_unknown_action_is_safely_acked_without_runtime() {
+        let (status, _, response) = call_feishu_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            unified_card_payload(None, "shell_anything", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(response.get("action").is_none());
     }
 
     #[test]
