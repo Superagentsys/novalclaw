@@ -139,7 +139,40 @@ pub enum OutboundDeliveryStatus {
 #[async_trait::async_trait]
 pub trait ChannelOutboundSender: Send + Sync {
     async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult;
+    /// Send an interactive card. Default falls back to `send_text_reply`
+    /// so existing senders (mock etc.) keep working without code changes.
+    async fn send_interactive_card(
+        &self,
+        target: &ReplyTarget,
+        card_json: &serde_json::Value,
+    ) -> OutboundResult {
+        // Default fallback: send a short text summary. Real Feishu
+        // outbound overrides this to POST `interactive` messages.
+        let summary = format!("[card] {}", short_card_summary(card_json));
+        self.send_text_reply(target, &summary).await
+    }
     fn channel_kind(&self) -> ChannelKind;
+}
+
+/// Format a short text summary of an interactive card for fallback
+/// / logging / preview. Never includes the full card payload.
+fn short_card_summary(card: &serde_json::Value) -> String {
+    let title = card
+        .pointer("/header/title/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut chars: String = title.chars().take(40).collect();
+    if title.chars().count() > 40 {
+        chars.push('…');
+    }
+    if chars.is_empty() {
+        let s = card.to_string();
+        chars = s.chars().take(40).collect::<String>();
+        if s.chars().count() > 40 {
+            chars.push('…');
+        }
+    }
+    chars
 }
 
 // =============================================================================
@@ -441,6 +474,131 @@ impl PlatformOutboundSender {
             )
         }
     }
+
+    /// Send an interactive message (card). Used by Feishu/Lark command palette.
+    /// The card content must already be a JSON object; we serialize it to a
+    /// JSON string before posting (per Feishu docs).
+    pub async fn send_interactive_card_message(
+        &self,
+        target: &ReplyTarget,
+        card: &serde_json::Value,
+    ) -> OutboundResult {
+        let token = match self.tenant_access_token().await {
+            Ok(token) => {
+                println!("[{}-outbound] token_fetch_ok card=true", self.provider);
+                token
+            }
+            Err(result) => {
+                println!(
+                    "[{}-outbound] token_fetch_failed card=true error_code={:?}",
+                    self.provider, result.error_code
+                );
+                return result;
+            }
+        };
+
+        // Feishu requires content to be a JSON-encoded *string*.
+        let content_str = match serde_json::to_string(card) {
+            Ok(s) => s,
+            Err(e) => {
+                return OutboundResult::failed(
+                    self.provider,
+                    "card_serialize_failed",
+                    &format!("card json serialize failed: {}", e),
+                );
+            }
+        };
+
+        println!(
+            "[{}-outbound] card_send_start receive_id_type=chat_id card_chars={}",
+            self.provider,
+            content_str.chars().count()
+        );
+
+        let response = match self
+            .client
+            .post(format!(
+                "{}/im/v1/messages?receive_id_type=chat_id",
+                self.api_base_url
+            ))
+            .bearer_auth(&token)
+            .json(&json!({
+                "receive_id": target.chat_id,
+                "msg_type": "interactive",
+                "content": content_str,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                println!(
+                    "[{}-outbound] card_send_failed error={}",
+                    self.provider, e
+                );
+                return OutboundResult::failed(
+                    self.provider,
+                    "card_send_failed",
+                    &format!("card request failed: {}", e),
+                );
+            }
+        };
+
+        let status = response.status();
+        let body = match response.json::<serde_json::Value>().await {
+            Ok(body) => body,
+            Err(e) => {
+                println!(
+                    "[{}-outbound] card_send_failed invalid_response",
+                    self.provider
+                );
+                return OutboundResult::failed(
+                    self.provider,
+                    "card_send_failed",
+                    &format!("card response invalid: {}", e),
+                );
+            }
+        };
+
+        let code = body
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        let platform_msg = body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let platform_message_id = body
+            .pointer("/data/message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(String::from);
+
+        if code == 0 {
+            println!(
+                "[{}-outbound] card_send_ok platform_message_id_present={}",
+                self.provider,
+                platform_message_id.is_some()
+            );
+            OutboundResult::success(
+                self.provider,
+                platform_message_id.unwrap_or_else(|| "accepted".to_string()),
+            )
+        } else {
+            println!(
+                "[{}-outbound] card_send_failed http_status={} platform_error_code={} message={}",
+                self.provider,
+                status.as_u16(),
+                code,
+                platform_msg
+            );
+            OutboundResult::failed(
+                self.provider,
+                &format!("platform_error_{}", code),
+                platform_msg,
+            )
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -463,6 +621,14 @@ impl FeishuOutboundSender {
 impl ChannelOutboundSender for FeishuOutboundSender {
     async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
         self.0.send_text_reply(target, text).await
+    }
+
+    async fn send_interactive_card(
+        &self,
+        target: &ReplyTarget,
+        card: &serde_json::Value,
+    ) -> OutboundResult {
+        self.0.send_interactive_card_message(target, card).await
     }
 
     fn channel_kind(&self) -> ChannelKind {
@@ -580,6 +746,11 @@ mod tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra: std::collections::HashMap::new(),
         };
         // The gateway turns this missing configuration into `not_configured`
@@ -598,6 +769,11 @@ mod tests {
             enabled: true,
             token: None,
             token_env: None,
+            security_mode: None,
+            verification_token: None,
+            verification_token_env: None,
+            encrypt_key: None,
+            encrypt_key_env: None,
             extra,
         };
         assert!(config.extra.get("app_id").is_some());

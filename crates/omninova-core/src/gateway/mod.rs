@@ -1912,6 +1912,7 @@ impl GatewayRuntime {
             .route("/webhook/feishu", post(http_feishu_webhook))
             .route("/webhook/lark", post(http_lark_webhook))
             .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            .route("/webhook/feishu/card", post(http_feishu_card_callback))
             .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
             .route("/estop/pause", post(http_estop_pause))
@@ -3103,6 +3104,302 @@ async fn http_feishu_webhook(
         })
 }
 
+/// Feishu card action callback endpoint.
+/// Feishu sends card interactions as JSON with a `action.value.action` field.
+/// Security: uses the same security_mode as the main Feishu webhook.
+async fn http_feishu_card_callback(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
+    use crate::gateway::feishu_worker::{
+        canonical_card_action, gateway_status_reply, help_reply,
+        recent_jobs_reply_text, summarize_job_for_card, RecentJobLine,
+    };
+
+    let channel_name = "feishu";
+    let cfg = runtime.get_config().await;
+
+    if !is_channel_enabled(&cfg, &ChannelKind::Feishu) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(GatewayError {
+                message: "Feishu channel is disabled".to_string(),
+            }),
+        ));
+    }
+
+    let sec_cfg = FeishuSecurityConfig::from_entry(cfg.channels_config.feishu.as_ref());
+
+        // Get token from header or payload
+        let header_token = headers
+            .get("x-lark-verification-token")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let payload_token = extract_token_from_payload(&raw_body);
+        let req_token = header_token.or(payload_token);
+
+        if matches!(sec_cfg.mode, FeishuSecurityMode::Token | FeishuSecurityMode::Encrypted) {
+            match req_token {
+                Some(token) => {
+                    match verify_feishu_verification_token(&sec_cfg, Some(token.as_str())) {
+                        Ok(true) => {
+                            println!("[feishu-card-security] token_verified=true security_mode={:?}", sec_cfg.mode);
+                        }
+                        Ok(false) => {
+                            println!("[feishu-card-security] token_mismatch security_mode={:?}", sec_cfg.mode);
+                            return Err((StatusCode::FORBIDDEN, Json(GatewayError {
+                                message: "verification_token mismatch".to_string(),
+                            })));
+                        }
+                        Err(e) => {
+                            println!("[feishu-card-security] token_error={} security_mode={:?}", e, sec_cfg.mode);
+                            return Err((StatusCode::FORBIDDEN, Json(GatewayError {
+                                message: format!("verification_token error: {}", e),
+                            })));
+                        }
+                    }
+                }
+                None => {
+                    println!("[feishu-card-security] token_missing security_mode={:?}", sec_cfg.mode);
+                    return Err((StatusCode::FORBIDDEN, Json(GatewayError {
+                        message: "verification_token missing".to_string(),
+                    })));
+                }
+            }
+        }
+
+    if matches!(sec_cfg.mode, FeishuSecurityMode::Dev | FeishuSecurityMode::Default) {
+        println!("[feishu-card-security] mode=dev insecure=true reason=no_verification");
+    }
+
+    let payload: serde_json::Value = match serde_json::from_str(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            let top_keys = payload_keys_summary(&raw_body);
+            println!(
+                "[feishu-card] invalid_json error={} payload_top_keys={:?}",
+                e, top_keys
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError { message: format!("invalid json: {}", e) }),
+            ));
+        }
+    };
+
+    let payload_shape_keys: Vec<&str> = payload
+        .as_object()
+        .map(|o| o.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    println!("[feishu-card] payload_shape keys={:?}", payload_shape_keys);
+
+    let action_opt = payload
+        .pointer("/event/action/value/action")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| payload.pointer("/action/value/action").and_then(|v| v.as_str()).map(String::from));
+
+    let Some(action) = action_opt else {
+        let top_keys = payload_keys_summary(&raw_body);
+        println!("[feishu-card] no_action_key top_keys={:?}", top_keys);
+        return Ok(Json(serde_json::json!({
+            "toast": { "type": "error", "content": "未识别操作" },
+            "ok": false
+        })));
+    };
+
+    println!(
+        "[feishu-card] action_received action_present={} action_chars={}",
+        !action.is_empty(),
+        action.chars().count()
+    );
+
+    let canonical = match canonical_card_action(&action) {
+        Some(c) => c,
+        None => {
+            println!(
+                "[feishu-security] unknown_action_rejected action_chars={}",
+                action.chars().count()
+            );
+            return Ok(Json(serde_json::json!({
+                "toast": { "type": "warning", "content": "未知操作，已忽略。请发送 / 打开功能菜单。" },
+                "ok": false
+            })));
+        }
+    };
+
+    println!("[feishu-card] action_allowed action={}", canonical);
+
+    let store = runtime.feishu_store();
+
+    // Gather real status data upfront (don't consume store yet)
+    let security_mode_str = Some(sec_cfg.mode.as_str());
+    let verification_token_configured = sec_cfg.verification_token.is_some();
+    let encrypt_key_configured = sec_cfg.encrypt_key.is_some();
+    let outbound_mode = cfg
+        .channels_config
+        .feishu
+        .as_ref()
+        .and_then(|e| e.extra.get("outbound_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("disabled");
+    let store_path = store
+        .as_ref()
+        .map(|s| s.db_path().to_string_lossy().to_string())
+        .unwrap_or_else(|| "(no store)".to_string());
+    let store_path_exists = store.is_some();
+    let (pending_jobs, pending_outbox) = store
+        .as_ref()
+        .and_then(|s| s.get_store_stats().ok())
+        .map(|stats| (stats.jobs_total, stats.outbox_total))
+        .unwrap_or((0, 0));
+
+    // Gather recent jobs data before consuming store
+    let recent_jobs_text = if canonical == "recent_jobs" {
+        match store.as_ref() {
+            Some(s) => {
+                match s.get_recent_jobs(5) {
+                    Ok(jobs) => {
+                        let lines: Vec<RecentJobLine> = jobs
+                            .into_iter()
+                            .map(|j| summarize_job_for_card(
+                                &j.job_id,
+                                &j.mode,
+                                &j.status.as_str(),
+                                j.attempts as i64,
+                                j.error_code.as_ref().map(|s| s.as_str()),
+                                j.created_at,
+                                j.completed_at,
+                            ))
+                            .collect();
+                        recent_jobs_reply_text(&lines)
+                    }
+                    Err(_) => "最近任务暂不可用：store unavailable".to_string(),
+                }
+            }
+            None => "最近任务暂不可用：store unavailable".to_string(),
+        }
+    } else {
+        String::new()
+    };
+
+    let reply_text: String = match canonical {
+        "monitor_30s" => "已收到监控任务（30 秒），正在执行。".to_string(),
+        "monitor_60s" => "已收到监控任务（60 秒），正在执行。".to_string(),
+        "gateway_status" => gateway_status_reply(
+            security_mode_str,
+            verification_token_configured,
+            encrypt_key_configured,
+            Some(outbound_mode),
+            store_path_exists,
+            &store_path,
+            pending_jobs,
+            pending_outbox,
+        ),
+        "recent_jobs" => recent_jobs_text,
+        "help" => help_reply(),
+        _ => "未知操作，已忽略。请发送 / 打开功能菜单。".to_string(),
+    };
+
+    let reply_preview: String = reply_text.chars().take(120).collect();
+
+    if matches!(canonical, "monitor_30s" | "monitor_60s") {
+        let text = if canonical == "monitor_30s" {
+            "/monitor 桌面 30秒"
+        } else {
+            "/monitor 桌面 60秒"
+        };
+        if let Some(chat_id) = payload
+            .pointer("/event/chat_id")
+            .and_then(|v| v.as_str())
+        {
+            let event_key = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
+            let job_id = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
+            let monitor_job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
+                ChannelKind::Feishu,
+                crate::channels::InboundMessage {
+                    text: text.to_string(),
+                    channel: ChannelKind::Feishu,
+                    user_id: payload
+                        .pointer("/event/user/open_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    session_id: Some(chat_id.to_string()),
+                    metadata: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("card_action".to_string(), serde_json::Value::String(canonical.to_string()));
+                        m
+                    },
+                },
+                serde_json::json!({ "card_action": canonical }),
+                false,
+                event_key,
+                Some(job_id),
+            );
+            let _ = runtime.try_send_feishu_job(monitor_job).await;
+        }
+    }
+
+    if let Some(ref s) = store {
+        if let Some(chat_id) = payload
+            .pointer("/event/chat_id")
+            .and_then(|v| v.as_str())
+        {
+            let job_id = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
+            let event_key = format!("card_{}_{}", chrono_timestamp_simple(), canonical);
+            let outbound_id = format!("{}_{}", job_id, chrono_timestamp_simple());
+            let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
+                outbound_id,
+                job_id: Some(job_id),
+                event_key: Some(event_key),
+                channel: channel_name.to_string(),
+                chat_id: Some(chat_id.to_string()),
+                reply_kind: Some("card_action_result".to_string()),
+                reply: None,
+                result_json: None,
+            };
+            let _ = s.insert_outbox(&outbox_input);
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "toast": { "type": "success", "content": reply_preview },
+        "ok": true,
+        "reply_preview_chars": reply_preview.chars().count(),
+        "action": canonical
+    })))
+}
+
+fn payload_keys_summary(raw: &str) -> Vec<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(o) = v.as_object() {
+            return o.keys().map(|k| k.as_str().to_string()).collect();
+        }
+    }
+    Vec::new()
+}
+
+fn extract_token_from_payload(raw: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let s = v
+        .pointer("/payload/verification_token")
+        .or_else(|| v.pointer("/verification_token"))
+        .and_then(|val| val.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some(s.to_string())
+}
+
+fn chrono_timestamp_simple() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+
+
+
 async fn http_lark_webhook(
     State(runtime): State<GatewayRuntime>,
     headers: HeaderMap,
@@ -4027,6 +4324,68 @@ async fn send_with_sender(
     sender.send_text_reply(target, reply).await
 }
 
+/// Send an interactive card through the configured channel sender.
+/// Returns `Ok(OutboundResult)` on completion, `Err(reason)` if the
+/// channel cannot send (e.g. unsupported channel).
+pub async fn deliver_interactive_card(
+    config: &Config,
+    inbound: &InboundMessage,
+    card: &serde_json::Value,
+) -> Result<OutboundResult, String> {
+    use crate::channels::adapters::outbound::{
+        FeishuOutboundSender, LarkOutboundSender, MockOutboundSender,
+    };
+    let channel_name_for_log = format!("{:?}", inbound.channel).to_lowercase();
+    let entry = match channel_entry_for_outbound(config, &inbound.channel) {
+        Some(e) => e,
+        None => return Err(format!("no channel entry for {}", channel_name_for_log)),
+    };
+    let provider = match inbound.channel {
+        ChannelKind::Feishu => "feishu",
+        ChannelKind::Lark => "lark",
+        _ => return Err("unsupported_channel".to_string()),
+    };
+    let target = match reply_target_from_inbound(inbound) {
+        Some(t) => t,
+        None => return Err("missing_reply_target".to_string()),
+    };
+    let outbound_mode = config_string(entry, "outbound_mode")
+        .unwrap_or_else(|| "disabled".to_string())
+        .to_ascii_lowercase();
+    if outbound_mode == "disabled" {
+        return Err("outbound_disabled".to_string());
+    }
+    match outbound_mode.as_str() {
+        "mock" => {
+            let sender = MockOutboundSender::new();
+            Ok(sender.send_interactive_card(&target, card).await)
+        }
+        "real" => {
+            let _app_id = match config_string(entry, "app_id") {
+                Some(v) => v,
+                None => return Err("missing_app_id".to_string()),
+            };
+            let _app_secret = match config_string(entry, "app_secret") {
+                Some(v) => v,
+                None => return Err("missing_app_secret".to_string()),
+            };
+            let token_cache = outbound_token_cache();
+            match inbound.channel {
+                ChannelKind::Feishu => {
+                    let sender = FeishuOutboundSender::new(_app_id, _app_secret, token_cache);
+                    Ok(sender.send_interactive_card(&target, card).await)
+                }
+                ChannelKind::Lark => {
+                    let sender = LarkOutboundSender::new(_app_id, _app_secret, token_cache);
+                    Ok(sender.send_interactive_card(&target, card).await)
+                }
+                _ => Err("unsupported_channel".to_string()),
+            }
+        }
+        _ => Err(format!("outbound_mode_unsupported: {}", outbound_mode)),
+    }
+}
+
 async fn deliver_platform_reply(
     config: &Config,
     inbound: &InboundMessage,
@@ -4398,24 +4757,22 @@ impl FeishuSecurityConfig {
 pub fn verify_feishu_verification_token(
     security_config: &FeishuSecurityConfig,
     request_token: Option<&str>,
-) -> Result<bool, &'static str> {
+) -> Result<bool, String> {
     match security_config.mode {
         FeishuSecurityMode::Dev | FeishuSecurityMode::Default => {
-            // Dev mode: allow without token verification
             Ok(true)
         }
         FeishuSecurityMode::Token | FeishuSecurityMode::Encrypted => {
-            // Token mode: require token
             let expected_token = security_config.verification_token.as_deref()
-                .ok_or("verification_token not configured")?;
-            
+                .ok_or_else(|| "verification_token not configured".to_string())?;
+
             match request_token {
                 Some(token) if token == expected_token => Ok(true),
                 Some(_) => Ok(false), // Token mismatch
-                None => Err("verification_token missing from request"),
+                None => Err("verification_token missing from request".to_string()),
             }
         }
-        FeishuSecurityMode::Invalid => Err("invalid security mode"),
+        FeishuSecurityMode::Invalid => Err("invalid security mode".to_string()),
     }
 }
 
@@ -7530,5 +7887,131 @@ mod tests {
             assert!(intent.is_some(), "Should detect intent for: {}", text);
             assert_eq!(intent.unwrap(), expected_intent, "Wrong intent for: {}", text);
         }
+    }
+
+    // ========== v0.8.9.1: card callback tests ==========
+    use super::{
+        extract_token_from_payload, payload_keys_summary, verify_feishu_verification_token,
+        chrono_timestamp_simple,
+    };
+    use crate::gateway::feishu_worker;
+
+    #[test]
+    fn test_payload_keys_summary_parses_valid_json() {
+        let raw = r#"{"event":{"action":{"value":{"action":"monitor_30s"}}},"header":{"token":"abc"}}"#;
+        let keys = payload_keys_summary(raw);
+        assert!(keys.contains(&"event".to_string()));
+        assert!(keys.contains(&"header".to_string()));
+    }
+
+    #[test]
+    fn test_payload_keys_summary_returns_empty_for_invalid_json() {
+        let raw = "not json at all";
+        let keys = payload_keys_summary(raw);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_extract_token_from_payload_finds_token() {
+        let raw = r#"{"verification_token":"my_secret_token"}"#;
+        let token = extract_token_from_payload(raw);
+        assert_eq!(token, Some("my_secret_token".to_string()));
+    }
+
+    #[test]
+    fn test_extract_token_from_payload_finds_nested_token() {
+        let raw = r#"{"payload":{"verification_token":"nested_token"}}"#;
+        let token = extract_token_from_payload(raw);
+        assert_eq!(token, Some("nested_token".to_string()));
+    }
+
+    #[test]
+    fn test_extract_token_from_payload_returns_none_when_missing() {
+        let raw = r#"{"event":{"action":{"value":{"action":"monitor_30s"}}}}"#;
+        let token = extract_token_from_payload(raw);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_verify_feishu_verification_token_dev_mode_always_true() {
+        use super::{FeishuSecurityConfig, FeishuSecurityMode};
+        let cfg = FeishuSecurityConfig {
+            mode: FeishuSecurityMode::Dev,
+            verification_token: None,
+            encrypt_key: None,
+            insecure: true,
+        };
+        let result = verify_feishu_verification_token(&cfg, Some("any_token"));
+        assert_eq!(result, Ok(true));
+    }
+
+    #[test]
+    fn test_verify_feishu_verification_token_token_mode_valid() {
+        use super::{FeishuSecurityConfig, FeishuSecurityMode};
+        let cfg = FeishuSecurityConfig {
+            mode: FeishuSecurityMode::Token,
+            verification_token: Some("expected_token".to_string()),
+            encrypt_key: None,
+            insecure: false,
+        };
+        let result = verify_feishu_verification_token(&cfg, Some("expected_token"));
+        assert_eq!(result, Ok(true));
+    }
+
+    #[test]
+    fn test_verify_feishu_verification_token_token_mode_mismatch() {
+        use super::{FeishuSecurityConfig, FeishuSecurityMode};
+        let cfg = FeishuSecurityConfig {
+            mode: FeishuSecurityMode::Token,
+            verification_token: Some("expected_token".to_string()),
+            encrypt_key: None,
+            insecure: false,
+        };
+        let result = verify_feishu_verification_token(&cfg, Some("wrong_token"));
+        assert_eq!(result, Ok(false));
+    }
+
+    #[test]
+    fn test_verify_feishu_verification_token_token_mode_missing() {
+        use super::{FeishuSecurityConfig, FeishuSecurityMode};
+        let cfg = FeishuSecurityConfig {
+            mode: FeishuSecurityMode::Token,
+            verification_token: Some("expected_token".to_string()),
+            encrypt_key: None,
+            insecure: false,
+        };
+        let result = verify_feishu_verification_token(&cfg, None);
+        assert_eq!(result.is_err(), true);
+    }
+
+    #[test]
+    fn test_gateway_status_reply_text_includes_all_fields() {
+        let s = feishu_worker::gateway_status_reply(
+            Some("token"),
+            true,
+            false,
+            Some("real"),
+            true,
+            "C:\\Users\\Hero\\.omninova\\state.sqlite",
+            5,
+            2,
+        );
+        assert!(s.contains("Gateway 状态"));
+        assert!(s.contains("security_mode"));
+        assert!(s.contains("outbound_mode"));
+        assert!(s.contains("store status"));
+        assert!(s.contains("pending jobs"));
+        assert!(s.contains("pending outbox"));
+        // Must NOT contain raw secrets
+        assert!(!s.contains("app_secret"));
+    }
+
+    #[test]
+    fn test_chrono_timestamp_simple_returns_reasonable_value() {
+        let ts = chrono_timestamp_simple();
+        // Should be in milliseconds, so should be > 1 trillion
+        assert!(ts > 1_000_000_000_000);
+        // Should not be absurdly large
+        assert!(ts < 2_000_000_000_000);
     }
 }

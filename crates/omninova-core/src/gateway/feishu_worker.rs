@@ -178,6 +178,323 @@ fn chat_only_blocked_response() -> String {
     "当前飞书普通聊天模式不直接执行工具任务。如需处理文件，请发送：/file <任务描述>。删除文件属于高风险操作，需要确认后才能执行。".to_string()
 }
 
+// =============================================================================
+// Command palette / interactive card
+// =============================================================================
+
+/// Check if the inbound text is a menu trigger that should open the command
+/// palette card instead of routing through chat_only / tool mode.
+pub fn is_menu_trigger(text: &str) -> bool {
+    let text_trimmed = text.trim();
+    if text_trimmed.is_empty() {
+        return false;
+    }
+    if text_trimmed == "/" {
+        return true;
+    }
+    if text_trimmed == "/功能" || text_trimmed == "/菜单" || text_trimmed == "/帮助" || text_trimmed == "/help" {
+        return true;
+    }
+    let lower = text_trimmed.to_lowercase();
+    matches!(lower.as_str(), "菜单" | "帮助" | "help" | "功能" | "menu" | "menu_trigger")
+}
+
+/// Allowed action keys for card action callbacks.
+/// Anything outside this set is rejected as "unknown action".
+pub const ALLOWED_CARD_ACTIONS: &[&str] = &[
+    "monitor_30s",
+    "monitor_60s",
+    "gateway_status",
+    "recent_jobs",
+    "help",
+];
+
+/// Build the command palette interactive card JSON.
+pub fn build_command_palette_card() -> serde_json::Value {
+    serde_json::json!({
+        "config": {
+            "wide_screen_mode": true
+        },
+        "header": {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": "OmniNova Agent 功能菜单"
+            }
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "请选择要执行的操作。普通聊天可以直接发送文字；工具任务请使用按钮或 slash 命令。"
+                }
+            },
+            {
+                "tag": "hr"
+            },
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "🟢 普通聊天说明"
+                }
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "桌面监控 30 秒"
+                        },
+                        "type": "primary",
+                        "value": {
+                            "action": "monitor_30s"
+                        }
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "桌面监控 60 秒"
+                        },
+                        "type": "primary",
+                        "value": {
+                            "action": "monitor_60s"
+                        }
+                    }
+                ]
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "Gateway 状态"
+                        },
+                        "type": "default",
+                        "value": {
+                            "action": "gateway_status"
+                        }
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "最近任务"
+                        },
+                        "type": "default",
+                        "value": {
+                            "action": "recent_jobs"
+                        }
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "帮助说明"
+                        },
+                        "type": "default",
+                        "value": {
+                            "action": "help"
+                        }
+                    }
+                ]
+            },
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": "高风险工具不在普通聊天中直接执行。"
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+/// Reply text for an "unknown action" rejection.
+pub fn unknown_action_reply() -> String {
+    "未知操作，已忽略。请发送 / 打开功能菜单。".to_string()
+}
+
+/// Help / usage reply text.
+pub fn help_reply() -> String {
+    let mut s = String::new();
+    s.push_str("OmniNova Agent 使用帮助\n\n");
+    s.push_str("普通聊天：直接发消息，比如“你好”。\n");
+    s.push_str("工具任务：使用 /monitor 桌面 30秒 / /monitor 桌面 60秒，或点击功能菜单中的按钮。\n");
+    s.push_str("功能菜单：发送 / 或 菜单 / help / 帮助 / 功能。\n");
+    s.push_str("安全说明：高风险工具默认不在飞书普通聊天中直接执行。\n");
+    s
+}
+
+/// Generate a Gateway status reply text from runtime and security config.
+pub fn gateway_status_reply(
+    security_mode: Option<&str>,
+    verification_token_configured: bool,
+    encrypt_key_configured: bool,
+    outbound_mode: Option<&str>,
+    store_path_exists: bool,
+    store_path: &str,
+    pending_jobs: i64,
+    pending_outbox: i64,
+) -> String {
+    let security_mode = security_mode.unwrap_or("dev");
+    let insecure = matches!(security_mode, "dev") && !verification_token_configured && !encrypt_key_configured;
+    let outbound_mode = outbound_mode.unwrap_or("disabled");
+    let store_status = if store_path_exists { "ok" } else { "missing" };
+
+    let mut s = String::new();
+    s.push_str("Gateway 状态\n\n");
+    s.push_str(&format!("gateway running : true\n"));
+    s.push_str(&format!("security_mode   : {}\n", security_mode));
+    s.push_str(&format!("insecure dev    : {}\n", insecure));
+    s.push_str(&format!("verification_token configured : {}\n", verification_token_configured));
+    s.push_str(&format!("encrypt_key configured : {}\n", encrypt_key_configured));
+    s.push_str(&format!("outbound_mode   : {}\n", outbound_mode));
+    s.push_str(&format!("store path      : {}\n", store_path));
+    s.push_str(&format!("store status    : {}\n", store_status));
+    s.push_str(&format!("pending jobs    : {}\n", pending_jobs));
+    s.push_str(&format!("pending outbox  : {}\n", pending_outbox));
+    s
+}
+
+/// Thin text-only wrapper used by card action handlers when no runtime is available.
+pub fn gateway_status_reply_text(
+    security_mode: Option<&str>,
+    verification_token_configured: bool,
+    encrypt_key_configured: bool,
+    outbound_mode: Option<&str>,
+) -> String {
+    gateway_status_reply(
+        security_mode,
+        verification_token_configured,
+        encrypt_key_configured,
+        outbound_mode,
+        false,
+        "(state.sqlite)",
+        0,
+        0,
+    )
+}
+
+/// Format recent jobs into a readable text body (max 5 jobs).
+pub fn recent_jobs_reply_text(jobs: &[RecentJobLine]) -> String {
+    if jobs.is_empty() {
+        return "最近 0 条任务：暂无。".to_string();
+    }
+    let mut s = String::new();
+    s.push_str(&format!("最近 {} 条任务（仅摘要，不含 payload）\n\n", jobs.len()));
+    for (idx, job) in jobs.iter().enumerate() {
+        s.push_str(&format!(
+            "{}. {} | mode={} | status={} | attempts={} | error={}\n   created_at={} | completed_at={}\n",
+            idx + 1,
+            job.job_id_short,
+            job.mode,
+            job.status,
+            job.attempts,
+            job.error_code.as_deref().unwrap_or("-"),
+            job.created_at,
+            job.completed_at.as_deref().unwrap_or("-"),
+        ));
+    }
+    s
+}
+
+/// Compact summary of a job, used by `recent_jobs_reply_text`.
+#[derive(Debug, Clone)]
+pub struct RecentJobLine {
+    pub job_id_short: String,
+    pub mode: String,
+    pub status: String,
+    pub attempts: i64,
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Internal helper: short ID for display.
+fn short_id(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        // Keep the tail for ease of cross-reference with logs.
+        let total = s.chars().count();
+        let skip = total.saturating_sub(max.saturating_sub(1));
+        let truncated: String = s.chars().skip(skip).collect();
+        format!("…{}", truncated)
+    }
+}
+
+/// Convert a Feishu job row from the store into a recent-job summary line.
+/// Truncates the full job_id to keep the line short.
+pub fn summarize_job_for_card(
+    job_id_full: &str,
+    mode: &str,
+    status: &str,
+    attempts: i64,
+    error_code: Option<&str>,
+    created_at: i64,
+    completed_at: Option<i64>,
+) -> RecentJobLine {
+    let created_str = chrono_timestamp_to_iso_ms(created_at);
+    let completed_str = completed_at.map(chrono_timestamp_to_iso_ms);
+    RecentJobLine {
+        job_id_short: short_id(job_id_full, 24),
+        mode: mode.to_string(),
+        status: status.to_string(),
+        attempts,
+        error_code: error_code.map(String::from),
+        created_at: created_str,
+        completed_at: completed_str,
+    }
+}
+
+/// Convert a Unix ms timestamp into an ISO-8601-ish yyyy-MM-dd HH:mm:ss string.
+fn chrono_timestamp_to_iso_ms(ts: i64) -> String {
+    let secs = ts / 1000;
+    let days_since_epoch = secs / 86400;
+    let secs_in_day = secs % 86400;
+    let hours = secs_in_day / 3600;
+    let mins = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    let mut remaining_days = days_since_epoch;
+    let mut year: i64 = 1970;
+    let days_in_year = |y: i64| if is_leap_year_int(y) { 366 } else { 365 };
+    while remaining_days >= days_in_year(year) {
+        remaining_days -= days_in_year(year);
+        year += 1;
+    }
+    let days_in_month = if is_leap_year_int(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1;
+    for (i, d) in days_in_month.iter().enumerate() {
+        if remaining_days < *d as i64 {
+            month = i + 1;
+            break;
+        }
+        remaining_days -= *d as i64;
+    }
+    let day = remaining_days + 1;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hours, mins, s
+    )
+}
+
+fn is_leap_year_int(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 /// Get progress reply for long-running tool mode tasks
 fn progress_reply_for_command(command: &str) -> String {
     match command {
@@ -678,6 +995,137 @@ fn extract_chat_id(inbound: &crate::channels::InboundMessage) -> Option<String> 
         .or_else(|| inbound.metadata.get("conversation_id").and_then(|v| v.as_str()).map(String::from))
 }
 
+// =============================================================================
+// Interactive card sending (command palette / card actions)
+// =============================================================================
+
+/// Send the command palette card. We persist a brief audit row but never
+/// store the full card JSON. The card can be reconstructed from
+/// `reply_kind=command_palette_card`.
+async fn send_command_palette_card(
+    runtime: &GatewayRuntime,
+    inbound: &crate::channels::InboundMessage,
+    channel_name: &str,
+    job_id: &str,
+    event_key: &str,
+) {
+    let card = build_command_palette_card();
+    let card_chars = card.to_string().chars().count();
+
+    println!("[feishu-card] send_palette_start card_chars={}", card_chars);
+
+    let store_opt = runtime.feishu_store();
+    let config = runtime.get_config().await;
+
+    let outbound_id = format!("{}_{}_palette_{}", job_id, chrono_timestamp(), chrono_timestamp());
+
+    if let Some(ref store) = store_opt {
+        let chat_id = extract_chat_id(inbound);
+        let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
+            outbound_id: outbound_id.clone(),
+            job_id: Some(job_id.to_string()),
+            event_key: Some(event_key.to_string()),
+            channel: channel_name.to_string(),
+            chat_id,
+            reply_kind: Some(ReplyKind::CommandPaletteCard.as_str().to_string()),
+            reply: None,
+            result_json: None,
+        };
+        let _ = store.insert_outbox(&outbox_input);
+        let _ = store.outbox_sending(&outbound_id);
+    }
+
+    match crate::gateway::deliver_interactive_card(&config, inbound, &card).await {
+        Ok(result) => {
+            let pm_id = result.platform_message_id.clone().unwrap_or_default();
+            if let Some(ref store) = store_opt {
+                let _ = store.outbox_sent(&outbound_id, &pm_id);
+            }
+            println!(
+                "[{}-card] palette_sent outbound_id={} platform_message_id_present={}",
+                channel_name,
+                outbound_id,
+                !pm_id.is_empty()
+            );
+        }
+        Err(e) => {
+            if let Some(ref store) = store_opt {
+                let _ = store.outbox_failed(&outbound_id, "card_send_failed", &e);
+            }
+            println!(
+                "[{}-card] palette_failed outbound_id={} error={}",
+                channel_name, outbound_id, e
+            );
+        }
+    }
+
+    println!("[feishu-card] send_palette_ok");
+}
+
+/// Send a card action result reply (e.g. status text, jobs list).
+/// Persists a short reply_preview; never stores full payload.
+async fn send_card_action_result(
+    runtime: &GatewayRuntime,
+    inbound: &crate::channels::InboundMessage,
+    text: &str,
+    reply_kind: ReplyKind,
+    channel_name: &str,
+    job_id: &str,
+    event_key: &str,
+) {
+    send_reply_with_outbox(
+        runtime,
+        inbound,
+        text,
+        channel_name,
+        job_id,
+        event_key,
+        reply_kind.as_str(),
+        OUTBOUND_TIMEOUT_SECS,
+    )
+    .await;
+}
+
+/// Try to dispatch a card action callback into an existing handling pipeline.
+/// Returns true only if the action is in the allow-list.
+pub fn resolve_card_action(action: &str) -> bool {
+    ALLOWED_CARD_ACTIONS.contains(&action)
+}
+
+/// Return the canonical action key (string) for an action string.
+/// Used as an audit field; never logs the full callback payload.
+pub fn canonical_card_action(action: &str) -> Option<&'static str> {
+    ALLOWED_CARD_ACTIONS
+        .iter()
+        .copied()
+        .find(|a| *a == action)
+}
+
+/// Construct a ReplyTarget from inbound metadata. Used by card sending.
+pub fn build_reply_target(
+    inbound: &crate::channels::InboundMessage,
+    channel_name: &str,
+) -> Option<crate::channels::adapters::outbound::ReplyTarget> {
+    let chat_id = extract_chat_id(inbound)?;
+    let channel = match channel_name {
+        "feishu" => ChannelKind::Feishu,
+        "lark" => ChannelKind::Lark,
+        _ => inbound.channel.clone(),
+    };
+    Some(crate::channels::adapters::outbound::ReplyTarget {
+        channel,
+        chat_id,
+        message_id: inbound.metadata.get("message_id").and_then(|v| v.as_str()).map(String::from),
+        user_id: inbound.user_id.clone(),
+    })
+}
+
+/// Determine if a Feishu inbound text routed from the webhook should open
+/// the command palette instead of going through chat / tool runtime.
+pub fn should_open_palette(text: &str) -> bool {
+    is_menu_trigger(text)
+}
+
 /// Reconstruct a reply body from its reply_kind and result_json.
 /// Returns Some(reply) if the reply can be reconstructed, None otherwise.
 pub fn reconstruct_reply(kind: ReplyKind, result_json: Option<&str>, chat_only_intent: Option<&str>) -> Option<String> {
@@ -718,6 +1166,22 @@ pub fn reconstruct_reply(kind: ReplyKind, result_json: Option<&str>, chat_only_i
             })
         }
         ReplyKind::LlmFinal => None, // Free-form LLM reply cannot be reconstructed
+        ReplyKind::CommandPaletteCard => Some(
+            "[card] OmniNova Agent 功能菜单 - 重建（详细卡片未持久化）".to_string()
+        ),
+        ReplyKind::CardActionResult => {
+            // The card action result is a plain text reply, reconstructed from result_json if present
+            result_json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
+        }
+        ReplyKind::GatewayStatusReply => result_json.and_then(|j| {
+            serde_json::from_str::<serde_json::Value>(j).ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
+        }),
+        ReplyKind::RecentJobsReply => result_json.and_then(|j| {
+            serde_json::from_str::<serde_json::Value>(j).ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
+        }),
     }
 }
 
@@ -807,6 +1271,27 @@ pub async fn process_feishu_job(
         chat_id_present,
         job.feishu_mode
     );
+    
+    // Command palette dispatch: triggers like "/", "菜单", "帮助", "help", "功能"
+    // are NOT routed through chat_only / tool runtime. We send the
+    // interactive card and mark the job as completed.
+    if is_menu_trigger(&job.inbound.text) {
+        println!(
+            "[feishu-router] mode=command_palette reason=menu_trigger job_id={} text_len={}",
+            job_id, text_len
+        );
+        send_command_palette_card(&runtime, &job.inbound, &channel_name, job_id, event_key).await;
+        if let Some(ref store) = runtime.feishu_store() {
+            let _ = store.job_completed(job_id);
+            let _ = store.update_event_status(event_key, EventStatus::Processed);
+        }
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        println!(
+            "[{}-worker] job_completed job_id={} duration_ms={} status=command_palette",
+            channel_name, job_id, duration_ms
+        );
+        return;
+    }
     
     // Check for tool intent in chat_only mode
     if job.is_chat_only {
@@ -1564,5 +2049,286 @@ mod tests {
         
         let inbound = reconstruct_inbound_for_retry(&outbox);
         assert!(inbound.is_none());
+    }
+
+    // ========== Command palette tests (v0.8.9) ==========
+    use crate::channels::adapters::outbound::{ChannelOutboundSender, MockOutboundSender, ReplyTarget};
+
+    #[test]
+    fn test_is_menu_trigger_slash() {
+        assert!(is_menu_trigger("/"));
+        assert!(is_menu_trigger(" / "));
+    }
+
+    #[test]
+    fn test_is_menu_trigger_chinese_tokens() {
+        assert!(is_menu_trigger("菜单"));
+        assert!(is_menu_trigger("帮助"));
+        assert!(is_menu_trigger("功能"));
+    }
+
+    #[test]
+    fn test_is_menu_trigger_help_keyword() {
+        assert!(is_menu_trigger("help"));
+        assert!(is_menu_trigger("HELP"));
+        assert!(is_menu_trigger(" Help "));
+    }
+
+    #[test]
+    fn test_is_menu_trigger_non_menu_text_not_triggered() {
+        assert!(!is_menu_trigger("hello"));
+        assert!(!is_menu_trigger("你好"));
+        assert!(!is_menu_trigger("/monitor desktop"));
+        assert!(!is_menu_trigger(""));
+        assert!(!is_menu_trigger("   "));
+    }
+
+    #[test]
+    fn test_canonical_card_action_allow_list() {
+        assert_eq!(canonical_card_action("monitor_30s"), Some("monitor_30s"));
+        assert_eq!(canonical_card_action("monitor_60s"), Some("monitor_60s"));
+        assert_eq!(canonical_card_action("gateway_status"), Some("gateway_status"));
+        assert_eq!(canonical_card_action("recent_jobs"), Some("recent_jobs"));
+        assert_eq!(canonical_card_action("help"), Some("help"));
+    }
+
+    #[test]
+    fn test_canonical_card_action_unknown_returns_none() {
+        assert!(canonical_card_action("file_delete").is_none());
+        assert!(canonical_card_action("rm_rf").is_none());
+        assert!(canonical_card_action("").is_none());
+        assert!(canonical_card_action("monitor_120s").is_none());
+        assert!(canonical_card_action("bash").is_none());
+    }
+
+    #[test]
+    fn test_resolve_card_action_returns_bool() {
+        assert!(resolve_card_action("monitor_30s"));
+        assert!(resolve_card_action("help"));
+        assert!(!resolve_card_action("evil"));
+        assert!(!resolve_card_action(""));
+    }
+
+    #[test]
+    fn test_build_command_palette_card_has_required_buttons() {
+        let card = build_command_palette_card();
+        let s = card.to_string();
+        assert!(s.contains("OmniNova Agent 功能菜单"));
+        assert!(s.contains("monitor_30s"));
+        assert!(s.contains("monitor_60s"));
+        assert!(s.contains("gateway_status"));
+        assert!(s.contains("recent_jobs"));
+        assert!(s.contains("help"));
+        // Privacy: card must NOT contain any obviously sensitive boilerplate.
+        assert!(!s.contains("app_secret"));
+        assert!(!s.contains("tenant_access_token"));
+        assert!(!s.contains("Authorization"));
+    }
+
+    #[test]
+    fn test_unknown_action_reply_is_safe() {
+        let s = unknown_action_reply();
+        assert!(s.contains("未知操作"));
+        assert!(s.contains("/"));
+    }
+
+    #[test]
+    fn test_help_reply_does_not_leak_secrets() {
+        let s = help_reply();
+        assert!(s.contains("普通聊天"));
+        assert!(s.contains("/monitor"));
+        assert!(!s.contains("app_secret"));
+        assert!(!s.contains("token"));
+    }
+
+    #[test]
+    fn test_gateway_status_reply_includes_basic_fields() {
+        let s = gateway_status_reply(
+            Some("token"),
+            true,
+            false,
+            Some("real"),
+            true,
+            "C:\\Users\\Hero\\.omninova\\state.sqlite",
+            3,
+            1,
+        );
+        assert!(s.contains("Gateway 状态"));
+        assert!(s.contains("token"));
+        assert!(s.contains("real"));
+        assert!(s.contains("state.sqlite"));
+        // Privacy: must not reveal app_secret / token values.
+        assert!(!s.contains("app_secret"));
+    }
+
+    #[test]
+    fn test_recent_jobs_reply_text_empty() {
+        let lines = recent_jobs_reply_text(&[]);
+        assert!(lines.contains("最近"));
+        assert!(lines.contains("0"));
+    }
+
+    #[test]
+    fn test_recent_jobs_reply_text_with_summary_lines() {
+        let jobs = vec![
+            summarize_job_for_card(
+                "abcdef-1234-5678-9abcdef01234",
+                "tool",
+                "COMPLETED",
+                1,
+                None,
+                1_700_000_000_000,
+                Some(1_700_000_060_000),
+            ),
+            summarize_job_for_card(
+                "failing-job-with-error",
+                "chat_only",
+                "FAILED",
+                3,
+                Some("timeout"),
+                1_700_000_120_000,
+                Some(1_700_000_180_000),
+            ),
+        ];
+        let s = recent_jobs_reply_text(&jobs);
+        // Two jobs summary must be present
+        assert!(s.contains("最近 2 条"));
+        assert!(s.contains("COMPLETED"));
+        assert!(s.contains("FAILED"));
+        assert!(s.contains("timeout"));
+        // Privacy: do not leak payload_json (we never asked for it)
+        assert!(!s.contains("payload_json"));
+    }
+
+    #[test]
+    fn test_summarize_job_for_card_shortens_id() {
+        let line = summarize_job_for_card(
+            "this_is_a_very_long_job_id_that_should_be_shortened_for_display",
+            "tool",
+            "RUNNING",
+            1,
+            None,
+            1_700_000_000_000,
+            None,
+        );
+        // The job id must be truncated to <= 24 chars (per short_id).
+        assert!(line.job_id_short.chars().count() <= 24);
+    }
+
+    #[test]
+    fn test_reconstruct_command_palette_card() {
+        let result = reconstruct_reply(ReplyKind::CommandPaletteCard, None, None);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("功能菜单"));
+    }
+
+    #[test]
+    fn test_reconstruct_card_action_result_with_text() {
+        let json = serde_json::json!({ "text": "card action result" });
+        let result = reconstruct_reply(
+            ReplyKind::CardActionResult,
+            Some(&json.to_string()),
+            None,
+        );
+        assert_eq!(result, Some("card action result".to_string()));
+    }
+
+    #[test]
+    fn test_reconstruct_card_action_result_without_text_returns_none() {
+        let result = reconstruct_reply(ReplyKind::CardActionResult, None, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_reconstruct_gateway_status_with_text() {
+        let json = serde_json::json!({ "text": "Gateway 状态 - test" });
+        let result = reconstruct_reply(
+            ReplyKind::GatewayStatusReply,
+            Some(&json.to_string()),
+            None,
+        );
+        assert_eq!(result, Some("Gateway 状态 - test".to_string()));
+    }
+
+    #[test]
+    fn test_reconstruct_recent_jobs_with_text() {
+        let json = serde_json::json!({ "text": "recent jobs summary" });
+        let result = reconstruct_reply(
+            ReplyKind::RecentJobsReply,
+            Some(&json.to_string()),
+            None,
+        );
+        assert_eq!(result, Some("recent jobs summary".to_string()));
+    }
+
+    #[test]
+    fn test_reply_kind_command_palette_card_is_retryable() {
+        assert!(ReplyKind::CommandPaletteCard.is_retryable());
+    }
+
+    #[test]
+    fn test_reply_kind_card_action_result_is_retryable() {
+        assert!(ReplyKind::CardActionResult.is_retryable());
+    }
+
+    #[test]
+    fn test_reply_kind_gateway_status_is_retryable() {
+        assert!(ReplyKind::GatewayStatusReply.is_retryable());
+    }
+
+    #[test]
+    fn test_reply_kind_recent_jobs_is_retryable() {
+        assert!(ReplyKind::RecentJobsReply.is_retryable());
+    }
+
+    #[test]
+    fn test_reply_kind_command_palette_str_roundtrip() {
+        assert_eq!(
+            ReplyKind::from_str(ReplyKind::CommandPaletteCard.as_str()),
+            Some(ReplyKind::CommandPaletteCard)
+        );
+        assert_eq!(
+            ReplyKind::from_str(ReplyKind::CardActionResult.as_str()),
+            Some(ReplyKind::CardActionResult)
+        );
+        assert_eq!(
+            ReplyKind::from_str(ReplyKind::GatewayStatusReply.as_str()),
+            Some(ReplyKind::GatewayStatusReply)
+        );
+        assert_eq!(
+            ReplyKind::from_str(ReplyKind::RecentJobsReply.as_str()),
+            Some(ReplyKind::RecentJobsReply)
+        );
+    }
+
+    // ========== Outbound / platform_webhook tests for send_interactive_card ==========
+
+    #[test]
+    fn test_mock_outbound_send_interactive_card_falls_back_to_text() {
+        let sender = MockOutboundSender::new();
+        let target = ReplyTarget {
+            channel: ChannelKind::Feishu,
+            chat_id: "oc_test".to_string(),
+            message_id: None,
+            user_id: None,
+        };
+        let card = build_command_palette_card();
+        let result = tokio_test_block_on(async {
+            sender.send_interactive_card(&target, &card).await
+        });
+        assert!(result.ok);
+        // The fallback sends a short summary text but still records a message.
+        assert_eq!(sender.count(), 1);
+    }
+
+    /// Tiny inline helper so tests don't need to add tokio as a test
+    /// dependency. We use tokio's block_on via the production runtime
+    /// since `omninova-core` already depends on tokio.
+    fn tokio_test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(future)
     }
 }

@@ -28,6 +28,8 @@ const SECRET_KEYS: &[&str] = &[
     "authorization",
     "app_access_token",
     "refresh_token",
+    "verification_token",
+    "encrypt_key",
     "secret",
     "password",
 ];
@@ -178,6 +180,14 @@ pub enum ReplyKind {
     MonitorFinal,
     /// Free-form LLM response - NOT retryable due to privacy
     LlmFinal,
+    /// Command palette interactive card - reconstructible (no payload stored)
+    CommandPaletteCard,
+    /// Card action result reply (e.g. status text, recent jobs list)
+    CardActionResult,
+    /// Reconstructed gateway status text reply
+    GatewayStatusReply,
+    /// Reconstructed recent-jobs summary
+    RecentJobsReply,
 }
 
 impl ReplyKind {
@@ -190,6 +200,10 @@ impl ReplyKind {
             ReplyKind::Unsupported => "unsupported_reply",
             ReplyKind::MonitorFinal => "monitor_final",
             ReplyKind::LlmFinal => "llm_final",
+            ReplyKind::CommandPaletteCard => "command_palette_card",
+            ReplyKind::CardActionResult => "card_action_result",
+            ReplyKind::GatewayStatusReply => "gateway_status_reply",
+            ReplyKind::RecentJobsReply => "recent_jobs_reply",
         }
     }
 
@@ -202,6 +216,10 @@ impl ReplyKind {
             "unsupported_reply" => Some(ReplyKind::Unsupported),
             "monitor_final" => Some(ReplyKind::MonitorFinal),
             "llm_final" => Some(ReplyKind::LlmFinal),
+            "command_palette_card" => Some(ReplyKind::CommandPaletteCard),
+            "card_action_result" => Some(ReplyKind::CardActionResult),
+            "gateway_status_reply" => Some(ReplyKind::GatewayStatusReply),
+            "recent_jobs_reply" => Some(ReplyKind::RecentJobsReply),
             _ => None,
         }
     }
@@ -214,7 +232,11 @@ impl ReplyKind {
             | ReplyKind::Failure
             | ReplyKind::ChatOnlyBlocked
             | ReplyKind::Unsupported
-            | ReplyKind::MonitorFinal => true,
+            | ReplyKind::MonitorFinal
+            | ReplyKind::CommandPaletteCard
+            | ReplyKind::CardActionResult
+            | ReplyKind::GatewayStatusReply
+            | ReplyKind::RecentJobsReply => true,
             ReplyKind::LlmFinal => false,
         }
     }
@@ -321,6 +343,9 @@ pub struct FeishuStore {
 }
 
 impl FeishuStore {
+    /// Returns the path of the state database file.
+    pub fn db_path(&self) -> &Path { &self.db_path }
+
     /// Open or create the Feishu store database
     pub fn open(config_dir: &Path) -> Result<Self, StoreError> {
         let db_dir = config_dir.to_path_buf();
@@ -2021,6 +2046,8 @@ mod tests {
         let json = r#"{
             "app_secret": "my_secret_key",
             "tenant_access_token": "token123",
+            "verification_token": "verification-token-must-not-leak",
+            "encrypt_key": "encrypt-key-must-not-leak",
             "normal_key": "visible_value"
         }"#;
         
@@ -2030,6 +2057,8 @@ mod tests {
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("my_secret_key"));
         assert!(!redacted.contains("token123"));
+        assert!(!redacted.contains("verification-token-must-not-leak"));
+        assert!(!redacted.contains("encrypt-key-must-not-leak"));
     }
     
     #[test]
