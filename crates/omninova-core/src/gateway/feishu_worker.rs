@@ -8,7 +8,7 @@ use crate::channels::adapters::outbound::OutboundResult;
 use crate::desktop_capture::{self, CaptureResult, MonitorResult};
 use crate::gateway::feishu_store::{FeishuStore, EventStatus, JobStatus, ReplyKind, chrono_timestamp};
 use crate::gateway::OutboundMsgCache;
-use crate::gateway::GatewayRuntime;
+use crate::gateway::{GatewayRuntime, MonitorFlightLease};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -52,6 +52,9 @@ pub struct FeishuAsyncJob {
     pub job_id: String,
     /// Event key for persistence tracking
     pub event_key: String,
+    /// Owner-scoped monitor lease acquired before the job is queued.
+    /// It contains only a hashed chat key and an opaque owner id.
+    pub(crate) monitor_guard_lease: Option<MonitorFlightLease>,
 }
 
 impl FeishuAsyncJob {
@@ -74,7 +77,7 @@ impl FeishuAsyncJob {
         let job_id = job_id.unwrap_or_else(|| {
             format!("job_{}_{}", created_at, &uuid::Uuid::new_v4().to_string()[..8])
         });
-        
+
         Self {
             channel,
             inbound,
@@ -84,7 +87,14 @@ impl FeishuAsyncJob {
             created_at,
             job_id,
             event_key,
+            monitor_guard_lease: None,
         }
+    }
+
+    /// Attach the monitor lease that the worker must renew and release.
+    pub(crate) fn with_monitor_guard_lease(mut self, lease: MonitorFlightLease) -> Self {
+        self.monitor_guard_lease = Some(lease);
+        self
     }
 }
 
@@ -766,7 +776,7 @@ fn format_capture_info(capture: &CaptureResult) -> String {
 }
 
 /// Parse monitor duration from text
-fn parse_monitor_duration_from_text(text: &str) -> u64 {
+pub(crate) fn parse_monitor_duration_from_text(text: &str) -> u64 {
     let text_lower = text.to_lowercase();
     
     // Manual parsing without regex
@@ -1321,29 +1331,120 @@ pub async fn process_feishu_job(
     
     // For tool mode /monitor command, use direct runner instead of Runtime
     if is_monitor_command(&job) {
+        let duration_secs = parse_monitor_duration_from_text(&job.inbound.text);
+        let ttl_secs = crate::gateway::monitor_guard_ttl_secs(duration_secs);
+        let guard = runtime.monitor_flight_guard();
+        let guard_source = if job.inbound.metadata.contains_key("card_action") {
+            "card"
+        } else {
+            "slash"
+        };
+        let chat_present = job.inbound.session_id.is_some();
+
+        // Normal webhook paths acquire before enqueueing. The fallback acquisition
+        // keeps direct/unit-created jobs safe without allowing card jobs to acquire twice.
+        let active_guard_lease = if let Some(lease) = job.monitor_guard_lease.clone() {
+            guard.renew(&lease).await.then_some(lease)
+        } else if let Some(chat_id) = job.inbound.session_id.as_deref() {
+            let acquired = guard.try_acquire_with_ttl(chat_id, ttl_secs).await;
+            if acquired.is_some() {
+                println!(
+                    "[{}-monitor] singleflight_acquired source={} command=/monitor chat_present=true ttl_secs={}",
+                    channel_name, guard_source, ttl_secs
+                );
+            }
+            acquired
+        } else {
+            None
+        };
+
+        // ==== Guard busy: short-circuit without running ====
+        if chat_present && active_guard_lease.is_none() {
+            println!(
+                "[{}-monitor] singleflight_busy source={} command=/monitor chat_present=true",
+                channel_name, guard_source
+            );
+            let busy_reply = "已有桌面监控任务正在执行，请等待当前任务完成后再试。";
+            let _ = send_reply_with_outbox(
+                &runtime, &job.inbound, busy_reply, &channel_name, job_id, event_key,
+                "busy", OUTBOUND_TIMEOUT_SECS
+            ).await;
+            if let Some(ref store) = runtime.feishu_store() {
+                let _ = store.job_completed(job_id);
+                let _ = store.update_event_status(event_key, EventStatus::Processed);
+            }
+            println!(
+                "[{}-worker] job_completed job_id={} duration_ms={} status=skipped_guard_busy",
+                channel_name, job_id, started_at.elapsed().as_millis() as u64
+            );
+            return;
+        }
+
         println!(
-            "[{}-worker] direct_monitor job_id={} text_len={}",
-            channel_name, job_id, text_len
+            "[{}-worker] direct_monitor job_id={} text_len={} guard_source={}",
+            channel_name, job_id, text_len, guard_source
         );
-        
+
         // Send progress reply
         let progress_reply = progress_reply_for_command("/monitor");
-        send_reply_with_outbox(&runtime, &job.inbound, &progress_reply, &channel_name, job_id, event_key, "progress", OUTBOUND_TIMEOUT_SECS).await;
-        
+        send_reply_with_outbox(
+            &runtime, &job.inbound, &progress_reply, &channel_name,
+            job_id, event_key, "progress", OUTBOUND_TIMEOUT_SECS
+        ).await;
+
+        // Queueing and the progress reply can consume part of the lease. Renew
+        // immediately before capture so the full monitor duration remains
+        // protected. If the owner has expired or been replaced, this stale job
+        // must not start a second capture.
+        if let Some(ref lease) = active_guard_lease {
+            if !guard.renew(lease).await {
+                println!(
+                    "[{}-monitor] singleflight_busy source={} command=/monitor chat_present=true reason=lease_expired_before_capture",
+                    channel_name, guard_source
+                );
+                let busy_reply = "已有桌面监控任务正在执行，请等待当前任务完成后再试。";
+                let _ = send_reply_with_outbox(
+                    &runtime, &job.inbound, busy_reply, &channel_name, job_id, event_key,
+                    "busy", OUTBOUND_TIMEOUT_SECS
+                ).await;
+                if let Some(ref store) = runtime.feishu_store() {
+                    let _ = store.job_completed(job_id);
+                    let _ = store.update_event_status(event_key, EventStatus::Processed);
+                }
+                println!(
+                    "[{}-worker] job_completed job_id={} duration_ms={} status=skipped_guard_expired",
+                    channel_name, job_id, started_at.elapsed().as_millis() as u64
+                );
+                return;
+            }
+        }
+
         // Run direct monitor
-        let duration_secs = parse_monitor_duration_from_text(&job.inbound.text);
         let result = direct_monitor_runner(&job, &channel_name).await;
-        
+
         // Format and send result
         let reply = format_monitor_result(&result, duration_secs);
-        send_reply_with_outbox(&runtime, &job.inbound, &reply, &channel_name, job_id, event_key, "final", OUTBOUND_TIMEOUT_SECS).await;
-        
+        send_reply_with_outbox(
+            &runtime, &job.inbound, &reply, &channel_name,
+            job_id, event_key, "final", OUTBOUND_TIMEOUT_SECS
+        ).await;
+
+        // ==== Release monitor single-flight guard ====
+        if let Some(ref lease) = active_guard_lease {
+            let released = guard.release(lease).await;
+            let monitor_succeeded = matches!(result, MonitorRunnerResult::Success { .. });
+            println!(
+                "[{}-monitor] singleflight_released source=worker job_id={} success={} released={}",
+                channel_name, job_id, monitor_succeeded, released
+            );
+        }
+
         // Mark job and event as completed
         if let Some(ref store) = runtime.feishu_store() {
             let _ = store.job_completed(job_id);
             let _ = store.update_event_status(event_key, EventStatus::Processed);
         }
-        
+
         let duration_ms = started_at.elapsed().as_millis() as u64;
         let status = match &result {
             MonitorRunnerResult::Success { .. } => "success",
@@ -1354,6 +1455,7 @@ pub async fn process_feishu_job(
             "[{}-worker] job_completed job_id={} duration_ms={} status={}",
             channel_name, job_id, duration_ms, status
         );
+
         return;
     }
     
@@ -1810,6 +1912,7 @@ mod tests {
             created_at: 0,
             job_id: "test".to_string(),
             event_key: "test:event_key".to_string(),
+            monitor_guard_lease: None,
         }
     }
 

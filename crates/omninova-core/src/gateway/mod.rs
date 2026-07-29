@@ -59,7 +59,6 @@ static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static OUTBOUND_TOKEN_CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
 static DEDUP_CACHE: OnceLock<Arc<DedupCache>> = OnceLock::new();
 static OUTBOUND_MSG_CACHE: OnceLock<Arc<OutboundMsgCache>> = OnceLock::new();
-static MONITOR_FLIGHT_CACHE: OnceLock<Arc<MonitorFlightGuard>> = OnceLock::new();
 const WORKSPACE_REQUIRED_MESSAGE: &str =
     "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
 
@@ -117,7 +116,7 @@ impl DedupCache {
 /// The output is fed into the cache key but is never logged or returned
 /// to the user — it deliberately prevents the raw event_id /
 /// open_message_id / chat_id from leaking through cache-trace logs.
-fn hash_dedup_string(s: &str) -> String {
+pub(crate) fn hash_dedup_string(s: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -174,73 +173,107 @@ impl OutboundMsgCache {
 ///
 /// Key design:
 /// - Per-chat (hashed chat_id) so different users don't interfere
-/// - TTL = max(monitor_duration + 10s, 40s) so a stuck/hung monitor
+/// - TTL = max(monitor_duration + 15s, 45s) so a stuck/hung monitor
 ///   does not lock the user out forever
-/// - `acquire()` returns `Guard` (auto-releases on drop) or `None` (already busy)
+/// - Every lease has an opaque owner id so an expired job cannot release a newer job
 /// - Guard is stored in a global cache to survive across HTTP callbacks
 #[derive(Debug, Clone)]
+struct MonitorFlightEntry {
+    owner_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorFlightLease {
+    key: String,
+    owner_id: String,
+    ttl_secs: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct MonitorFlightGuard {
-    /// Map: hash(chat_id) → Instant expiry
-    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Instant>>>,
+    /// Map: feishu:<hash(chat_id)>:desktop_monitor → active lease.
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, MonitorFlightEntry>>>,
     /// Minimum TTL for any guard entry
     min_ttl_secs: u64,
 }
 
+fn monitor_flight_key(chat_id: &str) -> String {
+    let raw_chat_id = chat_id.strip_prefix("feishu:").unwrap_or(chat_id);
+    format!(
+        "feishu:{}:desktop_monitor",
+        hash_dedup_string(raw_chat_id)
+    )
+}
+
+pub(crate) fn monitor_guard_ttl_secs(duration_secs: u64) -> u64 {
+    duration_secs.saturating_add(15).max(45)
+}
+
 impl MonitorFlightGuard {
-    fn global() -> Arc<MonitorFlightGuard> {
-        MONITOR_FLIGHT_CACHE
-            .get_or_init(|| Arc::new(MonitorFlightGuard {
-                inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                min_ttl_secs: 40, // minimum 40 seconds
-            }))
-            .clone()
+    fn new() -> Arc<MonitorFlightGuard> {
+        Arc::new(MonitorFlightGuard {
+            inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            min_ttl_secs: 45,
+        })
     }
 
     /// Attempt to acquire the single-flight slot for `chat_id` with a caller-specified TTL.
-    /// Returns `Some(())` if the slot was free; `None` if busy.
-    async fn try_acquire_with_ttl(&self, chat_id: &str, ttl_secs: u64) -> Option<()> {
-        let key = hash_dedup_string(chat_id);
+    /// Returns an owner-scoped lease if the slot was free; `None` if busy.
+    async fn try_acquire_with_ttl(
+        &self,
+        chat_id: &str,
+        ttl_secs: u64,
+    ) -> Option<MonitorFlightLease> {
+        let key = monitor_flight_key(chat_id);
         let now = Instant::now();
-
-        {
-            let cache = self.inner.read().await;
-            if let Some(expiry) = cache.get(&key) {
-                if now < *expiry {
-                    // Already busy within TTL
-                    return None;
-                }
-            }
+        let ttl_secs = ttl_secs.max(self.min_ttl_secs);
+        let mut cache = self.inner.write().await;
+        cache.retain(|_, entry| now < entry.expires_at);
+        if cache.contains_key(&key) {
+            return None;
         }
 
-        // Not busy (or TTL expired). Claim it.
-        let expiry = now + Duration::from_secs(ttl_secs);
-        let mut cache = self.inner.write().await;
-        cache.insert(key, expiry);
+        let owner_id = uuid::Uuid::new_v4().to_string();
+        cache.insert(
+            key.clone(),
+            MonitorFlightEntry {
+                owner_id: owner_id.clone(),
+                expires_at: now + Duration::from_secs(ttl_secs),
+            },
+        );
 
-        Some(())
+        Some(MonitorFlightLease {
+            key,
+            owner_id,
+            ttl_secs,
+        })
     }
 
-    /// Force-release a slot by key. Used by error/panic paths where
-    /// the `Guard` drop might not fire.
-    async fn force_release(&self, chat_id: &str) {
-        let key = hash_dedup_string(chat_id);
-        let mut cache = self.inner.write().await;
-        cache.remove(&key);
-    }
-
-    /// Force-release a slot by its pre-hashed key (for use from the worker,
-    /// which stores the already-hashed key in FeishuAsyncJob.monitor_guard_key).
-    async fn force_release_by_hash_key(&self, key: &str) {
-        let mut cache = self.inner.write().await;
-        cache.remove(key);
-    }
-
-    /// Remove all expired entries and return the current active count.
-    pub(crate) async fn purge_expired(&self) -> usize {
+    /// Extend a queued lease immediately before the monitor starts.
+    async fn renew(&self, lease: &MonitorFlightLease) -> bool {
         let now = Instant::now();
         let mut cache = self.inner.write().await;
-        cache.retain(|_, &mut expiry| now < expiry);
-        cache.len()
+        let Some(entry) = cache.get_mut(&lease.key) else {
+            return false;
+        };
+        if entry.owner_id != lease.owner_id || now >= entry.expires_at {
+            return false;
+        }
+        entry.expires_at = now + Duration::from_secs(lease.ttl_secs);
+        true
+    }
+
+    /// Release only if the caller still owns the active lease.
+    async fn release(&self, lease: &MonitorFlightLease) -> bool {
+        let mut cache = self.inner.write().await;
+        let is_owner = cache
+            .get(&lease.key)
+            .is_some_and(|entry| entry.owner_id == lease.owner_id);
+        if is_owner {
+            cache.remove(&lease.key);
+        }
+        is_owner
     }
 
     /// Clear all entries. Intended for unit tests.
@@ -248,6 +281,14 @@ impl MonitorFlightGuard {
     pub(crate) async fn clear(&self) {
         let mut cache = self.inner.write().await;
         cache.clear();
+    }
+
+    #[cfg(test)]
+    async fn active_count(&self) -> usize {
+        let now = Instant::now();
+        let mut cache = self.inner.write().await;
+        cache.retain(|_, entry| now < entry.expires_at);
+        cache.len()
     }
 }
 use std::time::Instant;
@@ -283,6 +324,10 @@ pub struct GatewayRuntime {
     feishu_queue_len: Arc<RwLock<usize>>,
     /// Feishu SQLite store for event/job/outbox persistence
     feishu_store: Option<Arc<FeishuStore>>,
+    /// Per-runtime webhook event deduplication state.
+    dedup_cache: Arc<DedupCache>,
+    /// Per-runtime, per-chat desktop-monitor single-flight state.
+    monitor_flights: Arc<MonitorFlightGuard>,
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +445,8 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dedup_cache: Arc::new(DedupCache::new(1800)),
+            monitor_flights: MonitorFlightGuard::new(),
         }
     }
 
@@ -417,7 +464,17 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dedup_cache: Arc::new(DedupCache::new(1800)),
+            monitor_flights: MonitorFlightGuard::new(),
         }
+    }
+
+    pub(crate) fn dedup_cache(&self) -> Arc<DedupCache> {
+        self.dedup_cache.clone()
+    }
+
+    pub(crate) fn monitor_flight_guard(&self) -> Arc<MonitorFlightGuard> {
+        self.monitor_flights.clone()
     }
     
     /// Initialize the Feishu async worker with the given queue
@@ -599,7 +656,11 @@ impl GatewayRuntime {
         match s.try_send(job) {
             Ok(()) => {
                 drop(sender);
-                self.inc_feishu_queue_len().await;
+                let queue_len = self.feishu_queue_len.clone();
+                tokio::spawn(async move {
+                    let mut len = queue_len.write().await;
+                    *len += 1;
+                });
                 Ok(true)
             }
             Err(_) => Ok(false),
@@ -3798,7 +3859,7 @@ async fn process_feishu_card_action_callback(
         .map(|value| value.to_string());
     let event_id_present = event_id_opt.is_some();
     let open_message_id_present = open_message_id_opt.is_some();
-    let dedup_cache = DedupCache::global();
+    let dedup_cache = runtime.dedup_cache();
 
     // Compute (key, ttl_secs, tier_label) for the cache. We use FxHash-style
     // of mixing the value into the string itself so we never log the raw id.
@@ -3956,19 +4017,18 @@ async fn process_feishu_card_action_callback(
 
     if matches!(canonical, "monitor_30s" | "monitor_60s") {
         // ==== Single-flight guard: only one monitor per chat at a time ====
-        // CRITICAL: the guard slot is stored IN the job so the WORKER releases it
+        // CRITICAL: the owner-scoped lease is stored IN the job so the WORKER releases it
         // when the monitor actually completes (not when the HTTP callback returns).
         // The HTTP handler exits before the monitor runs, so RAII in the handler
-        // would release too early. Instead we put the hashed key into the job.
-        let guard = MonitorFlightGuard::global();
+        // would release too early.
+        let guard = runtime.monitor_flight_guard();
         let monitor_duration_secs: u64 = if canonical == "monitor_30s" { 30 } else { 60 };
-        let ttl_secs = monitor_duration_secs.saturating_add(10).max(40);
+        let ttl_secs = monitor_guard_ttl_secs(monitor_duration_secs);
         let chat_id_str = chat_id.as_str();
-        let guard_key = hash_dedup_string(chat_id_str);
         match guard.try_acquire_with_ttl(chat_id_str, ttl_secs).await {
-            Some(()) => {
+            Some(lease) => {
                 println!(
-                    "[feishu-monitor] singleflight_acquired action={} ttl_secs={}",
+                    "[feishu-monitor] singleflight_acquired source=card action={} ttl_secs={} chat_present=true",
                     canonical, ttl_secs
                 );
                 // Non-blocking enqueue with a strict wall-clock deadline.
@@ -3982,7 +4042,8 @@ async fn process_feishu_card_action_callback(
                     false,
                     event_key.clone(),
                     Some(job_id.clone()),
-                ).with_monitor_guard_key(guard_key); // worker releases guard on completion
+                )
+                .with_monitor_guard_lease(lease.clone());
 
                 let enqueue_dispatch = tokio::time::timeout(
                     std::time::Duration::from_millis(50),
@@ -4003,6 +4064,13 @@ async fn process_feishu_card_action_callback(
                         (false, true)
                     }
                 };
+                if !queued_flag {
+                    let released = guard.release(&lease).await;
+                    println!(
+                        "[feishu-monitor] singleflight_released source=enqueue action={} success=false released={}",
+                        canonical, released
+                    );
+                }
 
                 // Detached task: outbox INSERT and any post-send bookkeeping. Must NOT block
                 // the HTTP callback. Only runs when the job was actually accepted.
@@ -4037,8 +4105,13 @@ async fn process_feishu_card_action_callback(
                 println!(
                     "[feishu-card] callback_ack ack_ms={ack_ms} action={canonical} queued={queued_flag} busy={busy_flag}"
                 );
+                let toast_content = if queued_flag {
+                    "已收到监控任务，正在执行。"
+                } else {
+                    "监控任务队列繁忙，请稍后再试。"
+                };
                 return Ok(Json(serde_json::json!({
-                    "toast": { "type": "info", "content": "已收到请求，正在处理" },
+                    "toast": { "type": "info", "content": toast_content },
                     "ok": true,
                     "action": canonical,
                     "queued": queued_flag,
@@ -4049,7 +4122,7 @@ async fn process_feishu_card_action_callback(
             None => {
                 // Single-flight: a monitor is already running in this chat.
                 println!(
-                    "[feishu-monitor] singleflight_busy action={} chat_present=true",
+                    "[feishu-monitor] singleflight_busy source=card action={} chat_present=true",
                     canonical
                 );
                 // Send a detached "already busy" message so the user doesn't
@@ -4083,7 +4156,7 @@ async fn process_feishu_card_action_callback(
                     "[feishu-card] callback_ack ack_ms={ack_ms} action={canonical} queued=false busy=true reason=singleflight"
                 );
                 return Ok(Json(serde_json::json!({
-                    "toast": { "type": "info", "content": "已收到请求，正在处理" },
+                    "toast": { "type": "info", "content": "已有桌面监控任务正在执行，请稍后再试" },
                     "ok": true,
                     "action": canonical,
                     "queued": false,
@@ -4801,7 +4874,7 @@ async fn http_channel_webhook(
     }
 
     // ==== DEDUPLICATION ====
-    let dedup_cache = DedupCache::global();
+    let dedup_cache = runtime.dedup_cache();
     let dedup_key = event_id.as_ref()
         .or(message_id.as_ref())
         .map(|k| format!("{}:{}", channel_name, k));
@@ -4863,8 +4936,8 @@ async fn http_channel_webhook(
             let prefixed = format!("feishu:{chat_id}");
             inbound.session_id = Some(prefixed.clone());
             println!(
-                "[{}-webhook] session_mode stateless=true session_id_prefix=feishu session_id={}",
-                channel_name, prefixed
+                "[{}-webhook] session_mode stateless=true session_id_prefix=feishu session_id_present=true",
+                channel_name
             );
         }
         
@@ -4930,9 +5003,19 @@ async fn http_channel_webhook(
             let event_key = event_id.as_ref()
                 .or(message_id.as_ref())
                 .map(|k| format!("{}:{}", channel_name, k))
-                .unwrap_or_else(|| format!("{}:{}:{}", channel_name, 
-                    inbound.session_id.as_deref().unwrap_or("unknown"),
-                    crate::gateway::feishu_store::FeishuStore::hash_text(&inbound.text)));
+                .unwrap_or_else(|| {
+                    let session_hash = inbound
+                        .session_id
+                        .as_deref()
+                        .map(hash_dedup_string)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!(
+                        "{}:{}:{}",
+                        channel_name,
+                        session_hash,
+                        crate::gateway::feishu_store::FeishuStore::hash_text(&inbound.text)
+                    )
+                });
             
             // Extract chat_id
             let chat_id = inbound.session_id.clone()
@@ -5059,8 +5142,77 @@ async fn http_channel_webhook(
                 }
             }
             
+            // Slash /monitor shares the exact same per-chat guard as card monitor actions.
+            // Acquire before queueing so a busy request never reaches direct_monitor.
+            let is_slash_monitor = inbound
+                .metadata
+                .get("slash_command")
+                .and_then(serde_json::Value::as_str)
+                == Some("/monitor");
+            let monitor_guard_lease = if is_slash_monitor {
+                if let Some(chat_identity) = inbound.session_id.as_deref() {
+                    let duration_secs =
+                        crate::gateway::feishu_worker::parse_monitor_duration_from_text(
+                            &inbound.text,
+                        );
+                    let ttl_secs = monitor_guard_ttl_secs(duration_secs);
+                    match runtime
+                        .monitor_flight_guard()
+                        .try_acquire_with_ttl(chat_identity, ttl_secs)
+                        .await
+                    {
+                        Some(lease) => {
+                            println!(
+                                "[feishu-monitor] singleflight_acquired source=slash command=/monitor chat_present=true ttl_secs={}",
+                                ttl_secs
+                            );
+                            Some(lease)
+                        }
+                        None => {
+                            println!(
+                                "[feishu-monitor] singleflight_busy source=slash command=/monitor chat_present=true"
+                            );
+                            if let Some(ref store) = runtime.feishu_store() {
+                                let _ = store.job_completed(&job_id);
+                                let _ = store.update_event_status(
+                                    &event_key,
+                                    crate::gateway::feishu_store::EventStatus::Processed,
+                                );
+                            }
+                            let runtime_busy = runtime.clone();
+                            let inbound_busy = inbound.clone();
+                            let job_id_busy = job_id.clone();
+                            let event_key_busy = event_key.clone();
+                            let channel_name_busy = channel_name.clone();
+                            tokio::spawn(async move {
+                                crate::gateway::feishu_worker::send_card_action_result(
+                                    &runtime_busy,
+                                    &inbound_busy,
+                                    "已有桌面监控任务正在执行，请等待当前任务完成后再试。",
+                                    crate::gateway::feishu_store::ReplyKind::CardActionResult,
+                                    &channel_name_busy,
+                                    &job_id_busy,
+                                    &event_key_busy,
+                                )
+                                .await;
+                            });
+                            return Ok(Json(serde_json::json!({
+                                "ok": true,
+                                "accepted": true,
+                                "processing": "skipped",
+                                "busy": true
+                            })));
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Create job with SAME job_id that was used in store (or generate new one if store unavailable)
-            let job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
+            let mut job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
                 inbound_channel,
                 inbound,
                 payload_clone,
@@ -5068,7 +5220,10 @@ async fn http_channel_webhook(
                 event_key.clone(),
                 Some(job_id.clone()),
             );
-            
+            if let Some(lease) = monitor_guard_lease.clone() {
+                job = job.with_monitor_guard_lease(lease);
+            }
+
             match runtime.try_send_feishu_job(job).await {
                 Ok(()) => {
                     // Update job status to QUEUED if store is available
@@ -5091,6 +5246,13 @@ async fn http_channel_webhook(
                     })));
                 }
                 Err(_) => {
+                    if let Some(ref lease) = monitor_guard_lease {
+                        let released = runtime.monitor_flight_guard().release(lease).await;
+                        println!(
+                            "[feishu-monitor] singleflight_released source=enqueue command=/monitor success=false released={}",
+                            released
+                        );
+                    }
                     println!(
                         "[{}-worker] queue_full capacity=100",
                         channel_name
@@ -7746,6 +7908,120 @@ mod tests {
         .to_string()
     }
 
+    #[test]
+    fn monitor_singleflight_key_hashes_chat_id_and_normalizes_feishu_prefix() {
+        let raw = "oc_monitor_private_value";
+        let raw_key = super::monitor_flight_key(raw);
+        let prefixed_key = super::monitor_flight_key(&format!("feishu:{raw}"));
+        assert_eq!(raw_key, prefixed_key);
+        assert!(raw_key.starts_with("feishu:h"));
+        assert!(raw_key.ends_with(":desktop_monitor"));
+        assert!(!raw_key.contains(raw));
+    }
+
+    #[test]
+    fn monitor_singleflight_ttl_includes_safety_margin() {
+        assert_eq!(super::monitor_guard_ttl_secs(30), 45);
+        assert_eq!(super::monitor_guard_ttl_secs(60), 75);
+        assert!(super::monitor_guard_ttl_secs(30) >= 40);
+        assert!(super::monitor_guard_ttl_secs(60) >= 70);
+    }
+
+    #[tokio::test]
+    async fn monitor_singleflight_acquire_is_atomic() {
+        let guard = MonitorFlightGuard::new();
+        let (first, second) = tokio::join!(
+            guard.try_acquire_with_ttl("oc_atomic", 45),
+            guard.try_acquire_with_ttl("feishu:oc_atomic", 45)
+        );
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1,
+            "exactly one concurrent acquire may succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_singleflight_release_is_owner_scoped() {
+        let guard = MonitorFlightGuard::new();
+        let old_lease = guard
+            .try_acquire_with_ttl("oc_owner", 45)
+            .await
+            .expect("first lease");
+        guard.clear().await;
+        let new_lease = guard
+            .try_acquire_with_ttl("oc_owner", 45)
+            .await
+            .expect("replacement lease");
+
+        assert!(!guard.release(&old_lease).await);
+        assert!(
+            guard
+                .try_acquire_with_ttl("oc_owner", 45)
+                .await
+                .is_none(),
+            "stale lease must not release the current owner"
+        );
+        assert!(guard.release(&new_lease).await);
+        assert!(
+            guard
+                .try_acquire_with_ttl("oc_owner", 45)
+                .await
+                .is_some(),
+            "release must allow a new monitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_singleflight_expired_lease_allows_reacquire() {
+        let guard = MonitorFlightGuard::new();
+        let expired = guard
+            .try_acquire_with_ttl("oc_expired", 45)
+            .await
+            .expect("initial lease");
+        {
+            let mut entries = guard.inner.write().await;
+            let expired_at =
+                std::time::Instant::now() - std::time::Duration::from_secs(1);
+            entries
+                .get_mut(&expired.key)
+                .expect("active entry")
+                .expires_at = expired_at;
+        }
+        let replacement = guard
+            .try_acquire_with_ttl("oc_expired", 45)
+            .await
+            .expect("expired lease must not block a replacement");
+
+        assert!(!guard.release(&expired).await);
+        assert!(guard.release(&replacement).await);
+    }
+
+    #[tokio::test]
+    async fn rejected_card_security_never_acquires_monitor_guard() {
+        let runtime = GatewayRuntime::new(feishu_security_config(
+            "token",
+            Some("expected-verification-token"),
+            None,
+        ));
+
+        let (missing_status, _, _) = call_feishu_http(
+            runtime.clone(),
+            unified_card_payload(None, "monitor_30s", true),
+        )
+        .await;
+        assert_ne!(missing_status, StatusCode::OK);
+        assert_eq!(runtime.monitor_flight_guard().active_count().await, 0);
+
+        let (mismatch_status, _, _) = call_feishu_http(
+            runtime.clone(),
+            unified_card_payload(Some("wrong-token"), "monitor_30s", true),
+        )
+        .await;
+        assert_ne!(mismatch_status, StatusCode::OK);
+        assert_eq!(runtime.monitor_flight_guard().active_count().await, 0);
+    }
+
     #[tokio::test]
     async fn unified_feishu_webhook_routes_card_action_before_message_filter() {
         let (status, _, response) = call_feishu_http(
@@ -7933,7 +8209,6 @@ mod tests {
     #[tokio::test]
     async fn unified_card_duplicate_event_id_is_deduped_without_requeue() {
         DedupCache::global().clear().await;
-        MonitorFlightGuard::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(4);
@@ -8067,7 +8342,7 @@ mod tests {
         let body = format!(
             r#"{{"schema":"2.0","header":{{"event_id":"evt_QUEUE_FULL","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_fullqueue","open_message_id":"om_fullqueue"}}}}}}"#
         );
-        let (status, _, response) = call_feishu_http(runtime, body).await;
+        let (status, _, response) = call_feishu_http(runtime.clone(), body).await;
 
         assert_eq!(status, StatusCode::OK, "callback must ACK under queue-full");
         assert_eq!(
@@ -8094,6 +8369,24 @@ mod tests {
             receiver.try_recv().is_err(),
             "no extra monitor job must have been queued under busy=true"
         );
+
+        // Queue rejection must release the lease immediately rather than waiting for TTL.
+        let retry_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_QUEUE_RETRY","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_fullqueue","open_message_id":"om_fullqueue_retry"}}}}}}"#
+        );
+        let (retry_status, _, retry_response) =
+            call_feishu_http(runtime, retry_body).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(
+            retry_response
+                .get("queued")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "queue failure must not leave the chat locked"
+        );
+        let _ = receiver
+            .try_recv()
+            .expect("monitor may enqueue after queue capacity is restored");
     }
 
     /// v0.9.1.2.1: tier 2 — when only open_message_id is present (no
@@ -8167,11 +8460,19 @@ mod tests {
             r1.get("queued").and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        let first_job = receiver.try_recv().expect("first monitor job enqueued");
+        let first_lease = first_job
+            .monitor_guard_lease
+            .as_ref()
+            .expect("first monitor job carries guard lease")
+            .clone();
 
         // Sleep 4 seconds — longer than tier-3 TTL (3s).
         tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
 
-        // Second click must NOT be a duplicate, must successfully enqueue.
+        // The dedup window has expired, but the original 45-second monitor
+        // single-flight remains active. The callback is therefore recognized
+        // as a fresh request and rejected as busy rather than as a duplicate.
         let (s2, _, r2) = call_feishu_http(runtime.clone(), body.clone()).await;
         assert_eq!(s2, StatusCode::OK);
         assert!(
@@ -8180,18 +8481,40 @@ mod tests {
         );
         assert_eq!(
             r2.get("queued").and_then(serde_json::Value::as_bool),
-            Some(true),
-            "second click after > 3s must enqueue a fresh job"
+            Some(false),
+            "an active monitor must prevent a second job from being queued"
         );
+        assert_eq!(
+            r2.get("busy").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "fresh callback must be classified as single-flight busy"
+        );
+        assert!(receiver.try_recv().is_err(), "busy callback must not enqueue");
 
-        // Sanity: drain whatever was enqueued.
-        while let Ok(_) = receiver.try_recv() {}
+        // Once the first run completes and releases its owner-scoped lease,
+        // the same no-id action is allowed again after the busy callback's
+        // independent three-second dedup window expires.
+        assert!(
+            runtime
+                .monitor_flight_guard()
+                .release(&first_lease)
+                .await,
+            "first monitor lease must release"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        let (s3, _, r3) = call_feishu_http(runtime, body).await;
+        assert_eq!(s3, StatusCode::OK);
+        assert_eq!(
+            r3.get("queued").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "monitor must enqueue again after the active lease is released"
+        );
+        assert!(receiver.try_recv().is_ok(), "replacement monitor job enqueued");
     }
 
     /// v0.9.1.2.2: single-flight — first monitor_30s card click acquires the guard.
     #[tokio::test]
     async fn unified_card_monitor_first_click_acquires_singleflight() {
-        MonitorFlightGuard::global().clear().await;
         DedupCache::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, mut receiver) =
@@ -8213,7 +8536,26 @@ mod tests {
             "first click must acquire guard and enqueue"
         );
         let job = receiver.try_recv().expect("first monitor job enqueued");
-        assert_eq!(job.monitor_guard_key.is_some(), true, "job must carry guard key");
+        assert!(
+            job.monitor_guard_lease.is_some(),
+            "job must carry monitor guard lease"
+        );
+        let lease = job.monitor_guard_lease.as_ref().expect("monitor lease");
+        assert!(
+            runtime.monitor_flight_guard().renew(lease).await,
+            "worker must be able to renew the lease without a second acquire"
+        );
+        assert!(
+            runtime
+                .monitor_flight_guard()
+                .try_acquire_with_ttl(
+                    job.inbound.session_id.as_deref().expect("chat session"),
+                    45,
+                )
+                .await
+                .is_none(),
+            "the same chat must remain single-flight while the lease is active"
+        );
         assert_eq!(
             job.inbound.text,
             "/monitor 桌面 30秒"
@@ -8224,7 +8566,6 @@ mod tests {
     /// returns busy=true, queued=false, no second job enqueued.
     #[tokio::test]
     async fn unified_card_monitor_second_click_returns_busy() {
-        MonitorFlightGuard::global().clear().await;
         DedupCache::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, mut receiver) =
@@ -8277,11 +8618,10 @@ mod tests {
     }
 
     /// v0.9.1.2.2: after guard TTL expires, a new click can re-acquire.
-    /// TTL = max(30+10, 40) = 40 seconds, so we sleep 41s to simulate expiry.
-    /// To keep test fast, we clear the guard instead of actually sleeping.
+    /// TTL = 30+15 = 45 seconds. To keep the test fast, clear this runtime's
+    /// in-memory guard instead of actually sleeping.
     #[tokio::test]
     async fn unified_card_monitor_reacquires_after_guard_release() {
-        MonitorFlightGuard::global().clear().await;
         DedupCache::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, mut receiver) =
@@ -8307,10 +8647,11 @@ mod tests {
 
         // Second click blocked by guard (different event_id bypasses dedup)
         let (s2, _, r2) = call_feishu_http(runtime.clone(), body2).await;
+        assert_eq!(s2, StatusCode::OK);
         assert_eq!(r2.get("busy").and_then(serde_json::Value::as_bool), Some(true));
 
         // Simulate guard expiry: clear the flight guard
-        MonitorFlightGuard::global().clear().await;
+        runtime.monitor_flight_guard().clear().await;
 
         // Third click after expiry: must succeed
         let (s3, _, r3) = call_feishu_http(runtime, body3).await;
@@ -8327,7 +8668,6 @@ mod tests {
     /// v0.9.1.2.2: ack_ms must still be recorded on busy response.
     #[tokio::test]
     async fn unified_card_monitor_busy_response_has_ack_ms() {
-        MonitorFlightGuard::global().clear().await;
         DedupCache::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, _) =
@@ -8350,6 +8690,101 @@ mod tests {
         let ack_ms = r2.get("ack_ms").and_then(serde_json::Value::as_i64);
         assert!(ack_ms.is_some(), "ack_ms must be recorded on busy response");
         assert!(ack_ms.unwrap_or(-1) >= 0, "ack_ms must be non-negative");
+    }
+
+    /// v0.9.1.2.2: slash /monitor during card monitor returns busy.
+    /// First: card monitor_30s acquires guard. Then: slash /monitor in same chat
+    /// should be blocked by the guard and return a busy reply (not run another monitor).
+    #[tokio::test]
+    async fn unified_slash_monitor_blocked_by_card_monitor() {
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        // Step 1: card monitor acquires the guard
+        let card_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SFslashC","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sfslash","open_message_id":"om_sfslash"}}}}}}"#
+        );
+        let (s1, _, r1) = call_feishu_http(runtime.clone(), card_body).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(r1.get("queued").and_then(serde_json::Value::as_bool), Some(true));
+        let _ = receiver.try_recv().expect("card monitor job enqueued");
+
+        // Step 2: slash /monitor with the same chat_id — should be blocked by guard.
+        // Slash /monitor comes in as an im.message.receive_v1 with text starting with /monitor.
+        // Must include message_type="text" to pass the message_type filter.
+        let slash_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SFslashS","event_type":"im.message.receive_v1","token":null}},"event":{{"message":{{"message_id":"om_sfslash_s","chat_id":"oc_sfslash","message_type":"text","content":"{{\"text\":\"/monitor 桌面 30秒\"}}"}},"sender":{{"sender_type":"user","open_id":"ou_test","id":"test_user"}}}}}}"#
+        );
+        let (s2, _, r2) = call_feishu_http(runtime.clone(), slash_body).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            r2.get("busy").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        // The slash should still ACK 200, but no new monitor job should be enqueued.
+        // Only one job should be in the queue (the card monitor).
+        assert!(
+            receiver.try_recv().is_err(),
+            "slash /monitor must not enqueue a second job when card monitor guard is held"
+        );
+    }
+
+    /// v0.9.1.2.2: after card monitor guard releases, slash /monitor can run normally.
+    #[tokio::test]
+    async fn unified_slash_monitor_runs_after_card_guard_released() {
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        // Card monitor acquires guard
+        let card_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SFreleaseC","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sfrelease","open_message_id":"om_sfrelease"}}}}}}"#
+        );
+        let (s1, _, r1) = call_feishu_http(runtime.clone(), card_body).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(r1.get("queued").and_then(serde_json::Value::as_bool), Some(true));
+        let _ = receiver.try_recv().expect("card monitor job enqueued");
+
+        // Slash blocked by guard — must include message_type="text".
+        let slash_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SFreleaseS","event_type":"im.message.receive_v1","token":null}},"event":{{"message":{{"message_id":"om_sfrelease_s","chat_id":"oc_sfrelease","message_type":"text","content":"{{\"text\":\"/monitor 桌面 30秒\"}}"}},"sender":{{"sender_type":"user","open_id":"ou_test","id":"test_user"}}}}}}"#
+        );
+        let (s2, _, busy_response) =
+            call_feishu_http(runtime.clone(), slash_body).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            busy_response
+                .get("busy")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(receiver.try_recv().is_err(), "slash blocked by guard");
+
+        // Simulate guard expiry
+        runtime.monitor_flight_guard().clear().await;
+
+        // Now slash should succeed
+        let retry_slash_body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SFreleaseS_retry","event_type":"im.message.receive_v1","token":null}},"event":{{"message":{{"message_id":"om_sfrelease_s_retry","chat_id":"oc_sfrelease","message_type":"text","content":"{{\"text\":\"/monitor 桌面 30秒\"}}"}},"sender":{{"sender_type":"user","open_id":"ou_test","id":"test_user"}}}}}}"#
+        );
+        let (s3, _, r3) = call_feishu_http(runtime, retry_slash_body).await;
+        assert_eq!(s3, StatusCode::OK);
+        // After guard expiry, slash /monitor enqueues a new job
+        let job = receiver.try_recv().expect("slash monitor job after guard release");
+        assert_eq!(
+            job.inbound.text.trim(),
+            "/monitor 桌面 30秒"
+        );
+        assert!(
+            job.monitor_guard_lease.is_some(),
+            "slash monitor must carry the shared guard lease"
+        );
+        assert_eq!(r3.get("accepted").and_then(serde_json::Value::as_bool), Some(true));
     }
 
     #[test]
@@ -9190,13 +9625,12 @@ mod tests {
 
     #[tokio::test]
     async fn feishu_duplicate_event_id_is_rejected() {
-        let runtime1 = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
-        let runtime2 = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
+        let runtime = GatewayRuntime::new(outbound_test_config(ChannelKind::Feishu, "mock", false));
         let body = r#"{"header":{"event_id":"evt_dup_001"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_dup_001","chat_id":"oc_chat","message_type":"text","content":"{\"text\":\"duplicate test\"}"}}}"#.to_string();
         
         // First request should succeed (not duplicate)
         let response1 = super::http_channel_webhook(
-            runtime1,
+            runtime.clone(),
             HeaderMap::new(),
             body.clone(),
             ChannelKind::Feishu,
@@ -9208,7 +9642,7 @@ mod tests {
         
         // Second request with same event_id should be duplicate
         let response2 = super::http_channel_webhook(
-            runtime2,
+            runtime,
             HeaderMap::new(),
             body,
             ChannelKind::Feishu,

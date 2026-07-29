@@ -1250,7 +1250,9 @@ impl FeishuStore {
             "#,
         )?;
         
-        let outbox_items = stmt.query_map(params![now - 60, now], |row| {
+        // `chrono_timestamp` is milliseconds; keep SENDING entries in-flight
+        // for a full minute before treating them as abandoned/recoverable.
+        let outbox_items = stmt.query_map(params![now - 60_000, now], |row| {
             Ok(FeishuOutbox {
                 id: row.get(0)?,
                 outbound_id: row.get(1)?,
