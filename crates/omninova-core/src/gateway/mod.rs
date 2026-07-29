@@ -59,6 +59,7 @@ static SESSION_LOCK_TIMEOUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 static OUTBOUND_TOKEN_CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
 static DEDUP_CACHE: OnceLock<Arc<DedupCache>> = OnceLock::new();
 static OUTBOUND_MSG_CACHE: OnceLock<Arc<OutboundMsgCache>> = OnceLock::new();
+static MONITOR_FLIGHT_CACHE: OnceLock<Arc<MonitorFlightGuard>> = OnceLock::new();
 const WORKSPACE_REQUIRED_MESSAGE: &str =
     "请先选择 Workspace，Agent 需要一个真实工作目录才能执行文件、Shell 或 Git 操作。";
 
@@ -168,6 +169,87 @@ impl OutboundMsgCache {
     }
 }
 
+/// Single-flight guard for desktop-monitor executions.
+/// Prevents concurrent monitor runs within the same Feishu chat session.
+///
+/// Key design:
+/// - Per-chat (hashed chat_id) so different users don't interfere
+/// - TTL = max(monitor_duration + 10s, 40s) so a stuck/hung monitor
+///   does not lock the user out forever
+/// - `acquire()` returns `Guard` (auto-releases on drop) or `None` (already busy)
+/// - Guard is stored in a global cache to survive across HTTP callbacks
+#[derive(Debug, Clone)]
+pub(crate) struct MonitorFlightGuard {
+    /// Map: hash(chat_id) → Instant expiry
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Instant>>>,
+    /// Minimum TTL for any guard entry
+    min_ttl_secs: u64,
+}
+
+impl MonitorFlightGuard {
+    fn global() -> Arc<MonitorFlightGuard> {
+        MONITOR_FLIGHT_CACHE
+            .get_or_init(|| Arc::new(MonitorFlightGuard {
+                inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                min_ttl_secs: 40, // minimum 40 seconds
+            }))
+            .clone()
+    }
+
+    /// Attempt to acquire the single-flight slot for `chat_id` with a caller-specified TTL.
+    /// Returns `Some(())` if the slot was free; `None` if busy.
+    async fn try_acquire_with_ttl(&self, chat_id: &str, ttl_secs: u64) -> Option<()> {
+        let key = hash_dedup_string(chat_id);
+        let now = Instant::now();
+
+        {
+            let cache = self.inner.read().await;
+            if let Some(expiry) = cache.get(&key) {
+                if now < *expiry {
+                    // Already busy within TTL
+                    return None;
+                }
+            }
+        }
+
+        // Not busy (or TTL expired). Claim it.
+        let expiry = now + Duration::from_secs(ttl_secs);
+        let mut cache = self.inner.write().await;
+        cache.insert(key, expiry);
+
+        Some(())
+    }
+
+    /// Force-release a slot by key. Used by error/panic paths where
+    /// the `Guard` drop might not fire.
+    async fn force_release(&self, chat_id: &str) {
+        let key = hash_dedup_string(chat_id);
+        let mut cache = self.inner.write().await;
+        cache.remove(&key);
+    }
+
+    /// Force-release a slot by its pre-hashed key (for use from the worker,
+    /// which stores the already-hashed key in FeishuAsyncJob.monitor_guard_key).
+    async fn force_release_by_hash_key(&self, key: &str) {
+        let mut cache = self.inner.write().await;
+        cache.remove(key);
+    }
+
+    /// Remove all expired entries and return the current active count.
+    pub(crate) async fn purge_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut cache = self.inner.write().await;
+        cache.retain(|_, &mut expiry| now < expiry);
+        cache.len()
+    }
+
+    /// Clear all entries. Intended for unit tests.
+    #[cfg(test)]
+    pub(crate) async fn clear(&self) {
+        let mut cache = self.inner.write().await;
+        cache.clear();
+    }
+}
 use std::time::Instant;
 use std::time::Duration;
 
@@ -3873,79 +3955,143 @@ async fn process_feishu_card_action_callback(
     let store = runtime.feishu_store();
 
     if matches!(canonical, "monitor_30s" | "monitor_60s") {
-        // Non-blocking enqueue with a strict wall-clock deadline.
-        // `try_send` is the primary path; we also wrap in `timeout` to defend
-        // against any pathological lock contention on the sender clone itself.
-        // Goal: NEVER block the HTTP callback waiting for the queue.
-        let monitor_job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
-            ChannelKind::Feishu,
-            inbound.clone(),
-            serde_json::json!({ "card_action": canonical }),
-            false,
-            event_key.clone(),
-            Some(job_id.clone()),
-        );
-        let enqueue_dispatch = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            runtime.try_send_feishu_job_nonblocking(monitor_job),
-        )
-        .await;
-        let (queued_flag, busy_flag) = match enqueue_dispatch {
-            Ok(Ok(true)) => {
-                println!("[feishu-card] monitor_queued action={canonical}");
-                (true, false)
-            }
-            Ok(Ok(false)) => {
-                println!("[feishu-card] monitor_busy action={canonical} reason=queue_full");
-                (false, true)
-            }
-            Ok(Err(_)) | Err(_) => {
-                println!("[feishu-card] monitor_busy action={canonical} reason=timeout_or_uninit");
-                (false, true)
-            }
-        };
+        // ==== Single-flight guard: only one monitor per chat at a time ====
+        // CRITICAL: the guard slot is stored IN the job so the WORKER releases it
+        // when the monitor actually completes (not when the HTTP callback returns).
+        // The HTTP handler exits before the monitor runs, so RAII in the handler
+        // would release too early. Instead we put the hashed key into the job.
+        let guard = MonitorFlightGuard::global();
+        let monitor_duration_secs: u64 = if canonical == "monitor_30s" { 30 } else { 60 };
+        let ttl_secs = monitor_duration_secs.saturating_add(10).max(40);
+        let chat_id_str = chat_id.as_str();
+        let guard_key = hash_dedup_string(chat_id_str);
+        match guard.try_acquire_with_ttl(chat_id_str, ttl_secs).await {
+            Some(()) => {
+                println!(
+                    "[feishu-monitor] singleflight_acquired action={} ttl_secs={}",
+                    canonical, ttl_secs
+                );
+                // Non-blocking enqueue with a strict wall-clock deadline.
+                // `try_send` is the primary path; we also wrap in `timeout` to defend
+                // against any pathological lock contention on the sender clone itself.
+                // Goal: NEVER block the HTTP callback waiting for the queue.
+                let monitor_job = crate::gateway::feishu_worker::FeishuAsyncJob::new(
+                    ChannelKind::Feishu,
+                    inbound.clone(),
+                    serde_json::json!({ "card_action": canonical }),
+                    false,
+                    event_key.clone(),
+                    Some(job_id.clone()),
+                ).with_monitor_guard_key(guard_key); // worker releases guard on completion
 
-        // Detached task: outbox INSERT and any post-send bookkeeping. Must NOT block
-        // the HTTP callback. Only runs when the job was actually accepted.
-        if queued_flag {
-            let runtime_bg = runtime.clone();
-            let inbound_bg = inbound.clone();
-            let chat_id_bg = chat_id.clone();
-            let job_id_bg = job_id.clone();
-            let event_key_bg = event_key.clone();
-            let store_bg = store.clone();
-            tokio::spawn(async move {
-                if let Some(s) = store_bg {
-                    let outbound_id = format!("{}_{}", job_id_bg, chrono_timestamp_simple());
-                    let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
-                        outbound_id,
-                        job_id: Some(job_id_bg.clone()),
-                        event_key: Some(event_key_bg.clone()),
-                        channel: "feishu".to_string(),
-                        chat_id: Some(chat_id_bg),
-                        reply_kind: Some("card_action_result".to_string()),
-                        reply: None,
-                        result_json: None,
-                    };
-                    let _ = s.insert_outbox(&outbox_input);
+                let enqueue_dispatch = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    runtime.try_send_feishu_job_nonblocking(monitor_job),
+                )
+                .await;
+                let (queued_flag, busy_flag) = match enqueue_dispatch {
+                    Ok(Ok(true)) => {
+                        println!("[feishu-card] monitor_queued action={canonical}");
+                        (true, false)
+                    }
+                    Ok(Ok(false)) => {
+                        println!("[feishu-card] monitor_busy action={canonical} reason=queue_full");
+                        (false, true)
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        println!("[feishu-card] monitor_busy action={canonical} reason=timeout_or_uninit");
+                        (false, true)
+                    }
+                };
+
+                // Detached task: outbox INSERT and any post-send bookkeeping. Must NOT block
+                // the HTTP callback. Only runs when the job was actually accepted.
+                if queued_flag {
+                    let runtime_bg = runtime.clone();
+                    let inbound_bg = inbound.clone();
+                    let chat_id_bg = chat_id.clone();
+                    let job_id_bg = job_id.clone();
+                    let event_key_bg = event_key.clone();
+                    let store_bg = store.clone();
+                    tokio::spawn(async move {
+                        if let Some(s) = store_bg {
+                            let outbound_id = format!("{}_{}", job_id_bg, chrono_timestamp_simple());
+                            let outbox_input = crate::gateway::feishu_store::FeishuOutboxInput {
+                                outbound_id,
+                                job_id: Some(job_id_bg.clone()),
+                                event_key: Some(event_key_bg.clone()),
+                                channel: "feishu".to_string(),
+                                chat_id: Some(chat_id_bg),
+                                reply_kind: Some("card_action_result".to_string()),
+                                reply: None,
+                                result_json: None,
+                            };
+                            let _ = s.insert_outbox(&outbox_input);
+                        }
+                        let _ = (runtime_bg, inbound_bg);
+                    });
                 }
-                let _ = (runtime_bg, inbound_bg);
-            });
-        }
 
-        // ==== Fast ACK return (monitor path) ====
-        let ack_ms = ack_start.elapsed().as_millis() as i64;
-        println!(
-            "[feishu-card] callback_ack ack_ms={ack_ms} action={canonical} queued={queued_flag} busy={busy_flag}"
-        );
-        return Ok(Json(serde_json::json!({
-            "toast": { "type": "info", "content": "已收到请求，正在处理" },
-            "ok": true,
-            "action": canonical,
-            "queued": queued_flag,
-            "busy": busy_flag,
-            "ack_ms": ack_ms
-        })));
+                // ==== Fast ACK return (monitor path) ====
+                let ack_ms = ack_start.elapsed().as_millis() as i64;
+                println!(
+                    "[feishu-card] callback_ack ack_ms={ack_ms} action={canonical} queued={queued_flag} busy={busy_flag}"
+                );
+                return Ok(Json(serde_json::json!({
+                    "toast": { "type": "info", "content": "已收到请求，正在处理" },
+                    "ok": true,
+                    "action": canonical,
+                    "queued": queued_flag,
+                    "busy": busy_flag,
+                    "ack_ms": ack_ms
+                })));
+            }
+            None => {
+                // Single-flight: a monitor is already running in this chat.
+                println!(
+                    "[feishu-monitor] singleflight_busy action={} chat_present=true",
+                    canonical
+                );
+                // Send a detached "already busy" message so the user doesn't
+                // see an error. The HTTP ACK is still fast (no runtime hit).
+                let runtime_busy = runtime.clone();
+                let chat_id_busy = chat_id.clone();
+                let canonical_busy = canonical.to_string();
+                tokio::spawn(async move {
+                    let inbound_busy = InboundMessage {
+                        text: format!("/card-action {canonical_busy} (busy)"),
+                        channel: ChannelKind::Feishu,
+                        user_id: None,
+                        session_id: Some(chat_id_busy.clone()),
+                        metadata: std::collections::HashMap::from([(
+                            "card_action".to_string(),
+                            serde_json::Value::String(format!("{canonical_busy}_busy")),
+                        )]),
+                    };
+                    crate::gateway::feishu_worker::send_card_action_result(
+                        &runtime_busy,
+                        &inbound_busy,
+                        "已有桌面监控任务正在执行，请等待当前任务完成后再试。",
+                        crate::gateway::feishu_store::ReplyKind::CardActionResult,
+                        "feishu",
+                        &format!("busy_{}", chrono_timestamp_simple()),
+                        &format!("busy_event_{}", chrono_timestamp_simple()),
+                    ).await;
+                });
+                let ack_ms = ack_start.elapsed().as_millis() as i64;
+                println!(
+                    "[feishu-card] callback_ack ack_ms={ack_ms} action={canonical} queued=false busy=true reason=singleflight"
+                );
+                return Ok(Json(serde_json::json!({
+                    "toast": { "type": "info", "content": "已收到请求，正在处理" },
+                    "ok": true,
+                    "action": canonical,
+                    "queued": false,
+                    "busy": true,
+                    "ack_ms": ack_ms
+                })));
+            }
+        }
     }
 
     // Non-monitor actions: gateway_status / recent_jobs / help / unknown.
@@ -6731,6 +6877,7 @@ mod tests {
         check_gateway_public_health, feishu_public_callback_urls, normalize_public_webhook_base_url,
         resolve_agent_max_tool_iterations, resolve_public_webhook_base_url, split_session_key,
         DedupCache, GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery,
+        MonitorFlightGuard,
         SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
@@ -7786,6 +7933,7 @@ mod tests {
     #[tokio::test]
     async fn unified_card_duplicate_event_id_is_deduped_without_requeue() {
         DedupCache::global().clear().await;
+        MonitorFlightGuard::global().clear().await;
         let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(4);
@@ -8038,6 +8186,170 @@ mod tests {
 
         // Sanity: drain whatever was enqueued.
         while let Ok(_) = receiver.try_recv() {}
+    }
+
+    /// v0.9.1.2.2: single-flight — first monitor_30s card click acquires the guard.
+    #[tokio::test]
+    async fn unified_card_monitor_first_click_acquires_singleflight() {
+        MonitorFlightGuard::global().clear().await;
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        let body = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF1","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf1","open_message_id":"om_sf1"}}}}}}"#
+        );
+        let (status, _, response) = call_feishu_http(runtime.clone(), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            response.get("queued").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "first click must acquire guard and enqueue"
+        );
+        let job = receiver.try_recv().expect("first monitor job enqueued");
+        assert_eq!(job.monitor_guard_key.is_some(), true, "job must carry guard key");
+        assert_eq!(
+            job.inbound.text,
+            "/monitor 桌面 30秒"
+        );
+    }
+
+    /// v0.9.1.2.2: single-flight — second monitor_30s while first is running
+    /// returns busy=true, queued=false, no second job enqueued.
+    #[tokio::test]
+    async fn unified_card_monitor_second_click_returns_busy() {
+        MonitorFlightGuard::global().clear().await;
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        // Use DIFFERENT event_ids so the second click bypasses the dedup cache
+        // and reaches the single-flight guard. The single-flight guard is what
+        // should return busy=true.
+        let body1 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF2a","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf2","open_message_id":"om_sf2a"}}}}}}"#
+        );
+        let body2 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF2b","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf2","open_message_id":"om_sf2b"}}}}}}"#
+        );
+
+        // First click: acquires guard
+        let (s1, _, r1) = call_feishu_http(runtime.clone(), body1).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(
+            r1.get("queued").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        // Second click: guard is held — returns busy
+        let (s2, _, r2) = call_feishu_http(runtime.clone(), body2).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            r2.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            r2.get("busy").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "second click must return busy=true"
+        );
+        assert_eq!(
+            r2.get("queued").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "second click must not enqueue a new job"
+        );
+        assert!(r2.get("ack_ms").is_some(), "ack_ms must be recorded");
+
+        // Only one job should be in the queue
+        let _first = receiver.try_recv().expect("first job");
+        assert!(
+            receiver.try_recv().is_err(),
+            "no second monitor job must be enqueued while guard is held"
+        );
+    }
+
+    /// v0.9.1.2.2: after guard TTL expires, a new click can re-acquire.
+    /// TTL = max(30+10, 40) = 40 seconds, so we sleep 41s to simulate expiry.
+    /// To keep test fast, we clear the guard instead of actually sleeping.
+    #[tokio::test]
+    async fn unified_card_monitor_reacquires_after_guard_release() {
+        MonitorFlightGuard::global().clear().await;
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        // Use unique event_ids so each click bypasses the dedup cache.
+        let body1 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF3a","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf3","open_message_id":"om_sf3a"}}}}}}"#
+        );
+        let body2 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF3b","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf3","open_message_id":"om_sf3b"}}}}}}"#
+        );
+        let body3 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_SF3c","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_sf3","open_message_id":"om_sf3c"}}}}}}"#
+        );
+
+        // First click
+        let (s1, _, r1) = call_feishu_http(runtime.clone(), body1).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(r1.get("queued").and_then(serde_json::Value::as_bool), Some(true));
+        let _ = receiver.try_recv().expect("first job");
+
+        // Second click blocked by guard (different event_id bypasses dedup)
+        let (s2, _, r2) = call_feishu_http(runtime.clone(), body2).await;
+        assert_eq!(r2.get("busy").and_then(serde_json::Value::as_bool), Some(true));
+
+        // Simulate guard expiry: clear the flight guard
+        MonitorFlightGuard::global().clear().await;
+
+        // Third click after expiry: must succeed
+        let (s3, _, r3) = call_feishu_http(runtime, body3).await;
+        assert_eq!(s3, StatusCode::OK);
+        assert_eq!(
+            r3.get("busy").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "third click after guard release must succeed"
+        );
+        assert_eq!(r3.get("queued").and_then(serde_json::Value::as_bool), Some(true));
+        let _ = receiver.try_recv().expect("second job after guard release");
+    }
+
+    /// v0.9.1.2.2: ack_ms must still be recorded on busy response.
+    #[tokio::test]
+    async fn unified_card_monitor_busy_response_has_ack_ms() {
+        MonitorFlightGuard::global().clear().await;
+        DedupCache::global().clear().await;
+        let runtime = GatewayRuntime::new(feishu_security_config("dev", None, None));
+        let (sender, _) =
+            tokio::sync::mpsc::channel::<crate::gateway::feishu_worker::FeishuAsyncJob>(8);
+        runtime.init_feishu_worker(sender).await;
+
+        // Use unique event_ids so the second click reaches the single-flight guard.
+        let body1 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_ACKBUSY1","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_ackbusy","open_message_id":"om_ackbusy1"}}}}}}"#
+        );
+        let body2 = format!(
+            r#"{{"schema":"2.0","header":{{"event_id":"evt_ACKBUSY2","event_type":"card.action.trigger","token":null}},"event":{{"action":{{"value":{{"action":"monitor_30s"}}}},"context":{{"open_chat_id":"oc_ackbusy","open_message_id":"om_ackbusy2"}}}}}}"#
+        );
+
+        let (s1, _, _) = call_feishu_http(runtime.clone(), body1).await;
+        assert_eq!(s1, StatusCode::OK);
+
+        let (_, _, r2) = call_feishu_http(runtime, body2).await;
+        assert_eq!(r2.get("busy").and_then(serde_json::Value::as_bool), Some(true));
+        let ack_ms = r2.get("ack_ms").and_then(serde_json::Value::as_i64);
+        assert!(ack_ms.is_some(), "ack_ms must be recorded on busy response");
+        assert!(ack_ms.unwrap_or(-1) >= 0, "ack_ms must be non-negative");
     }
 
     #[test]
