@@ -8,8 +8,9 @@ use omninova_core::config::{
     ProviderConfig, RobotConfig,
 };
 use omninova_core::gateway::{
-    check_gateway_public_health, normalize_public_webhook_base_url, GatewayHealth,
-    GatewayInboundResponse, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
+    check_gateway_public_health, normalize_gateway_public_config,
+    normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse,
+    GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
@@ -587,6 +588,10 @@ struct GatewayStatusPayload {
     gateway_public_mode: String,
     quick_tunnel_non_production: bool,
     cloudflared_configured: bool,
+    cloudflared_found: bool,
+    named_tunnel_name_configured: bool,
+    named_tunnel_hostname_configured: bool,
+    named_tunnel_config_complete: bool,
     enabled_channels: Vec<String>,
     security_mode: Option<String>,
     outbound_mode: Option<String>,
@@ -1662,6 +1667,10 @@ async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatu
         gateway_public_mode: status.gateway_public_mode,
         quick_tunnel_non_production: status.quick_tunnel_non_production,
         cloudflared_configured: status.cloudflared_configured,
+        cloudflared_found: status.cloudflared_found,
+        named_tunnel_name_configured: status.named_tunnel_name_configured,
+        named_tunnel_hostname_configured: status.named_tunnel_hostname_configured,
+        named_tunnel_config_complete: status.named_tunnel_config_complete,
         enabled_channels: status.enabled_channels,
         security_mode: status.security_mode,
         outbound_mode: status.outbound_mode,
@@ -1791,6 +1800,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             .and_then(serde_json::Value::as_str)
             .and_then(normalize_public_webhook_base_url);
     }
+    normalize_gateway_public_config(&mut gateway_public);
 
     SetupAppConfig {
         api_key: config.api_key.clone(),
@@ -1998,17 +2008,7 @@ fn setup_config_to_core(
             .and_then(serde_json::Value::as_str)
             .and_then(normalize_public_webhook_base_url);
     }
-    gateway_public.public_webhook_base_url = gateway_public
-        .public_webhook_base_url
-        .as_deref()
-        .and_then(normalize_public_webhook_base_url);
-    gateway_public.cloudflared_path = gateway_public
-        .cloudflared_path
-        .filter(|path| !path.as_os_str().is_empty());
-    gateway_public.named_tunnel_name =
-        normalize_optional_string(gateway_public.named_tunnel_name);
-    gateway_public.named_tunnel_hostname =
-        normalize_optional_string(gateway_public.named_tunnel_hostname);
+    normalize_gateway_public_config(&mut gateway_public);
     current.gateway_public = gateway_public;
 
     current.robot = setup.robot;
@@ -3009,6 +3009,34 @@ mod channel_tests {
             .unwrap()
             .extra
             .contains_key("public_webhook_base_url"));
+    }
+
+    #[test]
+    fn setup_named_tunnel_hostname_generates_and_persists_public_base() {
+        let core = Config::default();
+        let mut setup = setup_config_from_core(&core);
+        setup.gateway_public = GatewayPublicConfig {
+            mode: omninova_core::config::GatewayPublicMode::NamedCloudflareTunnel,
+            public_webhook_base_url: Some("https://stale.trycloudflare.com".to_string()),
+            cloudflared_path: Some(PathBuf::from(r"C:\Tools\cloudflared.exe")),
+            named_tunnel_name: Some("omninova-fixed".to_string()),
+            named_tunnel_hostname: Some(
+                "https://Fixed.Example.Test/webhook/feishu/card".to_string(),
+            ),
+        };
+
+        let saved =
+            setup_config_to_core(core, setup, ChannelValidationScope::Current("feishu"))
+                .expect("named tunnel setup saves");
+
+        assert_eq!(
+            saved.gateway_public.named_tunnel_hostname.as_deref(),
+            Some("fixed.example.test")
+        );
+        assert_eq!(
+            saved.gateway_public.public_webhook_base_url.as_deref(),
+            Some("https://fixed.example.test")
+        );
     }
 
     /// Test 1: Feishu extra roundtrip

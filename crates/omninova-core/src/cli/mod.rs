@@ -1,13 +1,15 @@
 mod tui;
 
-use crate::config::Config;
+use crate::config::{Config, GatewayPublicMode};
 use crate::daemon::service::{
     GatewayServiceCheckLevel, GatewayServiceCheckReport, GatewayServiceOperation,
     resolve_gateway_service,
 };
 use crate::gateway::{
-    check_gateway_public_health, feishu_public_callback_urls,
-    resolve_public_webhook_base_url, GatewayRuntime, GatewayRuntimeStatus,
+    check_gateway_public_health, cloudflared_available, feishu_public_callback_urls,
+    normalize_gateway_public_config, normalize_named_tunnel_hostname,
+    normalize_public_webhook_base_url, resolve_public_webhook_base_url, GatewayRuntime,
+    GatewayRuntimeStatus,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -903,6 +905,34 @@ fn lookup_config_key(config: &Config, key: &str) -> Result<String> {
                 _ => anyhow::bail!("unknown gateway key: {}", sub),
             }
         }
+        "gateway_public" => {
+            let sub = parts.get(1).unwrap_or(&"mode");
+            match *sub {
+                "mode" => Ok(config.gateway_public.mode.as_str().to_string()),
+                "public_webhook_base_url" => Ok(config
+                    .gateway_public
+                    .public_webhook_base_url
+                    .clone()
+                    .unwrap_or_default()),
+                "cloudflared_path" => Ok(config
+                    .gateway_public
+                    .cloudflared_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default()),
+                "named_tunnel_name" => Ok(config
+                    .gateway_public
+                    .named_tunnel_name
+                    .clone()
+                    .unwrap_or_default()),
+                "named_tunnel_hostname" => Ok(config
+                    .gateway_public
+                    .named_tunnel_hostname
+                    .clone()
+                    .unwrap_or_default()),
+                _ => anyhow::bail!("unknown gateway_public key: {}", sub),
+            }
+        }
         "api_key" => Ok(config.api_key.clone().unwrap_or_default()),
         _ => anyhow::bail!("unknown config key: {}", key),
     }
@@ -921,8 +951,46 @@ fn set_config_key(config: &mut Config, key: &str, value: &str) -> Result<()> {
                 _ => anyhow::bail!("unknown gateway key: {}", sub),
             }
         }
+        "gateway_public" => {
+            let sub = parts.get(1).unwrap_or(&"mode");
+            match *sub {
+                "mode" => {
+                    config.gateway_public.mode = match value {
+                        "quick_tunnel" => GatewayPublicMode::QuickTunnel,
+                        "named_cloudflare_tunnel" => {
+                            GatewayPublicMode::NamedCloudflareTunnel
+                        }
+                        "external_public_url" => GatewayPublicMode::ExternalPublicUrl,
+                        _ => anyhow::bail!(
+                            "gateway_public.mode must be quick_tunnel, named_cloudflare_tunnel, or external_public_url"
+                        ),
+                    };
+                }
+                "public_webhook_base_url" => {
+                    config.gateway_public.public_webhook_base_url =
+                        normalize_public_webhook_base_url(value);
+                }
+                "cloudflared_path" => {
+                    config.gateway_public.cloudflared_path = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(value.trim()))
+                    };
+                }
+                "named_tunnel_name" => {
+                    config.gateway_public.named_tunnel_name = non_empty_config_value(value);
+                }
+                "named_tunnel_hostname" => {
+                    config.gateway_public.named_tunnel_hostname = non_empty_config_value(value);
+                }
+                _ => anyhow::bail!("unknown gateway_public key: {}", sub),
+            }
+        }
         "api_key" => config.api_key = Some(value.to_string()),
         _ => anyhow::bail!("unknown config key: {}", key),
+    }
+    if parts[0] == "gateway_public" {
+        normalize_gateway_public_config(&mut config.gateway_public);
     }
     Ok(())
 }
@@ -932,9 +1000,25 @@ fn unset_config_key(config: &mut Config, key: &str) -> Result<()> {
         "default_provider" => config.default_provider = None,
         "default_model" => config.default_model = None,
         "api_key" => config.api_key = None,
+        "gateway_public.public_webhook_base_url" => {
+            config.gateway_public.public_webhook_base_url = None
+        }
+        "gateway_public.cloudflared_path" => config.gateway_public.cloudflared_path = None,
+        "gateway_public.named_tunnel_name" => config.gateway_public.named_tunnel_name = None,
+        "gateway_public.named_tunnel_hostname" => {
+            config.gateway_public.named_tunnel_hostname = None
+        }
         _ => anyhow::bail!("cannot unset key: {}", key),
     }
+    if key.starts_with("gateway_public.") {
+        normalize_gateway_public_config(&mut config.gateway_public);
+    }
     Ok(())
+}
+
+fn non_empty_config_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 async fn run_cron(cmd: &CronCommands, _config: &Config) -> Result<String> {
@@ -2023,32 +2107,6 @@ async fn run_gateway_status(config: &Config) -> Result<String> {
     Ok(serde_json::to_string_pretty(&status)?)
 }
 
-fn executable_exists_on_path(name: &str) -> bool {
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let candidates = if cfg!(windows) {
-        vec![name.to_string(), format!("{name}.exe")]
-    } else {
-        vec![name.to_string()]
-    };
-    std::env::split_paths(&path_value).any(|directory| {
-        candidates
-            .iter()
-            .any(|candidate| directory.join(candidate).is_file())
-    })
-}
-
-fn cloudflared_found(config: &Config) -> bool {
-    config
-        .gateway_public
-        .cloudflared_path
-        .as_ref()
-        .filter(|path| !path.as_os_str().is_empty())
-        .is_some_and(|path| path.is_file())
-        || executable_exists_on_path("cloudflared")
-}
-
 async fn run_gateway_doctor(config: &Config) -> Result<String> {
     use crate::gateway::FeishuSecurityConfig;
 
@@ -2183,12 +2241,48 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
     let public_base = resolve_public_webhook_base_url(config);
     let public_base_configured = public_base.is_some();
     let (feishu_webhook_url, card_callback_url) = feishu_public_callback_urls(config);
+    let named_mode = matches!(
+        config.gateway_public.mode,
+        GatewayPublicMode::NamedCloudflareTunnel
+    );
+    let named_tunnel_name_configured = config
+        .gateway_public
+        .named_tunnel_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+    let named_tunnel_hostname = config
+        .gateway_public
+        .named_tunnel_hostname
+        .as_deref()
+        .and_then(normalize_named_tunnel_hostname);
+    let named_tunnel_hostname_configured = named_tunnel_hostname.is_some();
+    let named_tunnel_config_complete =
+        named_tunnel_name_configured && named_tunnel_hostname_configured;
+    checks.push(serde_json::json!({
+        "check": "named_cloudflare_tunnel",
+        "ok": !named_mode || named_tunnel_config_complete,
+        "active": named_mode,
+        "name_configured": named_tunnel_name_configured,
+        "hostname_configured": named_tunnel_hostname_configured,
+        "public_base_generated": if named_mode { public_base.clone() } else { None },
+        "detail": if !named_mode {
+            "not selected".to_string()
+        } else if named_tunnel_config_complete {
+            "named tunnel configuration is complete".to_string()
+        } else {
+            format!(
+                "named tunnel configuration is incomplete: name={} hostname={}",
+                if named_tunnel_name_configured { "configured" } else { "missing" },
+                if named_tunnel_hostname_configured { "configured" } else { "missing" },
+            )
+        }
+    }));
     checks.push(serde_json::json!({
         "check": "public_webhook_base_url",
-        "ok": true,
+        "ok": !named_mode || public_base_configured,
         "mode": config.gateway_public.mode.as_str(),
         "configured": public_base_configured,
-        "public_base": public_base,
+        "public_base": public_base.clone(),
         "feishu_webhook_url": feishu_webhook_url,
         "feishu_card_callback_url": card_callback_url,
         "detail": if public_base_configured {
@@ -2209,18 +2303,24 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
         "detail": public_health.error.unwrap_or_else(|| "public Gateway health is OK".to_string()),
     }));
 
-    let cloudflared_available = cloudflared_found(config);
+    let cloudflared_found = cloudflared_available(config);
+    let cloudflared_required = matches!(
+        config.gateway_public.mode,
+        GatewayPublicMode::QuickTunnel | GatewayPublicMode::NamedCloudflareTunnel
+    );
     checks.push(serde_json::json!({
         "check": "cloudflared",
-        "ok": true,
-        "found": cloudflared_available,
+        "ok": !cloudflared_required || cloudflared_found,
+        "found": cloudflared_found,
         "configured_path_present": config.gateway_public.cloudflared_path.is_some(),
         "quick_tunnel_non_production": matches!(
             config.gateway_public.mode,
             crate::config::schema::GatewayPublicMode::QuickTunnel
         ),
-        "detail": if cloudflared_available {
+        "detail": if cloudflared_found {
             "cloudflared is available".to_string()
+        } else if cloudflared_required {
+            "cloudflared is required for the selected tunnel mode but was not found".to_string()
         } else {
             "cloudflared was not found; external_public_url mode remains available".to_string()
         }
@@ -2237,6 +2337,11 @@ async fn run_gateway_doctor(config: &Config) -> Result<String> {
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": all_ok,
         "gateway_bind": format!("{}:{}", config.gateway.host, config.gateway.port),
+        "public_mode": config.gateway_public.mode.as_str(),
+        "named_tunnel_name_configured": named_tunnel_name_configured,
+        "named_tunnel_hostname_configured": named_tunnel_hostname_configured,
+        "public_base_url_generated": public_base,
+        "cloudflared_found": cloudflared_found,
         "checks": checks,
     }))?)
 }
@@ -2534,6 +2639,115 @@ mod productized_gateway_tests {
     #[test]
     fn diagnostics_preview_truncation_is_utf8_safe() {
         assert_eq!(truncate_for_export("飞书网关状态", 3), "飞书网...");
+    }
+
+    #[test]
+    fn config_helpers_support_gateway_public_fields_and_normalize_urls() {
+        let mut config = Config::default();
+        set_config_key(&mut config, "gateway_public.mode", "quick_tunnel").unwrap();
+        set_config_key(
+            &mut config,
+            "gateway_public.public_webhook_base_url",
+            "https://example.test/webhook/feishu/card/",
+        )
+        .unwrap();
+        set_config_key(
+            &mut config,
+            "gateway_public.cloudflared_path",
+            r"C:\Tools\cloudflared\cloudflared.exe",
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_config_key(&config, "gateway_public.mode").unwrap(),
+            "quick_tunnel"
+        );
+        assert_eq!(
+            lookup_config_key(&config, "gateway_public.public_webhook_base_url").unwrap(),
+            "https://example.test"
+        );
+        assert_eq!(
+            lookup_config_key(&config, "gateway_public.cloudflared_path").unwrap(),
+            r"C:\Tools\cloudflared\cloudflared.exe"
+        );
+
+        unset_config_key(&mut config, "gateway_public.public_webhook_base_url").unwrap();
+        assert!(config.gateway_public.public_webhook_base_url.is_none());
+    }
+
+    #[test]
+    fn config_helper_rejects_unknown_gateway_public_mode() {
+        let mut config = Config::default();
+        let error =
+            set_config_key(&mut config, "gateway_public.mode", "production").unwrap_err();
+        assert!(error.to_string().contains("gateway_public.mode must be"));
+    }
+
+    #[test]
+    fn config_helpers_generate_named_tunnel_public_base() {
+        let mut config = Config::default();
+        set_config_key(
+            &mut config,
+            "gateway_public.named_tunnel_hostname",
+            "https://Fixed.Example.Test/webhook/feishu/card",
+        )
+        .unwrap();
+        set_config_key(
+            &mut config,
+            "gateway_public.named_tunnel_name",
+            "omninova-fixed",
+        )
+        .unwrap();
+        set_config_key(
+            &mut config,
+            "gateway_public.mode",
+            "named_cloudflare_tunnel",
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_config_key(&config, "gateway_public.named_tunnel_hostname").unwrap(),
+            "fixed.example.test"
+        );
+        assert_eq!(
+            lookup_config_key(&config, "gateway_public.public_webhook_base_url").unwrap(),
+            "https://fixed.example.test"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_doctor_reports_missing_named_tunnel_fields() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "omninova-gateway-doctor-named-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let mut config = Config::default();
+        config.config_path = temp_root.join("config.toml");
+        config.gateway_public.mode = GatewayPublicMode::NamedCloudflareTunnel;
+        config.gateway_public.named_tunnel_name = None;
+        config.gateway_public.named_tunnel_hostname = None;
+
+        let output = run_gateway_doctor(&config).await.unwrap();
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            report.get("public_mode").and_then(serde_json::Value::as_str),
+            Some("named_cloudflare_tunnel")
+        );
+        assert_eq!(
+            report
+                .get("named_tunnel_name_configured")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("named_tunnel_hostname_configured")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(output.contains("named tunnel configuration is incomplete"));
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[tokio::test]

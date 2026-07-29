@@ -336,6 +336,10 @@ export interface GatewayStatus {
   gateway_public_mode: GatewayPublicMode;
   quick_tunnel_non_production: boolean;
   cloudflared_configured: boolean;
+  cloudflared_found: boolean;
+  named_tunnel_name_configured: boolean;
+  named_tunnel_hostname_configured: boolean;
+  named_tunnel_config_complete: boolean;
   public_health: GatewayPublicHealthStatus;
   enabled_channels: string[];
   security_mode?: string | null;

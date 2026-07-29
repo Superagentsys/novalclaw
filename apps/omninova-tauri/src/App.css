@@ -1126,6 +1126,15 @@
   font-size: 12px;
 }
 
+.gateway-runtime-info {
+  padding: 9px 11px;
+  border: 1px solid rgba(56, 130, 105, 0.24);
+  border-radius: 9px;
+  background: rgba(56, 130, 105, 0.07);
+  color: #356f5b;
+  font-size: 12px;
+}
+
 @media (max-width: 900px) {
   .gateway-runtime-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));

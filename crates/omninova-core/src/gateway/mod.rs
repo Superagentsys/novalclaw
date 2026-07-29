@@ -17,7 +17,9 @@ use crate::channels::adapters::platform_webhook::{
 };
 use crate::channels::adapters::webhook::{inbound_from_webhook, WebhookInboundPayload};
 use crate::channels::{ChannelKind, InboundMessage};
-use crate::config::{resolve_effective_workspace_dir, Config};
+use crate::config::{
+    resolve_effective_workspace_dir, Config, GatewayPublicConfig, GatewayPublicMode,
+};
 use crate::gateway::feishu_worker::FeishuJobSender;
 use crate::memory::{factory::build_memory_from_config, Memory};
 use crate::providers::ChatMessage;
@@ -2467,7 +2469,12 @@ pub struct GatewayHealth {
 /// The persisted value never contains a Feishu endpoint path. This keeps one
 /// source of truth for both the normal event and card callback URLs.
 pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_end_matches('/');
+    let trimmed = value
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
     }
@@ -2478,43 +2485,102 @@ pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
         .unwrap_or(trimmed)
         .trim_end_matches('/');
 
-    if without_endpoint.is_empty() {
+    if without_endpoint.is_empty()
+        || ((without_endpoint.starts_with("http://")
+            || without_endpoint.starts_with("https://"))
+            && reqwest::Url::parse(without_endpoint)
+                .ok()
+                .is_some_and(|url| !url.username().is_empty() || url.password().is_some()))
+    {
         None
     } else {
         Some(without_endpoint.to_string())
     }
 }
 
-pub fn resolve_public_webhook_base_url(config: &Config) -> Option<String> {
-    let configured = config
-        .gateway_public
+/// Normalize a named Cloudflare Tunnel hostname without retaining credentials,
+/// query parameters, fragments, or callback paths.
+pub fn normalize_named_tunnel_hostname(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&candidate).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    parsed
+        .host_str()
+        .map(|hostname| hostname.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|hostname| !hostname.is_empty())
+}
+
+pub fn normalize_gateway_public_config(config: &mut GatewayPublicConfig) {
+    config.public_webhook_base_url = config
         .public_webhook_base_url
         .as_deref()
         .and_then(normalize_public_webhook_base_url);
+    config.cloudflared_path = config
+        .cloudflared_path
+        .take()
+        .filter(|path| !path.as_os_str().is_empty());
+    config.named_tunnel_name = config
+        .named_tunnel_name
+        .take()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    config.named_tunnel_hostname = config
+        .named_tunnel_hostname
+        .as_deref()
+        .and_then(normalize_named_tunnel_hostname);
+
+    if matches!(config.mode, GatewayPublicMode::NamedCloudflareTunnel) {
+        config.public_webhook_base_url = config
+            .named_tunnel_hostname
+            .as_ref()
+            .map(|hostname| format!("https://{hostname}"));
+    }
+}
+
+pub fn cloudflared_available(config: &Config) -> bool {
+    if config
+        .gateway_public
+        .cloudflared_path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+        .is_some_and(|path| path.is_file())
+    {
+        return true;
+    }
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates = if cfg!(windows) {
+        ["cloudflared.exe", "cloudflared"]
+    } else {
+        ["cloudflared", "cloudflared"]
+    };
+    std::env::split_paths(&path_value).any(|directory| {
+        candidates
+            .iter()
+            .any(|candidate| directory.join(candidate).is_file())
+    })
+}
+
+pub fn resolve_public_webhook_base_url(config: &Config) -> Option<String> {
+    let mut gateway_public = config.gateway_public.clone();
+    normalize_gateway_public_config(&mut gateway_public);
+    let configured = gateway_public.public_webhook_base_url;
     if configured.is_some() {
         return configured;
-    }
-
-    if matches!(
-        config.gateway_public.mode,
-        crate::config::schema::GatewayPublicMode::NamedCloudflareTunnel
-    ) {
-        if let Some(hostname) = config
-            .gateway_public
-            .named_tunnel_hostname
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let base = if hostname.starts_with("http://") || hostname.starts_with("https://") {
-                hostname.to_string()
-            } else {
-                format!("https://{hostname}")
-            };
-            if let Some(base) = normalize_public_webhook_base_url(&base) {
-                return Some(base);
-            }
-        }
     }
 
     config
@@ -2703,6 +2769,10 @@ pub struct GatewayRuntimeStatus {
     pub gateway_public_mode: String,
     pub quick_tunnel_non_production: bool,
     pub cloudflared_configured: bool,
+    pub cloudflared_found: bool,
+    pub named_tunnel_name_configured: bool,
+    pub named_tunnel_hostname_configured: bool,
+    pub named_tunnel_config_complete: bool,
     /// The auto-generated feishu normal event callback URL.
     pub feishu_webhook_url: Option<String>,
     /// The auto-generated feishu card interaction callback URL.
@@ -2744,6 +2814,17 @@ impl GatewayRuntimeStatus {
             .and_then(|v| v.as_str())
             .map(String::from);
         let public_webhook_base = resolve_public_webhook_base_url(&cfg);
+        let named_tunnel_name_configured = cfg
+            .gateway_public
+            .named_tunnel_name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        let named_tunnel_hostname_configured = cfg
+            .gateway_public
+            .named_tunnel_hostname
+            .as_deref()
+            .and_then(normalize_named_tunnel_hostname)
+            .is_some();
         let public_health = public_webhook_base
             .clone()
             .map(GatewayPublicHealthStatus::not_checked)
@@ -2835,6 +2916,11 @@ impl GatewayRuntimeStatus {
                 .cloudflared_path
                 .as_ref()
                 .is_some_and(|path| !path.as_os_str().is_empty()),
+            cloudflared_found: cloudflared_available(&cfg),
+            named_tunnel_name_configured,
+            named_tunnel_hostname_configured,
+            named_tunnel_config_complete: named_tunnel_name_configured
+                && named_tunnel_hostname_configured,
             feishu_webhook_url,
             feishu_card_callback_url,
             enabled_channels,
@@ -7036,10 +7122,11 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 mod tests {
     use super::{
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        check_gateway_public_health, feishu_public_callback_urls, normalize_public_webhook_base_url,
-        resolve_agent_max_tool_iterations, resolve_public_webhook_base_url, split_session_key,
-        DedupCache, GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery,
-        MonitorFlightGuard,
+        check_gateway_public_health, feishu_public_callback_urls,
+        normalize_gateway_public_config, normalize_named_tunnel_hostname,
+        normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
+        resolve_public_webhook_base_url, split_session_key, DedupCache, GatewayRuntime,
+        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard,
         SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
@@ -10165,6 +10252,84 @@ mod tests {
             resolve_public_webhook_base_url(&config).as_deref(),
             Some("https://gateway.example.test")
         );
+    }
+
+    #[test]
+    fn named_tunnel_hostname_normalizes_callback_urls_and_sensitive_suffixes() {
+        assert_eq!(
+            normalize_named_tunnel_hostname(
+                "https://Gateway.Example.Test/webhook/feishu/card?signature=hidden"
+            )
+            .as_deref(),
+            Some("gateway.example.test")
+        );
+        assert_eq!(
+            normalize_named_tunnel_hostname(
+                "gateway.example.test/webhook/feishu#callback"
+            )
+            .as_deref(),
+            Some("gateway.example.test")
+        );
+        assert_eq!(
+            normalize_public_webhook_base_url(
+                "https://gateway.example.test/webhook/feishu?signature=hidden"
+            )
+            .as_deref(),
+            Some("https://gateway.example.test")
+        );
+        assert_eq!(
+            normalize_public_webhook_base_url(
+                "https://user:password@gateway.example.test/webhook/feishu"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn named_tunnel_normalization_persists_generated_public_base() {
+        let mut public = GatewayPublicConfig {
+            mode: GatewayPublicMode::NamedCloudflareTunnel,
+            public_webhook_base_url: Some("https://stale.trycloudflare.com".to_string()),
+            named_tunnel_name: Some("  omninova-gateway  ".to_string()),
+            named_tunnel_hostname: Some(
+                "https://Fixed.Example.Test/webhook/feishu/card".to_string(),
+            ),
+            ..GatewayPublicConfig::default()
+        };
+
+        normalize_gateway_public_config(&mut public);
+
+        assert_eq!(public.named_tunnel_name.as_deref(), Some("omninova-gateway"));
+        assert_eq!(
+            public.named_tunnel_hostname.as_deref(),
+            Some("fixed.example.test")
+        );
+        assert_eq!(
+            public.public_webhook_base_url.as_deref(),
+            Some("https://fixed.example.test")
+        );
+    }
+
+    #[test]
+    fn non_named_public_modes_keep_their_configured_base() {
+        for mode in [
+            GatewayPublicMode::QuickTunnel,
+            GatewayPublicMode::ExternalPublicUrl,
+        ] {
+            let mut public = GatewayPublicConfig {
+                mode,
+                public_webhook_base_url: Some(
+                    "https://public.example.test/webhook/feishu/card".to_string(),
+                ),
+                named_tunnel_hostname: Some("ignored.example.test".to_string()),
+                ..GatewayPublicConfig::default()
+            };
+            normalize_gateway_public_config(&mut public);
+            assert_eq!(
+                public.public_webhook_base_url.as_deref(),
+                Some("https://public.example.test")
+            );
+        }
     }
 
     #[tokio::test]

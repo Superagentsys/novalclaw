@@ -49,12 +49,45 @@ function formatGatewayStartError(message: string): string {
 }
 
 function normalizePublicBaseUrl(value: string | null | undefined): string | null {
-  const trimmed = value?.trim().replace(/\/+$/, "") ?? "";
+  const trimmed = value?.trim().split(/[?#]/, 1)[0]?.replace(/\/+$/, "") ?? "";
   if (!trimmed) {
     return null;
   }
   const normalized = trimmed.replace(/\/webhook\/feishu(?:\/card)?$/i, "");
-  return normalized.replace(/\/+$/, "") || null;
+  const base = normalized.replace(/\/+$/, "");
+  if (/^https?:\/\//i.test(base)) {
+    try {
+      const parsed = new URL(base);
+      if (parsed.username || parsed.password) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return base || null;
+}
+
+function normalizeNamedTunnelHostname(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = new URL(
+      /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    );
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return null;
+    }
+    return parsed.hostname.replace(/\.$/, "").toLowerCase() || null;
+  } catch {
+    return null;
+  }
 }
 
 /** Redact sensitive values in a JSON object for display */
@@ -243,6 +276,10 @@ export function Setup({
     gateway_public_mode: "external_public_url",
     quick_tunnel_non_production: false,
     cloudflared_configured: false,
+    cloudflared_found: false,
+    named_tunnel_name_configured: false,
+    named_tunnel_hostname_configured: false,
+    named_tunnel_config_complete: false,
     public_health: {
       configured: false,
       ok: false,
@@ -686,19 +723,25 @@ export function Setup({
     setActionMessage("Workspace 目录已清空。保存后 Agent 会要求先选择真实工作目录。");
   };
 
+  const namedTunnelMode =
+    config.gateway_public?.mode === "named_cloudflare_tunnel";
+  const draftNamedTunnelHostname = normalizeNamedTunnelHostname(
+    config.gateway_public?.named_tunnel_hostname
+  );
   const draftNamedTunnelBase =
-    config.gateway_public?.mode === "named_cloudflare_tunnel" &&
-    config.gateway_public.named_tunnel_hostname
-      ? normalizePublicBaseUrl(
-          /^https?:\/\//i.test(config.gateway_public.named_tunnel_hostname)
-            ? config.gateway_public.named_tunnel_hostname
-            : `https://${config.gateway_public.named_tunnel_hostname}`
-        )
+    namedTunnelMode && draftNamedTunnelHostname
+      ? `https://${draftNamedTunnelHostname}`
       : null;
-  const draftPublicBase =
-    normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url) ??
-    draftNamedTunnelBase;
-  const callbackBase = draftPublicBase ?? gatewayStatus.url?.replace(/\/$/, "") ?? null;
+  const draftPublicBase = namedTunnelMode
+    ? draftNamedTunnelBase
+    : normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url);
+  const callbackBase = namedTunnelMode
+    ? draftNamedTunnelBase
+    : draftPublicBase ?? gatewayStatus.url?.replace(/\/$/, "") ?? null;
+  const namedTunnelNameConfigured =
+    Boolean(config.gateway_public?.named_tunnel_name?.trim());
+  const namedTunnelConfigComplete =
+    namedTunnelNameConfigured && Boolean(draftNamedTunnelHostname);
   const runtimeWebhookUrl = callbackBase ? `${callbackBase}/webhook/feishu` : null;
   const runtimeCardCallbackUrl = callbackBase
     ? `${callbackBase}/webhook/feishu/card`
@@ -1091,7 +1134,12 @@ export function Setup({
                 <label>
                   Public Base URL
                   <input
-                    value={config.gateway_public?.public_webhook_base_url ?? ""}
+                    value={
+                      namedTunnelMode
+                        ? draftNamedTunnelBase ?? ""
+                        : config.gateway_public?.public_webhook_base_url ?? ""
+                    }
+                    readOnly={namedTunnelMode}
                     onChange={(event) =>
                       setConfig({
                         ...config,
@@ -1104,7 +1152,11 @@ export function Setup({
                     }
                     placeholder="https://gateway.example.com"
                   />
-                  <small>只填写域名 Base；保存时会自动移除 webhook 路径后缀。</small>
+                  <small>
+                    {namedTunnelMode
+                      ? "由 Named Tunnel Hostname 自动生成并保存。"
+                      : "只填写域名 Base；保存时会自动移除 webhook 路径后缀。"}
+                  </small>
                 </label>
                 {config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
                   <>
@@ -1144,7 +1196,8 @@ export function Setup({
                     </label>
                   </>
                 ) : null}
-                {config.gateway_public?.mode === "quick_tunnel" ? (
+                {config.gateway_public?.mode === "quick_tunnel" ||
+                config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
                   <label>
                     cloudflared 路径
                     <input
@@ -1161,7 +1214,7 @@ export function Setup({
                       }
                       placeholder="C:\Program Files\cloudflared\cloudflared.exe"
                     />
-                    <small>本版本只检测 cloudflared，不负责启动或停止隧道。</small>
+                    <small>用于检测固定或临时隧道运行环境，不保存隧道凭据。</small>
                   </label>
                 ) : null}
               </div>
@@ -1177,6 +1230,18 @@ export function Setup({
                     {config.gateway_public?.mode ?? gatewayStatus.gateway_public_mode}
                   </strong>
                 </div>
+                {namedTunnelMode ? (
+                  <div>
+                    <span>Named Tunnel 配置</span>
+                    <strong>{namedTunnelConfigComplete ? "完整" : "缺失"}</strong>
+                  </div>
+                ) : null}
+                {namedTunnelMode ? (
+                  <div>
+                    <span>固定 Hostname</span>
+                    <strong>{draftNamedTunnelHostname || "未配置"}</strong>
+                  </div>
+                ) : null}
                 <div><span>安全模式</span><strong>{gatewayStatus.security_mode || "dev"}</strong></div>
                 <div><span>出站模式</span><strong>{gatewayStatus.outbound_mode || "disabled"}</strong></div>
                 <div><span>Store</span><strong>{gatewayStatus.store_opened ? "已打开" : "未打开"}</strong></div>
@@ -1227,7 +1292,8 @@ export function Setup({
               <div className="gateway-runtime-meta">
                 已启用频道：{gatewayStatus.enabled_channels?.join("、") || "无"}
                 {gatewayStatus.store_path ? ` · Store：${gatewayStatus.store_path}` : ""}
-                {` · cloudflared：${gatewayStatus.cloudflared_configured ? "已配置" : "未配置"}`}
+                {` · cloudflared path：${gatewayStatus.cloudflared_configured ? "已配置" : "未配置"}`}
+                {` · cloudflared found：${gatewayStatus.cloudflared_found ? "true" : "false"}`}
               </div>
               <div className="gateway-runtime-health-actions">
                 <button
@@ -1251,6 +1317,19 @@ export function Setup({
                 gatewayStatus.quick_tunnel_non_production) ? (
                 <div className="gateway-runtime-warning">
                   Quick Tunnel 地址会变化，只适合临时开发测试，不适合正式环境。
+                </div>
+              ) : null}
+              {namedTunnelMode ? (
+                <div
+                  className={
+                    namedTunnelConfigComplete
+                      ? "gateway-runtime-info"
+                      : "gateway-runtime-warning"
+                  }
+                >
+                  {namedTunnelConfigComplete
+                    ? "Named Tunnel 使用固定公网入口，飞书回调地址不会随重启变化。"
+                    : "Named Tunnel 配置不完整，请填写 Tunnel Name 和有效 Hostname。"}
                 </div>
               ) : null}
               {(gatewayStatus.security_mode || "dev") === "dev" ? (
