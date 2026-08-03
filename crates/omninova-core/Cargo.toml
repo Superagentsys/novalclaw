@@ -56,3 +56,5 @@ pdf-extract = "0.10.0"
 serde_yaml = "0.9.34"
 qrcode.workspace = true
 ratatui = "0.29"
+aes = "0.8"
+zip = { version = "2", features = ["deflate"] }
