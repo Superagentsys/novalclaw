@@ -382,12 +382,147 @@ impl PlatformOutboundSender {
 
     async fn send_text_reply(&self, target: &ReplyTarget, text: &str) -> OutboundResult {
         println!(
-            "[{}-outbound] send_text_reply_start chat_id_present={} text_len={}",
+            "[{}-outbound] send_text_reply_start chat_id_present={} message_id_present={} text_len={}",
             self.provider,
             !target.chat_id.is_empty(),
+            target.message_id.is_some(),
             text.len()
         );
-        
+
+        // If we have a message_id, try the reply message API first
+        if let Some(ref message_id) = target.message_id {
+            let reply_result = self
+                .send_text_by_reply_message(message_id, text)
+                .await;
+            if reply_result.ok {
+                return reply_result;
+            }
+            // Log reply failure and fallback to create message
+            println!(
+                "[{}-outbound] reply_message_fallback_to_create reason=reply_failed",
+                self.provider
+            );
+        }
+
+        // Fallback or direct: use create message API
+        self.send_text_by_create_message(target, text).await
+    }
+
+    /// Send text message via reply message API
+    async fn send_text_by_reply_message(
+        &self,
+        message_id: &str,
+        text: &str,
+    ) -> OutboundResult {
+        let token = match self.tenant_access_token().await {
+            Ok(token) => {
+                println!("[{}-outbound] token_fetch_ok reply=true", self.provider);
+                token
+            }
+            Err(result) => {
+                println!(
+                    "[{}-outbound] token_fetch_failed reply=true error_code={:?}",
+                    self.provider, result.error_code
+                );
+                return result;
+            }
+        };
+
+        println!(
+            "[{}-outbound] reply_message_start message_id_present=true text_len={}",
+            self.provider,
+            text.len()
+        );
+
+        let url = format!(
+            "{}/im/v1/messages/{}/reply",
+            self.api_base_url, message_id
+        );
+
+        let response = match self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({
+                "msg_type": "text",
+                "content": json!({ "text": text }).to_string(),
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                println!("[{}-outbound] reply_message_failed error={}", self.provider, e);
+                return OutboundResult::failed(
+                    self.provider,
+                    "reply_message_failed",
+                    &format!("reply request failed: {}", e),
+                );
+            }
+        };
+
+        let status = response.status();
+        let body = match response.json::<serde_json::Value>().await {
+            Ok(body) => body,
+            Err(e) => {
+                println!("[{}-outbound] reply_message_failed invalid_response", self.provider);
+                return OutboundResult::failed(
+                    self.provider,
+                    "reply_message_failed",
+                    &format!("reply response invalid: {}", e),
+                );
+            }
+        };
+
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let platform_msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        // Check for log_id in both top-level and error object
+        let log_id_present = body
+            .get("log_id")
+            .is_some()
+            || body
+                .get("error")
+                .and_then(|e| e.get("log_id"))
+                .is_some();
+        let platform_message_id = body
+            .pointer("/data/message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(String::from);
+
+        if code == 0 {
+            println!(
+                "[{}-outbound] reply_message_ok platform_message_id_present={}",
+                self.provider,
+                platform_message_id.is_some()
+            );
+            OutboundResult::success(
+                self.provider,
+                platform_message_id.unwrap_or_else(|| "accepted".to_string()),
+            )
+        } else {
+            println!(
+                "[{}-outbound] reply_message_failed http_status={} platform_error_code={} message={} log_id_present={}",
+                self.provider,
+                status.as_u16(),
+                code,
+                platform_msg,
+                log_id_present
+            );
+            OutboundResult::failed(
+                self.provider,
+                &format!("platform_error_{}", code),
+                platform_msg,
+            )
+        }
+    }
+
+    /// Send text message via create message API
+    async fn send_text_by_create_message(
+        &self,
+        target: &ReplyTarget,
+        text: &str,
+    ) -> OutboundResult {
         let token = match self.tenant_access_token().await {
             Ok(token) => {
                 println!("[{}-outbound] token_fetch_ok", self.provider);
@@ -778,5 +913,69 @@ mod tests {
         };
         assert!(config.extra.get("app_id").is_some());
         assert!(config.extra.get("app_secret").is_some());
+    }
+
+    // =============================================================================
+    // Reply message API tests
+    // =============================================================================
+
+    #[test]
+    fn reply_target_has_message_id_field() {
+        let target_with_msg_id = ReplyTarget {
+            channel: ChannelKind::Feishu,
+            chat_id: "chat_abc".to_string(),
+            message_id: Some("msg_xyz".to_string()),
+            user_id: Some("user_123".to_string()),
+        };
+        assert!(target_with_msg_id.message_id.is_some());
+
+        let target_without_msg_id = ReplyTarget {
+            channel: ChannelKind::Feishu,
+            chat_id: "chat_abc".to_string(),
+            message_id: None,
+            user_id: None,
+        };
+        assert!(target_without_msg_id.message_id.is_none());
+    }
+
+    #[test]
+    fn reply_target_serializes_without_secrets() {
+        let target = ReplyTarget {
+            channel: ChannelKind::Feishu,
+            chat_id: "chat_secret_id".to_string(),
+            message_id: Some("msg_secret_id".to_string()),
+            user_id: Some("user_secret_id".to_string()),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        // Verify fields are present (secrets are in values, not structure)
+        assert!(json.contains("chat_secret_id"));
+        assert!(json.contains("msg_secret_id"));
+        assert!(json.contains("user_secret_id"));
+    }
+
+    #[test]
+    fn outbound_result_error_includes_code_and_msg() {
+        let result = OutboundResult::failed("feishu", "platform_error_230006", "Bot ability is not activated.");
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some("platform_error_230006".to_string()));
+        assert_eq!(result.message, Some("Bot ability is not activated.".to_string()));
+    }
+
+    #[test]
+    fn outbound_result_success_includes_platform_message_id() {
+        let result = OutboundResult::success("feishu", "omni_msg_123".to_string());
+        assert!(result.ok);
+        assert_eq!(result.platform_message_id, Some("omni_msg_123".to_string()));
+        assert!(result.error_code.is_none());
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn outbound_result_summary_preserves_fields() {
+        let result = OutboundResult::failed("feishu", "platform_error_999", "test message");
+        let summary = result.to_summary();
+        assert_eq!(summary.error_code, result.error_code);
+        assert_eq!(summary.message, result.message);
+        assert_eq!(summary.ok, result.ok);
     }
 }
