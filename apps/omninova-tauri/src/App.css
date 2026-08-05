@@ -1003,6 +1003,163 @@
   color: #4a5aaa;
 }
 
+.gateway-runtime-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.gateway-runtime-heading {
+  align-items: flex-start;
+}
+
+.gateway-public-config {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(80, 100, 220, 0.12);
+  border-radius: 10px;
+  background: rgba(80, 100, 220, 0.025);
+}
+
+.gateway-public-config label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  color: rgba(45, 55, 85, 0.78);
+  font-size: 12px;
+}
+
+.gateway-public-config input,
+.gateway-public-config select {
+  width: 100%;
+}
+
+.gateway-public-config small {
+  color: rgba(60, 70, 100, 0.58);
+  line-height: 1.45;
+}
+
+.gateway-runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.gateway-runtime-grid > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid rgba(80, 100, 180, 0.14);
+  border-radius: 10px;
+  background: rgba(80, 100, 220, 0.035);
+}
+
+.gateway-runtime-grid span,
+.gateway-runtime-url-list span {
+  color: rgba(60, 70, 100, 0.65);
+  font-size: 12px;
+}
+
+.gateway-runtime-grid strong,
+.gateway-runtime-grid code {
+  overflow: hidden;
+  color: #2a2a3e;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-runtime-url-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gateway-runtime-url-list > div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.gateway-runtime-url-list code {
+  overflow: hidden;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(80, 100, 220, 0.06);
+  color: #4a5aaa;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-runtime-meta {
+  overflow-wrap: anywhere;
+  color: rgba(60, 70, 100, 0.7);
+  font-size: 12px;
+}
+
+.gateway-runtime-health-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gateway-public-error {
+  min-width: 0;
+  color: #a14d45;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.gateway-runtime-warning {
+  padding: 9px 11px;
+  border: 1px solid rgba(210, 150, 30, 0.28);
+  border-radius: 9px;
+  background: rgba(245, 180, 40, 0.08);
+  color: #8a6117;
+  font-size: 12px;
+}
+
+.gateway-runtime-info {
+  padding: 9px 11px;
+  border: 1px solid rgba(56, 130, 105, 0.24);
+  border-radius: 9px;
+  background: rgba(56, 130, 105, 0.07);
+  color: #356f5b;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .gateway-runtime-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .gateway-public-config {
+    grid-template-columns: 1fr;
+  }
+
+  .gateway-runtime-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .gateway-runtime-url-list > div {
+    grid-template-columns: 1fr auto;
+  }
+
+  .gateway-runtime-url-list code {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
 .empty-state {
   padding: 18px;
   border-radius: 14px;
@@ -2876,3 +3033,80 @@
 .channel-guide a:hover {
   text-decoration: underline;
 }
+
+/* Webhook URL section */
+.channel-webhook-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.webhook-url-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.webhook-url-label {
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.webhook-url-value {
+  flex: 1;
+  min-width: 200px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.health-message {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.health-message.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #166534;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.health-message.error {
+  background: rgba(239, 68, 68, 0.12);
+  color: #991b1b;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.health-message.checking {
+  background: rgba(59, 130, 246, 0.12);
+  color: #1e40af;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.localhost-warning {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #92400e;
+  line-height: 1.6;
+}
+
+/* Loading state for buttons */
+.setup-btn.is-loading {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
