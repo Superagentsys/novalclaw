@@ -2822,27 +2822,37 @@ pub fn run() {
                 );
             }
 
-            let window_config = app.config().app.windows.first().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "缺少主窗口配置，无法创建 OmniNova 窗口。",
-                )
-            })?;
-            let window = WebviewWindowBuilder::from_config(app.handle(), window_config)?
-                .data_directory(webview_user_data_dir.clone())
-                .build()
-                .map_err(|error| {
-                    let message = format!(
-                        "无法创建 OmniNova 窗口。WebView2 用户数据目录可能正在使用中：{}。请关闭旧实例后重试。原始错误：{error}",
-                        webview_user_data_dir.display()
-                    );
-                    eprintln!("[webview-startup] window_create_failed resource_may_be_in_use=true");
-                    std::io::Error::new(std::io::ErrorKind::Other, message)
+            // Guard: skip manual main window creation when Tauri already
+            // created one from app config (avoids `a webview with label 'main' already exists`).
+            if app.get_webview_window("main").is_some() {
+                eprintln!("[webview-startup] main_window_exists=true skip_manual_create=true");
+            } else {
+                let window_config = app.config().app.windows.first().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "缺少主窗口配置，无法创建 OmniNova 窗口。",
+                    )
                 })?;
-            eprintln!(
-                "[webview-startup] window_created=true user_data_dir={}",
-                webview_user_data_dir.display()
-            );
+                let window = WebviewWindowBuilder::from_config(app.handle(), window_config)?
+                    .data_directory(webview_user_data_dir.clone())
+                    .build()
+                    .map_err(|error| {
+                        let message = format!(
+                            "无法创建 OmniNova 窗口。WebView2 用户数据目录可能正在使用中：{}。请关闭旧实例后重试。原始错误：{error}",
+                            webview_user_data_dir.display()
+                        );
+                        eprintln!("[webview-startup] window_create_failed resource_may_be_in_use=true");
+                        std::io::Error::new(std::io::ErrorKind::Other, message)
+                    })?;
+                eprintln!(
+                    "[webview-startup] window_created=true user_data_dir={}",
+                    webview_user_data_dir.display()
+                );
+                #[cfg(debug_assertions)]
+                {
+                    window.open_devtools();
+                }
+            }
 
             let state = app.state::<Arc<Mutex<AppState>>>().inner().clone();
 
@@ -2882,10 +2892,6 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            #[cfg(debug_assertions)]
-            {
-                window.open_devtools();
-            }
             Ok(())
         })
         .build(tauri::generate_context!())
