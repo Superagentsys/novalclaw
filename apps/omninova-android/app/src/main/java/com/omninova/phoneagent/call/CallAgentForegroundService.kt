@@ -13,77 +13,78 @@ import com.omninova.phoneagent.R
 import com.omninova.phoneagent.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
-/**
- * 通话进行中的前台服务：负责驱动 ASR、调用网关、播 TTS。
- */
+/** Runs phone speech, the local agent, and TTS while a call is active. */
 class CallAgentForegroundService : Service() {
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var sessionId: String? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val app = applicationContext as OmniNovaApp
         when (intent?.action) {
             ACTION_START -> {
                 sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
                 startForegroundWithNotification()
-                sessionId?.let { startDialogLoop(it) }
+                sessionId?.let(::startDialogLoop)
             }
-            ACTION_STOP -> {
-                stopSelfSafely()
-            }
+            ACTION_STOP -> stopSelfSafely()
         }
         return START_NOT_STICKY
     }
 
     private fun startForegroundWithNotification() {
-        val intent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+        val openApp = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        val notif: Notification = NotificationCompat.Builder(this, OmniNovaApp.CALL_CHANNEL_ID)
+        val notification: Notification = NotificationCompat.Builder(this, OmniNovaApp.CALL_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.notif_title_in_call))
             .setContentText(getString(R.string.notif_text_in_call))
-            .setContentIntent(intent)
+            .setContentIntent(openApp)
             .setOngoing(true)
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIF_ID,
-                notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
-                    or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
             )
         } else {
-            startForeground(NOTIF_ID, notif)
+            startForeground(NOTIF_ID, notification)
         }
     }
 
     private fun startDialogLoop(sessionId: String) {
         val app = applicationContext as OmniNovaApp
+        var hasConversationContent = false
         app.speech.start(
             onPartial = { partial ->
+                hasConversationContent = true
                 app.logStore.appendTurn(sessionId, "caller", partial, isFinal = false)
             },
             onFinal = { transcript ->
+                hasConversationContent = true
                 app.logStore.appendTurn(sessionId, "caller", transcript, isFinal = true)
                 scope.launch {
-                    val reply = app.gateway.chat(
-                        text = transcript,
-                        sessionId = sessionId,
-                        channel = "cellular_telecom",
-                    ) ?: "抱歉，系统暂时无法应答。"
+                    val reply = app.localAgent.reply(transcript, app.settings.languageTag.value)
                     app.logStore.appendTurn(sessionId, "agent", reply, isFinal = true)
                     app.tts.speak(reply)
                 }
-            }
+            },
+            onError = { message ->
+                if (hasConversationContent) {
+                    app.logStore.updateMetadata(sessionId, mapOf("speech_error" to message))
+                } else {
+                    app.logStore.discardSession(sessionId)
+                }
+            },
         )
     }
 
@@ -94,18 +95,17 @@ class CallAgentForegroundService : Service() {
         sessionId?.let { id ->
             app.logStore.endSession(id)
             scope.launch {
-                app.logStore.session(id)?.let {
-                    val result = app.extractor.extract(it)
+                app.logStore.session(id)?.let { session ->
+                    val result = app.extractor.extract(session)
                     app.logStore.updateMetadata(
                         id,
                         mapOf(
+                            "processing" to "on_device",
                             "extracted_intent" to result.callIntent,
                             "extracted_summary" to (result.summary ?: ""),
                             "extracted_sentiment" to result.sentiment,
-                        )
+                        ),
                     )
-                    app.gateway.syncSession(it)
-                    app.gateway.extractKeyInfo(id)
                 }
             }
         }

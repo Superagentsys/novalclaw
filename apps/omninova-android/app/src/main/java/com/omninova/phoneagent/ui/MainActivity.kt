@@ -1,38 +1,103 @@
 package com.omninova.phoneagent.ui
 
 import android.Manifest
+import android.app.Activity
+import android.app.role.RoleManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PhoneCallback
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.omninova.phoneagent.OmniNovaApp
+import com.omninova.phoneagent.R
 import com.omninova.phoneagent.data.ConversationChannel
 import com.omninova.phoneagent.data.ConversationSessionFile
-import kotlinx.coroutines.launch
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
+    private var pendingAfterPermissions: (() -> Unit)? = null
 
     private val requestPermissions = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* no-op */ }
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        val microphoneGranted = results[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val action = pendingAfterPermissions
+        pendingAfterPermissions = null
+        if (microphoneGranted) {
+            action?.invoke()
+        } else {
+            Toast.makeText(this, getString(R.string.permission_microphone_required), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val requestScreeningRole = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val message = if (result.resultCode == Activity.RESULT_OK) {
+            getString(R.string.screening_enabled)
+        } else {
+            getString(R.string.screening_not_enabled)
+        }
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLocale.wrap(newBase))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,28 +106,56 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = lightColorScheme()) {
                 OmniNovaScreen(
                     app = app,
-                    onRequestPermissions = ::ensurePermissions,
+                    onRequestPermissions = { ensurePermissions() },
+                    onStartVoiceTest = { ensurePermissions { startSimulatedCall(app) } },
+                    onRequestScreeningRole = ::requestCallScreeningRole,
+                    onLanguageChange = { tag ->
+                        app.settings.setLanguageTag(tag)
+                        recreate()
+                    },
                 )
             }
         }
     }
 
-    private fun ensurePermissions() {
-        val perms = mutableListOf(
+    private fun ensurePermissions(afterGranted: (() -> Unit)? = null) {
+        val permissions = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.READ_CONTACTS,
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            perms += Manifest.permission.ANSWER_PHONE_CALLS
+            permissions += Manifest.permission.ANSWER_PHONE_CALLS
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms += Manifest.permission.POST_NOTIFICATIONS
+            permissions += Manifest.permission.POST_NOTIFICATIONS
         }
-        val missing = perms.filter {
+        val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing.isNotEmpty()) requestPermissions.launch(missing.toTypedArray())
+        if (missing.isEmpty()) {
+            afterGranted?.invoke()
+        } else {
+            pendingAfterPermissions = afterGranted
+            requestPermissions.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun requestCallScreeningRole() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Toast.makeText(this, getString(R.string.screening_android_10), Toast.LENGTH_LONG).show()
+            return
+        }
+        val roleManager = getSystemService(RoleManager::class.java)
+        if (!roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
+            Toast.makeText(this, getString(R.string.screening_not_supported), Toast.LENGTH_LONG).show()
+            return
+        }
+        if (roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+            Toast.makeText(this, getString(R.string.screening_already_enabled), Toast.LENGTH_SHORT).show()
+            return
+        }
+        requestScreeningRole.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING))
     }
 }
 
@@ -71,136 +164,166 @@ class MainActivity : ComponentActivity() {
 private fun OmniNovaScreen(
     app: OmniNovaApp,
     onRequestPermissions: () -> Unit,
+    onStartVoiceTest: () -> Unit,
+    onRequestScreeningRole: () -> Unit,
+    onLanguageChange: (String) -> Unit,
 ) {
-    val scope = rememberCoroutineScope()
-    val connected by app.gateway.connected.collectAsState()
-    val baseUrl by app.gateway.baseUrl.collectAsState()
     val isListening by app.speech.isListening.collectAsState()
+    val speechError by app.speech.lastError.collectAsState()
     val sessions by app.logStore.sessions.collectAsState()
-
+    val autoAnswer by app.settings.autoAnswerEnabled.collectAsState()
+    val spamScreening by app.settings.spamScreeningEnabled.collectAsState()
+    val languageTag by app.settings.languageTag.collectAsState()
     var showSettings by remember { mutableStateOf(false) }
-    var urlInput by remember { mutableStateOf(baseUrl) }
-    var autoAnswer by remember { mutableStateOf(true) }
-    var spamScreening by remember { mutableStateOf(true) }
-
-    LaunchedEffect(Unit) { app.gateway.checkConnection() }
+    var textInput by rememberSaveable { mutableStateOf("") }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("OmniNova 通话助手") },
+                title = { Text(stringResource(R.string.app_name)) },
                 actions = {
                     IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "设置")
+                        Icon(Icons.Filled.Settings, contentDescription = stringResource(R.string.content_settings))
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        startSimulatedCall(app, scope)
-                    }) {
-                        Icon(Icons.Filled.PhoneCallback, contentDescription = "模拟来电")
+                    IconButton(onClick = onStartVoiceTest) {
+                        Icon(
+                            Icons.Filled.PhoneCallback,
+                            contentDescription = stringResource(R.string.content_start_voice_test),
+                        )
                     }
-                }
+                },
             )
-        }
+        },
     ) { padding ->
         Column(
             modifier = Modifier
                 .padding(padding)
-                .fillMaxSize()
+                .fillMaxSize(),
         ) {
-            StatusBanner(connected = connected, isListening = isListening)
+            StatusBanner(isListening = isListening, speechError = speechError)
+            LocalTextTest(
+                value = textInput,
+                onValueChange = { textInput = it },
+                onSubmit = {
+                    submitLocalText(app, textInput)
+                    textInput = ""
+                },
+            )
             if (sessions.isEmpty()) {
-                EmptyState()
+                EmptyState(onStartVoiceTest = onStartVoiceTest, modifier = Modifier.weight(1f))
             } else {
-                SessionList(sessions = sessions)
+                SessionList(sessions = sessions, modifier = Modifier.weight(1f))
             }
         }
     }
 
     if (showSettings) {
         SettingsSheet(
-            urlInput = urlInput,
-            onUrlChange = { urlInput = it },
             autoAnswer = autoAnswer,
-            onAutoAnswerChange = { autoAnswer = it },
+            onAutoAnswerChange = app.settings::setAutoAnswerEnabled,
             spamScreening = spamScreening,
-            onSpamScreeningChange = { spamScreening = it },
-            onConnect = {
-                app.gateway.configure(urlInput)
-                scope.launch { app.gateway.checkConnection() }
-            },
+            onSpamScreeningChange = app.settings::setSpamScreeningEnabled,
             onRequestPermissions = onRequestPermissions,
+            onRequestScreeningRole = onRequestScreeningRole,
+            languageTag = languageTag,
+            onLanguageChange = onLanguageChange,
             onDismiss = { showSettings = false },
         )
     }
 }
 
 @Composable
-private fun StatusBanner(connected: Boolean, isListening: Boolean) {
+private fun StatusBanner(isListening: Boolean, speechError: String?) {
     Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .padding(end = 4.dp)
-            ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Surface(
-                    color = if (connected) Color(0xFF19C37D) else Color(0xFFFF9F1C),
+                    color = Color(0xFF19C37D),
                     shape = MaterialTheme.shapes.small,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.size(10.dp),
                 ) {}
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = stringResource(R.string.status_local_ready),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Spacer(Modifier.weight(1f))
+                if (isListening) {
+                    AssistChip(onClick = {}, label = { Text(stringResource(R.string.listening)) })
+                }
             }
-            Spacer(Modifier.width(8.dp))
             Text(
-                text = if (connected) "网关已连接" else "网关未连接",
-                style = MaterialTheme.typography.labelMedium
+                stringResource(R.string.status_local_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(Modifier.weight(1f))
-            if (isListening) {
-                AssistChip(onClick = {}, label = { Text("转写中") })
+            speechError?.let { error ->
+                Spacer(Modifier.height(4.dp))
+                Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
         }
     }
 }
 
 @Composable
-private fun EmptyState() {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text("暂无对话记录", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+private fun LocalTextTest(value: String, onValueChange: (String) -> Unit, onSubmit: () -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { Text(stringResource(R.string.local_text_label)) },
+            supportingText = { Text(stringResource(R.string.local_text_hint)) },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 1,
+            maxLines = 3,
+        )
         Spacer(Modifier.height(8.dp))
-        Text("来电或模拟通话后将自动记录",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Button(onClick = onSubmit, enabled = value.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.local_text_submit))
+        }
     }
 }
 
 @Composable
-private fun SessionList(sessions: List<ConversationSessionFile>) {
-    LazyColumn(modifier = Modifier.fillMaxSize()) {
-        items(sessions.reversed()) { s ->
+private fun EmptyState(onStartVoiceTest: () -> Unit, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(stringResource(R.string.no_conversations), fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            stringResource(R.string.no_conversations_hint),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(onClick = onStartVoiceTest) {
+            Text(stringResource(R.string.start_voice_test))
+        }
+    }
+}
+
+@Composable
+private fun SessionList(sessions: List<ConversationSessionFile>, modifier: Modifier = Modifier) {
+    LazyColumn(modifier = modifier.fillMaxWidth()) {
+        items(sessions.reversed(), key = { it.sessionId }) { session ->
             ListItem(
-                headlineContent = { Text("${s.turns.size} 轮对话") },
+                headlineContent = { Text(stringResource(R.string.conversation_turns, session.turns.size)) },
                 supportingContent = {
-                    val last = s.turns.lastOrNull()
+                    val last = session.turns.lastOrNull()
                     Text(
                         text = if (last != null) "${last.role}: ${last.text}"
-                        else "（无内容）",
-                        maxLines = 1
+                        else stringResource(R.string.no_content),
+                        maxLines = 1,
                     )
                 },
-                overlineContent = {
-                    Text("${s.channel.name} · ${s.startedAtUtc.take(19)}")
-                }
+                overlineContent = { Text("${session.channel.name} · ${session.startedAtUtc.take(19)}") },
             )
             HorizontalDivider()
         }
@@ -210,50 +333,87 @@ private fun SessionList(sessions: List<ConversationSessionFile>) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsSheet(
-    urlInput: String,
-    onUrlChange: (String) -> Unit,
     autoAnswer: Boolean,
     onAutoAnswerChange: (Boolean) -> Unit,
     spamScreening: Boolean,
     onSpamScreeningChange: (Boolean) -> Unit,
-    onConnect: () -> Unit,
     onRequestPermissions: () -> Unit,
+    onRequestScreeningRole: () -> Unit,
+    languageTag: String,
+    onLanguageChange: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text("设置", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            Text(stringResource(R.string.settings_title), fontWeight = FontWeight.Bold, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
-            OutlinedTextField(
-                value = urlInput,
-                onValueChange = onUrlChange,
-                label = { Text("OmniNova 网关地址") },
-                modifier = Modifier.fillMaxWidth()
-            )
+            Text(stringResource(R.string.language_title), fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
-            Button(onClick = onConnect, modifier = Modifier.fillMaxWidth()) {
-                Text("连接")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                LanguageButton(
+                    label = stringResource(R.string.language_simplified),
+                    selected = languageTag == "zh-CN",
+                    onClick = { onLanguageChange("zh-CN") },
+                )
+                LanguageButton(
+                    label = stringResource(R.string.language_traditional),
+                    selected = languageTag == "zh-TW",
+                    onClick = { onLanguageChange("zh-TW") },
+                )
+                LanguageButton(
+                    label = stringResource(R.string.language_english),
+                    selected = languageTag == "en",
+                    onClick = { onLanguageChange("en") },
+                )
             }
             Spacer(Modifier.height(16.dp))
+            Text(stringResource(R.string.local_mode_title), fontWeight = FontWeight.SemiBold)
+            Text(
+                stringResource(R.string.local_mode_description),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(16.dp))
             SwitchRow(
-                label = "自动接听 VoIP 通话",
+                label = stringResource(R.string.auto_answer),
                 checked = autoAnswer,
                 onCheckedChange = onAutoAnswerChange,
             )
+            Text(
+                stringResource(R.string.auto_answer_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
             SwitchRow(
-                label = "启用骚扰识别",
+                label = stringResource(R.string.spam_screening),
                 checked = spamScreening,
                 onCheckedChange = onSpamScreeningChange,
             )
+            OutlinedButton(onClick = onRequestScreeningRole, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.enable_screening))
+            }
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
-                Text("请求通话与麦克风权限")
+                Text(stringResource(R.string.grant_permissions))
             }
             Spacer(Modifier.height(24.dp))
-            Text("OmniNova Phone Agent v0.1.0",
+            Text(
+                stringResource(R.string.version),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
+    }
+}
+
+@Composable
+private fun RowScope.LanguageButton(label: String, selected: Boolean, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick, enabled = !selected, modifier = Modifier.weight(1f)) {
+        Text(label, maxLines = 1, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -263,34 +423,50 @@ private fun SwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, modifier = Modifier.weight(1f))
         Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 
-private fun startSimulatedCall(
-    app: OmniNovaApp,
-    scope: kotlinx.coroutines.CoroutineScope,
-) {
+private fun submitLocalText(app: OmniNovaApp, text: String) {
     val sessionId = UUID.randomUUID().toString()
-    app.logStore.startSession(sessionId, ConversationChannel.SIMULATED)
+    app.logStore.startSession(sessionId, ConversationChannel.IN_APP_VOICE)
+    app.logStore.appendTurn(sessionId, "caller", text.trim(), isFinal = true)
+    val reply = app.localAgent.reply(text, app.settings.languageTag.value)
+    app.logStore.appendTurn(sessionId, "agent", reply, isFinal = true)
+    app.logStore.updateMetadata(sessionId, mapOf("processing" to "on_device"))
+    app.logStore.endSession(sessionId)
+    app.tts.speak(reply)
+}
+
+private fun startSimulatedCall(app: OmniNovaApp) {
+    var sessionId: String? = null
+    fun ensureSession(): String {
+        return sessionId ?: UUID.randomUUID().toString().also { id ->
+            sessionId = id
+            app.logStore.startSession(id, ConversationChannel.SIMULATED)
+        }
+    }
+
     app.speech.start(
-        onPartial = { t ->
-            app.logStore.appendTurn(sessionId, "caller", t, isFinal = false)
+        onPartial = { text ->
+            app.logStore.appendTurn(ensureSession(), "caller", text, isFinal = false)
         },
         onFinal = { transcript ->
-            app.logStore.appendTurn(sessionId, "caller", transcript, isFinal = true)
-            scope.launch {
-                val reply = app.gateway.chat(
-                    text = transcript,
-                    sessionId = sessionId,
-                    channel = "simulated",
-                ) ?: "（网关未连接，示例回复）好的，已记录您的请求。"
-                app.logStore.appendTurn(sessionId, "agent", reply, isFinal = true)
-                app.tts.speak(reply)
+            val id = ensureSession()
+            app.logStore.appendTurn(id, "caller", transcript, isFinal = true)
+            val reply = app.localAgent.reply(transcript, app.settings.languageTag.value)
+            app.logStore.appendTurn(id, "agent", reply, isFinal = true)
+            app.logStore.updateMetadata(id, mapOf("processing" to "on_device"))
+            app.logStore.endSession(id)
+            app.tts.speak(reply)
+        },
+        onError = {
+            sessionId?.let { id ->
+                if (app.logStore.session(id)?.turns.isNullOrEmpty()) app.logStore.discardSession(id)
             }
-        }
+        },
     )
 }

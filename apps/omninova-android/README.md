@@ -1,88 +1,41 @@
-# OmniNova Phone Agent（Android）
+# OmniNova 通话助手（Android）
 
-与 iOS 客户端同构的 Android 工程，核心能力：
+这是一个手机本地运行的 Android 通话助手。它不连接电脑，不需要 OmniNova 网关、局域网地址、API 密钥或 `INTERNET` 权限。
 
-- `CallScreeningService` 在振铃前按 `skills/phone-call-assistant/spam_detection_rules.json` 识别骚扰
-- `InCallService` 在设备将本 App 设为默认拨号器后自动接听（需 `ANSWER_PHONE_CALLS`）
-- 前台服务 `CallAgentForegroundService` 驱动 `SpeechRecognizer` 转写并同步到 OmniNova 网关
-- `KeyInfoExtractor` 本地抽取关键信息，通话结束后触发网关侧二次抽取
+## 本地能力
 
-## 目录
+- 在手机本地保存会话记录、关键词提取结果和骚扰电话规则。
+- 用本地规则识别快递、预约、售后、推销和疑似诈骗话术，并生成确定性的本机回复。
+- 通过 Android 电话筛选服务按本地规则拦截或静音来电。
+- 支持简体中文、繁體中文和 English，可在应用设置中切换。
+- 提供文字本地测试：即使系统语音识别不可用，也能在手机上验证助手回复和会话记录。
 
-```
-apps/omninova-android/
-├── settings.gradle.kts
-├── build.gradle.kts
-├── gradle.properties
-├── gradle/wrapper/
-│   ├── gradle-wrapper.jar
-│   └── gradle-wrapper.properties
-├── gradlew / gradlew.bat
-└── app/
-    ├── build.gradle.kts
-    ├── proguard-rules.pro
-    └── src/main/
-        ├── AndroidManifest.xml
-        ├── java/com/omninova/phoneagent/
-        │   ├── OmniNovaApp.kt               # Application
-        │   ├── ui/MainActivity.kt           # Compose UI
-        │   ├── data/                        # 会话模型与落盘
-        │   ├── net/GatewayClient.kt         # OkHttp 客户端
-        │   └── call/                        # 通话相关服务与工具
-        │       ├── OmniCallScreeningService.kt
-        │       ├── OmniInCallService.kt
-        │       ├── CallAgentForegroundService.kt
-        │       ├── SpeechPipeline.kt
-        │       ├── AgentResponseSynthesizer.kt
-        │       ├── SpamDetector.kt
-        │       └── KeyInfoExtractor.kt
-        └── res/                              # 主题 / 字符串 / 图标
-```
+## 语音说明
 
-## 依赖与构建环境
+语音转文字和语音播报使用 Android 已安装的系统语音识别和 TTS 服务，应用不会将语音发送给电脑。
 
-- JDK 17（推荐 `Temurin 17`）
-- Android SDK Platform 34、Build-Tools 34.0.0
-- Android Gradle Plugin 8.3.2、Kotlin 1.9.23、Compose BOM 2024.04
+如果语音测试显示 `code 11`，表示 Android 系统的语音识别服务已断开。请在手机设置中启用或重启语音输入服务；文字本地测试仍然可以使用。
 
-`local.properties` 必须指定 SDK 位置：
+Android 的普通应用无法直接读取对方的蜂窝通话音频，这受系统隐私策略限制。本项目的语音测试和通话服务只使用应用可获得的麦克风输入。
 
-```properties
-sdk.dir=/Users/you/Library/Android/sdk
-# 或导出 ANDROID_SDK_ROOT 环境变量
-```
+## 使用步骤
 
-## 本地编译
+1. 安装 APK 后打开应用，并授予麦克风、电话和通知权限。
+2. 在首页输入一句文字，点击“发送本地测试”。出现两轮会话即表示本机助手正常运行。
+3. 如需语音测试，点击左上角电话图标或“开始语音测试”。
+4. 如需自动接听，将应用设为默认电话应用；如需骚扰筛选，在设置中授予 Android 通话筛选角色。
+
+## 构建
+
+需要 JDK 17、Android SDK Platform 34 和 Build-Tools 34.0.0：
 
 ```bash
 cd apps/omninova-android
 ./gradlew assembleDebug
-# 产物：app/build/outputs/apk/debug/app-debug.apk
-
-./gradlew assembleRelease  # 需配置 keystore.properties 与签名
 ```
 
-## 自动接听 / 骚扰拦截 激活步骤
+APK 输出位置：
 
-1. 安装 APK 后打开应用，授予：麦克风、电话、通讯录、通知权限。
-2. **设为默认拨号器**：系统 设置 → 应用 → 默认应用 → 电话应用 → 选择 OmniNova。
-3. **设为默认通话筛选**：系统 设置 → 应用 → 默认应用 → 通话筛选 App → 选择 OmniNova。
-4. 在应用设置中启用 "自动接听" 与 "骚扰识别"。
-
-## 与 OmniNova 网关对接
-
-默认网关地址 `http://127.0.0.1:10809`，可在应用设置中修改：
-
-| 接口 | 用途 |
-|------|------|
-| `GET /api/health` | 健康检查 |
-| `POST /api/inbound` | 单轮对话，body 含 session_id/channel/text |
-| `POST /api/webhook` | 通话结束后同步完整会话 JSON |
-| `POST /api/skill/phone-call-assistant/extract` | 触发关键信息抽取 |
-| `GET /api/skill/phone-call-assistant/rules` | 获取最新骚扰规则 |
-
-## 平台限制
-
-- 自动接听需要用户主动将本 App 设为默认拨号器（Android 政策限制）
-- Android 系统 `SpeechRecognizer` 仅识别麦克风流；无法直接获取对方通话音频
-- 骚扰识别需要将本 App 设为默认通话筛选应用（`BIND_SCREENING_SERVICE`）
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```

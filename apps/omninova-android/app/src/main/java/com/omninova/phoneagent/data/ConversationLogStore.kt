@@ -83,6 +83,15 @@ class ConversationLogStore(private val context: Context) {
         }
     }
 
+    /** Removes a session that never received any caller or agent content. */
+    fun discardSession(sessionId: String) {
+        _sessions.update { list ->
+            if (list.none { it.sessionId == sessionId }) return@update list
+            runCatching { fileFor(sessionId).delete() }
+            list.filterNot { it.sessionId == sessionId }
+        }
+    }
+
     fun updateMetadata(sessionId: String, entries: Map<String, String>) {
         _sessions.update { list ->
             val idx = list.indexOfFirst { it.sessionId == sessionId }
