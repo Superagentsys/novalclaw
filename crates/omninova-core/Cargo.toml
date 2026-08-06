@@ -43,6 +43,9 @@ home.workspace = true
 avif-serialize.workspace = true
 base64ct.workspace = true
 globset.workspace = true
+screenshots.workspace = true
+png.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
 url.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
 futures-util = "0.3"
@@ -53,3 +56,5 @@ pdf-extract = "0.10.0"
 serde_yaml = "0.9.34"
 qrcode.workspace = true
 ratatui = "0.29"
+aes = "0.8"
+zip = { version = "2", features = ["deflate"] }
