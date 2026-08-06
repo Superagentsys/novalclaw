@@ -333,18 +333,8 @@
 #
 # [channels_config.feishu]
 # enabled = false
-# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "...", outbound_mode = "disabled" }
-# outbound_mode: "disabled" (default HTTP response only), "mock" (no platform API call), or "real" (send reply through Feishu).
-#   # 说明：
-#   # - app_id: 飞书应用的 App ID（格式如 cli_xxx）
-#   # - app_secret: 飞书应用的 App Secret
-#   # - 如需额外字段（如 signing_secret、webhook_path），也可放在 extra 中
-#   # 示例：extra = { app_id = "cli_xxx", app_secret = "...", signing_secret = "..." }
-#   #
-#   # 注意：127.0.0.1 只能本机访问回调。真实飞书公网回调需要：
-#   # - 内网穿透（如 ngrok、frp）
-#   # - 或部署到公网服务器
-#   # 回调地址格式：https://your-domain/webhook/feishu
+# token_env = "FEISHU_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/feishu", app_id_env = "FEISHU_APP_ID", app_secret_env = "FEISHU_APP_SECRET", signing_secret_env = "FEISHU_SIGNING_SECRET" }
 #
 # [channels_config.line]
 # enabled = false
@@ -383,9 +373,8 @@
 #
 # [channels_config.lark]
 # enabled = false
-# extra = { app_id = "cli_xxxxxxxxxx", app_secret = "...", outbound_mode = "disabled" }
-# outbound_mode: "disabled" (default HTTP response only), "mock" (no platform API call), or "real" (send reply through Lark).
-#   # Lark（国际版飞书）与飞书配置格式相同
+# token_env = "LARK_BOT_TOKEN"
+# extra = { webhook_path = "/webhook/lark", signing_secret_env = "LARK_SIGNING_SECRET" }
 #
 # [channels_config.dingtalk]
 # enabled = false
