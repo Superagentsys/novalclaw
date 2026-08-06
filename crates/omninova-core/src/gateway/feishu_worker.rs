@@ -915,8 +915,10 @@ async fn send_reply_with_outbox(
                     println!("[{}-outbox] failed to audit: {}", channel_name, e);
                 }
                 println!(
-                    "[{}-outbox] audit outbound_id={} reply_kind=llm_final platform_message_id={}",
-                    channel_name, outbox.outbound_id, platform_msg_id
+                    "[{}-outbox] audit outbound_id={} reply_kind=llm_final platform_message_id_present={}",
+                    channel_name,
+                    outbox.outbound_id,
+                    !platform_msg_id.is_empty()
                 );
             }
             _ => {
@@ -967,8 +969,10 @@ async fn send_reply_with_outbox(
                 println!("[{}-outbox] failed to mark sent: {}", channel_name, e);
             }
             println!(
-                "[{}-outbox] sent outbound_id={} platform_message_id={}",
-                channel_name, outbound_id, platform_msg_id
+                "[{}-outbox] sent outbound_id={} platform_message_id_present={}",
+                channel_name,
+                outbound_id,
+                !platform_msg_id.is_empty()
             );
         }
         Ok(Ok(None)) => {
@@ -1613,8 +1617,8 @@ async fn deliver_platform_reply_and_record(
         if let Some(ref msg_id) = outbound_result.platform_message_id {
             OutboundMsgCache::global().record_outbound(channel_name, msg_id).await;
             println!(
-                "[{}-worker] recorded_outbound_message_id={}",
-                channel_name, msg_id
+                "[{}-worker] recorded_outbound_message_id=true",
+                channel_name
             );
         }
     }

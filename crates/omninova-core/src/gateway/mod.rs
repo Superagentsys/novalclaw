@@ -4986,8 +4986,10 @@ async fn http_channel_webhook(
     if let Some(incoming_msg_id) = message_id.as_ref() {
         let channel_str = channel_name.clone();
         if OutboundMsgCache::global().is_our_message(&channel_str, incoming_msg_id).await {
-            println!("[{}-webhook] skip_self_message reason=outbound_message_id_match message_id={}",
-                channel_name, incoming_msg_id);
+            println!(
+                "[{}-webhook] skip_self_message reason=outbound_message_id_match message_id_present=true",
+                channel_name
+            );
             return Ok(Json(serde_json::json!({
                 "ok": true,
                 "accepted": true,
@@ -5687,14 +5689,17 @@ async fn deliver_platform_reply(
             );
             
             // Record outbound message_id for self-message filtering
-            if result.ok && result.platform_message_id.is_some() {
-                let msg_id = result.platform_message_id.as_ref().unwrap();
-                let channel_str = format!("{:?}", inbound.channel).to_lowercase();
-                OutboundMsgCache::global().record_outbound(&channel_str, msg_id).await;
-                println!(
-                    "[{}-outbound] recorded_outbound_message_id message_id={} ttl_secs=1800",
-                    channel_name_for_log, msg_id
-                );
+            if result.ok {
+                if let Some(msg_id) = result.platform_message_id.as_ref() {
+                    let channel_str = format!("{:?}", inbound.channel).to_lowercase();
+                    OutboundMsgCache::global()
+                        .record_outbound(&channel_str, msg_id)
+                        .await;
+                    println!(
+                        "[{}-outbound] recorded_outbound_message_id=true ttl_secs=1800",
+                        channel_name_for_log
+                    );
+                }
             }
             
             Some(result)
