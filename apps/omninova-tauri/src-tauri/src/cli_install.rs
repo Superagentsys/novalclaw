@@ -9,6 +9,8 @@ use tauri::AppHandle;
 use tauri::Manager;
 
 const MARKER_LINE: &str = "# OmniNova CLI (PATH)";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +96,8 @@ fn same_executable_as_bundle(src: &Path, dst: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_add_user_path(dir: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
     let d = dir.to_string_lossy().replace('\'', "''");
     let ps = format!(
         "$d = [System.IO.Path]::GetFullPath('{d}'); \
@@ -105,6 +109,7 @@ fn windows_add_user_path(dir: &Path) -> Result<(), String> {
         d = d
     );
     let output = StdCommand::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps])
         .output()
         .map_err(|e| format!("无法执行 PowerShell：{e}"))?;

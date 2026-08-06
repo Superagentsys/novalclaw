@@ -11,6 +11,8 @@
   "app": {
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "OmniNova Claw",
         "width": 1080,
         "height": 720,

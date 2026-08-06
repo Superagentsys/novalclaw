@@ -4,6 +4,43 @@
   overflow: hidden;
 }
 
+.startup-error {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--surface-cream);
+  color: var(--text-primary);
+}
+
+.startup-error__card {
+  width: min(560px, 100%);
+  padding: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.startup-error__card h1 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.startup-error__card p {
+  margin: 0 0 16px;
+  color: var(--text-muted);
+}
+
+.startup-error__card code {
+  display: block;
+  margin-bottom: 18px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(44, 40, 36, 0.06);
+  overflow-wrap: anywhere;
+}
+
 /* ========== Skills gallery (visual card grid) ========== */
 .skill-switch {
   flex-shrink: 0;

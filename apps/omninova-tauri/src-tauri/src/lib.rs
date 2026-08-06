@@ -136,8 +136,28 @@ struct AppState {
 
 const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
 const WEBVIEW2_DATA_DIR_ENV: &str = "OMNINOVA_WEBVIEW2_DATA_DIR";
+const OPEN_DEVTOOLS_ENV: &str = "OMNINOVA_OPEN_DEVTOOLS";
 const WEBVIEW2_LOCK_SCAN_MAX_DEPTH: usize = 4;
 const WEBVIEW2_LOCK_SCAN_MAX_RESULTS: usize = 32;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+fn hide_std_command_window(command: &mut StdCommand) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_std_command_window(_command: &mut StdCommand) {}
+
+#[cfg(target_os = "windows")]
+fn hide_tokio_command_window(command: &mut tokio::process::Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_tokio_command_window(_command: &mut tokio::process::Command) {}
 
 #[derive(Debug)]
 struct WebviewStartupDiagnostics {
@@ -221,7 +241,9 @@ fn collect_webview_lock_like_files(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn windows_process_counts(current_pid: u32) -> (usize, usize) {
-    let Ok(output) = StdCommand::new("tasklist")
+    let mut command = StdCommand::new("tasklist");
+    hide_std_command_window(&mut command);
+    let Ok(output) = command
         .args(["/FO", "CSV", "/NH"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -368,7 +390,9 @@ fn is_working_agent_browser_binary(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    let Ok(output) = StdCommand::new(path)
+    let mut command = StdCommand::new(path);
+    hide_std_command_window(&mut command);
+    let Ok(output) = command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1160,7 +1184,9 @@ async fn check_browser_dep() -> Result<DepStatusPayload, String> {
 
 #[tauri::command]
 async fn install_browser_dep() -> Result<DepStatusPayload, String> {
-    let npm_out = tokio::process::Command::new("npm")
+    let mut npm_command = tokio::process::Command::new("npm");
+    hide_tokio_command_window(&mut npm_command);
+    let npm_out = npm_command
         .args(["install", "-g", "agent-browser"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1174,7 +1200,9 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
 
     let agent_browser_cmd = detect_agent_browser_binary()
         .unwrap_or_else(|| PathBuf::from("agent-browser"));
-    let chromium_out = tokio::process::Command::new(&agent_browser_cmd)
+    let mut chromium_command = tokio::process::Command::new(&agent_browser_cmd);
+    hide_tokio_command_window(&mut chromium_command);
+    let chromium_out = chromium_command
         .arg("install")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1191,7 +1219,9 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
 }
 
 async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayload {
-    match tokio::process::Command::new(bin)
+    let mut command = tokio::process::Command::new(bin);
+    hide_tokio_command_window(&mut command);
+    match command
         .arg(version_flag)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2850,7 +2880,12 @@ pub fn run() {
                 );
                 #[cfg(debug_assertions)]
                 {
-                    window.open_devtools();
+                    let open_devtools = std::env::var(OPEN_DEVTOOLS_ENV)
+                        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE"))
+                        .unwrap_or(false);
+                    if open_devtools {
+                        window.open_devtools();
+                    }
                 }
             }
 
@@ -2894,8 +2929,15 @@ pub fn run() {
 
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application");
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("[app-startup] application_build_failed error={error}");
+            return;
+        }
+    };
 
     app.run(|app_handle, event| {
         #[cfg(target_os = "macos")]
