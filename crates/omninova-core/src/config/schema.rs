@@ -59,8 +59,6 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
     #[serde(default)]
-    pub gateway_public: GatewayPublicConfig,
-    #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub tunnel: TunnelConfig,
@@ -201,7 +199,6 @@ impl Default for Config {
             storage: StorageConfig::default(),
             observability: ObservabilityConfig::default(),
             gateway: GatewayConfig::default(),
-            gateway_public: GatewayPublicConfig::default(),
             proxy: ProxyConfig::default(),
             tunnel: TunnelConfig::default(),
             browser: BrowserConfig::default(),
@@ -1067,46 +1064,6 @@ impl Default for GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayPublicMode {
-    QuickTunnel,
-    NamedCloudflareTunnel,
-    ExternalPublicUrl,
-}
-
-impl Default for GatewayPublicMode {
-    fn default() -> Self {
-        Self::ExternalPublicUrl
-    }
-}
-
-impl GatewayPublicMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::QuickTunnel => "quick_tunnel",
-            Self::NamedCloudflareTunnel => "named_cloudflare_tunnel",
-            Self::ExternalPublicUrl => "external_public_url",
-        }
-    }
-}
-
-/// Stable public ingress configuration. This section contains locations and
-/// hostnames only; tunnel credentials and webhook secrets never belong here.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GatewayPublicConfig {
-    #[serde(default)]
-    pub mode: GatewayPublicMode,
-    #[serde(default)]
-    pub public_webhook_base_url: Option<String>,
-    #[serde(default)]
-    pub cloudflared_path: Option<PathBuf>,
-    #[serde(default)]
-    pub named_tunnel_name: Option<String>,
-    #[serde(default)]
-    pub named_tunnel_hostname: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Proxy
 // ---------------------------------------------------------------------------
@@ -1390,17 +1347,6 @@ pub struct ChannelEntry {
     pub enabled: bool,
     pub token: Option<String>,
     pub token_env: Option<String>,
-    /// Security mode: "dev" (no verification), "token" (verify verification_token), "encrypted" (decrypt payload)
-    #[serde(default)]
-    pub security_mode: Option<String>,
-    /// Verification token for webhook security (used when security_mode=token or encrypted)
-    pub verification_token: Option<String>,
-    /// Env var name for verification_token (e.g., "FEISHU_VERIFICATION_TOKEN")
-    pub verification_token_env: Option<String>,
-    /// Encryption key for encrypted events (used when security_mode=encrypted)
-    pub encrypt_key: Option<String>,
-    /// Env var name for encrypt_key (e.g., "FEISHU_ENCRYPT_KEY")
-    pub encrypt_key_env: Option<String>,
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -2359,36 +2305,5 @@ workspace_dir = "C:\\agent-workspace"
         let toml = "provider = \"openai\"";
         let cfg: DelegateAgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.workspace_dir, None);
-    }
-
-    #[test]
-    fn gateway_public_defaults_keep_legacy_config_compatible() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(
-            cfg.gateway_public.mode,
-            GatewayPublicMode::ExternalPublicUrl
-        );
-        assert!(cfg.gateway_public.public_webhook_base_url.is_none());
-    }
-
-    #[test]
-    fn gateway_public_round_trips_without_secrets() {
-        let cfg = GatewayPublicConfig {
-            mode: GatewayPublicMode::NamedCloudflareTunnel,
-            public_webhook_base_url: Some("https://gateway.example.com".to_string()),
-            cloudflared_path: Some(PathBuf::from("C:\\tools\\cloudflared.exe")),
-            named_tunnel_name: Some("omninova".to_string()),
-            named_tunnel_hostname: Some("gateway.example.com".to_string()),
-        };
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        let restored: GatewayPublicConfig = toml::from_str(&serialized).unwrap();
-
-        assert_eq!(restored.mode, GatewayPublicMode::NamedCloudflareTunnel);
-        assert_eq!(
-            restored.public_webhook_base_url.as_deref(),
-            Some("https://gateway.example.com")
-        );
-        assert!(!serialized.to_ascii_lowercase().contains("secret"));
-        assert!(!serialized.to_ascii_lowercase().contains("token"));
     }
 }
