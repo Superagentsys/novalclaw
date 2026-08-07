@@ -17,10 +17,161 @@ use crate::gateway::dingtalk_worker::{
     verify_dingtalk_webhook_signature, send_dingtalk_text_message,
 };
 
-/// Static mutex serializing tests that mutate the `OMNINOVA_DINGTALK_*`
-/// process env vars, since those are read concurrently by
-/// `apply_env_overrides` and the secret resolver fallbacks.
+// =============================================================================
+// Environment-variable isolation helpers
+// =============================================================================
+//
+// `apply_env_overrides` (env.rs) and the resolver fallbacks in
+// `gateway/mod.rs` both read the six `OMNINOVA_DINGTALK_*` process env vars
+// at runtime. Test cases must therefore control those vars deterministically:
+// any host-level value, leak from a sibling test, or out-of-order execution
+// would otherwise flake these tests.
+//
+// `DingtalkEnvGuard` is a RAII guard that:
+//   1. acquires a process-wide mutex (serializes env-var tests);
+//   2. snapshots every existing `OMNINOVA_DINGTALK_*` value;
+//   3. removes every one of them so the test starts from a clean slate;
+//   4. on Drop, restores the snapshotted values (or removes them if absent).
+//
+// All tests that touch any of the six env vars must acquire this guard
+// first; nothing else mutates the process env without going through it.
+
+/// The set of process env vars that DingTalk resolver / override code reads.
+const DINGTALK_ENV_VARS: &[&str] = &[
+    "OMNINOVA_DINGTALK_ENABLED",
+    "OMNINOVA_DINGTALK_APP_KEY",
+    "OMNINOVA_DINGTALK_APP_SECRET",
+    "OMNINOVA_DINGTALK_ROBOT_CODE",
+    "OMNINOVA_DINGTALK_WEBHOOK_PATH",
+    "OMNINOVA_DINGTALK_OUTBOUND_MODE",
+];
+
+/// Process-wide mutex serializing tests that mutate `OMNINOVA_DINGTALK_*`.
 static DINGTALK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Snapshot of the previous values for the env vars this guard is
+/// tracking. Captures the canonical six at construction; additional keys
+/// added via `set()` are appended lazily and restored on Drop.
+#[derive(Debug)]
+struct EnvSnapshot {
+    canonical: Vec<(&'static str, Option<String>)>,
+    /// Extra keys the test set via `DingtalkEnvGuard::set`.
+    extra: Vec<(String, Option<String>)>,
+}
+
+impl EnvSnapshot {
+    fn capture_canonical() -> Self {
+        let canonical = DINGTALK_ENV_VARS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        Self {
+            canonical,
+            extra: Vec::new(),
+        }
+    }
+
+    fn clear_canonical(&self) {
+        for (k, _) in &self.canonical {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// Capture the previous value of an arbitrary key (used by `set` so
+    /// the value is restored on Drop). Idempotent per key: if the test
+    /// calls `set(same_key, ...)` twice, only the very first capture
+    /// survives, which is the correct semantics (the prior value at the
+    /// moment the test "took control" of the var is what we want to put
+    /// back later).
+    fn capture_extra(&mut self, key: &str) {
+        if self.extra.iter().any(|(k, _)| k == key) {
+            return;
+        }
+        self.extra.push((key.to_string(), std::env::var(key).ok()));
+    }
+
+    fn restore(&self) {
+        for (k, prev) in &self.canonical {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        for (k, prev) in &self.extra {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// RAII guard that gives the test exclusive, deterministic control over
+/// the `OMNINOVA_DINGTALK_*` process env vars for its lifetime.
+pub(crate) struct DingtalkEnvGuard {
+    /// Held for the guard's lifetime to serialize tests; the inner `()`
+    /// carries no data.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    snapshot: std::cell::RefCell<EnvSnapshot>,
+}
+
+impl DingtalkEnvGuard {
+    /// Acquire the env lock, snapshot the current values, then clear them
+    /// so the test starts from a known-clean state.
+    pub fn new() -> Self {
+        let lock = DINGTALK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = EnvSnapshot::capture_canonical();
+        snapshot.clear_canonical();
+        Self {
+            _lock: lock,
+            snapshot: std::cell::RefCell::new(snapshot),
+        }
+    }
+
+    /// Set one env var for the duration of the test. Captures the prior
+    /// value (if any) so it can be restored on Drop. Safe to call with
+    /// any name, including the canonical six and per-test `*_FOR_TEST`
+    /// keys.
+    pub fn set(&self, key: &str, value: &str) {
+        self.snapshot.borrow_mut().capture_extra(key);
+        std::env::set_var(key, value);
+    }
+
+    /// Convenience: remove the canonical six vars (same as on
+    /// construction). Useful when a test wants to "start over" mid-test.
+    pub fn clear_canonical(&self) {
+        self.snapshot.borrow().clear_canonical();
+    }
+}
+
+impl Drop for DingtalkEnvGuard {
+    fn drop(&mut self) {
+        // `RefCell::borrow` may panic if already borrowed mutably; that
+        // can only happen if `set` was called re-entrantly, which the
+        // `set` implementation does not do (it drops the borrow before
+        // returning). Snapshotting on Drop is therefore safe.
+        self.snapshot.borrow().restore();
+    }
+}
+
+impl Default for DingtalkEnvGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run `f` with a clean `OMNINOVA_DINGTALK_*` environment. The guard is
+/// active for the duration of the closure and the previous values are
+/// restored on return.
+///
+/// Use this for every test that asserts on resolver or override behavior
+/// so host-level state can never bleed in.
+pub(crate) fn with_clean_dingtalk_env<R>(f: impl FnOnce(&DingtalkEnvGuard) -> R) -> R {
+    let guard = DingtalkEnvGuard::new();
+    f(&guard)
+}
 
 // =============================================================================
 // Signature verification tests
@@ -547,31 +698,26 @@ fn dingtalk_config_template_contains_dingtalk_section() {
 /// 4. OMNINOVA_DINGTALK_APP_SECRET                    (default env var)
 #[test]
 fn dingtalk_resolver_uses_env_when_inline_empty() {
-    let _guard = DINGTALK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    with_clean_dingtalk_env(|guard| {
+        // Step 3: a custom-named env var carries the secret.
+        let env_name = "OMNINOVA_DINGTALK_APP_SECRET_FOR_TEST";
+        guard.set(env_name, "env_secret_value_xyz_123");
 
-    let env_name = "OMNINOVA_DINGTALK_APP_SECRET_FOR_TEST";
-    let prev = std::env::var(env_name).ok();
-    std::env::set_var(env_name, "env_secret_value_xyz_123");
+        let mut cfg = Config::default();
+        // Step 2 (inline) is empty; step 3 (named env var) supplies the value.
+        cfg.gateway.dingtalk.app_secret = String::new();
+        cfg.gateway.dingtalk.app_secret_env = Some(env_name.to_string());
 
-    let mut cfg = Config::default();
-    // Step 2 (inline) is empty; step 3 (named env var) supplies the value.
-    cfg.gateway.dingtalk.app_secret = String::new();
-    cfg.gateway.dingtalk.app_secret_env = Some(env_name.to_string());
-
-    let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
-        &cfg,
-        cfg.channels_config.dingtalk.as_ref(),
-    );
-    assert_eq!(
-        resolved.as_deref(),
-        Some("env_secret_value_xyz_123"),
-        "Resolver must fall back to env var (step 3) when inline (step 2) is empty"
-    );
-
-    match prev {
-        Some(v) => std::env::set_var(env_name, v),
-        None => std::env::remove_var(env_name),
-    }
+        let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
+            &cfg,
+            cfg.channels_config.dingtalk.as_ref(),
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("env_secret_value_xyz_123"),
+            "Resolver must fall back to env var (step 3) when inline (step 2) is empty"
+        );
+    });
 }
 
 /// Test: when the inline `gateway.dingtalk.app_secret` is non-empty, the
@@ -581,87 +727,79 @@ fn dingtalk_resolver_uses_env_when_inline_empty() {
 /// behind the operator's back.
 #[test]
 fn dingtalk_resolver_prefers_inline_config_before_env_fallback() {
-    let _guard = DINGTALK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    with_clean_dingtalk_env(|guard| {
+        // Set a hostile env var that must NOT be picked up.
+        let env_name = "OMNINOVA_DINGTALK_APP_SECRET_FOR_TEST";
+        guard.set(env_name, "env_secret_must_be_ignored");
 
-    let env_name = "OMNINOVA_DINGTALK_APP_SECRET_FOR_TEST";
-    let prev = std::env::var(env_name).ok();
-    std::env::set_var(env_name, "env_secret_must_be_ignored");
+        let mut cfg = Config::default();
+        cfg.gateway.dingtalk.app_secret = "inline_secret_wins".to_string();
+        cfg.gateway.dingtalk.app_secret_env = Some(env_name.to_string());
 
-    let mut cfg = Config::default();
-    cfg.gateway.dingtalk.app_secret = "inline_secret_wins".to_string();
-    cfg.gateway.dingtalk.app_secret_env = Some(env_name.to_string());
-
-    let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
-        &cfg,
-        cfg.channels_config.dingtalk.as_ref(),
-    );
-    assert_eq!(
-        resolved.as_deref(),
-        Some("inline_secret_wins"),
-        "Inline app_secret (step 2) must beat the named env var (step 3)"
-    );
-
-    match prev {
-        Some(v) => std::env::set_var(env_name, v),
-        None => std::env::remove_var(env_name),
-    }
+        let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
+            &cfg,
+            cfg.channels_config.dingtalk.as_ref(),
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("inline_secret_wins"),
+            "Inline app_secret (step 2) must beat the named env var (step 3)"
+        );
+    });
 }
 
 /// Test: a Config built from a stock template (no DingTalk section) keeps
 /// DingTalk disabled and uses the documented default webhook path. This
 /// guarantees that pre-existing user config files do not silently break.
+///
+/// Runs under a clean env guard so a host-level `OMNINOVA_DINGTALK_*`
+/// value (or a leak from a sibling test) cannot make the resolver return
+/// a non-None value and trip the "nothing is set" assertions below.
 #[test]
 fn gateway_without_dingtalk_config_still_defaults_disabled() {
-    let mut cfg = Config::default();
-    // Simulate an existing user config.toml with no [gateway.dingtalk] block.
-    cfg.gateway.dingtalk = GatewayDingtalkConfig::default();
-    assert!(!cfg.gateway.dingtalk.enabled);
-    assert!(cfg.gateway.dingtalk.app_key.is_empty());
-    assert!(cfg.gateway.dingtalk.app_secret.is_empty());
-    assert!(cfg.gateway.dingtalk.robot_code.is_empty());
-    assert_eq!(cfg.gateway.dingtalk.outbound_mode, "session_webhook");
-    assert_eq!(
-        cfg.gateway.dingtalk.webhook_path,
-        "/api/v1/gateway/dingtalk/events"
-    );
+    with_clean_dingtalk_env(|_guard| {
+        let mut cfg = Config::default();
+        // Simulate an existing user config.toml with no [gateway.dingtalk] block.
+        cfg.gateway.dingtalk = GatewayDingtalkConfig::default();
+        assert!(!cfg.gateway.dingtalk.enabled);
+        assert!(cfg.gateway.dingtalk.app_key.is_empty());
+        assert!(cfg.gateway.dingtalk.app_secret.is_empty());
+        assert!(cfg.gateway.dingtalk.robot_code.is_empty());
+        assert_eq!(cfg.gateway.dingtalk.outbound_mode, "session_webhook");
+        assert_eq!(
+            cfg.gateway.dingtalk.webhook_path,
+            "/api/v1/gateway/dingtalk/events"
+        );
 
-    // Resolvers return None when nothing is configured.
-    let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
-        &cfg,
-        cfg.channels_config.dingtalk.as_ref(),
-    );
-    assert!(resolved.is_none(), "No secret should resolve when nothing is set");
+        // Resolvers return None when nothing is configured AND the env is
+        // clean.
+        let resolved = crate::gateway::dingtalk_worker::resolve_dingtalk_secret(
+            &cfg,
+            cfg.channels_config.dingtalk.as_ref(),
+        );
+        assert!(resolved.is_none(), "No secret should resolve when nothing is set");
 
-    let resolved_key = crate::gateway::dingtalk_worker::resolve_dingtalk_app_key(
-        &cfg,
-        cfg.channels_config.dingtalk.as_ref(),
-    );
-    assert!(resolved_key.is_none(), "No app_key should resolve when nothing is set");
+        let resolved_key = crate::gateway::dingtalk_worker::resolve_dingtalk_app_key(
+            &cfg,
+            cfg.channels_config.dingtalk.as_ref(),
+        );
+        assert!(resolved_key.is_none(), "No app_key should resolve when nothing is set");
+    });
 }
 
 /// Test: env override path populates the inline `app_secret` field.
 #[test]
 fn dingtalk_env_overrides_populate_config() {
-    let _guard = DINGTALK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    with_clean_dingtalk_env(|guard| {
+        guard.set("OMNINOVA_DINGTALK_APP_KEY", "env_app_key_abc");
 
-    // Use the real env var name; guard with a mutex so we never leave
-    // OMNINOVA_DINGTALK_APP_KEY set in the process env and never race with
-    // other tests.
-    let key = "OMNINOVA_DINGTALK_APP_KEY";
-    let prev = std::env::var(key).ok();
-    std::env::set_var(key, "env_app_key_abc");
-
-    let mut cfg = Config::default();
-    apply_env_overrides(&mut cfg);
-    assert_eq!(
-        cfg.gateway.dingtalk.app_key, "env_app_key_abc",
-        "apply_env_overrides must populate gateway.dingtalk.app_key from env"
-    );
-
-    match prev {
-        Some(v) => std::env::set_var(key, v),
-        None => std::env::remove_var(key),
-    }
+        let mut cfg = Config::default();
+        apply_env_overrides(&mut cfg);
+        assert_eq!(
+            cfg.gateway.dingtalk.app_key, "env_app_key_abc",
+            "apply_env_overrides must populate gateway.dingtalk.app_key from env"
+        );
+    });
 }
 
 /// Test: when `gateway.dingtalk` is fully populated via the env, the
