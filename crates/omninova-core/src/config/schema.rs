@@ -1016,6 +1016,83 @@ pub struct GatewayConfig {
     pub webhook_signing_include_timestamp: bool,
     #[serde(default)]
     pub webhook_signing_require_timestamp: bool,
+    /// DingTalk (企业内部应用机器人) gateway config. Defaults to disabled.
+    /// When disabled, the `/api/v1/gateway/dingtalk/events` route is registered
+    /// but rejects all requests; no outbound DingTalk calls are made.
+    #[serde(default)]
+    pub dingtalk: GatewayDingtalkConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayDingtalkConfig {
+    /// Master switch. When `false` (the default), DingTalk routes are
+    /// registered but every webhook is rejected and no outbound calls happen.
+    #[serde(default)]
+    pub enabled: bool,
+    /// DingTalk AppKey. Prefer `app_key_env` (or `OMNINOVA_DINGTALK_APP_KEY`
+    /// environment variable) for real secrets; the inline value should stay
+    /// empty in committed config files.
+    #[serde(default)]
+    pub app_key: String,
+    /// Optional environment variable name holding the AppKey. Resolved after
+    /// the inline `app_key` field.
+    #[serde(default)]
+    pub app_key_env: Option<String>,
+    /// DingTalk AppSecret. Strongly prefer the env var path; never commit
+    /// a real secret here.
+    #[serde(default)]
+    pub app_secret: String,
+    /// Optional environment variable name holding the AppSecret.
+    #[serde(default)]
+    pub app_secret_env: Option<String>,
+    /// DingTalk robotCode (unique identifier for the enterprise app bot).
+    #[serde(default)]
+    pub robot_code: String,
+    /// Optional environment variable name holding the robotCode.
+    #[serde(default)]
+    pub robot_code_env: Option<String>,
+    /// HTTP path that DingTalk servers POST events to. Exposed for visibility
+    /// only; the actual route is registered as `/webhook/dingtalk` and the
+    /// public callback URL is `/api/v1/gateway/dingtalk/events`.
+    #[serde(default = "default_gateway_dingtalk_webhook_path")]
+    pub webhook_path: String,
+    /// Outbound delivery mode:
+    /// - `disabled` (default): never send replies back to DingTalk.
+    /// - `session_webhook`: reply via the sessionWebhook URL supplied in the
+    ///   inbound payload (the standard app-bot flow).
+    /// - `mock`: log only, no network call.
+    #[serde(default = "default_gateway_dingtalk_outbound_mode")]
+    pub outbound_mode: String,
+    /// When `true` (the default), DingTalk log lines redact sensitive
+    /// fields (app_secret, access_token, sessionWebhook, senderStaffId,
+    /// conversationId, messageId).
+    #[serde(default = "default_true")]
+    pub redact_sensitive_logs: bool,
+}
+
+impl Default for GatewayDingtalkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_key: String::new(),
+            app_key_env: None,
+            app_secret: String::new(),
+            app_secret_env: None,
+            robot_code: String::new(),
+            robot_code_env: None,
+            webhook_path: default_gateway_dingtalk_webhook_path(),
+            outbound_mode: default_gateway_dingtalk_outbound_mode(),
+            redact_sensitive_logs: true,
+        }
+    }
+}
+
+fn default_gateway_dingtalk_webhook_path() -> String {
+    "/api/v1/gateway/dingtalk/events".into()
+}
+
+fn default_gateway_dingtalk_outbound_mode() -> String {
+    "session_webhook".into()
 }
 
 fn default_gateway_host() -> String {
@@ -1063,6 +1140,7 @@ impl Default for GatewayConfig {
             webhook_signature_strict_priority: false,
             webhook_signing_include_timestamp: false,
             webhook_signing_require_timestamp: false,
+            dingtalk: GatewayDingtalkConfig::default(),
         }
     }
 }

@@ -2,8 +2,14 @@ pub mod pairing;
 pub mod ws;
 pub mod feishu_worker;
 pub mod feishu_store;
+pub mod dingtalk_worker;
+pub mod dingtalk_store;
+
+#[cfg(test)]
+mod dingtalk_tests;
 
 use crate::gateway::feishu_store::FeishuStore;
+use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
 use home;
 
 use crate::agent::sanitize_messages_for_provider;
@@ -326,6 +332,12 @@ pub struct GatewayRuntime {
     feishu_queue_len: Arc<RwLock<usize>>,
     /// Feishu SQLite store for event/job/outbox persistence
     feishu_store: Option<Arc<FeishuStore>>,
+    /// DingTalk async job queue sender (for background worker processing)
+    dingtalk_job_sender: Arc<RwLock<Option<dingtalk_worker::DingtalkJobSender>>>,
+    /// DingTalk worker queue length tracker
+    dingtalk_queue_len: Arc<RwLock<usize>>,
+    /// DingTalk in-memory store for job tracking
+    dingtalk_store: Option<Arc<dingtalk_store::DingtalkStore>>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
@@ -447,6 +459,9 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dingtalk_job_sender: Arc::new(RwLock::new(None)),
+            dingtalk_queue_len: Arc::new(RwLock::new(0)),
+            dingtalk_store: None,
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
         }
@@ -466,6 +481,9 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dingtalk_job_sender: Arc::new(RwLock::new(None)),
+            dingtalk_queue_len: Arc::new(RwLock::new(0)),
+            dingtalk_store: None,
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
         }
@@ -483,6 +501,25 @@ impl GatewayRuntime {
     pub async fn init_feishu_worker(&self, sender: FeishuJobSender) {
         let mut lock = self.feishu_job_sender.write().await;
         *lock = Some(sender);
+    }
+
+    pub async fn init_dingtalk_worker(&mut self) {
+        let mut worker_state = dingtalk_worker::DingtalkWorkerState::new();
+        let store = Arc::new(dingtalk_store::DingtalkStore::new());
+        self.dingtalk_store = Some(store.clone());
+        let sender = worker_state.sender();
+        let receiver = worker_state.take_receiver();
+        {
+            let mut lock = self.dingtalk_job_sender.write().await;
+            *lock = Some(sender);
+        }
+        let runtime = Arc::new(self.clone());
+        tokio::spawn(dingtalk_worker::start_dingtalk_worker(
+            worker_state,
+            runtime,
+            store,
+        ));
+        println!("[gateway] dingtalk_async_worker started");
     }
     
     /// Get approximate queue length
@@ -673,6 +710,29 @@ impl GatewayRuntime {
     pub async fn is_feishu_worker_initialized(&self) -> bool {
         let sender = self.feishu_job_sender.read().await;
         sender.is_some()
+    }
+
+    // -------------------------------------------------------------------------
+    // DingTalk async worker methods
+    // -------------------------------------------------------------------------
+
+    pub async fn dingtalk_queue_len(&self) -> usize {
+        *self.dingtalk_queue_len.read().await
+    }
+
+    pub async fn try_send_dingtalk_job(&self, job: dingtalk_worker::DingtalkAsyncJob) -> Result<(), dingtalk_worker::EnqueueError> {
+        let sender = self.dingtalk_job_sender.read().await;
+        let sender = sender.as_ref().ok_or(dingtalk_worker::EnqueueError::QueueFull)?;
+        sender.send(job).await.map_err(|_| dingtalk_worker::EnqueueError::QueueFull)
+    }
+
+    pub async fn is_dingtalk_worker_initialized(&self) -> bool {
+        let sender = self.dingtalk_job_sender.read().await;
+        sender.is_some()
+    }
+
+    pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
+        self.dingtalk_store.clone()
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
@@ -2080,7 +2140,10 @@ impl GatewayRuntime {
         let runtime = self.clone();
         let _worker_handle = spawn_worker(receiver, runtime.clone(), queue_len);
         println!("[gateway] feishu_async_worker started");
-        
+
+        // Initialize DingTalk async worker
+        self.init_dingtalk_worker().await;
+
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
         crate::gateway::feishu_worker::run_retry_worker_once(&runtime).await;
@@ -4508,7 +4571,258 @@ async fn http_dingtalk_webhook(
     headers: HeaderMap,
     raw_body: String,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
-    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Dingtalk).await
+    let cfg = runtime.get_config().await;
+
+    // ==== DingTalk-specific security checks ====
+    // 1. Enabled check.
+    //
+    // Effective state = `gateway.dingtalk.enabled` (preferred new master
+    // switch) OR legacy `channels_config.dingtalk.enabled` (kept for
+    // backwards compatibility). When both are unset (the default), the
+    // route returns `channel_disabled` and no further work is done.
+    if !is_dingtalk_effectively_enabled(&cfg) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": false,
+            "processing": "skipped",
+            "reason": "channel_disabled"
+        })));
+    }
+
+    // 2. Parse JSON payload early for signature verification
+    let payload: serde_json::Value = match serde_json::from_str(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[dingtalk-webhook] rejected reason=invalid_json parse_error={}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: "invalid_json".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // 3. Signature verification (DingTalk uses HMAC-SHA256 with timestamp+app_secret)
+    let dingtalk_entry = cfg.channels_config.dingtalk.as_ref();
+    let app_secret = resolve_dingtalk_secret(&cfg, dingtalk_entry);
+    if app_secret.is_some() {
+        match verify_dingtalk_webhook_signature(&headers, &raw_body, app_secret.as_deref()) {
+            Ok(()) => {
+                println!("[dingtalk-security] signature_verified");
+            }
+            Err(reason) => {
+                println!("[dingtalk-security] rejected reason={}", reason);
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(GatewayError {
+                        message: reason,
+                    }),
+                ));
+            }
+        }
+    } else {
+        // Dev mode - no app_secret configured
+        if std::sync::atomic::AtomicU64::new(0)
+            .fetch_add(0, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {}
+        // Low-frequency dev mode warning (every 100th request)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DEV_WARNING_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = DEV_WARNING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count % 100 == 0 {
+            println!("[dingtalk-security] insecure_webhook_allowed mode=dev");
+        }
+    }
+
+    // 4. Extract key fields for filtering
+    let msg_type = payload
+        .get("msgType")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let is_text_message = msg_type.as_deref() == Some("text");
+
+    // 5. Extract sender info (DingTalk corpid/userid)
+    let sender_staff_id = payload
+        .get("senderStaffId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let sender_nick = payload
+        .get("senderNick")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let conversation_id = payload
+        .get("conversationId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let session_webhook = payload
+        .get("sessionWebhook")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let message_id = payload
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let robot_code = payload
+        .get("robotCode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Log inbound (redacted sender/cid)
+    println!(
+        "[dingtalk-webhook] received msg_type={:?} has_sender={} has_conversation={} has_webhook={} has_msgid={} text_len={}",
+        msg_type,
+        sender_staff_id.as_ref().map(|_| true).unwrap_or(false),
+        conversation_id.as_ref().map(|_| true).unwrap_or(false),
+        session_webhook.as_ref().map(|_| true).unwrap_or(false),
+        message_id.as_ref().map(|_| true).unwrap_or(false),
+        payload.get("text")
+            .and_then(|v| v.as_str())
+            .map(|t| t.len())
+            .unwrap_or(0)
+    );
+
+    // 6. Filter: only handle text messages (Phase 1)
+    if !is_text_message {
+        println!("[dingtalk-webhook] skip_unsupported_message_type msg_type={:?}", msg_type);
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "skipped",
+            "reason": "unsupported_message_type"
+        })));
+    }
+
+    // 7. Extract text content
+    let text = payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        println!("[dingtalk-webhook] skip_empty_text");
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "skipped",
+            "reason": "empty_text"
+        })));
+    }
+
+    // 8. Build InboundMessage with DingTalk-specific metadata
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(ref sid) = sender_staff_id {
+        metadata.insert("senderStaffId".to_string(), serde_json::json!(sid));
+    }
+    if let Some(ref nick) = sender_nick {
+        metadata.insert("senderNick".to_string(), serde_json::json!(nick));
+    }
+    if let Some(ref cid) = conversation_id {
+        metadata.insert("conversationId".to_string(), serde_json::json!(cid));
+    }
+    if let Some(ref webhook) = session_webhook {
+        metadata.insert("sessionWebhook".to_string(), serde_json::json!(webhook));
+    }
+    if let Some(ref mid) = message_id {
+        metadata.insert("messageId".to_string(), serde_json::json!(mid));
+    }
+    if let Some(ref rc) = robot_code {
+        metadata.insert("robotCode".to_string(), serde_json::json!(rc));
+    }
+    metadata.insert("source".to_string(), serde_json::json!("dingtalk"));
+    metadata.insert("raw_payload".to_string(), payload.clone());
+
+    let inbound = InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: sender_staff_id,
+        session_id: conversation_id,
+        text,
+        metadata,
+    };
+
+    // 9. Check if DingTalk worker is initialized
+    let is_async_available = runtime.is_dingtalk_worker_initialized().await;
+
+    if is_async_available {
+        // Queue job for background processing
+        let job = dingtalk_worker::DingtalkAsyncJob::new(inbound, payload);
+        let job_id = job.job_id.clone();
+
+        match runtime.try_send_dingtalk_job(job).await {
+            Ok(()) => {
+                let queue_len = runtime.dingtalk_queue_len().await;
+                println!(
+                    "[dingtalk-webhook] ack_queued ack_ms={} queue_len={}",
+                    0,
+                    queue_len
+                );
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "queued",
+                    "job_id": job_id
+                })));
+            }
+            Err(_) => {
+                println!("[dingtalk-worker] queue_full capacity=100");
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "accepted": false,
+                    "processing": "queue_full",
+                    "retryable": true
+                })));
+            }
+        }
+    }
+
+    // 10. Fallback: sync processing via Runtime + outbound
+    println!("[dingtalk-webhook] sync_mode reason=worker_not_initialized");
+
+    let response = match runtime.process_inbound(&inbound).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[dingtalk-webhook] runtime_failed error={}", e);
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "error": "agent_runtime_failed",
+                "message": e.to_string()
+            })));
+        }
+    };
+
+    if response.reply.trim().is_empty() {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "completed",
+            "reply": ""
+        })));
+    }
+
+    // Deliver reply via sessionWebhook
+    let result = deliver_dingtalk_reply(&cfg, &inbound, &response.reply).await;
+    match result {
+        Ok(_) => {
+            println!("[dingtalk-webhook] outbound_ok reply_len={}", response.reply.len());
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed",
+                "reply": ""
+            })))
+        }
+        Err(e) => {
+            println!("[dingtalk-webhook] outbound_failed error={}", e);
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed_with_error",
+                "reply": "",
+                "platform_error": e
+            })))
+        }
+    }
 }
 
 async fn http_channel_webhook(
@@ -5712,6 +6026,299 @@ async fn deliver_platform_reply(
             ))
         }
     }
+}
+
+/// Resolve DingTalk app_secret from channel config (extra or env var) OR
+/// the new top-level `gateway.dingtalk` config block.
+///
+/// Order (first non-empty wins):
+/// 1. Channel entry's `app_secret` field in `extra`
+/// 2. `gateway.dingtalk.app_secret` (inline)
+/// 3. `gateway.dingtalk.app_secret_env` env var
+/// 4. `OMNINOVA_DINGTALK_APP_SECRET` env var directly
+fn resolve_dingtalk_secret(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("app_secret")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.app_secret.trim().is_empty() {
+        return Some(cfg.app_secret.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.app_secret_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_APP_SECRET") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Deliver reply via DingTalk sessionWebhook (Phase 1 outbound)
+async fn deliver_dingtalk_reply(
+    config: &Config,
+    inbound: &InboundMessage,
+    reply: &str,
+) -> Result<(), String> {
+    let entry = config.channels_config.dingtalk.as_ref();
+
+    // Outbound mode priority:
+    //   1. `gateway.dingtalk.outbound_mode`  (new top-level, default `session_webhook`)
+    //   2. legacy `channels_config.dingtalk.extra["outbound_mode"]`
+    // Treat absent / empty as `"disabled"` so the legacy "did not set a mode"
+    // behavior keeps working.
+    let outbound_mode = {
+        let top = config.gateway.dingtalk.outbound_mode.trim();
+        if !top.is_empty() {
+            top.to_string()
+        } else {
+            entry
+                .and_then(|e| e.extra.get("outbound_mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("disabled")
+                .to_string()
+        }
+    };
+
+    if outbound_mode == "disabled" {
+        println!("[dingtalk-webhook] outbound_skip reason=disabled");
+        return Ok(());
+    }
+
+    if outbound_mode == "mock" {
+        println!("[dingtalk-webhook] outbound_selected sender=mock");
+        return Ok(());
+    }
+
+    // real mode: use sessionWebhook
+    let session_webhook = inbound
+        .metadata
+        .get("sessionWebhook")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing_session_webhook".to_string())?;
+
+    let app_key = resolve_dingtalk_app_key(config, entry)
+        .ok_or_else(|| "missing_app_key".to_string())?;
+    let app_secret = resolve_dingtalk_secret(config, entry)
+        .ok_or_else(|| "missing_app_secret".to_string())?;
+
+    let token = dingtalk_worker::fetch_dingtalk_access_token(&app_key, &app_secret)
+        .await
+        .map_err(|e| format!("token_fetch_error: {}", e))?;
+
+    let conversation_id = inbound
+        .session_id
+        .clone()
+        .or_else(|| {
+            inbound
+                .metadata
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .ok_or_else(|| "missing_conversation_id".to_string())?;
+
+    let sender_staff_id = inbound
+        .metadata
+        .get("senderStaffId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    dingtalk_worker::send_dingtalk_text_message(
+        &token,
+        session_webhook,
+        &conversation_id,
+        sender_staff_id.as_deref(),
+        reply,
+    )
+    .await
+}
+
+/// Resolve DingTalk app_key from channel config (extra) OR the top-level
+/// `gateway.dingtalk` config. Order: channel extra, gateway.dingtalk.app_key,
+/// gateway.dingtalk.app_key_env, `OMNINOVA_DINGTALK_APP_KEY` env var.
+fn resolve_dingtalk_app_key(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("app_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.app_key.trim().is_empty() {
+        return Some(cfg.app_key.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.app_key_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_APP_KEY") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Resolve DingTalk robot_code with the same precedence as app_key.
+fn resolve_dingtalk_robot_code(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("robot_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.robot_code.trim().is_empty() {
+        return Some(cfg.robot_code.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.robot_code_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_ROBOT_CODE") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Returns true if the top-level `gateway.dingtalk` block is enabled.
+/// Per-channel `channels_config.dingtalk.enabled` continues to be honored
+/// by `is_channel_enabled`; this helper is for master-switch checks.
+fn is_dingtalk_gateway_enabled(config: &Config) -> bool {
+    config.gateway.dingtalk.enabled
+}
+
+/// Effective DingTalk enablement: top-level master switch OR legacy
+/// channel entry. Either being on is sufficient to accept inbound
+/// webhooks; the per-channel flag exists for backwards compatibility with
+/// existing config.toml files that only set `channels.dingtalk.enabled`.
+/// Both default to disabled, so a Config with neither set yields false.
+fn is_dingtalk_effectively_enabled(config: &Config) -> bool {
+    if is_dingtalk_gateway_enabled(config) {
+        return true;
+    }
+    if is_channel_enabled(config, &ChannelKind::Dingtalk) {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Worker-callable resolvers (used by `dingtalk_worker` at runtime, not only in tests)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn resolve_dingtalk_secret_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_secret(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_app_key_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_app_key(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_robot_code_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_robot_code(config, entry)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only re-exports (used by `dingtalk_worker` wrappers in unit tests)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_secret_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_secret(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_app_key_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_app_key(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_robot_code_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_robot_code(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn is_dingtalk_effectively_enabled_for_test(config: &Config) -> bool {
+    is_dingtalk_effectively_enabled(config)
 }
 
 fn signed_webhook_payload(
