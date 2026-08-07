@@ -18,6 +18,10 @@ interface ChannelConfigFormProps {
   onCopyWebhookUrl?: (url: string) => void;
   selectedChannelId?: string;
   onSelectedChannelChange?: (channelId: string) => void;
+  /** Runtime truth returned by gateway_status; independent from the editor selection. */
+  enabledChannelIds?: string[];
+  /** Shared Gateway Public Base URL used by status, callbacks, and health checks. */
+  publicBaseUrl?: string;
 }
 
 /** Get card callback path for feishu channel (used when channel is feishu) */
@@ -71,6 +75,8 @@ export function ChannelConfigForm({
   onCopyWebhookUrl,
   selectedChannelId,
   onSelectedChannelChange,
+  enabledChannelIds,
+  publicBaseUrl,
 }: ChannelConfigFormProps) {
   const [uncontrolledSelectedId, setUncontrolledSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
   const selectedId = selectedChannelId ?? uncontrolledSelectedId;
@@ -154,7 +160,6 @@ export function ChannelConfigForm({
             || field.key === "security_mode"
             || field.key === "verification_token"
             || field.key === "encrypt_key"
-            || field.key === "public_webhook_base_url"
           : base.has(field.key)
       );
     }
@@ -182,15 +187,22 @@ export function ChannelConfigForm({
     onChange({ ...value, [id]: cleanedEntry });
   };
 
-  const enabledList = CHANNEL_PRESETS.filter(
-    (preset) => getEntry(preset.id).enabled
+  const displayedEnabledChannelIds = enabledChannelIds
+    ?? CHANNEL_PRESETS.filter((preset) => getEntry(preset.id).enabled).map(
+      (preset) => preset.id
+    );
+  const enabledList = CHANNEL_PRESETS.filter((preset) =>
+    displayedEnabledChannelIds.includes(preset.id)
   ).map((preset) => preset.name);
 
   const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
   const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
     ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
     : "";
-  const webhookBaseUrl = publicWebhookBaseUrl || gatewayUrl?.trim() || "";
+  const webhookBaseUrl = normalizePublicWebhookBaseUrl(publicBaseUrl ?? "")
+    || publicWebhookBaseUrl
+    || gatewayUrl?.trim()
+    || "";
   const fullWebhookUrl = webhookBaseUrl
     ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
     : "";

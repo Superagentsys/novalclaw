@@ -4,7 +4,7 @@ mod desktop_capture;
 
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
-    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, ModelProviderConfig,
+    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
     ProviderConfig, RobotConfig,
 };
 use omninova_core::gateway::{
@@ -777,9 +777,10 @@ async fn open_workspace_dir(
 
 #[tauri::command]
 async fn save_setup_config(
-    config: SetupAppConfig,
+    mut config: SetupAppConfig,
     validate_all_channels: Option<bool>,
     active_channel_id: Option<String>,
+    changed_channel_ids: Option<Vec<String>>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<SaveSetupResult, String> {
     let state_ref = state.inner().clone();
@@ -798,6 +799,11 @@ async fn save_setup_config(
     } else {
         ChannelValidationScope::Current(active_channel_id.as_deref().unwrap_or("feishu"))
     };
+    if let (Some(channels), Some(changed_channel_ids)) =
+        (config.channels.as_mut(), changed_channel_ids.as_deref())
+    {
+        retain_changed_setup_channels(channels, changed_channel_ids);
+    }
     let mut next = setup_config_to_core(current, config, validation_scope)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
     let workspace_changed = current_workspace_dir != next.workspace_dir;
@@ -1527,6 +1533,7 @@ async fn test_gateway_health(
 
 #[tauri::command]
 async fn test_gateway_public_health(
+    base_url: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayPublicHealthStatus, String> {
     let state_ref = state.inner().clone();
@@ -1535,12 +1542,29 @@ async fn test_gateway_public_health(
         let app_state = state_ref.lock().await;
         (app_state.runtime.clone(), app_state.gateway_task.is_some())
     };
-    let config = runtime.get_config().await;
+    let mut config = runtime.get_config().await;
+    let requested_base_url = match base_url {
+        Some(value) => match normalize_public_webhook_base_url(&value) {
+            Some(value) => {
+                // This is an ephemeral probe target from the current UI draft.
+                // It must not persist or be overridden by a stale named-tunnel
+                // field while the request is in flight.
+                config.gateway_public.mode = GatewayPublicMode::ExternalPublicUrl;
+                config.gateway_public.public_webhook_base_url = Some(value.clone());
+                Some(value)
+            }
+            None => {
+                let result = GatewayPublicHealthStatus::not_configured();
+                let mut app_state = state_ref.lock().await;
+                app_state.last_public_health = Some(result.clone());
+                return Ok(result);
+            }
+        },
+        None => omninova_core::gateway::resolve_public_webhook_base_url(&config),
+    };
     let mut result = if running {
         check_gateway_public_health(&config).await
-    } else if let Some(base_url) =
-        omninova_core::gateway::resolve_public_webhook_base_url(&config)
-    {
+    } else if let Some(base_url) = requested_base_url {
         GatewayPublicHealthStatus {
             configured: true,
             ok: false,
@@ -1563,8 +1587,7 @@ async fn test_gateway_public_health(
     // Keep the configured base in the cached snapshot so stale results are
     // discarded automatically after the user changes Public Base URL.
     if result.base_url.is_none() {
-        result.base_url =
-            omninova_core::gateway::resolve_public_webhook_base_url(&config);
+        result.base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
     }
     let mut app_state = state_ref.lock().await;
     app_state.last_public_health = Some(result.clone());
@@ -1779,6 +1802,9 @@ async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
         let task = app_state.gateway_task.take();
         app_state.last_gateway_error = None;
         app_state.last_gateway_error_code = None;
+        // A successful public probe is no longer authoritative after the
+        // local origin stops. Clear it so restart cannot resurrect stale OK.
+        app_state.last_public_health = None;
         task
     };
     if let Some(task) = task {
@@ -2458,6 +2484,26 @@ fn merge_channel_entry(
     }
 }
 
+/// Keep only channels the current editor explicitly changed. Missing entries
+/// are merged from the persisted config by `channels_to_core`, preventing a
+/// stale/default selected channel from disabling another active integration.
+fn retain_changed_setup_channels(channels: &mut SetupChannelsConfig, changed: &[String]) {
+    let has = |channel_id: &str| changed.iter().any(|item| item == channel_id);
+    if !has("telegram") { channels.telegram = None; }
+    if !has("discord") { channels.discord = None; }
+    if !has("slack") { channels.slack = None; }
+    if !has("whatsapp") { channels.whatsapp = None; }
+    if !has("wechat") { channels.wechat = None; }
+    if !has("feishu") { channels.feishu = None; }
+    if !has("lark") { channels.lark = None; }
+    if !has("dingtalk") { channels.dingtalk = None; }
+    if !has("matrix") { channels.matrix = None; }
+    if !has("email") { channels.email = None; }
+    if !has("msteams") { channels.msteams = None; }
+    if !has("irc") { channels.irc = None; }
+    if !has("webhook") { channels.webhook = None; }
+}
+
 /// Validate that enabled Feishu/Lark channels have required extra fields
 fn validate_feishu_like_channels(channels: &SetupChannelsConfig) -> Result<(), String> {
     // Check Feishu
@@ -3019,6 +3065,57 @@ mod webview_startup_tests {
 mod channel_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn setup_save_retains_only_explicitly_changed_channel_entries() {
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        assert!(setup.feishu.is_none());
+        assert!(setup.dingtalk.is_some());
+    }
+
+    #[test]
+    fn setup_save_does_not_disable_unchanged_enabled_channels() {
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        assert!(merged.feishu.as_ref().is_some_and(|entry| entry.enabled));
+        assert!(merged.dingtalk.as_ref().is_some_and(|entry| entry.enabled));
+    }
 
     #[test]
     fn setup_migrates_legacy_public_webhook_url_to_gateway_public() {
