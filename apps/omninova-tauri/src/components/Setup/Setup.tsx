@@ -4,6 +4,8 @@ import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type Config,
+  type DingtalkDiagnostics,
+  type DingtalkPublicRouteProbe,
   type GatewayPublicMode,
   type GatewayStatus,
 } from "../../types/config";
@@ -87,7 +89,10 @@ function normalizePublicBaseUrl(value: string | null | undefined): string | null
   if (!trimmed) {
     return null;
   }
-  const normalized = trimmed.replace(/\/webhook\/feishu(?:\/card)?$/i, "");
+  const normalized = trimmed
+    .replace(/\/api\/v1\/gateway\/dingtalk\/events$/i, "")
+    .replace(/\/webhook\/dingtalk$/i, "")
+    .replace(/\/webhook\/feishu(?:\/card)?$/i, "");
   const base = normalized.replace(/\/+$/, "");
   if (/^https?:\/\//i.test(base)) {
     try {
@@ -360,6 +365,12 @@ export function Setup({
   );
   const [publicHealthStatusCode, setPublicHealthStatusCode] = useState<number | null>(null);
   const [publicHealthLoading, setPublicHealthLoading] = useState(false);
+  const [dingtalkDiagnostics, setDingtalkDiagnostics] =
+    useState<DingtalkDiagnostics | null>(null);
+  const [dingtalkDiagnosticsLoading, setDingtalkDiagnosticsLoading] = useState(false);
+  const [dingtalkRouteProbe, setDingtalkRouteProbe] =
+    useState<DingtalkPublicRouteProbe | null>(null);
+  const [dingtalkRouteLoading, setDingtalkRouteLoading] = useState(false);
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
@@ -505,6 +516,12 @@ export function Setup({
     return status;
   }, [syncHealthFromGatewayStatus]);
 
+  const refreshDingtalkDiagnostics = useCallback(async () => {
+    const diagnostics = await invokeTauri<DingtalkDiagnostics>("dingtalk_diagnostics");
+    setDingtalkDiagnostics(diagnostics);
+    return diagnostics;
+  }, []);
+
   const refreshCliInstall = useCallback(async () => {
     try {
       const s = await invokeTauri<CliInstallStatus>("cli_install_status");
@@ -543,6 +560,15 @@ export function Setup({
       window.clearInterval(interval);
     };
   }, [activeTab, refreshGatewayStatus]);
+
+  useEffect(() => {
+    if (activeTab !== "channels" || activeChannelId !== "dingtalk") {
+      return;
+    }
+    void refreshDingtalkDiagnostics().catch(() => {
+      // Explicit button actions surface Tauri/browser errors to the user.
+    });
+  }, [activeTab, activeChannelId, refreshDingtalkDiagnostics]);
 
   const loadSetupState = async () => {
     setBusyAction("load");
@@ -874,6 +900,63 @@ export function Setup({
     }
   };
 
+  const handleRunDingtalkDiagnostics = async () => {
+    setDingtalkDiagnosticsLoading(true);
+    try {
+      await refreshGatewayStatus();
+      const diagnostics = await refreshDingtalkDiagnostics();
+      setActionMessage(
+        diagnostics.next_steps.length === 0
+          ? "钉钉本地诊断通过，建议继续测试公网路由。"
+          : `钉钉诊断完成：发现 ${diagnostics.next_steps.length} 项待处理。`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setActionMessage(`钉钉诊断失败：${message}`);
+    } finally {
+      setDingtalkDiagnosticsLoading(false);
+    }
+  };
+
+  const handleTestDingtalkPublicRoute = async () => {
+    const baseUrl = resolveDraftPublicBase(config.gateway_public)
+      ?? normalizePublicBaseUrl(gatewayStatus.public_webhook_base_url);
+    if (!baseUrl) {
+      const result: DingtalkPublicRouteProbe = {
+        configured: false,
+        reachable: false,
+        status_code: null,
+        result_kind: "not_configured",
+        message: "Public Base URL 未配置。",
+      };
+      setDingtalkRouteProbe(result);
+      setActionMessage(result.message);
+      return;
+    }
+
+    setDingtalkRouteLoading(true);
+    try {
+      const result = await invokeTauri<DingtalkPublicRouteProbe>(
+        "test_dingtalk_public_route",
+        { baseUrl }
+      );
+      setDingtalkRouteProbe(result);
+      setActionMessage(result.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDingtalkRouteProbe({
+        configured: true,
+        reachable: false,
+        status_code: null,
+        result_kind: "network_error",
+        message,
+      });
+      setActionMessage(`钉钉公网路由检测失败：${message}`);
+    } finally {
+      setDingtalkRouteLoading(false);
+    }
+  };
+
   const copyGatewayUrl = (url: string | null | undefined, label: string) => {
     if (!url) {
       setActionMessage(`${label}尚未生成。`);
@@ -920,6 +1003,10 @@ export function Setup({
     : normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url)
       ?? normalizePublicBaseUrl(gatewayStatus.public_webhook_base_url);
   const callbackBase = draftPublicBase;
+  const rawPublicBaseInput = config.gateway_public?.public_webhook_base_url?.trim() ?? "";
+  const publicBaseContainsDingtalkPath =
+    /\/api\/v1\/gateway\/dingtalk\/events\/?(?:[?#].*)?$/i.test(rawPublicBaseInput)
+    || /\/webhook\/dingtalk\/?(?:[?#].*)?$/i.test(rawPublicBaseInput);
   const namedTunnelNameConfigured =
     Boolean(config.gateway_public?.named_tunnel_name?.trim());
   const namedTunnelConfigComplete =
@@ -927,6 +1014,9 @@ export function Setup({
   const runtimeWebhookUrl = callbackBase ? `${callbackBase}/webhook/feishu` : null;
   const runtimeCardCallbackUrl = callbackBase
     ? `${callbackBase}/webhook/feishu/card`
+    : null;
+  const runtimeDingtalkCallbackUrl = callbackBase
+    ? `${callbackBase}/api/v1/gateway/dingtalk/events`
     : null;
   const lastStartedLabel = gatewayStatus.last_started_at
     ? new Date(gatewayStatus.last_started_at * 1000).toLocaleString()
@@ -1353,6 +1443,11 @@ export function Setup({
                       ? "由 Named Tunnel Hostname 自动生成并保存。"
                       : "只填写域名 Base；保存时会自动移除 webhook 路径后缀。"}
                   </small>
+                  {publicBaseContainsDingtalkPath ? (
+                    <small className="gateway-public-error">
+                      请只填写公网根地址；保存时会移除钉钉回调路径。
+                    </small>
+                  ) : null}
                 </label>
                 {config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
                   <>
@@ -1597,6 +1692,118 @@ export function Setup({
                 void navigator.clipboard.writeText(url);
               }}
             />
+            {activeChannelId === "dingtalk" ? (
+              <section className="setup-section gateway-runtime-panel">
+                <div className="section-heading gateway-runtime-heading">
+                  <div>
+                    <h2>钉钉诊断</h2>
+                    <div className="section-subtitle">
+                      只读检查本地配置、Gateway、worker 与公网路由，不调用钉钉平台 API。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleRunDingtalkDiagnostics()}
+                    disabled={dingtalkDiagnosticsLoading}
+                  >
+                    {dingtalkDiagnosticsLoading ? "诊断中…" : "刷新钉钉诊断"}
+                  </button>
+                </div>
+
+                <div className="gateway-runtime-url-list">
+                  <div>
+                    <span>钉钉消息接收地址</span>
+                    <code>{runtimeDingtalkCallbackUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(
+                        runtimeDingtalkCallbackUrl,
+                        "钉钉消息接收地址"
+                      )}
+                      disabled={!runtimeDingtalkCallbackUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                </div>
+
+                {dingtalkDiagnostics ? (
+                  <div className="gateway-runtime-grid">
+                    <div>
+                      <span>DingTalk</span>
+                      <strong>{dingtalkDiagnostics.dingtalk_enabled ? "enabled" : "disabled"}</strong>
+                    </div>
+                    <div><span>App Key</span><strong>{dingtalkDiagnostics.app_key_present ? "present" : "missing"}</strong></div>
+                    <div><span>App Secret</span><strong>{dingtalkDiagnostics.app_secret_present ? "present" : "missing"}</strong></div>
+                    <div><span>RobotCode</span><strong>{dingtalkDiagnostics.robot_code_present ? "present" : "missing"}</strong></div>
+                    <div><span>Gateway</span><strong>{dingtalkDiagnostics.local_gateway_running ? "running" : "stopped"}</strong></div>
+                    <div><span>Local Health</span><strong>{dingtalkDiagnostics.local_health}</strong></div>
+                    <div><span>Public Base URL</span><strong>{dingtalkDiagnostics.public_base_url_present ? "present" : "missing"}</strong></div>
+                    <div>
+                      <span>Public Health</span>
+                      <strong>
+                        {dingtalkDiagnostics.public_health}
+                        {dingtalkDiagnostics.public_health_status_code
+                          ? ` · HTTP ${dingtalkDiagnostics.public_health_status_code}`
+                          : ""}
+                      </strong>
+                    </div>
+                    <div><span>Worker</span><strong>{dingtalkDiagnostics.worker_started ? "started" : "not_started"}</strong></div>
+                    <div><span>Outbound</span><strong>{dingtalkDiagnostics.outbound_mode || "missing"}</strong></div>
+                    <div><span>Webhook Path</span><code>{dingtalkDiagnostics.webhook_path}</code></div>
+                  </div>
+                ) : (
+                  <p className="setup-action-hint">正在读取钉钉诊断状态…</p>
+                )}
+
+                <div className="gateway-runtime-health-actions">
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleTestDingtalkPublicRoute()}
+                    disabled={dingtalkRouteLoading}
+                  >
+                    {dingtalkRouteLoading ? "检测中…" : "测试公网路由"}
+                  </button>
+                  {dingtalkRouteProbe ? (
+                    <span className={
+                      dingtalkRouteProbe.reachable
+                        ? "gateway-runtime-info"
+                        : "gateway-public-error"
+                    }>
+                      {dingtalkRouteProbe.message}
+                      {dingtalkRouteProbe.status_code
+                        ? `（HTTP ${dingtalkRouteProbe.status_code}）`
+                        : ""}
+                    </span>
+                  ) : null}
+                </div>
+
+                {(config.gateway_public?.mode === "quick_tunnel"
+                  || dingtalkDiagnostics?.quick_tunnel) ? (
+                  <div className="gateway-runtime-warning">
+                    Quick Tunnel 地址可能变化；重启 cloudflared 后，需要更新钉钉后台回调地址并重新发布应用。
+                  </div>
+                ) : null}
+                {dingtalkDiagnostics?.public_health === "failed" ? (
+                  <div className="gateway-runtime-warning">
+                    本地 Gateway 正常但公网检测失败时，请优先检查 cloudflared 是否运行以及公网地址是否过期。
+                  </div>
+                ) : null}
+                {dingtalkDiagnostics?.next_steps.length ? (
+                  <div className="gateway-runtime-warning">
+                    <strong>建议下一步</strong>
+                    <ul>
+                      {dingtalkDiagnostics.next_steps.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
           </>
         );
       case "skills":

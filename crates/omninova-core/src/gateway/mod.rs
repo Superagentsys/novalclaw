@@ -536,6 +536,16 @@ impl GatewayRuntime {
         let runtime = Arc::new(self.clone());
         dingtalk_worker::start_dingtalk_worker(worker_state, runtime, store).await;
     }
+
+    /// Read-only diagnostic state. This does not start, stop, or replace the
+    /// worker channel and never exposes queued payloads or platform IDs.
+    pub async fn dingtalk_worker_started(&self) -> bool {
+        self.dingtalk_job_sender
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
     
     /// Get approximate queue length
     pub async fn feishu_queue_len(&self) -> usize {
@@ -2581,10 +2591,17 @@ pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
         return None;
     }
 
-    let without_endpoint = trimmed
-        .strip_suffix("/webhook/feishu/card")
-        .or_else(|| trimmed.strip_suffix("/webhook/feishu"))
-        .unwrap_or(trimmed)
+    let lower = trimmed.to_ascii_lowercase();
+    let endpoint_len = [
+        "/api/v1/gateway/dingtalk/events",
+        "/webhook/feishu/card",
+        "/webhook/feishu",
+        "/webhook/dingtalk",
+    ]
+    .iter()
+    .find_map(|suffix| lower.ends_with(suffix).then_some(suffix.len()))
+    .unwrap_or(0);
+    let without_endpoint = trimmed[..trimmed.len().saturating_sub(endpoint_len)]
         .trim_end_matches('/');
 
     if without_endpoint.is_empty()
@@ -2856,6 +2873,112 @@ pub async fn check_gateway_public_health(config: &Config) -> GatewayPublicHealth
         status_code: last_status,
         error_kind: Some("health_endpoint_not_found".to_string()),
         error: Some("公网入口可达，但未找到 Health 接口。".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DingtalkPublicRouteProbe {
+    pub configured: bool,
+    pub reachable: bool,
+    pub status_code: Option<u16>,
+    pub result_kind: String,
+    pub message: String,
+}
+
+fn classify_dingtalk_route_response(status_code: u16, body: &str) -> DingtalkPublicRouteProbe {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("1033") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: false,
+            status_code: Some(status_code),
+            result_kind: "tunnel_unreachable".to_string(),
+            message: "公网隧道不可达或地址已过期。".to_string(),
+        };
+    }
+    if lower.contains("missing_timestamp") || lower.contains("missing_sign") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "missing_timestamp".to_string(),
+            message: "路由可达，缺少签名头；这是手动空请求的预期结果。".to_string(),
+        };
+    }
+    if lower.contains("signature_mismatch") || lower.contains("invalid_sign") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "signature_mismatch".to_string(),
+            message: "路由可达，签名未通过；这是无有效签名手动请求的预期结果。".to_string(),
+        };
+    }
+    if (200..300).contains(&status_code) {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "ok".to_string(),
+            message: "钉钉公网回调路由可达。".to_string(),
+        };
+    }
+    DingtalkPublicRouteProbe {
+        configured: true,
+        reachable: false,
+        status_code: Some(status_code),
+        result_kind: "http_error".to_string(),
+        message: format!("钉钉公网回调路由返回 HTTP {status_code}。"),
+    }
+}
+
+/// Probe only route reachability with an empty JSON body. No platform secret,
+/// signature, user message, or identifier is sent or retained.
+pub async fn check_dingtalk_public_route(base_url: &str) -> DingtalkPublicRouteProbe {
+    let Some(base_url) = normalize_public_webhook_base_url(base_url) else {
+        return DingtalkPublicRouteProbe {
+            configured: false,
+            reachable: false,
+            status_code: None,
+            result_kind: "not_configured".to_string(),
+            message: "Public Base URL 未配置。".to_string(),
+        };
+    };
+    let callback_url = format!("{base_url}/api/v1/gateway/dingtalk/events");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return DingtalkPublicRouteProbe {
+                configured: true,
+                reachable: false,
+                status_code: None,
+                result_kind: "client_error".to_string(),
+                message: "无法创建公网路由检测客户端。".to_string(),
+            };
+        }
+    };
+
+    match client.post(callback_url).json(&serde_json::json!({})).send().await {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            classify_dingtalk_route_response(status_code, &body)
+        }
+        Err(error) => DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: false,
+            status_code: None,
+            result_kind: if error.is_timeout() {
+                "timeout"
+            } else {
+                "network_error"
+            }
+            .to_string(),
+            message: "公网隧道不可达或地址已过期，请检查 cloudflared。".to_string(),
+        },
     }
 }
 
@@ -6389,6 +6512,42 @@ fn is_dingtalk_effectively_enabled(config: &Config) -> bool {
     false
 }
 
+/// Sanitized DingTalk configuration snapshot used by desktop diagnostics.
+/// It deliberately exposes only presence booleans and non-secret mode/path
+/// labels while reusing the same resolvers as the live outbound path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DingtalkDiagnosticConfigState {
+    pub enabled: bool,
+    pub app_key_present: bool,
+    pub app_secret_present: bool,
+    pub robot_code_present: bool,
+    pub webhook_path: String,
+    pub outbound_mode: String,
+}
+
+pub fn dingtalk_diagnostic_config_state(config: &Config) -> DingtalkDiagnosticConfigState {
+    let entry = config.channels_config.dingtalk.as_ref();
+    let top_level_mode = config.gateway.dingtalk.outbound_mode.trim();
+    let outbound_mode = if top_level_mode.is_empty() {
+        entry
+            .and_then(|entry| entry.extra.get("outbound_mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("disabled")
+            .to_string()
+    } else {
+        top_level_mode.to_string()
+    };
+
+    DingtalkDiagnosticConfigState {
+        enabled: is_dingtalk_effectively_enabled(config),
+        app_key_present: resolve_dingtalk_app_key(config, entry).is_some(),
+        app_secret_present: resolve_dingtalk_secret(config, entry).is_some(),
+        robot_code_present: resolve_dingtalk_robot_code(config, entry).is_some(),
+        webhook_path: "/api/v1/gateway/dingtalk/events".to_string(),
+        outbound_mode,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DingTalk payload parsing helpers (Phase 3 — real-platform compatibility)
 // ---------------------------------------------------------------------------
@@ -7911,7 +8070,10 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 mod tests {
     use super::{
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        check_gateway_public_health, feishu_public_callback_urls,
+        check_dingtalk_public_route, check_gateway_public_health,
+        classify_dingtalk_route_response,
+        dingtalk_diagnostic_config_state,
+        feishu_public_callback_urls,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
         normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
         resolve_public_webhook_base_url, split_session_key, DedupCache, GatewayRuntime,
@@ -10999,7 +11161,62 @@ mod tests {
             normalize_public_webhook_base_url("https://example.test/webhook/feishu"),
             Some("https://example.test".to_string())
         );
+        assert_eq!(
+            normalize_public_webhook_base_url(
+                "https://example.test/api/v1/gateway/dingtalk/events/"
+            ),
+            Some("https://example.test".to_string())
+        );
+        assert_eq!(
+            normalize_public_webhook_base_url("https://example.test/webhook/dingtalk"),
+            Some("https://example.test".to_string())
+        );
         assert_eq!(normalize_public_webhook_base_url("   "), None);
+    }
+
+    #[test]
+    fn dingtalk_diagnostic_config_state_contains_presence_only() {
+        let mut config = Config::default();
+        config.gateway.dingtalk.enabled = true;
+        config.gateway.dingtalk.app_key = "diagnostic-app-key".to_string();
+        config.gateway.dingtalk.app_secret = "diagnostic-app-secret".to_string();
+        config.gateway.dingtalk.robot_code = "diagnostic-robot-code".to_string();
+
+        let state = dingtalk_diagnostic_config_state(&config);
+        assert!(state.enabled);
+        assert!(state.app_key_present);
+        assert!(state.app_secret_present);
+        assert!(state.robot_code_present);
+        assert_eq!(state.webhook_path, "/api/v1/gateway/dingtalk/events");
+
+        let rendered = serde_json::to_string(&state).expect("serialize diagnostics");
+        assert!(!rendered.contains("diagnostic-app-key"));
+        assert!(!rendered.contains("diagnostic-app-secret"));
+        assert!(!rendered.contains("diagnostic-robot-code"));
+    }
+
+    #[test]
+    fn dingtalk_route_probe_classifies_expected_unsigned_responses() {
+        let missing = classify_dingtalk_route_response(401, r#"{"message":"missing_timestamp"}"#);
+        assert!(missing.reachable);
+        assert_eq!(missing.result_kind, "missing_timestamp");
+
+        let mismatch = classify_dingtalk_route_response(403, r#"{"message":"signature_mismatch"}"#);
+        assert!(mismatch.reachable);
+        assert_eq!(mismatch.result_kind, "signature_mismatch");
+
+        let tunnel = classify_dingtalk_route_response(530, "Cloudflare error 1033");
+        assert!(!tunnel.reachable);
+        assert_eq!(tunnel.result_kind, "tunnel_unreachable");
+    }
+
+    #[tokio::test]
+    async fn dingtalk_route_probe_reports_unconfigured_without_network_access() {
+        let result = check_dingtalk_public_route("   ").await;
+        assert!(!result.configured);
+        assert!(!result.reachable);
+        assert_eq!(result.status_code, None);
+        assert_eq!(result.result_kind, "not_configured");
     }
 
     #[test]

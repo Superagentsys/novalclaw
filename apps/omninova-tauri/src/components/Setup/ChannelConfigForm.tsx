@@ -35,7 +35,7 @@ function getWebhookPath(channelId: string): string {
     case "feishu": return "/webhook/feishu";
     case "lark": return "/webhook/lark";
     case "wechat": return "/webhook/wechat";
-    case "dingtalk": return "/webhook/dingtalk";
+    case "dingtalk": return "/api/v1/gateway/dingtalk/events";
     case "webhook": return "/webhook";
     default: return "/webhook";
   }
@@ -50,6 +50,8 @@ function isLocalhost(url: string): boolean {
 function normalizePublicWebhookBaseUrl(value: string): string {
   return value
     .trim()
+    .replace(/\/api\/v1\/gateway\/dingtalk\/events\/?$/i, "")
+    .replace(/\/webhook\/dingtalk\/?$/i, "")
     .replace(/\/webhook\/feishu\/card\/?$/i, "")
     .replace(/\/webhook\/feishu\/?$/i, "")
     .replace(/\/$/, "");
@@ -606,7 +608,11 @@ export function ChannelConfigForm({
                 </li>
                 <li>获取 App Key 和 App Secret</li>
                 <li>
-                  配置消息接收地址为 <code>/webhook/dingtalk</code>
+                  如需 sendFromApp fallback，请在本地配置中设置
+                  <code>gateway.dingtalk.robot_code</code>；诊断区只显示 present / missing。
+                </li>
+                <li>
+                  配置消息接收地址为 <code>/api/v1/gateway/dingtalk/events</code>
                 </li>
               </ol>
             </div>

@@ -354,6 +354,44 @@ export interface GatewayStatus {
   error_code?: string | null;
 }
 
+export interface DingtalkDiagnostics {
+  dingtalk_enabled: boolean;
+  app_key_present: boolean;
+  app_secret_present: boolean;
+  robot_code_present: boolean;
+  webhook_path: string;
+  local_gateway_running: boolean;
+  local_health: "ok" | "failed" | "not_ready";
+  public_base_url_present: boolean;
+  public_base_url?: string | null;
+  public_health: "ok" | "failed" | "not_checked" | "not_configured";
+  public_health_status_code?: number | null;
+  public_health_error?: string | null;
+  final_dingtalk_callback_url?: string | null;
+  worker_started: boolean;
+  outbound_mode: string;
+  public_mode: GatewayPublicMode | string;
+  quick_tunnel: boolean;
+  next_steps: string[];
+}
+
+export interface DingtalkPublicRouteProbe {
+  configured: boolean;
+  reachable: boolean;
+  status_code?: number | null;
+  result_kind:
+    | "ok"
+    | "missing_timestamp"
+    | "signature_mismatch"
+    | "tunnel_unreachable"
+    | "not_configured"
+    | "timeout"
+    | "network_error"
+    | "client_error"
+    | "http_error";
+  message: string;
+}
+
 export type ChannelKindValue =
   | "cli"
   | "web"

@@ -8,9 +8,10 @@ use omninova_core::config::{
     ProviderConfig, RobotConfig,
 };
 use omninova_core::gateway::{
-    check_gateway_public_health, normalize_gateway_public_config,
+    check_dingtalk_public_route, check_gateway_public_health,
+    dingtalk_diagnostic_config_state, normalize_gateway_public_config,
     normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse,
-    GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
+    DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
@@ -1595,6 +1596,113 @@ async fn test_gateway_public_health(
 }
 
 #[tauri::command]
+async fn dingtalk_diagnostics(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DingtalkDiagnosticsPayload, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let status = gateway_status_from_state(&state_ref).await;
+    let runtime = {
+        let app_state = state_ref.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let config_status = dingtalk_diagnostic_config_state(&config);
+    let worker_started = status.running && runtime.dingtalk_worker_started().await;
+    let public_base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
+    let final_dingtalk_callback_url = dingtalk_callback_url(public_base_url.as_deref());
+    let public_health = if !status.public_health.configured {
+        "not_configured"
+    } else if status.public_health.ok {
+        "ok"
+    } else if status.public_health.error_kind.as_deref() == Some("not_checked") {
+        "not_checked"
+    } else {
+        "failed"
+    }
+    .to_string();
+    let local_health = if !status.running {
+        "not_ready"
+    } else if status.health_ok {
+        "ok"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    let mut next_steps = Vec::new();
+    if !config_status.enabled {
+        next_steps.push("启用 DingTalk 频道后重新启动 Gateway。".to_string());
+    }
+    if !config_status.app_key_present {
+        next_steps.push("配置 DingTalk App Key。".to_string());
+    }
+    if !config_status.app_secret_present {
+        next_steps.push("配置 DingTalk App Secret。".to_string());
+    }
+    if !config_status.robot_code_present {
+        next_steps.push("配置 DingTalk RobotCode。".to_string());
+    }
+    if config_status.outbound_mode.trim().is_empty()
+        || config_status.outbound_mode == "disabled"
+    {
+        next_steps.push("配置 DingTalk outbound mode。".to_string());
+    }
+    if !status.running {
+        next_steps.push("启动 Gateway。".to_string());
+    }
+    if public_base_url.is_none() {
+        next_steps.push("填写 Public Base URL 公网根地址。".to_string());
+    } else if public_health == "failed" {
+        next_steps.push("检查 cloudflared 是否运行，公网地址是否已过期。".to_string());
+    }
+    if status.running && !worker_started {
+        next_steps.push("DingTalk worker 未启动，请重启 Gateway 并检查启动日志。".to_string());
+    }
+
+    Ok(DingtalkDiagnosticsPayload {
+        dingtalk_enabled: config_status.enabled,
+        app_key_present: config_status.app_key_present,
+        app_secret_present: config_status.app_secret_present,
+        robot_code_present: config_status.robot_code_present,
+        webhook_path: config_status.webhook_path,
+        local_gateway_running: status.running,
+        local_health,
+        public_base_url_present: public_base_url.is_some(),
+        public_base_url,
+        public_health,
+        public_health_status_code: status.public_health.status_code,
+        public_health_error: status.public_health.error,
+        final_dingtalk_callback_url,
+        worker_started,
+        outbound_mode: config_status.outbound_mode,
+        public_mode: status.gateway_public_mode,
+        quick_tunnel: status.quick_tunnel_non_production,
+        next_steps,
+    })
+}
+
+#[tauri::command]
+async fn test_dingtalk_public_route(
+    base_url: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DingtalkPublicRouteProbe, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let base_url = base_url
+        .as_deref()
+        .and_then(normalize_public_webhook_base_url)
+        .or_else(|| omninova_core::gateway::resolve_public_webhook_base_url(&config));
+    Ok(match base_url {
+        Some(base_url) => check_dingtalk_public_route(&base_url).await,
+        None => check_dingtalk_public_route("").await,
+    })
+}
+
+#[tauri::command]
 fn cli_install_status(app: AppHandle) -> Result<cli_install::CliInstallStatus, String> {
     cli_install::cli_install_status(&app)
 }
@@ -2484,6 +2592,34 @@ fn merge_channel_entry(
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DingtalkDiagnosticsPayload {
+    dingtalk_enabled: bool,
+    app_key_present: bool,
+    app_secret_present: bool,
+    robot_code_present: bool,
+    webhook_path: String,
+    local_gateway_running: bool,
+    local_health: String,
+    public_base_url_present: bool,
+    public_base_url: Option<String>,
+    public_health: String,
+    public_health_status_code: Option<u16>,
+    public_health_error: Option<String>,
+    final_dingtalk_callback_url: Option<String>,
+    worker_started: bool,
+    outbound_mode: String,
+    public_mode: String,
+    quick_tunnel: bool,
+    next_steps: Vec<String>,
+}
+
+fn dingtalk_callback_url(base_url: Option<&str>) -> Option<String> {
+    base_url
+        .and_then(normalize_public_webhook_base_url)
+        .map(|base| format!("{base}/api/v1/gateway/dingtalk/events"))
+}
+
 /// Keep only channels the current editor explicitly changed. Missing entries
 /// are merged from the persisted config by `channels_to_core`, preventing a
 /// stale/default selected channel from disabling another active integration.
@@ -2860,6 +2996,8 @@ pub fn run() {
             restart_gateway,
             test_gateway_health,
             test_gateway_public_health,
+            dingtalk_diagnostics,
+            test_dingtalk_public_route,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -3065,6 +3203,62 @@ mod webview_startup_tests {
 mod channel_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn dingtalk_callback_url_uses_public_root_without_duplicate_slashes() {
+        assert_eq!(
+            dingtalk_callback_url(Some("https://example.test")),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(
+            dingtalk_callback_url(Some("https://example.test/")),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(
+            dingtalk_callback_url(Some(
+                "https://example.test/api/v1/gateway/dingtalk/events"
+            )),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(dingtalk_callback_url(None), None);
+    }
+
+    #[test]
+    fn dingtalk_diagnostics_payload_contains_no_sensitive_values() {
+        let payload = DingtalkDiagnosticsPayload {
+            dingtalk_enabled: true,
+            app_key_present: true,
+            app_secret_present: true,
+            robot_code_present: true,
+            webhook_path: "/api/v1/gateway/dingtalk/events".to_string(),
+            local_gateway_running: true,
+            local_health: "ok".to_string(),
+            public_base_url_present: true,
+            public_base_url: Some("https://example.test".to_string()),
+            public_health: "ok".to_string(),
+            public_health_status_code: Some(200),
+            public_health_error: None,
+            final_dingtalk_callback_url: Some(
+                "https://example.test/api/v1/gateway/dingtalk/events".to_string(),
+            ),
+            worker_started: true,
+            outbound_mode: "session_webhook".to_string(),
+            public_mode: "quick_tunnel".to_string(),
+            quick_tunnel: true,
+            next_steps: Vec::new(),
+        };
+        let rendered = serde_json::to_string(&payload).expect("serialize diagnostics");
+        for forbidden in [
+            "secret-value",
+            "access-token-value",
+            "session-webhook-value",
+            "robot-code-value",
+            "conversation-id-value",
+            "message-id-value",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
 
     #[test]
     fn setup_save_retains_only_explicitly_changed_channel_entries() {
