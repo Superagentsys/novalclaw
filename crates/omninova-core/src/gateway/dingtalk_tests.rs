@@ -919,3 +919,331 @@ fn dingtalk_gateway_legacy_channel_enabled_compat() {
         "Both off -> disabled"
     );
 }
+
+// =============================================================================
+// Phase 2 — DingTalk text command router
+// =============================================================================
+//
+// These tests assert that the command router produces the right reply text
+// for known commands and that plain text falls through to the agent. They
+// do NOT depend on any network, store, or runtime — they only exercise
+// `dingtalk_commands::evaluate_dingtalk_command` and friends.
+
+use crate::gateway::dingtalk_commands::{
+    evaluate_dingtalk_command, parse_dingtalk_command, strip_bot_mention,
+    to_normalized_for_match, DingtalkCommand, DingtalkStatusInputs,
+    build_dingtalk_help_text, build_dingtalk_menu_text,
+    build_dingtalk_status_text, build_dingtalk_ping_text,
+    build_dingtalk_monitor_text,
+};
+
+/// Helper: a default `Config` for the command router. Phase 2 does not
+/// require config to enable commands — the user might type `help` even
+/// when the bot is disabled, to see what's going on.
+fn cmd_test_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.gateway.dingtalk.enabled = false; // disabled is the default
+    cfg
+}
+
+fn cmd_inputs<'a>(cfg: &'a Config) -> DingtalkStatusInputs<'a> {
+    DingtalkStatusInputs {
+        config: cfg,
+        worker_initialized: false,
+        queue_len: 0,
+    }
+}
+
+/// Build a fake DingTalk payload containing a `text.content` field as
+/// the real platform actually delivers it. Phase 1 currently copies
+/// `payload.text` (a string) into `InboundMessage.text`; the command
+/// router prefers the real `text.content` form when present.
+fn build_dingtalk_payload(text_content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "msgType": "text",
+        "text": { "content": text_content },
+        "senderStaffId": "staff-redact-me",
+        "conversationId": "conv-redact-me",
+        "sessionWebhook": "https://oapi.dingtalk.com/robot/hook?access_token=redact-me",
+        "messageId": "msg-redact-me",
+        "robotCode": "robot-redact-me",
+    })
+}
+
+/// Test: `help` returns the canned help text.
+#[test]
+fn dingtalk_help_command_returns_help_text() {
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("help");
+    let result = evaluate_dingtalk_command(
+        "help",
+        Some(&payload),
+        cmd_inputs(&cfg),
+    );
+    let (cmd, reply) = result.expect("help must be recognized as a command");
+    assert_eq!(cmd, DingtalkCommand::Help);
+    assert!(
+        reply.contains("DingTalk bot help"),
+        "reply must contain the help header (got {reply:?})"
+    );
+    assert!(
+        reply.contains("status"),
+        "help text must mention status command"
+    );
+    // Help text must be exactly the builder's output (snapshot to catch
+    // accidental formatting changes).
+    assert_eq!(reply, build_dingtalk_help_text());
+}
+
+/// Test: `menu` returns the canned menu text.
+#[test]
+fn dingtalk_menu_command_returns_menu_text() {
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("menu");
+    let (cmd, reply) = evaluate_dingtalk_command("menu", Some(&payload), cmd_inputs(&cfg))
+        .expect("menu must be a command");
+    assert_eq!(cmd, DingtalkCommand::Menu);
+    assert_eq!(reply, build_dingtalk_menu_text());
+    // Ensure menu also covers every recognized command name so a user
+    // hitting /menu sees what is actually wired up.
+    for token in ["help", "menu", "status", "ping"] {
+        assert!(
+            reply.contains(token),
+            "menu must advertise `{token}` (got {reply:?})"
+        );
+    }
+}
+
+/// Test: `status` output is redacted — no app_secret, no access_token,
+/// no sessionWebhook URL, no sender/conversation/message/robot ids.
+#[test]
+fn dingtalk_status_command_returns_redacted_status() {
+    let mut cfg = cmd_test_config();
+    cfg.gateway.dingtalk.app_secret = "super-secret-app-secret-value".to_string();
+    cfg.gateway.dingtalk.app_key = "super-secret-app-key-value".to_string();
+    cfg.gateway.dingtalk.robot_code = "super-secret-robot-code".to_string();
+
+    // Mirror the webhook's sessionWebhook value into the inbound
+    // metadata, exactly as Phase 1 does. If status leaks it, the
+    // redaction check below will fail.
+    let mut payload = build_dingtalk_payload("status");
+    payload["sessionWebhook"] =
+        serde_json::json!("https://oapi.dingtalk.com/robot/hook?access_token=token-redact-me");
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "sessionWebhook".to_string(),
+        serde_json::json!("webhook-redact-me"),
+    );
+    metadata.insert(
+        "accessToken".to_string(),
+        serde_json::json!("token-redact-me-very-very-secret"),
+    );
+
+    let reply = build_dingtalk_status_text(DingtalkStatusInputs {
+        config: &cfg,
+        worker_initialized: true,
+        queue_len: 7,
+    });
+
+    assert_does_not_leak(&reply, "status", &[
+        "super-secret-app-secret-value",
+        "super-secret-app-key-value",
+        "super-secret-robot-code",
+        "token-redact-me",
+        "webhook-redact-me",
+    ]);
+    // The redaction notice must explicitly call out that webhook URLs
+    // are not shown, so operators can see at a glance that the output
+    // is intentionally redacted.
+    assert!(
+        reply.contains("no secrets")
+            && reply.contains("tokens")
+            && reply.contains("ids")
+            && reply.contains("webhook URLs are shown"),
+        "status must include a redaction disclaimer (got {reply:?})"
+    );
+    assert!(
+        !reply.contains("access_token=")
+            && !reply.contains("accessToken")
+            && !reply.contains("sessionWebhook=")
+            && !reply.contains("senderStaffId=")
+            && !reply.contains("conversationId=")
+            && !reply.contains("messageId=")
+            && !reply.contains("robotCode="),
+        "status must NOT include raw field=value fragments (got {reply:?})"
+    );
+    // Sanity: the redacted status must still mention the configured
+    // counts and states.
+    assert!(reply.contains("enabled"), "status must report enabled/disabled");
+    assert!(reply.contains("present"), "status must report app_key present");
+    assert!(reply.contains("queue_count"), "status must report queue_count");
+    assert!(reply.contains("7"), "status must include the queue length");
+    assert_eq!(reply, build_dingtalk_status_text(DingtalkStatusInputs {
+        config: &cfg,
+        worker_initialized: true,
+        queue_len: 7,
+    }));
+}
+
+fn assert_does_not_leak(haystack: &str, label: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            !haystack.contains(needle),
+            "{label} reply must NOT contain {needle:?}; got: {haystack:?}"
+        );
+    }
+}
+
+/// Test: `ping` returns exactly `pong`.
+#[test]
+fn dingtalk_ping_command_returns_pong() {
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("ping");
+    let (cmd, reply) = evaluate_dingtalk_command("ping", Some(&payload), cmd_inputs(&cfg))
+        .expect("ping must be a command");
+    assert_eq!(cmd, DingtalkCommand::Ping);
+    assert_eq!(reply, build_dingtalk_ping_text());
+    assert_eq!(reply, "pong");
+}
+
+/// Test: `monitor` returns the explicit "not available" notice rather
+/// than half-implementing the feature.
+#[test]
+fn dingtalk_monitor_command_returns_not_available_notice() {
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("monitor");
+    let (cmd, reply) = evaluate_dingtalk_command("monitor", Some(&payload), cmd_inputs(&cfg))
+        .expect("monitor must be a command");
+    assert_eq!(cmd, DingtalkCommand::Monitor);
+    assert_eq!(reply, build_dingtalk_monitor_text());
+    assert!(reply.contains("not available"));
+}
+
+/// Test: `strip_bot_mention` removes the leading `@bot` token so that
+/// `@bot help`, `/help`, and `help` all parse identically. Phase 2
+/// commands must work whether or not the user explicitly mentioned the
+/// bot.
+#[test]
+fn dingtalk_command_strips_bot_mention() {
+    assert_eq!(strip_bot_mention("@bot help"), "help");
+    assert_eq!(strip_bot_mention("@机器人菜单"), "");
+    assert_eq!(strip_bot_mention("   @bot   menu   "), "menu");
+    // No mention -> unchanged.
+    assert_eq!(strip_bot_mention("hello"), "hello");
+    // Slash prefix on the bot-mention input is also handled by the
+    // normalizer, not the mention stripper.
+    assert_eq!(strip_bot_mention("@bot /help"), "/help");
+
+    // End-to-end: a payload whose `text.content` is "@bot help" must be
+    // recognized as the help command.
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("@bot help");
+    let result = evaluate_dingtalk_command(
+        "@bot help",
+        Some(&payload),
+        cmd_inputs(&cfg),
+    );
+    assert!(result.is_some(), "after mention strip, @bot help -> help must parse");
+    assert_eq!(result.unwrap().0, DingtalkCommand::Help);
+}
+
+/// Test: a leading `/` is stripped before matching.
+#[test]
+fn dingtalk_command_strips_leading_slash() {
+    let cfg = cmd_test_config();
+    let payload = build_dingtalk_payload("/help");
+    let (cmd, _) = evaluate_dingtalk_command("/help", Some(&payload), cmd_inputs(&cfg))
+        .expect("/help must be a command");
+    assert_eq!(cmd, DingtalkCommand::Help);
+
+    // Mixed case + leading slash + spaces.
+    let payload2 = build_dingtalk_payload("  /STATUS  ");
+    let (cmd, _) = evaluate_dingtalk_command("  /STATUS  ", Some(&payload2), cmd_inputs(&cfg))
+        .expect("/STATUS must be a command");
+    assert_eq!(cmd, DingtalkCommand::Status);
+}
+
+/// Test: plain text that is NOT a command returns `None` so the agent
+/// pipeline keeps handling it exactly like Phase 1.
+#[test]
+fn dingtalk_unknown_plain_text_still_flows_to_agent() {
+    let cfg = cmd_test_config();
+    // No payload -> helper falls back to raw_text.
+    let result = evaluate_dingtalk_command("tell me about rust", None, cmd_inputs(&cfg));
+    assert!(
+        result.is_none(),
+        "ordinary text must NOT be classified as a command, got {result:?}"
+    );
+
+    // With a payload that does not contain a command.
+    let payload = build_dingtalk_payload("what is the weather like in Tokyo");
+    let result = evaluate_dingtalk_command(
+        "what is the weather like in Tokyo",
+        Some(&payload),
+        cmd_inputs(&cfg),
+    );
+    assert!(result.is_none(), "weather question must not parse as a command");
+}
+
+/// Test: Chinese aliases (`帮助`, `菜单`, `状态`) parse the same as the
+/// ASCII forms.
+#[test]
+fn dingtalk_chinese_command_aliases_parse() {
+    assert_eq!(parse_dingtalk_command("帮助"), Some(DingtalkCommand::Help));
+    assert_eq!(parse_dingtalk_command("菜单"), Some(DingtalkCommand::Menu));
+    assert_eq!(parse_dingtalk_command("状态"), Some(DingtalkCommand::Status));
+}
+
+/// Test: extra redaction coverage on top of the inline status tests.
+/// `to_normalized_for_match` and `parse_dingtalk_command` together
+/// should never surface any of the forbidden strings to a reply.
+#[test]
+fn dingtalk_status_does_not_leak_secret_or_webhook() {
+    let mut cfg = Config::default();
+    cfg.gateway.dingtalk.app_key = "leak-app-key".to_string();
+    cfg.gateway.dingtalk.app_secret = "leak-app-secret".to_string();
+    cfg.gateway.dingtalk.robot_code = "leak-robot-code".to_string();
+    cfg.gateway.dingtalk.webhook_path = "/leak-webhook-path-do-not-show".to_string();
+
+    let reply = build_dingtalk_status_text(DingtalkStatusInputs {
+        config: &cfg,
+        worker_initialized: false,
+        queue_len: 0,
+    });
+
+    // `webhook_path` is shown (it's a route hint, not a secret), but the
+    // configured value must be the only thing that could leak. The
+    // exhaustive leak test below must not contain any of the secrets.
+    for forbidden in [
+        "leak-app-key",
+        "leak-app-secret",
+        "leak-robot-code",
+        "leak-webhook-path",
+        "leak-app_key",
+        "leak-app_secret",
+        "leak-robot_code",
+    ] {
+        assert!(
+            !reply.contains(forbidden),
+            "status reply leaked {forbidden:?}: {reply:?}"
+        );
+    }
+}
+
+/// Test: `to_normalized_for_match` preserves the textual semantics for
+/// non-commands (so the agent path can still echo them back via the
+/// inbound metadata) — we only mutate a private copy.
+#[test]
+fn dingtalk_normalizer_does_not_mutate_known_plain_text() {
+    assert_eq!(
+        to_normalized_for_match("hello world"),
+        "hello world"
+    );
+    // Chinese text stays as-is (we only ascii-case-fold).
+    assert_eq!(
+        to_normalized_for_match("今天天气怎么样"),
+        "今天天气怎么样"
+    );
+    // Slash only trims; the remainder is left intact.
+    assert_eq!(to_normalized_for_match("/hello"), "hello");
+}

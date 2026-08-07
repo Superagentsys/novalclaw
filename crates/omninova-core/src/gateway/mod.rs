@@ -4,6 +4,7 @@ pub mod feishu_worker;
 pub mod feishu_store;
 pub mod dingtalk_worker;
 pub mod dingtalk_store;
+pub mod dingtalk_commands;
 
 #[cfg(test)]
 mod dingtalk_tests;
@@ -4778,6 +4779,59 @@ async fn http_dingtalk_webhook(
 
     // 10. Fallback: sync processing via Runtime + outbound
     println!("[dingtalk-webhook] sync_mode reason=worker_not_initialized");
+
+    // Phase 2: short-circuit commands (help/menu/status/ping/monitor)
+    // even in the sync fallback path. Non-command text continues into
+    // the agent exactly like Phase 1.
+    let sync_command_inputs = crate::gateway::dingtalk_commands::DingtalkStatusInputs {
+        config: &cfg,
+        worker_initialized: false,
+        queue_len: runtime.dingtalk_queue_len().await,
+    };
+    let command_decision = crate::gateway::dingtalk_commands::evaluate_dingtalk_command(
+        &inbound.text,
+        Some(&payload),
+        sync_command_inputs,
+    );
+    if let Some((cmd, command_reply)) = command_decision {
+        println!(
+            "[dingtalk-webhook] command_reply command={}",
+            cmd.name()
+        );
+        if command_reply.trim().is_empty() {
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed",
+                "reply": ""
+            })));
+        }
+        let result = deliver_dingtalk_reply(&cfg, &inbound, &command_reply).await;
+        match result {
+            Ok(_) => {
+                println!(
+                    "[dingtalk-webhook] outbound_ok reply_len={}",
+                    command_reply.len()
+                );
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "completed",
+                    "reply": ""
+                })));
+            }
+            Err(e) => {
+                println!("[dingtalk-webhook] outbound_failed error={}", e);
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "completed_with_error",
+                    "reply": "",
+                    "platform_error": e
+                })));
+            }
+        }
+    }
 
     let response = match runtime.process_inbound(&inbound).await {
         Ok(r) => r,

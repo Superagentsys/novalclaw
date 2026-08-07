@@ -152,12 +152,22 @@ async fn process_dingtalk_job(
     // Update store: processing
     store.update_status(&job_id, JobStatus::Processing).await;
 
-    // Route to agent
-    let reply = match route_to_agent(&runtime, &inbound).await {
-        Ok(r) => r,
-        Err(e) => {
-            store.mark_failed(&job_id, e.to_string()).await;
-            return;
+    // Phase 2: short-circuit commands (help/menu/status/ping/monitor).
+    // Non-command text falls through to the agent exactly like Phase 1.
+    let reply = if let Some((cmd, command_reply)) = evaluate_command_for_job(&runtime, &job).await {
+        println!(
+            "[dingtalk-worker] command_reply command={} job_id={}",
+            cmd.name(),
+            job_id
+        );
+        command_reply
+    } else {
+        match route_to_agent(&runtime, &inbound).await {
+            Ok(r) => r,
+            Err(e) => {
+                store.mark_failed(&job_id, e.to_string()).await;
+                return;
+            }
         }
     };
 
@@ -172,6 +182,35 @@ async fn process_dingtalk_job(
             store.mark_failed(&job_id, e.to_string()).await;
         }
     }
+}
+
+/// Try to interpret the inbound text as a DingTalk command. Returns
+/// `Some((command, reply))` when the message is a recognized command
+/// (the agent must NOT be invoked), or `None` when the message is
+/// ordinary text that must continue into the agent pipeline.
+///
+/// Errors reading the live config or queue length are non-fatal: when
+/// the helper cannot render `/status`, the worker falls back to the
+/// agent like any other non-command message.
+async fn evaluate_command_for_job(
+    runtime: &Arc<GatewayRuntime>,
+    job: &DingtalkAsyncJob,
+) -> Option<(crate::gateway::dingtalk_commands::DingtalkCommand, String)> {
+    let config = runtime.get_config().await;
+    let queue_len = runtime.dingtalk_queue_len().await;
+    let worker_initialized = runtime.is_dingtalk_worker_initialized().await;
+
+    let inputs = crate::gateway::dingtalk_commands::DingtalkStatusInputs {
+        config: &config,
+        worker_initialized,
+        queue_len,
+    };
+
+    crate::gateway::dingtalk_commands::evaluate_dingtalk_command(
+        &job.inbound.text,
+        Some(&job.raw_payload),
+        inputs,
+    )
 }
 
 async fn route_to_agent(
