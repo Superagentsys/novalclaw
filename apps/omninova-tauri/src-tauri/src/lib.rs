@@ -9,7 +9,8 @@ use omninova_core::config::{
 };
 use omninova_core::gateway::{
     check_dingtalk_public_route, check_gateway_public_health,
-    dingtalk_diagnostic_config_state, normalize_gateway_public_config,
+    dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
+    feishu_public_callback_urls, normalize_gateway_public_config,
     normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse,
     DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
@@ -1683,6 +1684,95 @@ async fn dingtalk_diagnostics(
 }
 
 #[tauri::command]
+async fn feishu_diagnostics(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<FeishuDiagnosticsPayload, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let status = gateway_status_from_state(&state_ref).await;
+    let runtime = {
+        let app_state = state_ref.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let config_status = feishu_diagnostic_config_state(&config);
+    let public_base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
+    let (final_feishu_event_callback_url, final_feishu_card_callback_url) =
+        feishu_public_callback_urls(&config);
+    let public_health = if !status.public_health.configured {
+        "not_configured"
+    } else if status.public_health.ok {
+        "ok"
+    } else if status.public_health.error_kind.as_deref() == Some("not_checked") {
+        "not_checked"
+    } else {
+        "failed"
+    }
+    .to_string();
+    let local_health = if !status.running {
+        "not_ready"
+    } else if status.health_ok {
+        "ok"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    let mut next_steps = Vec::new();
+    if !config_status.enabled {
+        next_steps.push("启用 Feishu 频道后重新启动 Gateway。".to_string());
+    }
+    if !config_status.app_id_present {
+        next_steps.push("配置 Feishu App ID。".to_string());
+    }
+    if !config_status.app_secret_present {
+        next_steps.push("配置 Feishu App Secret。".to_string());
+    }
+    if matches!(config_status.security_mode.as_str(), "token" | "encrypted")
+        && !config_status.verification_token_present
+    {
+        next_steps.push("当前安全模式需要配置 Verification Token。".to_string());
+    }
+    if config_status.security_mode == "encrypted" && !config_status.encrypt_key_present {
+        next_steps.push("encrypted 模式需要配置 Encrypt Key。".to_string());
+    }
+    if config_status.outbound_mode == "disabled" {
+        next_steps.push("配置 Feishu outbound mode。".to_string());
+    }
+    if !status.running {
+        next_steps.push("启动 Gateway。".to_string());
+    }
+    if public_base_url.is_none() {
+        next_steps.push("填写 Public Base URL 公网根地址。".to_string());
+    } else if public_health == "failed" {
+        next_steps.push("检查 Public Health、cloudflared 和公网地址是否有效。".to_string());
+    }
+
+    Ok(FeishuDiagnosticsPayload {
+        feishu_enabled: config_status.enabled,
+        app_id_present: config_status.app_id_present,
+        app_secret_present: config_status.app_secret_present,
+        verification_token_present: config_status.verification_token_present,
+        encrypt_key_present: config_status.encrypt_key_present,
+        security_mode: config_status.security_mode,
+        outbound_mode: config_status.outbound_mode,
+        store_opened: status.store_opened,
+        retry_worker_started: status.retry_worker_enabled,
+        local_gateway_running: status.running,
+        local_health,
+        public_base_url_present: public_base_url.is_some(),
+        public_base_url,
+        public_health,
+        public_health_status_code: status.public_health.status_code,
+        public_health_error: status.public_health.error,
+        final_feishu_event_callback_url,
+        final_feishu_card_callback_url,
+        quick_tunnel: status.quick_tunnel_non_production,
+        next_steps,
+    })
+}
+
+#[tauri::command]
 async fn test_dingtalk_public_route(
     base_url: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
@@ -2614,6 +2704,30 @@ struct DingtalkDiagnosticsPayload {
     next_steps: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FeishuDiagnosticsPayload {
+    feishu_enabled: bool,
+    app_id_present: bool,
+    app_secret_present: bool,
+    verification_token_present: bool,
+    encrypt_key_present: bool,
+    security_mode: String,
+    outbound_mode: String,
+    store_opened: bool,
+    retry_worker_started: bool,
+    local_gateway_running: bool,
+    local_health: String,
+    public_base_url_present: bool,
+    public_base_url: Option<String>,
+    public_health: String,
+    public_health_status_code: Option<u16>,
+    public_health_error: Option<String>,
+    final_feishu_event_callback_url: Option<String>,
+    final_feishu_card_callback_url: Option<String>,
+    quick_tunnel: bool,
+    next_steps: Vec<String>,
+}
+
 fn dingtalk_callback_url(base_url: Option<&str>) -> Option<String> {
     base_url
         .and_then(normalize_public_webhook_base_url)
@@ -2996,6 +3110,7 @@ pub fn run() {
             restart_gateway,
             test_gateway_health,
             test_gateway_public_health,
+            feishu_diagnostics,
             dingtalk_diagnostics,
             test_dingtalk_public_route,
         ])
@@ -3309,6 +3424,106 @@ mod channel_tests {
         let merged = channels_to_core(setup, &current);
         assert!(merged.feishu.as_ref().is_some_and(|entry| entry.enabled));
         assert!(merged.dingtalk.as_ref().is_some_and(|entry| entry.enabled));
+    }
+
+    #[test]
+    fn enabled_channel_status_reports_feishu_and_dingtalk_together() {
+        let channels = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(enabled_channel_names(&channels), vec!["feishu", "dingtalk"]);
+    }
+
+    #[test]
+    fn saving_dingtalk_preserves_complete_feishu_configuration() {
+        let feishu_extra = HashMap::from([
+            ("app_id".to_string(), serde_json::json!("saved-feishu-app")),
+            ("app_secret".to_string(), serde_json::json!("saved-feishu-secret")),
+            ("outbound_mode".to_string(), serde_json::json!("real")),
+        ]);
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                security_mode: Some("encrypted".to_string()),
+                verification_token: Some("saved-feishu-token".to_string()),
+                encrypt_key: Some("saved-feishu-key".to_string()),
+                extra: feishu_extra.clone(),
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                extra: HashMap::from([(
+                    "app_key".to_string(),
+                    serde_json::json!("updated-dingtalk-app"),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        let feishu = merged.feishu.expect("Feishu must be preserved");
+        assert!(feishu.enabled);
+        assert_eq!(feishu.extra, feishu_extra);
+        assert_eq!(feishu.security_mode.as_deref(), Some("encrypted"));
+        assert_eq!(feishu.verification_token.as_deref(), Some("saved-feishu-token"));
+        assert_eq!(feishu.encrypt_key.as_deref(), Some("saved-feishu-key"));
+    }
+
+    #[test]
+    fn saving_feishu_preserves_complete_dingtalk_configuration() {
+        let dingtalk_extra = HashMap::from([
+            ("app_key".to_string(), serde_json::json!("saved-dingtalk-app")),
+            ("app_secret".to_string(), serde_json::json!("saved-dingtalk-secret")),
+            ("robot_code".to_string(), serde_json::json!("saved-dingtalk-robot")),
+            ("outbound_mode".to_string(), serde_json::json!("session_webhook")),
+        ]);
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                extra: dingtalk_extra.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: true,
+                extra: HashMap::from([(
+                    "app_id".to_string(),
+                    serde_json::json!("updated-feishu-app"),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["feishu".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        let dingtalk = merged.dingtalk.expect("DingTalk must be preserved");
+        assert!(dingtalk.enabled);
+        assert_eq!(dingtalk.extra, dingtalk_extra);
     }
 
     #[test]

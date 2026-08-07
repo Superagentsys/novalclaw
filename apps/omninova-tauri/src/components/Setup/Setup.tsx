@@ -6,6 +6,7 @@ import {
   type Config,
   type DingtalkDiagnostics,
   type DingtalkPublicRouteProbe,
+  type FeishuDiagnostics,
   type GatewayPublicMode,
   type GatewayStatus,
 } from "../../types/config";
@@ -365,6 +366,9 @@ export function Setup({
   );
   const [publicHealthStatusCode, setPublicHealthStatusCode] = useState<number | null>(null);
   const [publicHealthLoading, setPublicHealthLoading] = useState(false);
+  const [feishuDiagnostics, setFeishuDiagnostics] =
+    useState<FeishuDiagnostics | null>(null);
+  const [feishuDiagnosticsLoading, setFeishuDiagnosticsLoading] = useState(false);
   const [dingtalkDiagnostics, setDingtalkDiagnostics] =
     useState<DingtalkDiagnostics | null>(null);
   const [dingtalkDiagnosticsLoading, setDingtalkDiagnosticsLoading] = useState(false);
@@ -522,6 +526,12 @@ export function Setup({
     return diagnostics;
   }, []);
 
+  const refreshFeishuDiagnostics = useCallback(async () => {
+    const diagnostics = await invokeTauri<FeishuDiagnostics>("feishu_diagnostics");
+    setFeishuDiagnostics(diagnostics);
+    return diagnostics;
+  }, []);
+
   const refreshCliInstall = useCallback(async () => {
     try {
       const s = await invokeTauri<CliInstallStatus>("cli_install_status");
@@ -560,6 +570,15 @@ export function Setup({
       window.clearInterval(interval);
     };
   }, [activeTab, refreshGatewayStatus]);
+
+  useEffect(() => {
+    if (activeTab !== "channels" || activeChannelId !== "feishu") {
+      return;
+    }
+    void refreshFeishuDiagnostics().catch(() => {
+      // Explicit button actions surface Tauri/browser errors to the user.
+    });
+  }, [activeTab, activeChannelId, refreshFeishuDiagnostics]);
 
   useEffect(() => {
     if (activeTab !== "channels" || activeChannelId !== "dingtalk") {
@@ -916,6 +935,31 @@ export function Setup({
     } finally {
       setDingtalkDiagnosticsLoading(false);
     }
+  };
+
+  const handleRunFeishuDiagnostics = async () => {
+    setFeishuDiagnosticsLoading(true);
+    try {
+      await refreshGatewayStatus();
+      const diagnostics = await refreshFeishuDiagnostics();
+      setActionMessage(
+        diagnostics.next_steps.length === 0
+          ? "飞书诊断通过；公网连通性请使用 Public Health 检测。"
+          : `飞书诊断完成：发现 ${diagnostics.next_steps.length} 项待处理。`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setActionMessage(`飞书诊断失败：${message}`);
+    } finally {
+      setFeishuDiagnosticsLoading(false);
+    }
+  };
+
+  const handleTestFeishuPublicHealth = async () => {
+    await handleTestGatewayPublicHealth();
+    await refreshFeishuDiagnostics().catch(() => {
+      // The shared Public Health result remains visible even if refresh fails.
+    });
   };
 
   const handleTestDingtalkPublicRoute = async () => {
@@ -1692,6 +1736,119 @@ export function Setup({
                 void navigator.clipboard.writeText(url);
               }}
             />
+            {activeChannelId === "feishu" ? (
+              <section className="setup-section gateway-runtime-panel">
+                <div className="section-heading gateway-runtime-heading">
+                  <div>
+                    <h2>飞书诊断</h2>
+                    <div className="section-subtitle">
+                      只读检查配置、Gateway、Store、Retry worker 与 Public Health，不模拟飞书签名请求。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleRunFeishuDiagnostics()}
+                    disabled={feishuDiagnosticsLoading}
+                  >
+                    {feishuDiagnosticsLoading ? "诊断中…" : "刷新飞书诊断"}
+                  </button>
+                </div>
+
+                <div className="gateway-runtime-url-list">
+                  <div>
+                    <span>普通事件回调</span>
+                    <code>{runtimeWebhookUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(runtimeWebhookUrl, "飞书普通事件回调 URL")}
+                      disabled={!runtimeWebhookUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                  <div>
+                    <span>卡片交互回调</span>
+                    <code>{runtimeCardCallbackUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(runtimeCardCallbackUrl, "飞书卡片交互回调 URL")}
+                      disabled={!runtimeCardCallbackUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                </div>
+
+                {feishuDiagnostics ? (
+                  <div className="gateway-runtime-grid">
+                    <div><span>Feishu</span><strong>{feishuDiagnostics.feishu_enabled ? "enabled" : "disabled"}</strong></div>
+                    <div><span>App ID</span><strong>{feishuDiagnostics.app_id_present ? "present" : "missing"}</strong></div>
+                    <div><span>App Secret</span><strong>{feishuDiagnostics.app_secret_present ? "present" : "missing"}</strong></div>
+                    <div><span>Verification Token</span><strong>{feishuDiagnostics.verification_token_present ? "present" : "missing"}</strong></div>
+                    <div><span>Encrypt Key</span><strong>{feishuDiagnostics.encrypt_key_present ? "present" : "missing"}</strong></div>
+                    <div><span>Security</span><strong>{feishuDiagnostics.security_mode}</strong></div>
+                    <div><span>Outbound</span><strong>{feishuDiagnostics.outbound_mode}</strong></div>
+                    <div><span>Gateway</span><strong>{feishuDiagnostics.local_gateway_running ? "running" : "stopped"}</strong></div>
+                    <div><span>Local Health</span><strong>{feishuDiagnostics.local_health}</strong></div>
+                    <div><span>Public Base URL</span><strong>{feishuDiagnostics.public_base_url_present ? "present" : "missing"}</strong></div>
+                    <div>
+                      <span>Public Health</span>
+                      <strong>
+                        {feishuDiagnostics.public_health}
+                        {feishuDiagnostics.public_health_status_code
+                          ? ` · HTTP ${feishuDiagnostics.public_health_status_code}`
+                          : ""}
+                      </strong>
+                    </div>
+                    <div><span>Store</span><strong>{feishuDiagnostics.store_opened ? "opened" : "not_opened"}</strong></div>
+                    <div><span>Retry worker</span><strong>{feishuDiagnostics.retry_worker_started ? "started" : "not_started"}</strong></div>
+                  </div>
+                ) : (
+                  <p className="setup-action-hint">正在读取飞书诊断状态…</p>
+                )}
+
+                <div className="gateway-runtime-health-actions">
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleTestFeishuPublicHealth()}
+                    disabled={publicHealthLoading || !draftPublicBase}
+                  >
+                    {publicHealthLoading ? "检测中…" : "测试 Public Health"}
+                  </button>
+                  <span className={
+                    publicHealthStatus === "ok"
+                      ? "gateway-runtime-info"
+                      : publicHealthStatus === "error"
+                        ? "gateway-public-error"
+                        : "setup-action-hint"
+                  }>
+                    {publicHealthMessage}
+                    {publicHealthStatusCode ? `（HTTP ${publicHealthStatusCode}）` : ""}
+                  </span>
+                </div>
+
+                {(config.gateway_public?.mode === "quick_tunnel"
+                  || feishuDiagnostics?.quick_tunnel) ? (
+                  <div className="gateway-runtime-warning">
+                    Quick Tunnel 地址可能变化；重启 cloudflared 后，需要更新飞书后台两个回调地址。
+                  </div>
+                ) : null}
+                {feishuDiagnostics?.next_steps.length ? (
+                  <div className="gateway-runtime-warning">
+                    <strong>建议下一步</strong>
+                    <ul>
+                      {feishuDiagnostics.next_steps.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
             {activeChannelId === "dingtalk" ? (
               <section className="setup-section gateway-runtime-panel">
                 <div className="section-heading gateway-runtime-heading">

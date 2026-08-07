@@ -4097,6 +4097,30 @@ async fn process_feishu_card_action_callback(
         }
     };
 
+    // Feishu validates the dedicated card callback URL with the same
+    // top-level url_verification payload used by the normal event endpoint.
+    // This must return before card action extraction because the challenge
+    // intentionally has no event/action object.
+    if payload.get("type").and_then(serde_json::Value::as_str)
+        == Some("url_verification")
+    {
+        println!("[feishu-card] url_verification_detected");
+        let challenge = payload
+            .get("challenge")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(GatewayError {
+                        message: "missing_challenge".to_string(),
+                    }),
+                )
+            })?;
+        println!("[feishu-card] challenge_response_sent");
+        return Ok(Json(serde_json::json!({ "challenge": challenge })));
+    }
+
     println!(
         "[feishu-card] payload_shape top_keys={:?} event_keys={:?}",
         safe_json_object_keys(Some(&payload)),
@@ -6901,6 +6925,46 @@ impl FeishuSecurityConfig {
     }
 }
 
+/// Sanitized Feishu configuration snapshot used by desktop diagnostics.
+/// Secret-bearing values are reduced to presence booleans before the value
+/// leaves core, so the renderer never receives credentials.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FeishuDiagnosticConfigState {
+    pub enabled: bool,
+    pub app_id_present: bool,
+    pub app_secret_present: bool,
+    pub verification_token_present: bool,
+    pub encrypt_key_present: bool,
+    pub security_mode: String,
+    pub outbound_mode: String,
+}
+
+pub fn feishu_diagnostic_config_state(config: &Config) -> FeishuDiagnosticConfigState {
+    let entry = config.channels_config.feishu.as_ref();
+    let security = FeishuSecurityConfig::from_entry(entry);
+    let configured_extra = |key: &str| {
+        entry
+            .and_then(|entry| entry.extra.get(key))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(FeishuSecurityConfig::is_configured_secret)
+    };
+
+    FeishuDiagnosticConfigState {
+        enabled: entry.is_some_and(|entry| entry.enabled),
+        app_id_present: configured_extra("app_id"),
+        app_secret_present: configured_extra("app_secret"),
+        verification_token_present: security.verification_token.is_some(),
+        encrypt_key_present: security.encrypt_key.is_some(),
+        security_mode: security.mode.as_str().to_string(),
+        outbound_mode: entry
+            .and_then(|entry| entry.extra.get("outbound_mode"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|mode| !mode.trim().is_empty())
+            .unwrap_or("disabled")
+            .to_string(),
+    }
+}
+
 /// Verify the verification token from the request
 pub fn verify_feishu_verification_token(
     security_config: &FeishuSecurityConfig,
@@ -8072,7 +8136,7 @@ mod tests {
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
         check_dingtalk_public_route, check_gateway_public_health,
         classify_dingtalk_route_response,
-        dingtalk_diagnostic_config_state,
+        dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
         feishu_public_callback_urls,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
         normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
@@ -8081,7 +8145,9 @@ mod tests {
         SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
-    use crate::config::{Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode};
+    use crate::config::{
+        ChannelEntry, Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode,
+    };
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use serde_json::json;
@@ -8805,6 +8871,55 @@ mod tests {
             .expect("Feishu card response body");
         let value = serde_json::from_slice(&bytes).expect("Feishu card response must be JSON");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn feishu_card_url_verification_returns_challenge() {
+        let challenge = "card-verification-challenge";
+        let body = json!({
+            "type": "url_verification",
+            "token": "card-verification-token",
+            "challenge": challenge
+        })
+        .to_string();
+
+        let (status, response) = call_feishu_card_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            body,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("challenge").and_then(serde_json::Value::as_str),
+            Some(challenge)
+        );
+        assert!(response.get("toast").is_none());
+    }
+
+    #[tokio::test]
+    async fn feishu_card_challenge_does_not_require_action() {
+        let token = "configured-card-token";
+        let body = json!({
+            "type": "url_verification",
+            "token": token,
+            "challenge": "challenge-without-action"
+        })
+        .to_string();
+
+        let (status, response) = call_feishu_card_http(
+            GatewayRuntime::new(feishu_security_config("token", Some(token), None)),
+            body,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("challenge").and_then(serde_json::Value::as_str),
+            Some("challenge-without-action")
+        );
+        assert!(response.get("ok").is_none());
+        assert!(response.get("toast").is_none());
     }
 
     #[test]
@@ -11196,6 +11311,42 @@ mod tests {
     }
 
     #[test]
+    fn feishu_diagnostic_config_state_contains_presence_only() {
+        let mut config = Config::default();
+        config.channels_config.feishu = Some(ChannelEntry {
+            enabled: true,
+            security_mode: Some("encrypted".to_string()),
+            verification_token: Some("diagnostic-verification-token".to_string()),
+            encrypt_key: Some("diagnostic-encrypt-key".to_string()),
+            extra: HashMap::from([
+                ("app_id".to_string(), json!("diagnostic-app-id")),
+                ("app_secret".to_string(), json!("diagnostic-app-secret")),
+                ("outbound_mode".to_string(), json!("real")),
+            ]),
+            ..Default::default()
+        });
+
+        let state = feishu_diagnostic_config_state(&config);
+        assert!(state.enabled);
+        assert!(state.app_id_present);
+        assert!(state.app_secret_present);
+        assert!(state.verification_token_present);
+        assert!(state.encrypt_key_present);
+        assert_eq!(state.security_mode, "encrypted");
+        assert_eq!(state.outbound_mode, "real");
+
+        let rendered = serde_json::to_string(&state).expect("serialize diagnostics");
+        for secret in [
+            "diagnostic-app-id",
+            "diagnostic-app-secret",
+            "diagnostic-verification-token",
+            "diagnostic-encrypt-key",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
     fn dingtalk_route_probe_classifies_expected_unsigned_responses() {
         let missing = classify_dingtalk_route_response(401, r#"{"message":"missing_timestamp"}"#);
         assert!(missing.reachable);
@@ -11235,6 +11386,28 @@ mod tests {
             Some("https://gateway.example.test")
         );
         let (event_url, card_url) = feishu_public_callback_urls(&config);
+        assert_eq!(
+            event_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu")
+        );
+        assert_eq!(
+            card_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu/card")
+        );
+    }
+
+    #[test]
+    fn feishu_callback_urls_handle_trailing_slash_and_unconfigured_base() {
+        let empty = Config::default();
+        assert_eq!(feishu_public_callback_urls(&empty), (None, None));
+
+        let mut configured = Config::default();
+        configured.gateway_public = GatewayPublicConfig {
+            mode: GatewayPublicMode::ExternalPublicUrl,
+            public_webhook_base_url: Some("https://gateway.example.test/".to_string()),
+            ..GatewayPublicConfig::default()
+        };
+        let (event_url, card_url) = feishu_public_callback_urls(&configured);
         assert_eq!(
             event_url.as_deref(),
             Some("https://gateway.example.test/webhook/feishu")

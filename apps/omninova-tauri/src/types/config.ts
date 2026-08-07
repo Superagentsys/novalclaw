@@ -375,6 +375,29 @@ export interface DingtalkDiagnostics {
   next_steps: string[];
 }
 
+export interface FeishuDiagnostics {
+  feishu_enabled: boolean;
+  app_id_present: boolean;
+  app_secret_present: boolean;
+  verification_token_present: boolean;
+  encrypt_key_present: boolean;
+  security_mode: string;
+  outbound_mode: string;
+  store_opened: boolean;
+  retry_worker_started: boolean;
+  local_gateway_running: boolean;
+  local_health: "ok" | "failed" | "not_ready";
+  public_base_url_present: boolean;
+  public_base_url?: string | null;
+  public_health: "ok" | "failed" | "not_checked" | "not_configured";
+  public_health_status_code?: number | null;
+  public_health_error?: string | null;
+  final_feishu_event_callback_url?: string | null;
+  final_feishu_card_callback_url?: string | null;
+  quick_tunnel: boolean;
+  next_steps: string[];
+}
+
 export interface DingtalkPublicRouteProbe {
   configured: boolean;
   reachable: boolean;
