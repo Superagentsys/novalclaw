@@ -190,13 +190,22 @@ pub fn build_dingtalk_status_text(inputs: DingtalkStatusInputs<'_>) -> String {
     let dt = &cfg.gateway.dingtalk;
 
     let gateway_enabled = dt.enabled;
-    let legacy_channel_enabled = cfg.channels_config.dingtalk.as_ref().map(|e| e.enabled).unwrap_or(false);
+    let legacy_channel_enabled = cfg
+        .channels_config
+        .dingtalk
+        .as_ref()
+        .map(|e| e.enabled)
+        .unwrap_or(false);
 
     let app_key_present = !dt.app_key.trim().is_empty();
     let app_secret_present = !dt.app_secret.trim().is_empty();
     let robot_code_present = !dt.robot_code.trim().is_empty();
 
-    let status = if gateway_enabled { "enabled" } else { "disabled" };
+    let status = if gateway_enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
 
     format!(
         "DingTalk bot status\n\
@@ -213,14 +222,34 @@ pub fn build_dingtalk_status_text(inputs: DingtalkStatusInputs<'_>) -> String {
          \n\
          (no secrets, tokens, ids, or webhook URLs are shown)",
         status,
-        if legacy_channel_enabled { "true" } else { "false" },
+        if legacy_channel_enabled {
+            "true"
+        } else {
+            "false"
+        },
         if app_key_present { "present" } else { "absent" },
-        if app_secret_present { "present" } else { "absent" },
-        if robot_code_present { "present" } else { "absent" },
-        if inputs.worker_initialized { "true" } else { "false" },
+        if app_secret_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if robot_code_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if inputs.worker_initialized {
+            "true"
+        } else {
+            "false"
+        },
         inputs.queue_len,
         dt.outbound_mode,
-        if dt.redact_sensitive_logs { "true" } else { "false" },
+        if dt.redact_sensitive_logs {
+            "true"
+        } else {
+            "false"
+        },
     )
 }
 
@@ -265,7 +294,7 @@ pub fn evaluate_dingtalk_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, GatewayDingtalkConfig};
+    use crate::config::Config;
 
     fn empty_inputs<'a>(cfg: &'a Config) -> DingtalkStatusInputs<'a> {
         DingtalkStatusInputs {
@@ -299,10 +328,42 @@ mod tests {
     fn parse_dingtalk_command_matches_known_aliases() {
         assert_eq!(parse_dingtalk_command("help"), Some(DingtalkCommand::Help));
         assert_eq!(parse_dingtalk_command("菜单"), Some(DingtalkCommand::Menu));
-        assert_eq!(parse_dingtalk_command("status"), Some(DingtalkCommand::Status));
-        assert_eq!(parse_dingtalk_command("状态"), Some(DingtalkCommand::Status));
+        assert_eq!(
+            parse_dingtalk_command("status"),
+            Some(DingtalkCommand::Status)
+        );
+        assert_eq!(
+            parse_dingtalk_command("状态"),
+            Some(DingtalkCommand::Status)
+        );
         assert_eq!(parse_dingtalk_command("ping"), Some(DingtalkCommand::Ping));
-        assert_eq!(parse_dingtalk_command("monitor"), Some(DingtalkCommand::Monitor));
+        assert_eq!(
+            parse_dingtalk_command("monitor"),
+            Some(DingtalkCommand::Monitor)
+        );
         assert_eq!(parse_dingtalk_command("anything else"), None);
+    }
+
+    #[test]
+    fn command_normalization_handles_mentions_spaces_and_newlines() {
+        let payload = serde_json::json!({
+            "text": { "content": "  @OmniNova\n  /STATUS  \r\n" }
+        });
+        let normalized = normalize_dingtalk_command_text("ignored", Some(&payload));
+        assert_eq!(to_normalized_for_match(&normalized), "status");
+
+        let chinese = serde_json::json!({
+            "text": { "content": "@机器人\n帮助" }
+        });
+        let normalized = normalize_dingtalk_command_text("ignored", Some(&chinese));
+        assert_eq!(
+            parse_dingtalk_command(&to_normalized_for_match(&normalized)),
+            Some(DingtalkCommand::Help)
+        );
+
+        assert_eq!(
+            parse_dingtalk_command(&to_normalized_for_match(" \n /ping \r\n")),
+            Some(DingtalkCommand::Ping)
+        );
     }
 }

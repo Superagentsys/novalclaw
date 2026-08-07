@@ -505,22 +505,36 @@ impl GatewayRuntime {
     }
 
     pub async fn init_dingtalk_worker(&mut self) {
-        let mut worker_state = dingtalk_worker::DingtalkWorkerState::new();
+        // Keep initialization idempotent. Most importantly, never replace the
+        // sender while the receiver from the same channel is still running.
+        {
+            let sender = self.dingtalk_job_sender.read().await;
+            if sender.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                println!("[dingtalk-async-worker] already_started=true");
+                return;
+            }
+        }
+
+        let worker_state = dingtalk_worker::DingtalkWorkerState::with_queue_len(
+            self.dingtalk_queue_len.clone(),
+        );
         let store = Arc::new(dingtalk_store::DingtalkStore::new());
         self.dingtalk_store = Some(store.clone());
         let sender = worker_state.sender();
-        let receiver = worker_state.take_receiver();
+
+        // Check again under the write lock. A repeated init must not install a
+        // sender from a new channel whose receiver will never be started.
         {
             let mut lock = self.dingtalk_job_sender.write().await;
+            if lock.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                println!("[dingtalk-async-worker] already_started=true");
+                return;
+            }
             *lock = Some(sender);
         }
+
         let runtime = Arc::new(self.clone());
-        tokio::spawn(dingtalk_worker::start_dingtalk_worker(
-            worker_state,
-            runtime,
-            store,
-        ));
-        println!("[gateway] dingtalk_async_worker started");
+        dingtalk_worker::start_dingtalk_worker(worker_state, runtime, store).await;
     }
     
     /// Get approximate queue length
@@ -722,14 +736,31 @@ impl GatewayRuntime {
     }
 
     pub async fn try_send_dingtalk_job(&self, job: dingtalk_worker::DingtalkAsyncJob) -> Result<(), dingtalk_worker::EnqueueError> {
-        let sender = self.dingtalk_job_sender.read().await;
-        let sender = sender.as_ref().ok_or(dingtalk_worker::EnqueueError::QueueFull)?;
-        sender.send(job).await.map_err(|_| dingtalk_worker::EnqueueError::QueueFull)
+        let sender = self
+            .dingtalk_job_sender
+            .read()
+            .await
+            .as_ref()
+            .filter(|sender| !sender.is_closed())
+            .cloned()
+            .ok_or(dingtalk_worker::EnqueueError::QueueFull)?;
+        {
+            // Increment before send so a fast receiver cannot decrement from
+            // zero and leave the approximate count permanently stale.
+            let mut queue_len = self.dingtalk_queue_len.write().await;
+            *queue_len += 1;
+        }
+        if sender.send(job).await.is_err() {
+            let mut queue_len = self.dingtalk_queue_len.write().await;
+            *queue_len = queue_len.saturating_sub(1);
+            return Err(dingtalk_worker::EnqueueError::QueueFull);
+        }
+        Ok(())
     }
 
     pub async fn is_dingtalk_worker_initialized(&self) -> bool {
         let sender = self.dingtalk_job_sender.read().await;
-        sender.is_some()
+        sender.as_ref().is_some_and(|sender| !sender.is_closed())
     }
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
@@ -4777,12 +4808,24 @@ async fn http_dingtalk_webhook(
 
     if is_async_available {
         // Queue job for background processing
+        let text_len = inbound.text.chars().count();
+        let queue_len_before = runtime.dingtalk_queue_len().await;
+        println!(
+            "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={}",
+            text_len,
+            queue_len_before
+        );
+
         let job = dingtalk_worker::DingtalkAsyncJob::new(inbound, payload);
         let job_id = job.job_id.clone();
 
         match runtime.try_send_dingtalk_job(job).await {
             Ok(()) => {
                 let queue_len = runtime.dingtalk_queue_len().await;
+                println!(
+                    "[dingtalk-webhook] enqueue_success=true queue_len={}",
+                    queue_len
+                );
                 println!(
                     "[dingtalk-webhook] ack_queued ack_ms={} queue_len={}",
                     0,
@@ -4796,6 +4839,12 @@ async fn http_dingtalk_webhook(
                 })));
             }
             Err(_) => {
+                let queue_len = runtime.dingtalk_queue_len().await;
+                println!(
+                    "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={} result=failed",
+                    text_len,
+                    queue_len
+                );
                 println!("[dingtalk-worker] queue_full capacity=100");
                 return Ok(Json(serde_json::json!({
                     "ok": false,

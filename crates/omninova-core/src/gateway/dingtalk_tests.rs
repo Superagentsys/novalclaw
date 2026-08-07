@@ -1541,3 +1541,29 @@ fn dingtalk_default_gateway_port_is_10809() {
         "default host must stay loopback; cloudflared forwards externally"
     );
 }
+
+#[tokio::test]
+async fn dingtalk_worker_init_is_idempotent_and_keeps_the_same_channel() {
+    let mut runtime = crate::gateway::GatewayRuntime::new(Config::default());
+    runtime.init_dingtalk_worker().await;
+    let first = runtime
+        .dingtalk_job_sender
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .expect("worker sender should be installed");
+    assert!(!first.is_closed());
+
+    runtime.init_dingtalk_worker().await;
+    let second = runtime
+        .dingtalk_job_sender
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .expect("worker sender should remain installed");
+
+    assert!(first.same_channel(&second));
+    assert!(!second.is_closed());
+}

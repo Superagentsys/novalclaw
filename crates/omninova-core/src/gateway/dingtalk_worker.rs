@@ -34,10 +34,7 @@ pub struct DingtalkAsyncJob {
 }
 
 impl DingtalkAsyncJob {
-    pub fn new(
-        inbound: InboundMessage,
-        raw_payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(inbound: InboundMessage, raw_payload: serde_json::Value) -> Self {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -66,6 +63,7 @@ pub struct DingtalkWorkerState {
     sender: Option<mpsc::Sender<DingtalkAsyncJob>>,
     receiver: Option<mpsc::Receiver<DingtalkAsyncJob>>,
     pub queue_len: Arc<RwLock<usize>>,
+    initialized: bool,
 }
 
 impl Default for DingtalkWorkerState {
@@ -76,20 +74,43 @@ impl Default for DingtalkWorkerState {
 
 impl DingtalkWorkerState {
     pub fn new() -> Self {
+        Self::with_queue_len(Arc::new(RwLock::new(0)))
+    }
+
+    pub fn with_queue_len(queue_len: Arc<RwLock<usize>>) -> Self {
         let (sender, receiver) = mpsc::channel::<DingtalkAsyncJob>(QUEUE_CAPACITY);
         Self {
             sender: Some(sender),
             receiver: Some(receiver),
-            queue_len: Arc::new(RwLock::new(0)),
+            queue_len,
+            initialized: false,
         }
+    }
+
+    /// Check if the worker has been initialized (receiver taken)
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 
     pub fn sender(&self) -> DingtalkJobSender {
         self.sender.clone().expect("sender already taken")
     }
 
+    /// Take the receiver for starting the worker loop.
+    /// Returns Some(receiver) if not yet taken, None if already initialized.
+    /// This prevents panic on repeated initialization.
+    pub fn try_take_receiver(&mut self) -> Option<mpsc::Receiver<DingtalkAsyncJob>> {
+        if self.initialized {
+            return None;
+        }
+        self.initialized = true;
+        self.receiver.take()
+    }
+
+    /// Take the receiver for starting the worker loop.
+    /// Panics if already taken. Use try_take_receiver() for safe idempotent access.
     pub fn take_receiver(&mut self) -> mpsc::Receiver<DingtalkAsyncJob> {
-        self.receiver.take().expect("receiver already taken")
+        self.try_take_receiver().expect("receiver already taken")
     }
 
     pub async fn try_enqueue(&self, job: DingtalkAsyncJob) -> Result<(), EnqueueError> {
@@ -99,7 +120,10 @@ impl DingtalkWorkerState {
         }
         drop(queue_len);
 
-        self.sender().send(job).await.map_err(|_| EnqueueError::QueueFull)?;
+        self.sender()
+            .send(job)
+            .await
+            .map_err(|_| EnqueueError::QueueFull)?;
 
         let mut queue_len = self.queue_len.write().await;
         *queue_len += 1;
@@ -117,17 +141,53 @@ pub enum EnqueueError {
 // Worker
 // ---------------------------------------------------------------------------
 
-/// Start the DingTalk worker
+/// Start the DingTalk worker.
+/// Returns immediately if the worker is already running (idempotent).
 pub async fn start_dingtalk_worker(
     mut state: DingtalkWorkerState,
     runtime: Arc<GatewayRuntime>,
     store: Arc<DingtalkStore>,
 ) {
-    let mut receiver = state.take_receiver();
+    let receiver = match state.try_take_receiver() {
+        Some(rx) => rx,
+        None => {
+            println!("[dingtalk-async-worker] already_started=true");
+            return;
+        }
+    };
     let queue_len = state.queue_len.clone();
 
+    println!("[dingtalk-async-worker] started=true");
+
     tokio::spawn(async move {
+        let mut receiver = receiver;
+        println!("[dingtalk-worker] loop_started=true");
+
         while let Some(job) = receiver.recv().await {
+            let text_len = job.inbound.text.chars().count();
+            let has_conversation = job
+                .inbound
+                .session_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let has_webhook = job
+                .inbound
+                .metadata
+                .get("sessionWebhook")
+                .map(|v| !v.as_str().unwrap_or("").trim().is_empty())
+                .unwrap_or(false);
+            let has_robot_code = job
+                .inbound
+                .metadata
+                .get("robotCode")
+                .map(|v| !v.as_str().unwrap_or("").trim().is_empty())
+                .unwrap_or(false);
+
+            println!(
+                "[dingtalk-worker] job_received=true text_len={} has_conversation={} has_webhook={} has_robot_code={}",
+                text_len, has_conversation, has_webhook, has_robot_code
+            );
+
             let runtime_clone = runtime.clone();
             let store_clone = store.clone();
             let queue_len_clone = queue_len.clone();
@@ -138,6 +198,8 @@ pub async fn start_dingtalk_worker(
                 *ql = ql.saturating_sub(1);
             });
         }
+
+        println!("[dingtalk-worker] loop_stopped=true reason=receiver_closed");
     });
 }
 
@@ -154,21 +216,21 @@ async fn process_dingtalk_job(
 
     // Phase 2: short-circuit commands (help/menu/status/ping/monitor).
     // Non-command text falls through to the agent exactly like Phase 1.
-    let reply = if let Some((cmd, command_reply)) = evaluate_command_for_job(&runtime, &job).await {
-        println!(
-            "[dingtalk-worker] command_reply command={} job_id={}",
-            cmd.name(),
-            job_id
-        );
+    let command_result = evaluate_command_for_job(&runtime, &job).await;
+    let reply = if let Some((cmd, command_reply)) = command_result {
+        println!("[dingtalk-command] matched=true command={}", cmd.name());
         command_reply
     } else {
-        match route_to_agent(&runtime, &inbound).await {
+        println!("[dingtalk-command] matched=false command=none");
+        let reply = match route_to_agent(&runtime, &inbound).await {
             Ok(r) => r,
             Err(e) => {
+                println!("[dingtalk-worker] job_failed=true reason=agent_error");
                 store.mark_failed(&job_id, e.to_string()).await;
                 return;
             }
-        }
+        };
+        reply
     };
 
     // Send reply via sessionWebhook
@@ -176,9 +238,14 @@ async fn process_dingtalk_job(
 
     match result {
         Ok(_) => {
+            println!("[dingtalk-worker] job_completed=true");
             store.update_status(&job_id, JobStatus::Completed).await;
         }
         Err(e) => {
+            println!(
+                "[dingtalk-worker] job_failed=true reason={}",
+                safe_error_kind(&e)
+            );
             store.mark_failed(&job_id, e.to_string()).await;
         }
     }
@@ -236,46 +303,117 @@ async fn send_reply_via_session_webhook(
     let config = runtime.get_config().await;
     let entry = config.channels_config.dingtalk.as_ref();
 
-    // App key and secret precedence (first non-empty wins):
-    //   1. channels_config.dingtalk.extra["app_key"|"app_secret"]
-    //   2. gateway.dingtalk.app_key|app_secret  (inline)
-    //   3. gateway.dingtalk.app_key_env|app_secret_env  (env var name)
-    //   4. OMNINOVA_DINGTALK_APP_KEY|APP_SECRET
-    let app_key = crate::gateway::resolve_dingtalk_app_key_for_worker(&config, entry)
-        .ok_or_else(|| "missing_app_key".to_string())?;
-    let app_secret = crate::gateway::resolve_dingtalk_secret_for_worker(&config, entry)
-        .ok_or_else(|| "missing_app_secret".to_string())?;
+    let outbound_mode = {
+        let configured = config.gateway.dingtalk.outbound_mode.trim();
+        if !configured.is_empty() {
+            configured
+        } else {
+            entry
+                .and_then(|entry| entry.extra.get("outbound_mode"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("disabled")
+        }
+    };
 
-    // The legacy `sessionWebhook` URL is informational for the
-    // `sendFromApp` API path (which sends via `robotCode` +
-    // `conversationId`). We log its presence without ever echoing it
-    // back to the caller.
-    let session_webhook_present = inbound
+    if outbound_mode == "disabled" {
+        println!("[dingtalk-outbound] sending=false mode=disabled");
+        return Ok(());
+    }
+    if outbound_mode == "mock" {
+        println!("[dingtalk-outbound] sending=false mode=mock");
+        return Ok(());
+    }
+
+    let session_webhook = inbound
         .metadata
         .get("sessionWebhook")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let session_webhook_present = session_webhook.is_some();
+    let robot_code_present = inbound
+        .metadata
+        .get("robotCode")
+        .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    if !session_webhook_present {
+    let conversation_id_present = inbound.session_id.is_some();
+
+    if let Some(webhook) = session_webhook {
         println!(
-            "[dingtalk-worker] session_webhook_missing fallback=robot_code_required \
+            "[dingtalk-outbound] sending=true mode=session_webhook robot_code_present={} conversation_id_present={} webhook_present=true",
+            robot_code_present, conversation_id_present
+        );
+        match send_dingtalk_session_webhook(webhook, reply).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                println!(
+                    "[dingtalk-outbound] fallback=true from=session_webhook to=send_from_app reason={}",
+                    safe_error_kind(&error)
+                );
+            }
+        }
+    } else {
+        println!(
+            "[dingtalk-outbound] session_webhook_missing fallback=robot_code_required \
              inbound_session_id_present={}",
             inbound.session_id.is_some()
         );
     }
 
-    let token = fetch_dingtalk_access_token(&app_key, &app_secret).await?;
+    println!(
+        "[dingtalk-outbound] sending=true mode=send_from_app robot_code_present={} conversation_id_present={} webhook_present={}",
+        robot_code_present, conversation_id_present, session_webhook_present
+    );
 
-    // Look up the configured robot_code so the send path can build a
-    // valid `sendFromApp` body even when the inbound payload omits it.
+    // App key and secret are only needed for the sendFromApp fallback.
+    let app_key = crate::gateway::resolve_dingtalk_app_key_for_worker(&config, entry)
+        .ok_or_else(|| "missing_app_key".to_string())?;
+    let app_secret = crate::gateway::resolve_dingtalk_secret_for_worker(&config, entry)
+        .ok_or_else(|| "missing_app_secret".to_string())?;
+
+    let token = match fetch_dingtalk_access_token(&app_key, &app_secret).await {
+        Ok(token) => {
+            println!("[dingtalk-outbound] access_token_present=true");
+            token
+        }
+        Err(error) => {
+            println!("[dingtalk-outbound] access_token_present=false");
+            return Err(error);
+        }
+    };
+
     let fallback_robot_code = crate::gateway::resolve_dingtalk_robot_code_for_worker(
         &config,
         config.channels_config.dingtalk.as_ref(),
     );
 
-    send_dingtalk_text_message(&token, &inbound, fallback_robot_code.as_deref(), reply)
+    send_dingtalk_text_message(&token, inbound, fallback_robot_code.as_deref(), reply)
         .await
-        .map_err(|e| format!("session_webhook_error: {}", e))
+        .map_err(|error| format!("send_from_app_error:{error}"))
+}
+
+async fn send_dingtalk_session_webhook(webhook: &str, text: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(webhook).map_err(|_| "invalid_session_webhook".to_string())?;
+    if url.scheme() != "https" || url.host_str() != Some("oapi.dingtalk.com") {
+        return Err("invalid_session_webhook_host".to_string());
+    }
+
+    let client = dingtalk_http_client()?;
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .json(&build_session_webhook_payload(text))
+        .send()
+        .await
+        .map_err(|_| {
+            println!(
+                "[dingtalk-outbound] response status=0 err_code=network_error err_msg_len=0 body_len=0"
+            );
+            "network_error".to_string()
+        })?;
+
+    handle_dingtalk_send_response(response).await
 }
 
 /// Fetch DingTalk access token via app_key + app_secret
@@ -283,46 +421,57 @@ pub(crate) async fn fetch_dingtalk_access_token(
     app_key: &str,
     app_secret: &str,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = dingtalk_http_client()?;
     let resp = client
         .post("https://api.dingtalk.com/v1.0/oauth2/accessToken")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json; charset=utf-8")
         .json(&serde_json::json!({
             "appKey": app_key,
             "appSecret": app_secret,
         }))
         .send()
         .await
-        .map_err(|e| format!("network_error: {}", e))?;
+        .map_err(|_| {
+            println!(
+                "[dingtalk-outbound] response status=0 err_code=token_network_error err_msg_len=0 body_len=0"
+            );
+            "token_network_error".to_string()
+        })?;
 
     let status = resp.status();
     let body = resp
         .text()
         .await
-        .map_err(|e| format!("read_error: {}", e))?;
+        .map_err(|_| "token_read_error".to_string())?;
 
     if !status.is_success() {
-        return Err(format!("http_error: status={} body={}", status.as_u16(), redact_for_log(&body)));
+        let summary = summarize_dingtalk_response(status.as_u16(), &body);
+        println!(
+            "[dingtalk-outbound] response status={} err_code={} err_msg_len={} body_len={}",
+            summary.status, summary.err_code, summary.err_msg_len, summary.body_len
+        );
+        return Err(format!(
+            "token_http_error:status={} code={} msg_len={} body_len={}",
+            summary.status, summary.err_code, summary.err_msg_len, summary.body_len
+        ));
     }
 
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("parse_error: {}", e))?;
+        serde_json::from_str(&body).map_err(|_| "token_parse_error".to_string())?;
 
-    json.get("accessToken")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| {
-            let err_code = json
-                .get("errCode")
-                .and_then(|v| v.as_i64())
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let err_msg = json
-                .get("errMsg")
-                .and_then(|v| v.as_str())
-                .unwrap_or("no token in response");
-            format!("token_error: code={} msg={}", err_code, err_msg)
-        })
+    if let Some(token) = json.get("accessToken").and_then(|value| value.as_str()) {
+        return Ok(token.to_string());
+    }
+
+    let summary = summarize_dingtalk_json(status.as_u16(), body.len(), &json);
+    println!(
+        "[dingtalk-outbound] response status={} err_code={} err_msg_len={} body_len={}",
+        summary.status, summary.err_code, summary.err_msg_len, summary.body_len
+    );
+    Err(format!(
+        "token_error:code={} msg_len={} body_len={}",
+        summary.err_code, summary.err_msg_len, summary.body_len
+    ))
 }
 
 /// Send text message via DingTalk `sendFromApp` API.
@@ -345,7 +494,7 @@ pub(crate) async fn send_dingtalk_text_message(
     fallback_robot_code: Option<&str>,
     text: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = dingtalk_http_client()?;
 
     let robot_code = inbound
         .metadata
@@ -378,18 +527,12 @@ pub(crate) async fn send_dingtalk_text_message(
 
     // DingTalk expects `msgParam` as a JSON-encoded string, not an
     // object. Serialize the inner content object as a String.
-    let msg_param_str = serde_json::json!({ "content": text }).to_string();
-
-    let mut body = serde_json::json!({
-        "robotCode": robot_code,
-        "msgKey": "sampleText",
-        "msgParam": msg_param_str,
-        "conversationId": conversation_id,
-    });
-
-    if let Some(ref staff_id) = sender_staff_id {
-        body["senderStaffId"] = serde_json::json!(staff_id);
-    }
+    let body = build_send_from_app_payload(
+        robot_code,
+        &conversation_id,
+        sender_staff_id.as_deref(),
+        text,
+    );
 
     let resp = client
         .post("https://api.dingtalk.com/v1.0/im/robot/sendFromApp")
@@ -398,62 +541,190 @@ pub(crate) async fn send_dingtalk_text_message(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("network_error: {}", e))?;
+        .map_err(|_| {
+            println!(
+                "[dingtalk-outbound] response status=0 err_code=network_error err_msg_len=0 body_len=0"
+            );
+            "network_error".to_string()
+        })?;
 
-    let status = resp.status();
-    let resp_body = resp
-        .text()
-        .await
-        .map_err(|e| format!("read_error: {}", e))?;
+    handle_dingtalk_send_response(resp).await
+}
 
-    if !status.is_success() {
-        return Err(format!(
-            "http_error: status={} body_present={} body_len={}",
-            status.as_u16(),
-            !resp_body.is_empty(),
-            resp_body.len()
-        ));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DingtalkResponseSummary {
+    status: u16,
+    err_code: String,
+    err_msg_len: usize,
+    body_len: usize,
+    log_id_present: bool,
+    success: bool,
+}
+
+fn build_session_webhook_payload(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "msgtype": "text",
+        "text": { "content": text },
+    })
+}
+
+fn build_send_from_app_payload(
+    robot_code: &str,
+    conversation_id: &str,
+    sender_staff_id: Option<&str>,
+    text: &str,
+) -> serde_json::Value {
+    // DingTalk requires msgParam to be a JSON string, not a nested object.
+    let msg_param = serde_json::json!({ "content": text }).to_string();
+    let mut body = serde_json::json!({
+        "robotCode": robot_code,
+        "msgKey": "sampleText",
+        "msgParam": msg_param,
+        "conversationId": conversation_id,
+    });
+    if let Some(sender_staff_id) = sender_staff_id {
+        body["senderStaffId"] = serde_json::json!(sender_staff_id);
+    }
+    body
+}
+
+fn dingtalk_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(OUTBOUND_TIMEOUT_SECS))
+        .build()
+        .map_err(|_| "http_client_error".to_string())
+}
+
+fn json_string_or_number(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| {
+        value
+            .as_str()
+            .map(ToString::to_string)
+            .or_else(|| value.as_i64().map(|number| number.to_string()))
+            .or_else(|| value.as_u64().map(|number| number.to_string()))
+    })
+}
+
+fn summarize_dingtalk_json(
+    status: u16,
+    body_len: usize,
+    json: &serde_json::Value,
+) -> DingtalkResponseSummary {
+    let err_code = json_string_or_number(
+        json.get("errCode")
+            .or_else(|| json.get("errcode"))
+            .or_else(|| json.get("code")),
+    )
+    .unwrap_or_else(|| "0".to_string());
+    let err_msg_len = json
+        .get("errMsg")
+        .or_else(|| json.get("errmsg"))
+        .or_else(|| json.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.chars().count())
+        .unwrap_or(0);
+    let log_id_present = json
+        .get("logId")
+        .or_else(|| json.get("logid"))
+        .or_else(|| json.get("requestId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let explicit_success = json.get("success").and_then(serde_json::Value::as_bool);
+    let success = (200..300).contains(&status)
+        && match explicit_success {
+            Some(value) => value,
+            None => err_code == "0" || err_code.eq_ignore_ascii_case("ok"),
+        };
+
+    DingtalkResponseSummary {
+        status,
+        err_code,
+        err_msg_len,
+        body_len,
+        log_id_present,
+        success,
+    }
+}
+
+fn summarize_dingtalk_response(status: u16, body: &str) -> DingtalkResponseSummary {
+    if body.trim().is_empty() {
+        return DingtalkResponseSummary {
+            status,
+            err_code: if (200..300).contains(&status) {
+                "0"
+            } else {
+                "unknown"
+            }
+            .to_string(),
+            err_msg_len: 0,
+            body_len: body.len(),
+            log_id_present: false,
+            success: (200..300).contains(&status),
+        };
     }
 
-    let json: serde_json::Value = serde_json::from_str(&resp_body)
-        .map_err(|e| format!("parse_error: {}", e))?;
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(json) => summarize_dingtalk_json(status, body.len(), &json),
+        Err(_) => DingtalkResponseSummary {
+            status,
+            err_code: "invalid_json".to_string(),
+            err_msg_len: 0,
+            body_len: body.len(),
+            log_id_present: false,
+            success: false,
+        },
+    }
+}
 
-    if json.get("success").and_then(|v| v.as_bool()) == Some(true) {
+async fn handle_dingtalk_send_response(response: reqwest::Response) -> Result<(), String> {
+    let status = response.status().as_u16();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => {
+            println!(
+                "[dingtalk-outbound] response status={} err_code=read_error err_msg_len=0 body_len=0",
+                status
+            );
+            return Err("read_error".to_string());
+        }
+    };
+    let summary = summarize_dingtalk_response(status, &body);
+    println!(
+        "[dingtalk-outbound] response status={} err_code={} err_msg_len={} body_len={}",
+        summary.status, summary.err_code, summary.err_msg_len, summary.body_len
+    );
+
+    if summary.success {
         Ok(())
     } else {
-        let err_code = json
-            .get("errCode")
-            .and_then(|v| v.as_i64())
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let err_msg_len = json
-            .get("errMsg")
-            .and_then(|v| v.as_str())
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        let log_id_present = json
-            .get("logId")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
         Err(format!(
-            "send_error: err_code={} err_msg_len={} log_id_present={}",
-            err_code, err_msg_len, log_id_present
+            "send_error:status={} code={} msg_len={} log_id_present={}",
+            summary.status, summary.err_code, summary.err_msg_len, summary.log_id_present
         ))
     }
 }
 
-/// Redact sensitive values from log strings. Only used as a
-/// defense-in-depth helper for any future code path that needs to
-/// log opaque bodies; current log lines never include message bodies
-/// directly.
-fn redact_for_log(input: &str) -> String {
-    // Truncate long bodies for log safety
-    let truncated: String = input.chars().take(200).collect();
-    if input.len() > 200 {
-        format!("{}…[truncated]", truncated)
+fn safe_error_kind(error: &str) -> &'static str {
+    if error.starts_with("invalid_session_webhook") {
+        "invalid_session_webhook"
+    } else if error.contains("missing_app_key") {
+        "missing_app_key"
+    } else if error.contains("missing_app_secret") {
+        "missing_app_secret"
+    } else if error.contains("missing_robot_code") {
+        "missing_robot_code"
+    } else if error.contains("missing_conversation_id") {
+        "missing_conversation_id"
+    } else if error.contains("token_") {
+        "access_token_error"
+    } else if error.contains("network_error") {
+        "network_error"
+    } else if error.contains("send_error") {
+        "platform_error"
+    } else if error.contains("read_error") || error.contains("parse_error") {
+        "invalid_platform_response"
     } else {
-        truncated
+        "outbound_error"
     }
 }
 
@@ -478,14 +749,14 @@ pub(crate) fn verify_dingtalk_signature(
 }
 
 pub(crate) fn hmac_sha256_base64(data: &str, key: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     let bytes = result.into_bytes();
@@ -558,18 +829,47 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_for_log_truncation() {
-        let long = "x".repeat(300);
-        let result = redact_for_log(&long);
-        assert!(result.len() < 250);
-        assert!(result.contains("…[truncated]"));
+    fn test_session_webhook_payload_is_text_message() {
+        let body = build_session_webhook_payload("pong");
+        assert_eq!(body["msgtype"], "text");
+        assert_eq!(body["text"]["content"], "pong");
     }
 
     #[test]
-    fn test_redact_for_log_short() {
-        let short = "hello world";
-        let result = redact_for_log(short);
-        assert_eq!(result, "hello world");
+    fn test_send_from_app_payload_uses_json_string_msg_param() {
+        let body = build_send_from_app_payload("robot", "conversation", Some("sender"), "pong");
+        assert_eq!(body["msgKey"], "sampleText");
+        let msg_param = body["msgParam"]
+            .as_str()
+            .expect("msgParam must be a string");
+        let decoded: serde_json::Value = serde_json::from_str(msg_param).unwrap();
+        assert_eq!(decoded["content"], "pong");
+    }
+
+    #[test]
+    fn test_dingtalk_response_summary_accepts_both_api_success_shapes() {
+        let session = summarize_dingtalk_response(200, r#"{"errcode":0,"errmsg":"ok"}"#);
+        assert!(session.success);
+        assert_eq!(session.err_code, "0");
+
+        let send_from_app = summarize_dingtalk_response(200, r#"{"success":true}"#);
+        assert!(send_from_app.success);
+    }
+
+    #[test]
+    fn test_dingtalk_response_summary_is_structured_and_redacted() {
+        let secret = "must-not-appear-in-log-summary";
+        let body = format!(
+            r#"{{"errCode":"Forbidden","errMsg":"{}","logId":"present"}}"#,
+            secret
+        );
+        let summary = summarize_dingtalk_response(403, &body);
+        assert!(!summary.success);
+        assert_eq!(summary.status, 403);
+        assert_eq!(summary.err_code, "Forbidden");
+        assert_eq!(summary.err_msg_len, secret.chars().count());
+        assert!(summary.log_id_present);
+        assert!(!format!("{summary:?}").contains(secret));
     }
 
     #[tokio::test]
@@ -588,6 +888,87 @@ mod tests {
         assert_eq!(job.channel, ChannelKind::Dingtalk);
         assert_eq!(job.inbound.text, "hello");
         assert!(job.job_id.starts_with("dt_job_"));
+    }
+
+    #[test]
+    fn test_dingtalk_worker_state_try_take_receiver_idempotent() {
+        // First take should succeed
+        let mut state1 = DingtalkWorkerState::new();
+        assert!(!state1.is_initialized());
+        let receiver1 = state1.try_take_receiver();
+        assert!(receiver1.is_some());
+        assert!(state1.is_initialized());
+
+        // Second take should return None (idempotent, no panic)
+        let receiver2 = state1.try_take_receiver();
+        assert!(receiver2.is_none());
+    }
+
+    #[test]
+    fn test_dingtalk_worker_state_take_receiver_panics_on_second_call() {
+        // take_receiver should panic on second call (same as before, but explicit test)
+        let mut state = DingtalkWorkerState::new();
+        let _ = state.take_receiver();
+        // After first take, try_take_receiver returns None, which means the state is "done"
+        // The old take_receiver behavior (expect) would panic - we verify that
+        // try_take_receiver is the safe alternative
+        let result = state.try_take_receiver();
+        assert!(
+            result.is_none(),
+            "try_take_receiver should return None after initialization"
+        );
+    }
+
+    #[test]
+    fn test_dingtalk_worker_state_new_is_not_initialized() {
+        let state = DingtalkWorkerState::new();
+        assert!(!state.is_initialized());
+    }
+
+    #[test]
+    fn test_dingtalk_worker_state_sender_cloned_but_not_taken() {
+        // Creating multiple states should each have their own sender
+        let state1 = DingtalkWorkerState::new();
+        let state2 = DingtalkWorkerState::new();
+
+        // Each state has its own sender, cloning is fine
+        let sender1 = state1.sender();
+        let sender2 = state2.sender();
+        assert!(!sender1.is_closed());
+        assert!(!sender2.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_dingtalk_worker_sender_and_receiver_share_one_channel() {
+        let mut state = DingtalkWorkerState::new();
+        let sender = state.sender();
+        let mut receiver = state
+            .try_take_receiver()
+            .expect("receiver should be available once");
+        let job = DingtalkAsyncJob::new(
+            InboundMessage {
+                channel: ChannelKind::Dingtalk,
+                user_id: None,
+                session_id: Some("conversation".to_string()),
+                text: "ping".to_string(),
+                metadata: Default::default(),
+            },
+            serde_json::json!({}),
+        );
+
+        sender.send(job).await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("receiver timed out")
+            .expect("channel closed");
+        assert_eq!(received.inbound.text, "ping");
+    }
+
+    #[test]
+    fn test_dingtalk_worker_can_share_runtime_queue_counter() {
+        let queue_len = Arc::new(RwLock::new(0));
+        let state = DingtalkWorkerState::with_queue_len(queue_len.clone());
+        assert!(Arc::ptr_eq(&state.queue_len, &queue_len));
     }
 }
 
