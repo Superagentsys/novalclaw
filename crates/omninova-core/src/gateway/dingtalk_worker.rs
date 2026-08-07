@@ -246,35 +246,34 @@ async fn send_reply_via_session_webhook(
     let app_secret = crate::gateway::resolve_dingtalk_secret_for_worker(&config, entry)
         .ok_or_else(|| "missing_app_secret".to_string())?;
 
-    // Extract sessionWebhook from inbound metadata
-    let session_webhook = inbound
+    // The legacy `sessionWebhook` URL is informational for the
+    // `sendFromApp` API path (which sends via `robotCode` +
+    // `conversationId`). We log its presence without ever echoing it
+    // back to the caller.
+    let session_webhook_present = inbound
         .metadata
         .get("sessionWebhook")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "missing_session_webhook".to_string())?;
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !session_webhook_present {
+        println!(
+            "[dingtalk-worker] session_webhook_missing fallback=robot_code_required \
+             inbound_session_id_present={}",
+            inbound.session_id.is_some()
+        );
+    }
 
     let token = fetch_dingtalk_access_token(&app_key, &app_secret).await?;
 
-    let conversation_id = inbound
-        .session_id
-        .clone()
-        .or_else(|| {
-            inbound
-                .metadata
-                .get("conversationId")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .ok_or_else(|| "missing_conversation_id".to_string())?;
+    // Look up the configured robot_code so the send path can build a
+    // valid `sendFromApp` body even when the inbound payload omits it.
+    let fallback_robot_code = crate::gateway::resolve_dingtalk_robot_code_for_worker(
+        &config,
+        config.channels_config.dingtalk.as_ref(),
+    );
 
-    let sender_staff_id = inbound
-        .metadata
-        .get("senderStaffId")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    send_dingtalk_text_message(&token, session_webhook, &conversation_id, sender_staff_id.as_deref(), reply)
+    send_dingtalk_text_message(&token, &inbound, fallback_robot_code.as_deref(), reply)
         .await
         .map_err(|e| format!("session_webhook_error: {}", e))
 }
@@ -326,26 +325,69 @@ pub(crate) async fn fetch_dingtalk_access_token(
         })
 }
 
-/// Send text message via DingTalk sessionWebhook API
+/// Send text message via DingTalk `sendFromApp` API.
+///
+/// Field mapping (DingTalk enterprise app bot, in-house bot):
+/// - `robotCode`     — from `inbound.metadata["robotCode"]` (DingTalk
+///                     assigns this to every inbound message). Falls
+///                     back to the configured `gateway.dingtalk.robot_code`
+///                     when the metadata is missing (older proxies).
+/// - `conversationId` — from `inbound.session_id` (the platform
+///                     `conversationId`).
+/// - `senderStaffId`  — from `inbound.metadata["senderStaffId"]`.
+///
+/// The signature is intentionally narrow: callers must supply the
+/// InboundMessage so we never have to derive these fields from a
+/// possibly-leaked session webhook URL.
 pub(crate) async fn send_dingtalk_text_message(
     token: &str,
-    session_webhook: &str,
-    conversation_id: &str,
-    sender_staff_id: Option<&str>,
+    inbound: &InboundMessage,
+    fallback_robot_code: Option<&str>,
     text: &str,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
 
+    let robot_code = inbound
+        .metadata
+        .get("robotCode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| fallback_robot_code.map(str::trim).filter(|s| !s.is_empty()))
+        .ok_or_else(|| "missing_robot_code".to_string())?;
+
+    let conversation_id = inbound
+        .session_id
+        .clone()
+        .or_else(|| {
+            inbound
+                .metadata
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .ok_or_else(|| "missing_conversation_id".to_string())?;
+
+    let sender_staff_id = inbound
+        .metadata
+        .get("senderStaffId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    // DingTalk expects `msgParam` as a JSON-encoded string, not an
+    // object. Serialize the inner content object as a String.
+    let msg_param_str = serde_json::json!({ "content": text }).to_string();
+
     let mut body = serde_json::json!({
-        "robotCode": session_webhook,
-        "topLevelUnitId": conversation_id,
+        "robotCode": robot_code,
         "msgKey": "sampleText",
-        "msgParam": serde_json::json!({
-            "content": text,
-        }),
+        "msgParam": msg_param_str,
+        "conversationId": conversation_id,
     });
 
-    if let Some(staff_id) = sender_staff_id {
+    if let Some(ref staff_id) = sender_staff_id {
         body["senderStaffId"] = serde_json::json!(staff_id);
     }
 
@@ -359,21 +401,22 @@ pub(crate) async fn send_dingtalk_text_message(
         .map_err(|e| format!("network_error: {}", e))?;
 
     let status = resp.status();
-    let body = resp
+    let resp_body = resp
         .text()
         .await
         .map_err(|e| format!("read_error: {}", e))?;
 
     if !status.is_success() {
         return Err(format!(
-            "http_error: status={} body={}",
+            "http_error: status={} body_present={} body_len={}",
             status.as_u16(),
-            redact_for_log(&body)
+            !resp_body.is_empty(),
+            resp_body.len()
         ));
     }
 
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("parse_error: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| format!("parse_error: {}", e))?;
 
     if json.get("success").and_then(|v| v.as_bool()) == Some(true) {
         Ok(())
@@ -383,15 +426,27 @@ pub(crate) async fn send_dingtalk_text_message(
             .and_then(|v| v.as_i64())
             .map(|c| c.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let err_msg = json
+        let err_msg_len = json
             .get("errMsg")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        Err(format!("send_error: code={} msg={}", err_code, err_msg))
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        let log_id_present = json
+            .get("logId")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        Err(format!(
+            "send_error: err_code={} err_msg_len={} log_id_present={}",
+            err_code, err_msg_len, log_id_present
+        ))
     }
 }
 
-/// Redact sensitive values from log strings
+/// Redact sensitive values from log strings. Only used as a
+/// defense-in-depth helper for any future code path that needs to
+/// log opaque bodies; current log lines never include message bodies
+/// directly.
 fn redact_for_log(input: &str) -> String {
     // Truncate long bodies for log safety
     let truncated: String = input.chars().take(200).collect();

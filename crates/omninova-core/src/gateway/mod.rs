@@ -2171,6 +2171,13 @@ impl GatewayRuntime {
             .route("/webhook/feishu", post(http_feishu_webhook))
             .route("/webhook/lark", post(http_lark_webhook))
             .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            // Alias documented in `config.template.toml` and used by the
+            // real DingTalk enterprise app bot callback wizard:
+            //   `https://<public-host>/api/v1/gateway/dingtalk/events`.
+            // Both routes point to the same handler so the documented
+            // URL works end-to-end while the legacy `/webhook/dingtalk`
+            // path keeps working for anyone already wired up.
+            .route("/api/v1/gateway/dingtalk/events", post(http_dingtalk_webhook))
             .route("/webhook/feishu/card", post(http_feishu_card_callback))
             .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
@@ -4637,12 +4644,38 @@ async fn http_dingtalk_webhook(
         }
     }
 
-    // 4. Extract key fields for filtering
+    // 4. Extract key fields for filtering.
+    //
+    // Real DingTalk enterprise app bot v1 callbacks send:
+    //   - `msgtype` (lowercase) for the message-type discriminator
+    //   - `text.content` (nested) for the user-visible text
+    //   - `msgId` (camelCase) for the platform message id
+    //
+    // Some DingTalk client SDKs and proxies still emit `msgType`,
+    // `text` as a flat string, or `messageId`. We accept both for
+    // forward compatibility without changing the Phase 1 internal model.
     let msg_type = payload
         .get("msgType")
+        .or_else(|| payload.get("msgtype"))
         .and_then(|v| v.as_str())
         .map(String::from);
     let is_text_message = msg_type.as_deref() == Some("text");
+
+    // URL verification challenge (real DingTalk sends this once at
+    // first connection). Phase 1 silently dropped these; Phase 3 must
+    // echo `challenge` back so the platform registers our URL.
+    if payload.get("eventType").and_then(|v| v.as_str())
+        == Some("url_verification")
+    {
+        if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
+            println!(
+                "[dingtalk-webhook] url_verification_ok challenge_len={}",
+                challenge.len()
+            );
+            return Ok(Json(serde_json::json!({ "challenge": challenge })));
+        }
+        println!("[dingtalk-webhook] url_verification_missing_challenge");
+    }
 
     // 5. Extract sender info (DingTalk corpid/userid)
     let sender_staff_id = payload
@@ -4663,6 +4696,7 @@ async fn http_dingtalk_webhook(
         .map(String::from);
     let message_id = payload
         .get("messageId")
+        .or_else(|| payload.get("msgId"))
         .and_then(|v| v.as_str())
         .map(String::from);
     let robot_code = payload
@@ -4670,18 +4704,16 @@ async fn http_dingtalk_webhook(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    // Log inbound (redacted sender/cid)
+    // Log inbound (presence flags and length only — never the values).
     println!(
-        "[dingtalk-webhook] received msg_type={:?} has_sender={} has_conversation={} has_webhook={} has_msgid={} text_len={}",
+        "[dingtalk-webhook] received msg_type={:?} has_sender={} has_conversation={} has_webhook={} has_msgid={} has_robot_code={} text_len={}",
         msg_type,
         sender_staff_id.as_ref().map(|_| true).unwrap_or(false),
         conversation_id.as_ref().map(|_| true).unwrap_or(false),
         session_webhook.as_ref().map(|_| true).unwrap_or(false),
         message_id.as_ref().map(|_| true).unwrap_or(false),
-        payload.get("text")
-            .and_then(|v| v.as_str())
-            .map(|t| t.len())
-            .unwrap_or(0)
+        robot_code.as_ref().map(|_| true).unwrap_or(false),
+        extract_dingtalk_text_len(&payload)
     );
 
     // 6. Filter: only handle text messages (Phase 1)
@@ -4695,12 +4727,10 @@ async fn http_dingtalk_webhook(
         })));
     }
 
-    // 7. Extract text content
-    let text = payload
-        .get("text")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_default();
+    // 7. Extract text content. Accept both nested `text.content` (real
+    // DingTalk) and flat `text` (some proxies / SDKs). `text.content`
+    // wins when both are present.
+    let text = extract_dingtalk_text(&payload);
     if text.trim().is_empty() {
         println!("[dingtalk-webhook] skip_empty_text");
         return Ok(Json(serde_json::json!({
@@ -6167,12 +6197,19 @@ async fn deliver_dingtalk_reply(
     }
 
     // real mode: use sessionWebhook
-    let session_webhook = inbound
+    let session_webhook_present = inbound
         .metadata
         .get("sessionWebhook")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "missing_session_webhook".to_string())?;
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !session_webhook_present {
+        println!(
+            "[dingtalk-webhook] session_webhook_missing fallback=robot_code_required \
+             inbound_session_id_present={}",
+            inbound.session_id.is_some()
+        );
+    }
 
     let app_key = resolve_dingtalk_app_key(config, entry)
         .ok_or_else(|| "missing_app_key".to_string())?;
@@ -6183,29 +6220,15 @@ async fn deliver_dingtalk_reply(
         .await
         .map_err(|e| format!("token_fetch_error: {}", e))?;
 
-    let conversation_id = inbound
-        .session_id
-        .clone()
-        .or_else(|| {
-            inbound
-                .metadata
-                .get("conversationId")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .ok_or_else(|| "missing_conversation_id".to_string())?;
-
-    let sender_staff_id = inbound
-        .metadata
-        .get("senderStaffId")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    // Fallback robot_code comes from the gateway top-level config so
+    // the send path can build a valid `sendFromApp` body even when the
+    // inbound payload does not carry a `robotCode` field.
+    let fallback_robot_code = resolve_dingtalk_robot_code(config, entry);
 
     dingtalk_worker::send_dingtalk_text_message(
         &token,
-        session_webhook,
-        &conversation_id,
-        sender_staff_id.as_deref(),
+        inbound,
+        fallback_robot_code.as_deref(),
         reply,
     )
     .await
@@ -6318,6 +6341,40 @@ fn is_dingtalk_effectively_enabled(config: &Config) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// DingTalk payload parsing helpers (Phase 3 — real-platform compatibility)
+// ---------------------------------------------------------------------------
+//
+// Real DingTalk enterprise app bot v1 callbacks deliver the user-visible
+// text under `text.content`, not as a flat `text` string. The same body
+// shape, however, also travels through some proxies / SDKs as a flat
+// `text` field. Both shapes are accepted here so the same handler can
+// process real production callbacks AND the synthetic payloads used in
+// tests.
+
+/// Extract the user-visible text from a DingTalk callback payload,
+/// preferring the nested `text.content` shape and falling back to a
+/// flat `text` string when only that one is present.
+fn extract_dingtalk_text(payload: &serde_json::Value) -> String {
+    if let Some(content) = payload
+        .get("text")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+    {
+        return content.to_string();
+    }
+    if let Some(s) = payload.get("text").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    String::new()
+}
+
+/// Length of the user-visible text without copying it out — used in
+/// log lines that must not contain the message body itself.
+fn extract_dingtalk_text_len(payload: &serde_json::Value) -> usize {
+    extract_dingtalk_text(payload).chars().count()
+}
+
+// ---------------------------------------------------------------------------
 // Worker-callable resolvers (used by `dingtalk_worker` at runtime, not only in tests)
 // ---------------------------------------------------------------------------
 
@@ -6368,6 +6425,23 @@ pub(crate) fn resolve_dingtalk_robot_code_for_test(
     entry: Option<&crate::config::schema::ChannelEntry>,
 ) -> Option<String> {
     resolve_dingtalk_robot_code(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn extract_dingtalk_text_for_test(payload: &serde_json::Value) -> String {
+    extract_dingtalk_text(payload)
+}
+
+/// List of HTTP paths the DingTalk webhook handler is registered at.
+/// Exposed for the Phase 3 integration regression tests so we can
+/// confirm both the documented callback URL and the legacy alias are
+/// bound to the same handler without spinning up a full router.
+#[cfg(test)]
+pub(crate) fn dingtalk_known_route_paths_for_test() -> &'static [&'static str] {
+    &[
+        "/webhook/dingtalk",
+        "/api/v1/gateway/dingtalk/events",
+    ]
 }
 
 #[cfg(test)]

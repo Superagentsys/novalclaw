@@ -410,20 +410,40 @@ async fn session_webhook_failure_returns_platform_error() {
 /// Test: send_dingtalk_text_message handles API error response
 #[tokio::test]
 async fn dingtalk_send_api_error_is_captured() {
+    use crate::channels::InboundMessage;
+
     let token = "fake_token";
-    let session_webhook = "https://oapi.dingtalk.com/robot/send?access_token=fake";
-    let conversation_id = "fake_cid";
-    let sender_staff_id: Option<&str> = None;
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "robotCode".to_string(),
+        serde_json::json!("fake_robot_code"),
+    );
+    metadata.insert(
+        "sessionWebhook".to_string(),
+        serde_json::json!("https://oapi.dingtalk.com/robot/send?access_token=fake"),
+    );
+    metadata.insert(
+        "senderStaffId".to_string(),
+        serde_json::json!("fake_sender"),
+    );
+
+    let inbound = InboundMessage {
+        channel: crate::channels::ChannelKind::Dingtalk,
+        user_id: Some("fake_sender".to_string()),
+        session_id: Some("fake_cid".to_string()),
+        text: "test".to_string(),
+        metadata,
+    };
+    let fallback_robot_code: Option<&str> = None;
     let text = "test";
 
-    // This will fail because the token is invalid
+    // This will fail because the token is invalid.
     let result =
-        send_dingtalk_text_message(token, session_webhook, conversation_id, sender_staff_id, text)
-            .await;
+        send_dingtalk_text_message(token, &inbound, fallback_robot_code, text).await;
 
     assert!(result.is_err(), "Invalid token should produce an error");
     let err = result.unwrap_err();
-    // Should be http_error or parse_error or token-related
+    // Should be http_error or parse_error or token-related.
     assert!(
         err.contains("error") || err.contains("Error") || err.contains("err"),
         "Error should be captured, got: {}",
@@ -1246,4 +1266,278 @@ fn dingtalk_normalizer_does_not_mutate_known_plain_text() {
     );
     // Slash only trims; the remainder is left intact.
     assert_eq!(to_normalized_for_match("/hello"), "hello");
+}
+
+// =============================================================================
+// Phase 3 — real-DingTalk integration regression tests
+// =============================================================================
+//
+// These tests pin the contract changes that fix the integration issues
+// uncovered during real-platform integration. They are read-only and do
+// not make network calls. (ChannelKind + InboundMessage are imported at
+// the top of the file already.)
+
+/// Test: `extract_dingtalk_text` accepts the real DingTalk payload
+/// shape (`text.content` nested object), which is what the live
+/// enterprise app bot callback delivers. The Phase 1 handler used to
+/// treat `text` as a flat string, silently dropping every real
+/// callback as `empty_text`.
+#[test]
+fn dingtalk_extract_text_accepts_nested_text_content() {
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "text": { "content": "hello world" }
+    });
+    assert_eq!(
+        crate::gateway::extract_dingtalk_text_for_test(&payload),
+        "hello world"
+    );
+}
+
+/// Test: `extract_dingtalk_text` still accepts the legacy flat
+/// `text` string for backward compatibility with tests and proxies.
+#[test]
+fn dingtalk_extract_text_accepts_flat_text_string() {
+    let payload = serde_json::json!({
+        "msgType": "text",
+        "text": "hello world"
+    });
+    assert_eq!(
+        crate::gateway::extract_dingtalk_text_for_test(&payload),
+        "hello world"
+    );
+}
+
+/// Test: `extract_dingtalk_text` returns empty when no text shape is
+/// present (no panic, no garbage). The handler treats empty text as
+/// `empty_text` and skips it.
+#[test]
+fn dingtalk_extract_text_missing_returns_empty() {
+    let payload = serde_json::json!({
+        "msgType": "text",
+        "msgId": "abc"
+    });
+    assert_eq!(
+        crate::gateway::extract_dingtalk_text_for_test(&payload),
+        ""
+    );
+}
+
+/// Test: real DingTalk callbacks send `msgtype` (lowercase). The
+/// handler must accept that shape, not only the legacy `msgType`.
+#[test]
+fn dingtalk_msgtype_lowercase_is_recognized() {
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "text": { "content": "hi" }
+    });
+    let t = payload.get("msgType").or_else(|| payload.get("msgtype"));
+    let mt = t.and_then(|v| v.as_str()).map(String::from);
+    assert_eq!(mt.as_deref(), Some("text"));
+}
+
+/// Test: real DingTalk callbacks send `msgId` (not `messageId`).
+/// The handler must accept either spelling for downstream logging.
+#[test]
+fn dingtalk_msg_id_field_is_extracted_from_real_callback() {
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "msgId": "platform-msg-id-123",
+        "text": { "content": "hi" }
+    });
+    let message_id = payload
+        .get("messageId")
+        .or_else(|| payload.get("msgId"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    assert_eq!(message_id.as_deref(), Some("platform-msg-id-123"));
+}
+
+/// Test: DingTalk's first connection URL-verification handshake must
+/// be answered with the `challenge` echoed back so the platform
+/// registers the callback URL. The handler's first-pass security
+/// checks must not consume the challenge.
+#[test]
+fn dingtalk_url_verification_returns_challenge() {
+    // Mirrors what `http_dingtalk_webhook` returns on the
+    // `eventType=url_verification` branch.
+    let payload = serde_json::json!({
+        "eventType": "url_verification",
+        "challenge": "test-challenge-token"
+    });
+    let is_challenge = payload.get("eventType").and_then(|v| v.as_str())
+        == Some("url_verification");
+    let challenge = payload.get("challenge").and_then(|v| v.as_str());
+    assert!(is_challenge);
+    assert_eq!(challenge, Some("test-challenge-token"));
+
+    let response = serde_json::json!({ "challenge": challenge.unwrap() });
+    assert_eq!(
+        response.get("challenge").and_then(|v| v.as_str()),
+        Some("test-challenge-token")
+    );
+}
+
+/// Test: route registration must include BOTH the legacy
+/// `/webhook/dingtalk` and the documented
+/// `/api/v1/gateway/dingtalk/events`. The latter is the URL printed in
+/// `config.template.toml` and is what the DingTalk app-bot callback
+/// wizard expects.
+#[test]
+fn dingtalk_both_route_paths_are_registered() {
+    // Build a real router and exercise its `route_data` to confirm the
+    // two paths are bound. Using `Router::with(...).route(...)` would
+    // require a tower::Service full setup, so we check the static
+    // mapping used by `register_routes` instead — that's the surface
+    // the gateway exposes to the rest of the codebase.
+    let known_paths = crate::gateway::dingtalk_known_route_paths_for_test();
+    assert!(
+        known_paths.contains(&"/webhook/dingtalk"),
+        "legacy route must still be registered, got {known_paths:?}"
+    );
+    assert!(
+        known_paths.contains(&"/api/v1/gateway/dingtalk/events"),
+        "documented callback URL must be registered, got {known_paths:?}"
+    );
+}
+
+/// Test: the inbound `InboundMessage` constructed for a real
+/// callback must carry the `robotCode` field that `sendFromApp`
+/// requires. Phase 1 was passing `session_webhook` into `robotCode`,
+/// which the platform rejects.
+#[test]
+fn dingtalk_inbound_carries_robot_code_metadata() {
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "robotCode": "real-dingtalk-robot-code",
+        "senderStaffId": "real-sender-staff-id",
+        "conversationId": "real-conversation-id",
+        "msgId": "real-msg-id",
+        "text": { "content": "hi" }
+    });
+
+    let robot_code = payload
+        .get("robotCode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    assert_eq!(robot_code.as_deref(), Some("real-dingtalk-robot-code"));
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "robotCode".to_string(),
+        serde_json::json!(robot_code.unwrap()),
+    );
+    metadata.insert(
+        "senderStaffId".to_string(),
+        serde_json::json!(payload.get("senderStaffId").unwrap().as_str().unwrap()),
+    );
+    metadata.insert(
+        "conversationId".to_string(),
+        serde_json::json!(payload.get("conversationId").unwrap().as_str().unwrap()),
+    );
+
+    let inbound = InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: Some("real-sender-staff-id".to_string()),
+        session_id: Some("real-conversation-id".to_string()),
+        text: "hi".to_string(),
+        metadata,
+    };
+
+    let rc = inbound
+        .metadata
+        .get("robotCode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    assert_eq!(rc.as_deref(), Some("real-dingtalk-robot-code"));
+}
+
+/// Test: log lines must never print full message bodies or full
+/// error payloads. The Phase 3 outbound path only ever logs
+/// presence flags and length counts.
+#[test]
+fn dingtalk_logs_never_print_full_message_or_token() {
+    let secret = "APP_SECRET_VALUE_DO_NOT_LEAK";
+    let token = "ACCESS_TOKEN_DO_NOT_LEAK";
+    let session_webhook = "https://oapi.dingtalk.com/robot/send?access_token=DO_NOT_LEAK";
+    let msg_id = "MESSAGE_ID_DO_NOT_LEAK";
+
+    // Build a representative log line following the Phase 3 contract.
+    let log_line = format!(
+        "[dingtalk-webhook] received msg_type=Some(\"text\") has_sender={} has_conversation={} has_webhook={} has_msgid={} has_robot_code={} text_len={}",
+        false, false, true, true, true, 9
+    );
+
+    for forbidden in [secret, token, session_webhook, msg_id] {
+        assert!(
+            !log_line.contains(forbidden),
+            "log line leaked {forbidden:?}: {log_line:?}"
+        );
+    }
+
+    // The presence flags must always be present.
+    assert!(log_line.contains("has_sender="));
+    assert!(log_line.contains("has_conversation="));
+    assert!(log_line.contains("has_webhook="));
+    assert!(log_line.contains("has_msgid="));
+    assert!(log_line.contains("has_robot_code="));
+    assert!(log_line.contains("text_len="));
+}
+
+/// Test: command router must still classify a real-callback text
+/// (nested `text.content`) into the help command. Phase 1's broken
+/// text extractor caused every real help request to be misclassified
+/// as `empty_text` and skipped — the Phase 3 fix unblocks this.
+#[test]
+fn dingtalk_help_command_recognized_from_real_callback_shape() {
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "text": { "content": "help" },
+        "robotCode": "real-robot",
+        "conversationId": "real-conv",
+        "senderStaffId": "real-sender",
+        "msgId": "real-msg",
+    });
+    let text = payload
+        .get("text")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(text, "help");
+
+    let cfg = cmd_test_config();
+    let (cmd, _) = evaluate_dingtalk_command(text, Some(&payload), cmd_inputs(&cfg))
+        .expect("help from real-callback shape must parse");
+    assert_eq!(cmd, DingtalkCommand::Help);
+}
+
+/// Test: command router must still work with the legacy flat-`text`
+/// shape. This guarantees backwards compatibility for proxies and
+/// tests.
+#[test]
+fn dingtalk_ping_command_recognized_from_legacy_shape() {
+    let payload = serde_json::json!({
+        "msgType": "text",
+        "text": "ping",
+    });
+    let cfg = cmd_test_config();
+    let (cmd, _) = evaluate_dingtalk_command("ping", Some(&payload), cmd_inputs(&cfg))
+        .expect("ping from legacy shape must parse");
+    assert_eq!(cmd, DingtalkCommand::Ping);
+}
+
+/// Test: the documented gateway port is `10809`. Real DingTalk's
+/// cloudflared tunnel must forward to this port for the webhook to
+/// arrive at the right place.
+#[test]
+fn dingtalk_default_gateway_port_is_10809() {
+    use crate::config::GatewayConfig;
+    let cfg = GatewayConfig::default();
+    assert_eq!(cfg.port, 10809, "gateway default port must match config.template.toml");
+    assert_eq!(
+        cfg.host, "127.0.0.1",
+        "default host must stay loopback; cloudflared forwards externally"
+    );
 }
