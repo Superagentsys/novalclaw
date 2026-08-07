@@ -5,8 +5,8 @@
 //! continues to flow into the Agent exactly like Phase 1.
 //!
 //! Supported (case-insensitive, after `@bot` mention stripping):
-//! - `help`, `帮助`     -> Help
-//! - `menu`, `菜单`     -> Menu
+//! - `help`, `帮助`     -> shared Agent menu
+//! - `menu`, `菜单`, `panel`, `面板` -> shared Agent menu
 //! - `status`, `状态`   -> Status (redacted: no secrets/tokens/IDs)
 //! - `ping`             -> Ping
 //! - `monitor`          -> explicitly unsupported in Phase 2
@@ -14,6 +14,7 @@
 //! All command variants also accept a leading `/` (e.g. `/help`).
 
 use crate::config::Config;
+use crate::gateway::agent_menu::render_agent_menu_as_dingtalk_text;
 
 /// All commands the DingTalk worker understands in Phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +128,7 @@ pub fn to_normalized_for_match(text: &str) -> String {
 pub fn parse_dingtalk_command(normalized: &str) -> Option<DingtalkCommand> {
     match normalized {
         "help" | "帮助" | "?" => Some(DingtalkCommand::Help),
-        "menu" | "菜单" => Some(DingtalkCommand::Menu),
+        "menu" | "菜单" | "panel" | "面板" => Some(DingtalkCommand::Menu),
         "status" | "状态" => Some(DingtalkCommand::Status),
         "ping" | "pong" => Some(DingtalkCommand::Ping),
         "monitor" => Some(DingtalkCommand::Monitor),
@@ -139,34 +140,13 @@ pub fn parse_dingtalk_command(normalized: &str) -> Option<DingtalkCommand> {
 /// wording and so the integration path doesn't depend on a hidden
 /// format.
 pub fn build_dingtalk_help_text() -> String {
-    [
-        "DingTalk bot help",
-        "",
-        "Available commands:",
-        "- help | /help | 帮助        show this message",
-        "- menu | /menu | 菜单        show the command menu",
-        "- status | /status | 状态    show bot status (no secrets)",
-        "- ping | /ping                health check, replies with pong",
-        "",
-        "Anything else is forwarded to the agent.",
-    ]
-    .join("\n")
+    render_agent_menu_as_dingtalk_text()
 }
 
 /// Reply text for `/menu`. The menu mirrors the help list so users on
 /// either entry point see the same set of commands.
 pub fn build_dingtalk_menu_text() -> String {
-    [
-        "DingTalk command menu",
-        "",
-        "1) help   /help   帮助    this bot's commands",
-        "2) menu   /menu   菜单    command menu (this message)",
-        "3) status /status 状态    bot status (no secrets)",
-        "4) ping   /ping            health check (replies pong)",
-        "",
-        "Other text is sent to the agent.",
-    ]
-    .join("\n")
+    render_agent_menu_as_dingtalk_text()
 }
 
 /// Inputs needed to render status without leaking secrets.
@@ -328,6 +308,8 @@ mod tests {
     fn parse_dingtalk_command_matches_known_aliases() {
         assert_eq!(parse_dingtalk_command("help"), Some(DingtalkCommand::Help));
         assert_eq!(parse_dingtalk_command("菜单"), Some(DingtalkCommand::Menu));
+        assert_eq!(parse_dingtalk_command("panel"), Some(DingtalkCommand::Menu));
+        assert_eq!(parse_dingtalk_command("面板"), Some(DingtalkCommand::Menu));
         assert_eq!(
             parse_dingtalk_command("status"),
             Some(DingtalkCommand::Status)

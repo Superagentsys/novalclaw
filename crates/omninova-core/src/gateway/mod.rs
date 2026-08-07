@@ -1,5 +1,6 @@
 pub mod pairing;
 pub mod ws;
+pub mod agent_menu;
 pub mod feishu_worker;
 pub mod feishu_store;
 pub mod dingtalk_worker;

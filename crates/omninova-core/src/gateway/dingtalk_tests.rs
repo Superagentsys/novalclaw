@@ -990,7 +990,7 @@ fn build_dingtalk_payload(text_content: &str) -> serde_json::Value {
     })
 }
 
-/// Test: `help` returns the canned help text.
+/// Test: `help` returns the shared Agent menu text.
 #[test]
 fn dingtalk_help_command_returns_help_text() {
     let cfg = cmd_test_config();
@@ -1003,8 +1003,8 @@ fn dingtalk_help_command_returns_help_text() {
     let (cmd, reply) = result.expect("help must be recognized as a command");
     assert_eq!(cmd, DingtalkCommand::Help);
     assert!(
-        reply.contains("DingTalk bot help"),
-        "reply must contain the help header (got {reply:?})"
+        reply.contains("OmniNova Agent 功能菜单"),
+        "reply must contain the shared menu header (got {reply:?})"
     );
     assert!(
         reply.contains("status"),
@@ -1015,7 +1015,7 @@ fn dingtalk_help_command_returns_help_text() {
     assert_eq!(reply, build_dingtalk_help_text());
 }
 
-/// Test: `menu` returns the canned menu text.
+/// Test: `menu` returns the shared Agent menu text.
 #[test]
 fn dingtalk_menu_command_returns_menu_text() {
     let cfg = cmd_test_config();
@@ -1024,13 +1024,32 @@ fn dingtalk_menu_command_returns_menu_text() {
         .expect("menu must be a command");
     assert_eq!(cmd, DingtalkCommand::Menu);
     assert_eq!(reply, build_dingtalk_menu_text());
-    // Ensure menu also covers every recognized command name so a user
-    // hitting /menu sees what is actually wired up.
-    for token in ["help", "menu", "status", "ping"] {
+    for token in [
+        "普通聊天说明",
+        "桌面监控 30 秒",
+        "桌面监控 60 秒",
+        "Gateway 状态",
+        "最近任务",
+        "帮助说明",
+        "高风险工具不在普通聊天中直接执行",
+    ] {
         assert!(
             reply.contains(token),
-            "menu must advertise `{token}` (got {reply:?})"
+            "menu must include `{token}` (got {reply:?})"
         );
+    }
+}
+
+#[test]
+fn dingtalk_menu_aliases_return_the_shared_menu() {
+    let cfg = cmd_test_config();
+    for alias in [
+        "menu", "/menu", "菜单", "panel", "/panel", "面板", "help", "帮助",
+    ] {
+        let payload = build_dingtalk_payload(alias);
+        let (_, reply) = evaluate_dingtalk_command(alias, Some(&payload), cmd_inputs(&cfg))
+            .unwrap_or_else(|| panic!("{alias:?} must open the Agent menu"));
+        assert_eq!(reply, build_dingtalk_menu_text());
     }
 }
 
