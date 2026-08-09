@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMediaInteraction } from "./ChatMediaInteraction";
+import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -1636,7 +1637,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   key={i}
                   className={`chat-bubble chat-bubble-${msg.role}`}
                 >
-                  <div className="chat-bubble-content">{msg.content}</div>
+                  <div className="chat-bubble-content">
+                    {msg.role === "assistant" ? (
+                      <MarkdownMessage content={msg.content} />
+                    ) : (
+                      msg.content
+                    )}
+                  </div>
                   {msg.agent && (
                     <div className="chat-bubble-meta">Agent: {msg.agent}</div>
                   )}
