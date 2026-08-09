@@ -3,7 +3,6 @@ import omninovalLogo from "../assets/omninoval-logo.png";
 
 export type AppNavId =
   | "chat"
-  | "cron"
   | "general"
   | "providers"
   | "channels"
@@ -22,7 +21,6 @@ const PRIMARY_NAV: NavItem[] = [
   { id: "persona", label: "Agents", icon: "bot" },
   { id: "channels", label: "频道", icon: "nodes" },
   { id: "skills", label: "技能", icon: "puzzle" },
-  { id: "cron", label: "定时任务", icon: "clock" },
 ];
 
 function NavIcon({ name }: { name: NavItem["icon"] }) {
@@ -120,7 +118,16 @@ export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
             title={collapsed ? "展开侧栏" : "收起侧栏"}
             aria-label="切换侧栏"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               {collapsed ? <path d="M9 18l6-6-6-6" /> : <path d="M15 18l-6-6 6-6" />}
             </svg>
           </button>

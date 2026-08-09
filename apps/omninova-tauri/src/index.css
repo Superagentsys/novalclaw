@@ -11,7 +11,7 @@
   --accent-blue-strong: #1d4ed8;
   --accent-blue-soft: rgba(37, 99, 235, 0.12);
   --accent-gradient: linear-gradient(135deg, #3b6ef0 0%, #2563eb 100%);
-  --sidebar-w: 240px;
+  --sidebar-w: 208px; /* bug#4：收窄侧栏，减少留白 */
   --radius-sm: 10px;
   --radius-md: 12px;
   --radius-lg: 16px;

@@ -1452,7 +1452,7 @@ export function Setup({
 
   const setupPreviewBlock = (
     <div className="setup-preview-wrap">
-      <div className="setup-preview">
+      <div className={`setup-preview${previewCollapsed ? " setup-preview--collapsed" : ""}`}>
         <div className="setup-preview-header">
           <span>配置预览 (JSON)</span>
           <div className="setup-preview-actions">

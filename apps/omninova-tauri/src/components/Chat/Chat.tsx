@@ -23,6 +23,17 @@ import {
 import type {
   AgentRunEvent,
 } from "../AgentRun/types";
+import {
+  addTask,
+  formatDuration,
+  formatTaskTime,
+  loadTaskHistory,
+  patchTask,
+  saveTaskHistory,
+  taskStatusLabel,
+  type TaskHistoryEntry,
+  type TaskStatus,
+} from "../../utils/taskHistory";
 import type {
   AgentPersonaConfig,
   Config,
@@ -54,6 +65,8 @@ const DROP_IMAGE_INLINE_MAX_BYTES = 256 * 1024;
 const CHAT_ATTACHMENT_INPUT_ID = "chat-composer-file-input";
 /** 单次拖放最多处理的文件数 */
 const DROP_FILES_MAX_COUNT = 16;
+/** 会话级临时 Workspace 的持久化 key（bug#3：工作空间记忆） */
+const SESSION_WORKSPACE_STORAGE_KEY = "omninova.chat.sessionWorkspaces.v1";
 
 const TEXT_FILE_EXTENSIONS = new Set([
   "txt",
@@ -160,91 +173,132 @@ function readFileAsDataURL(file: File): Promise<string> {
   });
 }
 
-/** 将拖放/选择的文件转为可粘贴进输入框的文本（Markdown） */
-async function formatDroppedFilesContent(files: FileList | readonly File[]): Promise<string> {
+/**
+ * 输入框附件（bug#1/#2）：拖入/选择/粘贴的文件先以「芯片」形式展示在
+ * 输入框上方，发送时才把 content 拼接进消息正文。
+ */
+interface ComposerAttachment {
+  id: string;
+  name: string;
+  kind: "image" | "text" | "other";
+  /** 发送时拼接进消息的文本（Markdown 图片 / 文本内容 / 占位说明） */
+  content: string;
+  /** 芯片上的补充说明，如大小或读取失败原因 */
+  note?: string;
+}
+
+let composerAttachmentSeq = 0;
+function nextAttachmentId(): string {
+  composerAttachmentSeq += 1;
+  return `attachment-${Date.now()}-${composerAttachmentSeq}`;
+}
+
+/** 将拖放/选择/粘贴的文件转为结构化附件（浏览器 File API 路径） */
+async function buildAttachmentsFromFiles(
+  files: FileList | readonly File[]
+): Promise<ComposerAttachment[]> {
   const list = Array.from(files).slice(0, DROP_FILES_MAX_COUNT);
-  const parts: string[] = [];
+  const items: ComposerAttachment[] = [];
 
   for (const file of list) {
     const displayName = file.name?.trim() || "unnamed";
+    const sizeKb = Math.round(file.size / 1024);
 
     if (file.size === 0) {
-      parts.push(`\n\n[空文件: ${displayName}]`);
+      items.push({
+        id: nextAttachmentId(),
+        name: displayName,
+        kind: "other",
+        content: `[空文件: ${displayName}]`,
+        note: "空文件",
+      });
       continue;
     }
 
     if (file.type.startsWith("image/")) {
       if (file.size > DROP_IMAGE_INLINE_MAX_BYTES) {
-        parts.push(
-          `\n\n[图片: ${displayName} · ${Math.round(file.size / 1024)} KB — 超过 ${Math.round(DROP_IMAGE_INLINE_MAX_BYTES / 1024)} KB 上限未嵌入；请缩小后再拖入或改用文字描述。]`
-        );
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "image",
+          content: `[图片: ${displayName} · ${sizeKb} KB — 超过 ${Math.round(DROP_IMAGE_INLINE_MAX_BYTES / 1024)} KB 上限未嵌入；请缩小后再添加或改用文字描述。]`,
+          note: `${sizeKb} KB · 超限未嵌入`,
+        });
         continue;
       }
       try {
         const dataUrl = await readFileAsDataURL(file);
-        parts.push(`\n\n![${escapeMarkdownImageAlt(displayName)}](${dataUrl})`);
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "image",
+          content: `![${escapeMarkdownImageAlt(displayName)}](${dataUrl})`,
+          note: `${sizeKb} KB`,
+        });
       } catch {
-        parts.push(`\n\n[图片读取失败: ${displayName}]`);
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "image",
+          content: `[图片读取失败: ${displayName}]`,
+          note: "读取失败",
+        });
       }
       continue;
     }
 
     if (isProbablyTextFile(file)) {
       if (file.size > DROP_TEXT_FILE_MAX_BYTES) {
-        parts.push(
-          `\n\n[文本附件 ${displayName}: 过大 (${Math.round(file.size / 1024)} KB)，上限 ${Math.round(DROP_TEXT_FILE_MAX_BYTES / 1024)} KB — 请拆分或使用更小文件。]`
-        );
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "text",
+          content: `[文本附件 ${displayName}: 过大 (${sizeKb} KB)，上限 ${Math.round(DROP_TEXT_FILE_MAX_BYTES / 1024)} KB — 请拆分或使用更小文件。]`,
+          note: `${sizeKb} KB · 超限`,
+        });
         continue;
       }
       try {
         const text = await file.text();
-        parts.push(`\n\n--- 附件: ${displayName} ---\n${text}\n--- 附件结束 ---`);
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "text",
+          content: `--- 附件: ${displayName} ---\n${text}\n--- 附件结束 ---`,
+          note: `${sizeKb} KB`,
+        });
       } catch {
-        parts.push(`\n\n[文本读取失败: ${displayName}]`);
+        items.push({
+          id: nextAttachmentId(),
+          name: displayName,
+          kind: "text",
+          content: `[文本读取失败: ${displayName}]`,
+          note: "读取失败",
+        });
       }
       continue;
     }
 
-    parts.push(
-      `\n\n[附件: ${displayName} · ${file.type || "未知类型"} · ${Math.round(file.size / 1024)} KB — 未能自动读取此类文件内容；可先导出为文本再拖入。]`
-    );
+    items.push({
+      id: nextAttachmentId(),
+      name: displayName,
+      kind: "other",
+      content: `[附件: ${displayName} · ${file.type || "未知类型"} · ${sizeKb} KB — 未能自动读取此类文件内容；可先导出为文本再添加，或让 Agent 用工作区工具读取。]`,
+      note: `${sizeKb} KB · 未读取内容`,
+    });
   }
 
-  return parts.join("");
+  return items;
 }
 
 interface ChatMessage extends StoredChatMessage {
   steps?: ExecutionStep[];
 }
 
-type SidebarTab = "avatars" | "channels" | "scheduled";
-
-interface ImChannelEntry {
-  id: string;
-  name: string;
-  platform: string;
-  createdAt: string;
-}
-
-interface ScheduledTaskEntry {
-  id: string;
-  name: string;
-  cron: string;
-  createdAt: string;
-}
-
-const IM_PLATFORM_OPTIONS = [
-  "feishu",
-  "lark",
-  "dingtalk",
-  "wechat",
-  "telegram",
-  "discord",
-  "slack",
-];
+type SidebarTab = "avatars" | "history";
 
 interface ChatProps {
-  /** 与侧栏「定时任务」入口同步 */
+  /** 初始侧栏分区：智能体列表或历史任务。 */
   initialSidebarTab?: SidebarTab;
 }
 
@@ -253,12 +307,9 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [avatars, setAvatars] = useState<StoredAvatarSession[]>(initialStorage.avatars);
   const [activeAvatarId, setActiveAvatarId] = useState(initialStorage.activeAvatarId);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>(initialSidebarTab);
-  const [channels, setChannels] = useState<ImChannelEntry[]>([]);
-  const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskEntry[]>([]);
-  const [newChannelName, setNewChannelName] = useState("");
-  const [newChannelPlatform, setNewChannelPlatform] = useState(IM_PLATFORM_OPTIONS[0]);
-  const [newTaskName, setNewTaskName] = useState("");
-  const [newTaskCron, setNewTaskCron] = useState("0 9 * * *");
+  const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>(() =>
+    loadTaskHistory()
+  );
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>(
     initialStorage.messagesBySession
   );
@@ -269,13 +320,20 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [historyLoading, setHistoryLoading] = useState(false);
   // 输入草稿与运行状态按会话隔离，避免一个会话影响其它会话。
   const [inputs, setInputs] = useState<Record<string, string>>({});
+  // bug#1/#2：待发送附件（拖入/选择/粘贴），按会话隔离，以芯片展示。
+  const [attachmentsBySession, setAttachmentsBySession] = useState<
+    Record<string, ComposerAttachment[]>
+  >({});
   const [runs, setRuns] = useState<
     Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string; longRunning?: boolean }>
   >({});
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
-  const [availableModels] = useState<string[]>(["auto", "openai", "anthropic", "gemini", "ollama"]);
+  // bug#10：下拉选项来自实际已启用的 Provider（而非写死列表），选中值随消息发送生效。
+  const [availableProviders, setAvailableProviders] = useState<
+    { id: string; label: string }[]
+  >([]);
   const [selectedModel, setSelectedModel] = useState("auto");
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -305,7 +363,27 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
    * priority when the Agent processes a message (higher than per-agent or
    * global workspace_dir).
    */
-  const [sessionWorkspaceDirs, setSessionWorkspaceDirs] = useState<Record<string, string>>({});
+  const [sessionWorkspaceDirs, setSessionWorkspaceDirs] = useState<Record<string, string>>(() => {
+    try {
+      const raw = localStorage.getItem(SESSION_WORKSPACE_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        SESSION_WORKSPACE_STORAGE_KEY,
+        JSON.stringify(sessionWorkspaceDirs)
+      );
+    } catch {
+      // localStorage 不可用时忽略
+    }
+  }, [sessionWorkspaceDirs]);
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
@@ -331,6 +409,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const activeSteps = activeRun?.steps ?? [];
   const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
+  const attachments = attachmentsBySession[activeAvatarId] ?? [];
 
   useEffect(() => {
     runsRef.current = runs;
@@ -508,6 +587,39 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   }, [avatars, activeAvatarId, messagesBySession, deletedSessionIds]);
 
   useEffect(() => {
+    saveTaskHistory(taskHistory);
+  }, [taskHistory]);
+
+  // 记录一次新任务（发送消息即视为一次任务）。
+  const recordTaskStart = useCallback((entry: TaskHistoryEntry) => {
+    setTaskHistory((prev) => addTask(prev, entry));
+  }, []);
+
+  // 终态到达时更新任务状态/耗时/结果预览。使用函数式更新以保持回调稳定。
+  const finalizeTask = useCallback(
+    (runId: string, status: TaskStatus, resultPreview?: string) => {
+      setTaskHistory((prev) => {
+        const target = prev.find((t) => t.runId === runId);
+        if (!target) return prev;
+        const endedAt = Date.now();
+        return patchTask(prev, runId, {
+          status,
+          endedAt,
+          durationMs: Math.max(0, endedAt - target.startedAt),
+          resultPreview: resultPreview
+            ? resultPreview.slice(0, 200)
+            : target.resultPreview,
+        });
+      });
+    },
+    []
+  );
+
+  const handleClearTaskHistory = useCallback(() => {
+    setTaskHistory((prev) => prev.filter((t) => t.status === "running"));
+  }, []);
+
+  useEffect(() => {
     void refreshGatewayStatus();
     const t = setInterval(refreshGatewayStatus, GATEWAY_STATUS_POLL_MS);
     return () => clearInterval(t);
@@ -555,6 +667,14 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         setWorkspaceDir(agentWorkspace || globalWorkspace || null);
         setWorkspaceSource(agentWorkspace ? "agent" : globalWorkspace ? "global" : null);
         setWorkspaceStatus(cfg.workspace_status ?? null);
+        const enabled = (cfg.providers ?? [])
+          .filter((p) => p.enabled)
+          .map((p) => ({ id: p.id, label: p.name || p.id }));
+        setAvailableProviders(enabled);
+        // 之前选中的 Provider 已被禁用/删除时回退到自动。
+        setSelectedModel((prev) =>
+          prev === "auto" || enabled.some((p) => p.id === prev) ? prev : "auto"
+        );
         const stored = localStorage.getItem(DESKTOP_VISION_SESSION_KEY);
         if (stored === "1") setDesktopVisionOn(true);
         else if (stored === "0") setDesktopVisionOn(false);
@@ -722,6 +842,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           if (!cancelledRef.current[avatarId]) {
             appendAssistantMessageOnce(runId, finalReply, avatarId);
           }
+          finalizeTask(runId, "completed", finalReply);
         }
         if (import.meta.env.DEV) {
           console.log("[finishRun] run_id=" + runId);
@@ -734,6 +855,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         if (!completedRunIdsRef.current.has(runId)) {
           completedRunIdsRef.current.add(runId);
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
+          finalizeTask(runId, "cancelled");
         }
         finishRun(runId);
         return;
@@ -746,6 +868,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         if (!cancelledRef.current[avatarId]) {
           appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
         }
+        finalizeTask(runId, "failed", rawError);
       }
       finishRun(runId);
     }).then((fn) => {
@@ -760,7 +883,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       disposed = true;
       unlisten?.();
     };
-  }, [appendAssistantMessageOnce, findAvatarIdByRunId, finishRun]);
+  }, [appendAssistantMessageOnce, findAvatarIdByRunId, finishRun, finalizeTask]);
 
   const refreshGatewayStatus = async () => {
     try {
@@ -786,6 +909,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   };
 
   const handleDeleteAvatar = (id: string) => {
+    // bug#12：删除不可撤销（会同时删除网关侧会话），先让用户确认。
+    const name = avatars.find((a) => a.id === id)?.name ?? "该会话";
+    const running = Boolean(runs[id]);
+    const ok = window.confirm(
+      running
+        ? `「${name}」有任务正在执行，删除会终止任务并清空聊天记录，且无法恢复。确定删除吗？`
+        : `确定删除「${name}」吗？聊天记录将被清空且无法恢复。`
+    );
+    if (!ok) return;
+
     // 终止该会话可能正在进行的任务，并清理其计时器/运行态。
     cancelledRef.current[id] = true;
     const timer = elapsedTimersRef.current[id];
@@ -823,6 +956,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         return next;
       });
       setInputs((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setAttachmentsBySession((prev) => {
+        if (!prev[id]) return prev;
         const next = { ...prev };
         delete next[id];
         return next;
@@ -877,45 +1016,6 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     syncChatSessions,
   ]);
 
-  const handleCreateChannel = () => {
-    const name = newChannelName.trim();
-    if (!name) {
-      setError("请先输入 IM 频道名称");
-      return;
-    }
-    const entry: ImChannelEntry = {
-      id: `im-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-      name,
-      platform: newChannelPlatform,
-      createdAt: formatTime(new Date()),
-    };
-    setChannels((prev) => [entry, ...prev]);
-    setNewChannelName("");
-    setError(null);
-  };
-
-  const handleCreateScheduledTask = () => {
-    const name = newTaskName.trim();
-    const cron = newTaskCron.trim();
-    if (!name) {
-      setError("请先输入定时任务名称");
-      return;
-    }
-    if (!cron) {
-      setError("请先输入 Cron 表达式");
-      return;
-    }
-    const entry: ScheduledTaskEntry = {
-      id: `cron-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-      name,
-      cron,
-      createdAt: formatTime(new Date()),
-    };
-    setScheduledTasks((prev) => [entry, ...prev]);
-    setNewTaskName("");
-    setError(null);
-  };
-
   const handleCancel = useCallback(() => {
     if (!activeRunId) return;
     cancelledRef.current[activeAvatarId] = true;
@@ -931,6 +1031,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     const avatarId = activeAvatarId;
     const targetSessionId = sessionId;
     const text = input.trim();
+    // bug#1/#2：附件在发送时才拼接进正文；聊天气泡只显示简洁的附件名。
+    const pendingAttachments = attachmentsBySession[avatarId] ?? [];
+    const attachmentBlock = pendingAttachments
+      .map((a) => a.content.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
+    const displayText = pendingAttachments.length
+      ? `${text ? `${text}\n\n` : ""}📎 附件：${pendingAttachments.map((a) => a.name).join("、")}`
+      : text;
     const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
     if (active && terminalRunIdsRef.current.has(active)) {
       finishRun(active);
@@ -938,7 +1048,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       setError("当前 Agent 仍在执行，请等待完成或取消。");
       return;
     }
-    if (!text) return;
+    if (!outgoingText) return;
     // Generate a run_id for real-time event correlation.
     const runId = crypto.randomUUID();
     runAvatarIdsRef.current[runId] = avatarId;
@@ -980,6 +1090,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       );
     };
     setActiveInput("");
+    setAttachmentsBySession((prev) => {
+      if (!prev[avatarId]?.length) return prev;
+      const next = { ...prev };
+      delete next[avatarId];
+      return next;
+    });
     setError(null);
     cancelledRef.current[avatarId] = false;
     activeRunIdRef.current = runId;
@@ -992,13 +1108,23 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
       ...prev,
-      [avatarId]: [...(prev[avatarId] ?? []), { role: "user", content: text }],
+      [avatarId]: [...(prev[avatarId] ?? []), { role: "user", content: displayText }],
     }));
     setAvatars((prev) =>
       prev.map((a) =>
         a.id === avatarId ? { ...a, lastAt: formatTime(new Date()) } : a
       )
     );
+
+    recordTaskStart({
+      runId,
+      title: displayText,
+      avatarId,
+      agentName: avatars.find((a) => a.id === avatarId)?.name ?? avatarId,
+      sessionId: targetSessionId,
+      status: "running",
+      startedAt: Date.now(),
+    });
 
     elapsedTimersRef.current[avatarId] = setInterval(() => {
       setRuns((prev) => {
@@ -1051,13 +1177,19 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
           }));
           setInputs((prev) => ({ ...prev, [avatarId]: text }));
+          if (pendingAttachments.length) {
+            setAttachmentsBySession((prev) => ({
+              ...prev,
+              [avatarId]: pendingAttachments,
+            }));
+          }
           return;
         }
       }
 
       const payload = {
         channel: "web" as const,
-        text,
+        text: outgoingText,
         sessionId: targetSessionId,
         userId: USER_ID,
         metadata,
@@ -1135,30 +1267,81 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     [appendActiveInput]
   );
 
-  const appendAttachmentContent = useCallback(
-    (insert: string) => {
-      const trimmed = insert.trim();
-      if (!trimmed) return;
-      appendActiveInput((prev) => (prev.trim() ? `${prev}\n${trimmed}` : trimmed));
+  const addAttachments = useCallback(
+    (items: ComposerAttachment[]) => {
+      if (!items.length) return;
+      setAttachmentsBySession((prev) => ({
+        ...prev,
+        [activeAvatarId]: [...(prev[activeAvatarId] ?? []), ...items],
+      }));
     },
-    [appendActiveInput]
+    [activeAvatarId]
   );
 
+  const removeAttachment = useCallback(
+    (id: string) => {
+      setAttachmentsBySession((prev) => ({
+        ...prev,
+        [activeAvatarId]: (prev[activeAvatarId] ?? []).filter((a) => a.id !== id),
+      }));
+    },
+    [activeAvatarId]
+  );
+
+  /** Tauri 桌面：按路径逐个读取，生成附件芯片（bug#1） */
   const mergePathsIntoInput = useCallback(
     async (paths: string[]) => {
-      const insert = await readComposerAttachmentsFromPaths(paths);
-      appendAttachmentContent(insert);
+      const limited = paths.slice(0, DROP_FILES_MAX_COUNT);
+      const items: ComposerAttachment[] = [];
+      for (const path of limited) {
+        const name = workspaceBasename(path);
+        try {
+          const content = await readComposerAttachmentsFromPaths([path]);
+          if (!content.trim()) continue;
+          const ext = fileExtensionLower(name);
+          const isImage = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(ext);
+          items.push({
+            id: nextAttachmentId(),
+            name,
+            kind: isImage ? "image" : TEXT_FILE_EXTENSIONS.has(ext) ? "text" : "other",
+            content: content.trim(),
+          });
+        } catch (err) {
+          items.push({
+            id: nextAttachmentId(),
+            name,
+            kind: "other",
+            content: `[附件读取失败: ${name}]`,
+            note: err instanceof Error ? err.message : "读取失败",
+          });
+        }
+      }
+      addAttachments(items);
     },
-    [appendAttachmentContent]
+    [addAttachments]
   );
 
   /** 浏览器预览等非 Tauri 环境：用 File API 读取 */
   const mergeDroppedIntoInput = useCallback(
     async (files: FileList | readonly File[]) => {
-      const insert = await formatDroppedFilesContent(files);
-      appendAttachmentContent(insert);
+      const items = await buildAttachmentsFromFiles(files);
+      addAttachments(items);
     },
-    [appendAttachmentContent]
+    [addAttachments]
+  );
+
+  /** bug#2：粘贴图片/文件进输入框 */
+  const handleComposerPaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const files = e.clipboardData?.files;
+      if (!files?.length) return;
+      e.preventDefault();
+      if (sending) return;
+      void mergeDroppedIntoInput(files).catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+    },
+    [mergeDroppedIntoInput, sending]
   );
 
   /** Tauri 桌面：WKWebView 会拦截 HTML5 拖放，需用原生 onDragDropEvent 拿路径 */
@@ -1443,90 +1626,76 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             </button>
             <button
               type="button"
-              className={sidebarTab === "channels" ? "is-active" : ""}
-              onClick={() => setSidebarTab("channels")}
+              className={sidebarTab === "history" ? "is-active" : ""}
+              onClick={() => setSidebarTab("history")}
             >
-              IM 频道
-            </button>
-            <button
-              type="button"
-              className={sidebarTab === "scheduled" ? "is-active" : ""}
-              onClick={() => setSidebarTab("scheduled")}
-            >
-              定时任务
+              历史任务
             </button>
           </nav>
-          {sidebarTab === "channels" ? (
+          {sidebarTab === "history" ? (
             <section className="chat-sidebar-section">
-              <h3 className="chat-sidebar-heading">创建 IM 频道</h3>
-              <select
-                value={newChannelPlatform}
-                onChange={(event) => setNewChannelPlatform(event.target.value)}
-              >
-                {IM_PLATFORM_OPTIONS.map((platform) => (
-                  <option key={platform} value={platform}>
-                    {platform}
-                  </option>
-                ))}
-              </select>
-              <input
-                value={newChannelName}
-                onChange={(event) => setNewChannelName(event.target.value)}
-                placeholder="频道名称，例如：研发群"
-              />
-              <button type="button" className="chat-new-avatar" onClick={handleCreateChannel}>
-                + 创建 IM 频道
-              </button>
-              <ul className="chat-avatar-list">
-                {channels.length === 0 ? (
-                  <li className="chat-avatar-time">暂无 IM 频道</li>
+              <div className="chat-history-head">
+                <h3 className="chat-sidebar-heading">历史任务</h3>
+                {taskHistory.some((t) => t.status !== "running") ? (
+                  <button
+                    type="button"
+                    className="chat-history-clear"
+                    onClick={handleClearTaskHistory}
+                    title="清空已结束的历史任务"
+                  >
+                    清空
+                  </button>
+                ) : null}
+              </div>
+              <ul className="chat-task-list">
+                {taskHistory.length === 0 ? (
+                  <li className="chat-avatar-time">暂无历史任务</li>
                 ) : (
-                  channels.map((item) => (
-                    <li key={item.id}>
-                      <div className="chat-avatar-item">
-                        <span className="chat-avatar-icon">#</span>
-                        <span className="chat-avatar-name">{item.name}</span>
-                        <span className="chat-avatar-time">{item.platform}</span>
-                      </div>
-                    </li>
-                  ))
-                )}
-              </ul>
-            </section>
-          ) : null}
-          {sidebarTab === "scheduled" ? (
-            <section className="chat-sidebar-section">
-              <h3 className="chat-sidebar-heading">创建定时任务</h3>
-              <input
-                value={newTaskName}
-                onChange={(event) => setNewTaskName(event.target.value)}
-                placeholder="任务名称，例如：早报推送"
-              />
-              <input
-                value={newTaskCron}
-                onChange={(event) => setNewTaskCron(event.target.value)}
-                placeholder="Cron，例如：0 9 * * *"
-              />
-              <button
-                type="button"
-                className="chat-new-avatar"
-                onClick={handleCreateScheduledTask}
-              >
-                + 创建定时任务
-              </button>
-              <ul className="chat-avatar-list">
-                {scheduledTasks.length === 0 ? (
-                  <li className="chat-avatar-time">暂无定时任务</li>
-                ) : (
-                  scheduledTasks.map((task) => (
-                    <li key={task.id}>
-                      <div className="chat-avatar-item">
-                        <span className="chat-avatar-icon">⏰</span>
-                        <span className="chat-avatar-name">{task.name}</span>
-                        <span className="chat-avatar-time">{task.cron}</span>
-                      </div>
-                    </li>
-                  ))
+                  taskHistory.map((task) => {
+                    const exists = avatars.some((a) => a.id === task.avatarId);
+                    return (
+                      <li key={task.runId}>
+                        <button
+                          type="button"
+                          className="chat-task-item"
+                          disabled={!exists}
+                          title={
+                            exists
+                              ? "跳转到该任务所属会话"
+                              : "该会话已删除"
+                          }
+                          onClick={() => {
+                            if (exists) {
+                              setActiveAvatarId(task.avatarId);
+                              setSidebarTab("avatars");
+                            }
+                          }}
+                        >
+                          <div className="chat-task-row">
+                            <span
+                              className={`chat-task-badge chat-task-badge--${task.status}`}
+                            >
+                              {taskStatusLabel(task.status)}
+                            </span>
+                            <span className="chat-task-title">
+                              {task.title}
+                            </span>
+                          </div>
+                          <div className="chat-task-meta">
+                            <span className="chat-task-agent">
+                              {task.agentName}
+                            </span>
+                            <span className="chat-task-time">
+                              {formatTaskTime(task.startedAt)}
+                              {task.durationMs != null
+                                ? ` · ${formatDuration(task.durationMs)}`
+                                : ""}
+                            </span>
+                          </div>
+                        </button>
+                      </li>
+                    );
+                  })
                 )}
               </ul>
             </section>
@@ -1535,6 +1704,23 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
 
         <main className="chat-main">
           <div className="chat-main-toolbar">
+            {/* bug#9：工作区路径常驻显示，避免多项目混淆 */}
+            <button
+              type="button"
+              className={`chat-toolbar-workspace${activeWorkspaceDir ? "" : " chat-toolbar-workspace--empty"}`}
+              title={
+                activeWorkspaceDir
+                  ? `${workspaceLabel} Workspace：${activeWorkspaceDir}（点击可更换）`
+                  : "尚未选择 Workspace，点击选择"
+              }
+              onClick={(e) => void handleChooseWorkspace(e)}
+              disabled={sending}
+            >
+              <span aria-hidden>📁</span>
+              <span className="chat-toolbar-workspace-path">
+                {activeWorkspaceDir ? `${workspaceLabel} · ${workspaceSummary}` : "未选择 Workspace"}
+              </span>
+            </button>
             <div className="chat-main-toolbar-spacer" />
             <div className="chat-target-pill">
               <span className="chat-target-pill-icon" aria-hidden>
@@ -1762,6 +1948,34 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               onChange={handleAttachFilesChange}
             />
 
+            {attachments.length ? (
+              <div className="chat-attachment-chips" aria-label="待发送附件">
+                {attachments.map((a) => (
+                  <span
+                    key={a.id}
+                    className={`chat-attachment-chip chat-attachment-chip--${a.kind}`}
+                    title={a.note ? `${a.name}（${a.note}）` : a.name}
+                  >
+                    <span aria-hidden>
+                      {a.kind === "image" ? "🖼️" : a.kind === "text" ? "📄" : "📎"}
+                    </span>
+                    <span className="chat-attachment-chip-name">{a.name}</span>
+                    {a.note ? (
+                      <span className="chat-attachment-chip-note">{a.note}</span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="chat-attachment-chip-remove"
+                      aria-label={`移除附件 ${a.name}`}
+                      onClick={() => removeAttachment(a.id)}
+                      disabled={sending}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             <div
               className={`chat-input-row${composerDragActive ? " chat-input-row--drag-over" : ""}`}
               onDragEnter={handleComposerDragEnter}
@@ -1799,9 +2013,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                 onKeyDown={handleKeyDown}
                 onDragOver={handleComposerDragOverFiles}
                 onDrop={handleComposerDropFiles}
+                onPaste={handleComposerPaste}
                 placeholder={
                   gatewayStatus === "connected"
-                    ? "输入消息，Enter 发送…（支持拖入文件）"
+                    ? "输入消息，Enter 发送…（支持拖入/粘贴文件）"
                     : "网关未连接…（仍可拖入文件编辑草稿）"
                 }
                 rows={1}
@@ -1820,7 +2035,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   type="button"
                   className="chat-send-fab"
                   onClick={() => void handleSend()}
-                  disabled={!input.trim() || gatewayStatus !== "connected"}
+                  disabled={
+                    (!input.trim() && attachments.length === 0) ||
+                    gatewayStatus !== "connected"
+                  }
                   aria-label="发送"
                 >
                   ↑
@@ -1832,11 +2050,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                 className="chat-model-select"
                 value={selectedModel}
                 onChange={(e) => setSelectedModel(e.target.value)}
-                title="模型"
+                title={
+                  availableProviders.length
+                    ? "选择本次对话优先使用的模型服务"
+                    : "尚未启用任何模型服务，请先在 设置 → 模型 中配置"
+                }
               >
-                {availableModels.map((m) => (
-                  <option key={m} value={m}>
-                    {m === "auto" ? "自动模型" : m}
+                <option value="auto">自动模型</option>
+                {availableProviders.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
                   </option>
                 ))}
               </select>
@@ -1890,19 +2113,6 @@ function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; live
       pending: "等待",
     };
     return labels[status ?? ""] ?? "记录";
-
-    switch (status) {
-      case "running":
-        return "进行中";
-      case "done":
-        return "完成";
-      case "error":
-        return "失败";
-      case "pending":
-        return "等待";
-      default:
-        return "记录";
-    }
   };
 
   return (
@@ -1918,7 +2128,8 @@ function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; live
           />
         </div>
       ) : null}
-      <ol>
+      {/* bug#5：实时时间线已展示进度时，不再重复渲染脚手架步骤列表 */}
+      <ol className={liveSessionId ? "chat-execution-steps-hidden" : undefined}>
         {steps.map((step, index) => (
           <li key={`${step.title}-${index}`} className={`chat-execution-step chat-execution-step--${step.status ?? "info"}`}>
             <span className="chat-execution-step-title">{step.title}</span>

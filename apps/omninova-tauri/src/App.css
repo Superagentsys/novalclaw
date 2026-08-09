@@ -311,11 +311,18 @@
   border: none;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.35);
-  color: var(--text-muted);
+  /* bug#6：提高箭头图标对比度，避免在浅色背景下不可见 */
+  color: var(--text-primary);
+  opacity: 0.75;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+}
+
+.app-shell-collapse svg {
+  display: block;
 }
 
 .app-shell-collapse:hover {
@@ -342,9 +349,9 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 9px 10px;
   border: none;
   border-radius: 12px;
   background: transparent;
@@ -405,6 +412,20 @@
   display: none;
 }
 
+/* bug#7：折叠态下品牌 Logo 与折叠按钮宽度超出侧栏导致重叠，改为纵向堆叠并居中 */
+.app-shell-root--collapsed .app-shell-sidebar-head {
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+}
+
+/* bug#8：折叠态下导航图标居中 */
+.app-shell-root--collapsed .app-shell-nav-item {
+  justify-content: center;
+  padding: 10px 0;
+}
+
 .app-shell-main {
   flex: 1;
   min-width: 0;
@@ -413,6 +434,13 @@
   flex-direction: column;
   overflow: hidden;
   background: var(--surface-cream);
+}
+
+/* 常驻挂载的视图容器（用于聊天页显隐切换，保留其运行态） */
+.app-view {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
 /* ========== Setup embedded / standalone ========== */
@@ -801,7 +829,8 @@
 .section-subtitle {
   margin-top: 6px;
   font-size: 13px;
-  color: rgba(255, 245, 237, 0.7);
+  /* bug#11：原为近白色，在浅色卡片上不可见 */
+  color: rgba(70, 76, 105, 0.75);
 }
 
 .setup-grid {
@@ -1219,6 +1248,17 @@
   color: #2a2a3e;
 }
 
+/* bug#13：折叠时仅保留标题行，去掉大片空白边框区域 */
+.setup-preview.setup-preview--collapsed {
+  min-height: 0;
+}
+
+.setup-preview.setup-preview--collapsed .setup-preview-header {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
 .setup-preview-header {
   display: flex;
   align-items: center;
@@ -1530,6 +1570,43 @@
   flex: 1;
 }
 
+/* bug#5：实时时间线存在时隐藏冗余的脚手架步骤 */
+.chat-execution-steps-hidden {
+  display: none;
+}
+
+/* bug#9：顶部工具栏常驻显示当前 Workspace */
+.chat-toolbar-workspace {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 40%;
+  padding: 6px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-toolbar-workspace:hover:not(:disabled) {
+  background: #fff;
+}
+
+.chat-toolbar-workspace--empty {
+  color: #b0552a;
+  border-color: rgba(200, 120, 60, 0.45);
+}
+
+.chat-toolbar-workspace-path {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl; /* 路径过长时保留结尾（项目名）更有辨识度 */
+  text-align: left;
+}
+
 .chat-target-pill {
   display: inline-flex;
   align-items: center;
@@ -1582,6 +1659,11 @@
   cursor: pointer;
   font-size: 16px;
   line-height: 1;
+  /* bug#8：图标严格居中 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
 }
 
 .chat-icon-btn:hover {
@@ -2031,6 +2113,61 @@
   border: 0;
 }
 
+/* bug#1/#2：待发送附件芯片 */
+.chat-attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 4px 8px;
+}
+
+.chat-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.chat-attachment-chip-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.chat-attachment-chip-note {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.chat-attachment-chip-remove {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.chat-attachment-chip-remove:hover:not(:disabled) {
+  background: rgba(200, 60, 60, 0.15);
+  color: #b03030;
+}
+
 .chat-attach-btn {
   flex-shrink: 0;
   width: 40px;
@@ -2070,6 +2207,11 @@
   font-weight: 700;
   cursor: pointer;
   line-height: 1;
+  /* bug#8：发送箭头居中 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   box-shadow: var(--shadow-accent);
   transition: transform var(--transition-fast), box-shadow var(--transition-fast),
     filter var(--transition-fast);
@@ -2338,6 +2480,133 @@
   color: var(--accent-blue);
   font-weight: 600;
   box-shadow: var(--shadow-xs);
+}
+
+/* Sidebar tabs now hold 4 entries; tighten spacing so they fit. */
+.chat-sidebar-tabs button {
+  padding-left: 2px;
+  padding-right: 2px;
+}
+
+/* --- Task history panel --- */
+.chat-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chat-history-clear {
+  border: none;
+  background: transparent;
+  color: #9a9ab8;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.chat-history-clear:hover {
+  background: rgba(80, 100, 220, 0.08);
+  color: #4a5aaa;
+}
+
+.chat-task-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-task-item {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.chat-task-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: var(--border-soft);
+}
+
+.chat-task-item:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.chat-task-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-task-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.chat-task-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: #aaaacc;
+}
+
+.chat-task-agent {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-task-time {
+  flex-shrink: 0;
+}
+
+.chat-task-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  line-height: 1.5;
+}
+
+.chat-task-badge--running {
+  background: rgba(37, 99, 235, 0.14);
+  color: #2563eb;
+}
+
+.chat-task-badge--completed {
+  background: rgba(22, 163, 74, 0.14);
+  color: #16a34a;
+}
+
+.chat-task-badge--failed {
+  background: rgba(220, 38, 38, 0.14);
+  color: #dc2626;
+}
+
+.chat-task-badge--cancelled {
+  background: rgba(120, 120, 140, 0.16);
+  color: #6b6b80;
 }
 
 /* --- Main chat area --- */

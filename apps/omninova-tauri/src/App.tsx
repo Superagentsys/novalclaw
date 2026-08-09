@@ -10,18 +10,24 @@ function App() {
   return (
     <div className="app-root">
       <AppShell activeNav={nav} onNavigate={setNav}>
-        {nav === "chat" || nav === "cron" ? (
-          <Chat
-            initialSidebarTab={nav === "cron" ? "scheduled" : "avatars"}
-          />
-        ) : (
+        {/*
+          Chat 始终挂载，仅用显隐切换：切到设置页时不卸载，
+          从而保留正在执行的任务、草稿与进度（bug#3）。
+        */}
+        <div
+          className="app-view"
+          style={{ display: nav === "chat" ? "flex" : "none" }}
+        >
+          <Chat />
+        </div>
+        {nav !== "chat" ? (
           <Setup
             embedded
             activeTab={nav}
             onTabChange={(tab) => setNav(tab)}
             onConfigSuccess={() => setNav("chat")}
           />
-        )}
+        ) : null}
       </AppShell>
     </div>
   );
