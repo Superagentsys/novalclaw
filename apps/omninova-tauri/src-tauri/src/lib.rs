@@ -15,7 +15,10 @@ use omninova_core::gateway::{
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
-use omninova_core::skills::{import_skills_from_dir, load_skills_from_dir};
+use omninova_core::skills::{
+    import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
+    skillhub_install, skillhub_list, SkillHubCategory, SkillHubItem,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1163,6 +1166,16 @@ struct SkillsPackageSummaryPayload {
     total: usize,
     names: Vec<String>,
     items: Vec<SkillSummaryItem>,
+    /// Top-level directory names (slugs) of installed skills, for install-state marking.
+    slugs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillHubInstallResult {
+    slug: String,
+    installed: usize,
+    dir: String,
 }
 
 #[tauri::command]
@@ -1646,11 +1659,71 @@ async fn skills_package_summary(
         })
         .collect::<Vec<_>>();
 
+    let slugs = installed_skill_slugs(&target).unwrap_or_default();
+
     Ok(SkillsPackageSummaryPayload {
         dir: target.to_string_lossy().into_owned(),
         total: names.len(),
         names,
         items,
+        slugs,
+    })
+}
+
+fn skills_target_dir(config: &Config) -> PathBuf {
+    config
+        .skills
+        .open_skills_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.workspace_dir.join("skills"))
+}
+
+#[tauri::command]
+async fn skillhub_browse(
+    source: Option<String>,
+    category: Option<String>,
+    keyword: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<Vec<SkillHubItem>, String> {
+    let source = source.unwrap_or_else(|| "all".to_string());
+    skillhub_list(
+        &source,
+        category.as_deref(),
+        keyword.as_deref(),
+        page.unwrap_or(1),
+        page_size.unwrap_or(24),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn skillhub_category_list() -> Result<Vec<SkillHubCategory>, String> {
+    skillhub_categories().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn skillhub_install_skill(
+    slug: String,
+    namespace: Option<String>,
+    version: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<SkillHubInstallResult, String> {
+    let target = {
+        let app_state = state.lock().await;
+        let config = app_state.runtime.get_config().await;
+        skills_target_dir(&config)
+    };
+    let (installed_slug, installed) =
+        skillhub_install(&target, &slug, namespace.as_deref(), version.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(SkillHubInstallResult {
+        slug: installed_slug,
+        installed,
+        dir: target.to_string_lossy().into_owned(),
     })
 }
 
@@ -2809,6 +2882,9 @@ pub fn run() {
             cli_install_to_user_path,
             import_skills,
             skills_package_summary,
+            skillhub_browse,
+            skillhub_category_list,
+            skillhub_install_skill,
             composer_attachments::read_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
             restart_gateway,
