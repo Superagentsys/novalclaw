@@ -1051,6 +1051,17 @@ pub struct GatewayDingtalkConfig {
     /// Optional environment variable name holding the robotCode.
     #[serde(default)]
     pub robot_code_env: Option<String>,
+    /// DingTalk advanced-card template id used by createAndDeliver. An empty
+    /// value disables only the interactive menu card, not the Gateway.
+    #[serde(default)]
+    pub card_template_id: String,
+    /// Optional environment variable holding the advanced-card template id.
+    #[serde(default)]
+    pub card_template_id_env: Option<String>,
+    /// DingTalk connection mode. HTTP keeps the stable webhook + text bot
+    /// flow; Stream additionally enables OmniNova advanced interactive cards.
+    #[serde(default)]
+    pub transport_mode: DingtalkTransportMode,
     /// HTTP path that DingTalk servers POST events to. Exposed for visibility
     /// only; the actual route is registered as `/webhook/dingtalk` and the
     /// public callback URL is `/api/v1/gateway/dingtalk/events`.
@@ -1080,6 +1091,9 @@ impl Default for GatewayDingtalkConfig {
             app_secret_env: None,
             robot_code: String::new(),
             robot_code_env: None,
+            card_template_id: String::new(),
+            card_template_id_env: None,
+            transport_mode: DingtalkTransportMode::default(),
             webhook_path: default_gateway_dingtalk_webhook_path(),
             outbound_mode: default_gateway_dingtalk_outbound_mode(),
             redact_sensitive_logs: true,
@@ -2468,5 +2482,73 @@ workspace_dir = "C:\\agent-workspace"
         );
         assert!(!serialized.to_ascii_lowercase().contains("secret"));
         assert!(!serialized.to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn legacy_dingtalk_config_defaults_card_template_to_disabled() {
+        let cfg: GatewayDingtalkConfig = toml::from_str(
+            r#"
+enabled = true
+outbound_mode = "session_webhook"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.card_template_id.is_empty());
+        assert!(cfg.card_template_id_env.is_none());
+        assert_eq!(cfg.transport_mode, DingtalkTransportMode::Http);
+    }
+
+    #[test]
+    fn dingtalk_card_template_round_trips() {
+        let mut cfg = GatewayDingtalkConfig::default();
+        cfg.card_template_id = "template-id".to_string();
+        cfg.card_template_id_env = Some("OMNINOVA_DINGTALK_CARD_TEMPLATE_ID".to_string());
+        cfg.transport_mode = DingtalkTransportMode::Stream;
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let restored: GatewayDingtalkConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.card_template_id, "template-id");
+        assert_eq!(
+            restored.card_template_id_env.as_deref(),
+            Some("OMNINOVA_DINGTALK_CARD_TEMPLATE_ID")
+        );
+        assert_eq!(restored.transport_mode, DingtalkTransportMode::Stream);
+    }
+
+    #[test]
+    fn dingtalk_transport_mode_preserves_template_when_switching_to_http() {
+        let mut cfg = GatewayDingtalkConfig::default();
+        cfg.card_template_id = "template-id".to_string();
+        cfg.transport_mode = DingtalkTransportMode::Stream;
+        cfg.transport_mode = DingtalkTransportMode::Http;
+
+        let restored: GatewayDingtalkConfig =
+            toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.transport_mode, DingtalkTransportMode::Http);
+        assert_eq!(restored.card_template_id, "template-id");
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DingtalkTransportMode {
+    #[default]
+    Http,
+    Stream,
+}
+
+impl DingtalkTransportMode {
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" => Some(Self::Http),
+            "stream" => Some(Self::Stream),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Stream => "stream",
+        }
     }
 }

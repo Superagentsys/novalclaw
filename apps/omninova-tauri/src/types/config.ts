@@ -193,6 +193,8 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "DINGTALK_TOKEN",
     fields: [
+      { key: "transport_mode", label: "连接模式", placeholder: "http/stream", type: "text", isExtra: true },
+      { key: "card_template_id", label: "Card Template ID", placeholder: "DingTalk advanced card template ID (optional)", type: "text", isExtra: true },
       { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text", isExtra: true },
       { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password", isExtra: true },
       { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },

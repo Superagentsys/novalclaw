@@ -217,8 +217,10 @@ async fn process_dingtalk_job(
     // Phase 2: short-circuit commands (help/menu/status/ping/monitor).
     // Non-command text falls through to the agent exactly like Phase 1.
     let command_result = evaluate_command_for_job(&runtime, &job).await;
+    let mut should_send_menu_card = false;
     let reply = if let Some((cmd, command_reply)) = command_result {
         println!("[dingtalk-command] matched=true command={}", cmd.name());
+        should_send_menu_card = cmd.prefers_menu_card();
         command_reply
     } else {
         println!("[dingtalk-command] matched=false command=none");
@@ -233,8 +235,35 @@ async fn process_dingtalk_job(
         reply
     };
 
-    // Send reply via sessionWebhook
-    let result = send_reply_via_session_webhook(&runtime, &inbound, &reply).await;
+    let result = if should_send_menu_card {
+        let availability = resolve_dingtalk_card_availability(&runtime, &inbound).await;
+        println!(
+            "[dingtalk-card] availability={} mode={}",
+            availability.log_value(),
+            if matches!(
+                availability,
+                crate::gateway::dingtalk_card::DingtalkCardAvailability::UnsupportedTransport
+            ) {
+                "http"
+            } else {
+                "stream"
+            }
+        );
+        match menu_delivery_plan(availability) {
+            DingtalkMenuDeliveryPlan::InteractiveCard => {
+                send_menu_card_with_text_fallback(
+                    || send_dingtalk_agent_menu_card(&runtime, &inbound),
+                    || send_reply_via_session_webhook(&runtime, &inbound, CARD_CREATE_FAILED_TEXT),
+                )
+                .await
+            }
+            DingtalkMenuDeliveryPlan::TextOnly(message) => {
+                send_reply_via_session_webhook(&runtime, &inbound, message).await
+            }
+        }
+    } else {
+        send_reply_via_session_webhook(&runtime, &inbound, &reply).await
+    };
 
     match result {
         Ok(_) => {
@@ -277,6 +306,22 @@ async fn evaluate_command_for_job(
         &job.inbound.text,
         Some(&job.raw_payload),
         inputs,
+    )
+}
+
+/// Build the same sanitized, live status used by the existing `/status`
+/// command. Advanced-card callbacks reuse this rather than fabricating a
+/// separate status snapshot.
+pub(crate) async fn build_runtime_dingtalk_status_text(runtime: &GatewayRuntime) -> String {
+    let config = runtime.get_config().await;
+    let queue_len = runtime.dingtalk_queue_len().await;
+    let worker_initialized = runtime.dingtalk_worker_started().await;
+    crate::gateway::dingtalk_commands::build_dingtalk_status_text(
+        crate::gateway::dingtalk_commands::DingtalkStatusInputs {
+            config: &config,
+            worker_initialized,
+            queue_len,
+        },
     )
 }
 
@@ -391,6 +436,217 @@ async fn send_reply_via_session_webhook(
     send_dingtalk_text_message(&token, inbound, fallback_robot_code.as_deref(), reply)
         .await
         .map_err(|error| format!("send_from_app_error:{error}"))
+}
+
+const HTTP_CARD_UNAVAILABLE_TEXT: &str = "当前 DingTalk 连接使用 HTTP 模式。\n\nOmniNova 互动卡片仅在 Stream 模式下启用。\n如需使用可点击 Agent 菜单，请在 DingTalk 设置中切换到 Stream 模式。\n\n当前仍可通过文本命令使用 Gateway 状态、帮助和普通 Agent 对话。";
+const MISSING_CARD_TEMPLATE_TEXT: &str = "DingTalk 当前已使用 Stream 模式，但互动卡片模板尚未配置。\n\n请先在 OmniNova DingTalk 设置中填写 Card Template ID。\n当前仍可继续使用普通文本交互。";
+const CARD_STREAM_DISCONNECTED_TEXT: &str = "DingTalk 当前使用 Stream 模式，但 Stream 连接尚未就绪。\n\n互动卡片暂时不可用，请确认 DingTalk Stream 连接状态。\n当前仍可继续使用普通文本交互。";
+const MISSING_CARD_CONTEXT_TEXT: &str = "当前会话暂时无法创建互动卡片，请继续使用文本命令。";
+const CARD_CREATE_FAILED_TEXT: &str =
+    "互动卡片创建失败，已切换为文本交互模式。\n\n你仍可继续使用普通命令。";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DingtalkMenuDeliveryPlan {
+    InteractiveCard,
+    TextOnly(&'static str),
+}
+
+fn menu_delivery_plan(
+    availability: crate::gateway::dingtalk_card::DingtalkCardAvailability,
+) -> DingtalkMenuDeliveryPlan {
+    use crate::gateway::dingtalk_card::DingtalkCardAvailability;
+    match availability {
+        DingtalkCardAvailability::UnsupportedTransport => {
+            DingtalkMenuDeliveryPlan::TextOnly(HTTP_CARD_UNAVAILABLE_TEXT)
+        }
+        DingtalkCardAvailability::MissingTemplate => {
+            DingtalkMenuDeliveryPlan::TextOnly(MISSING_CARD_TEMPLATE_TEXT)
+        }
+        DingtalkCardAvailability::StreamDisconnected => {
+            DingtalkMenuDeliveryPlan::TextOnly(CARD_STREAM_DISCONNECTED_TEXT)
+        }
+        DingtalkCardAvailability::MissingContext => {
+            DingtalkMenuDeliveryPlan::TextOnly(MISSING_CARD_CONTEXT_TEXT)
+        }
+        DingtalkCardAvailability::Available => DingtalkMenuDeliveryPlan::InteractiveCard,
+    }
+}
+
+async fn resolve_dingtalk_card_availability(
+    runtime: &GatewayRuntime,
+    inbound: &InboundMessage,
+) -> crate::gateway::dingtalk_card::DingtalkCardAvailability {
+    use crate::config::schema::DingtalkTransportMode;
+
+    let config = runtime.get_config().await;
+    let entry = config.channels_config.dingtalk.as_ref();
+    let transport_mode = crate::gateway::resolve_dingtalk_transport_mode_for_worker(&config, entry);
+    if transport_mode == DingtalkTransportMode::Http {
+        return crate::gateway::dingtalk_card::determine_card_availability(
+            transport_mode,
+            false,
+            false,
+            false,
+        );
+    }
+
+    let template_configured =
+        crate::gateway::resolve_dingtalk_card_template_for_worker(&config, entry).is_some();
+    let fallback_robot_code =
+        crate::gateway::resolve_dingtalk_robot_code_for_worker(&config, entry);
+    let context_complete = crate::gateway::dingtalk_card::DingtalkCardTarget::from_inbound(
+        inbound,
+        fallback_robot_code.as_deref(),
+    )
+    .is_ok();
+    let stream_registered = runtime.is_dingtalk_stream_registered();
+
+    crate::gateway::dingtalk_card::determine_card_availability(
+        transport_mode,
+        template_configured,
+        stream_registered,
+        context_complete,
+    )
+}
+
+async fn send_menu_card_with_text_fallback<CardSend, CardFuture, TextSend, TextFuture>(
+    send_card: CardSend,
+    send_text: TextSend,
+) -> Result<(), String>
+where
+    CardSend: FnOnce() -> CardFuture,
+    CardFuture: std::future::Future<Output = Result<(), String>>,
+    TextSend: FnOnce() -> TextFuture,
+    TextFuture: std::future::Future<Output = Result<(), String>>,
+{
+    match send_card().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            println!(
+                "[dingtalk-card] fallback_to_text=true reason={}",
+                safe_error_kind(&error)
+            );
+            send_text().await
+        }
+    }
+}
+
+/// Create and deliver the shared Agent menu through DingTalk Advanced Cards.
+/// The callback is delivered over DingTalk Stream; the legacy HTTP ActionCard
+/// URL is intentionally not the default because it cannot provide a reliable
+/// application callback for this flow.
+async fn send_dingtalk_agent_menu_card(
+    runtime: &Arc<GatewayRuntime>,
+    inbound: &InboundMessage,
+) -> Result<(), String> {
+    let config = runtime.get_config().await;
+    let entry = config.channels_config.dingtalk.as_ref();
+    let outbound_mode = {
+        let configured = config.gateway.dingtalk.outbound_mode.trim();
+        if !configured.is_empty() {
+            configured
+        } else {
+            entry
+                .and_then(|entry| entry.extra.get("outbound_mode"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("disabled")
+        }
+    };
+    validate_dingtalk_card_outbound_mode(outbound_mode).map_err(|error| {
+        log_dingtalk_card_failure(0, &error, 0, 0);
+        error
+    })?;
+    let template_id = crate::gateway::resolve_dingtalk_card_template_for_worker(&config, entry)
+        .ok_or_else(|| {
+            println!("[dingtalk-card] interactive_card_unavailable reason=missing_template_id");
+            "missing_card_template_id".to_string()
+        })?;
+    let app_key = crate::gateway::resolve_dingtalk_app_key_for_worker(&config, entry)
+        .ok_or_else(|| "missing_app_key".to_string())?;
+    let app_secret = crate::gateway::resolve_dingtalk_secret_for_worker(&config, entry)
+        .ok_or_else(|| "missing_app_secret".to_string())?;
+    let fallback_robot_code =
+        crate::gateway::resolve_dingtalk_robot_code_for_worker(&config, entry);
+    let target = crate::gateway::dingtalk_card::DingtalkCardTarget::from_inbound(
+        inbound,
+        fallback_robot_code.as_deref(),
+    )?;
+    let token = fetch_dingtalk_access_token(&app_key, &app_secret).await?;
+    crate::gateway::dingtalk_card::create_and_deliver_menu_card(&token, &template_id, &target)
+        .await
+        .map(|_| ())
+}
+
+fn validate_dingtalk_card_outbound_mode(outbound_mode: &str) -> Result<(), String> {
+    match outbound_mode.trim() {
+        // `session_webhook` controls ordinary text replies. Interactive menu
+        // cards use the inbound sessionWebhook independently of text mode.
+        "session_webhook" | "real" => Ok(()),
+        mode => Err(format!("card_outbound_mode_{mode}")),
+    }
+}
+
+const DINGTALK_MENU_CARD_API_KIND: &str = "sessionWebhook/actionCard";
+
+fn log_dingtalk_card_failure(
+    http_status: u16,
+    err_code: &str,
+    err_msg_len: usize,
+    body_len: usize,
+) {
+    println!(
+        "{}",
+        format_dingtalk_card_response_log(http_status, err_code, err_msg_len, body_len)
+    );
+}
+
+fn format_dingtalk_card_response_log(
+    http_status: u16,
+    err_code: &str,
+    err_msg_len: usize,
+    body_len: usize,
+) -> String {
+    format!(
+        "[dingtalk-card] response api_kind={} http_status={} err_code={} err_msg_len={} body_len={}",
+        DINGTALK_MENU_CARD_API_KIND, http_status, err_code, err_msg_len, body_len
+    )
+}
+
+async fn handle_dingtalk_card_send_response(response: reqwest::Response) -> Result<(), String> {
+    let status = response.status().as_u16();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => {
+            log_dingtalk_card_failure(status, "read_error", 0, 0);
+            return Err("read_error".to_string());
+        }
+    };
+    let summary = summarize_dingtalk_response(status, &body);
+    log_dingtalk_card_failure(
+        summary.status,
+        &summary.err_code,
+        summary.err_msg_len,
+        summary.body_len,
+    );
+
+    if summary.success {
+        Ok(())
+    } else {
+        Err(format!(
+            "send_error:status={} code={} msg_len={} log_id_present={}",
+            summary.status, summary.err_code, summary.err_msg_len, summary.log_id_present
+        ))
+    }
+}
+
+pub(crate) fn dingtalk_agent_menu_callback_url(config: &crate::config::Config) -> Option<String> {
+    crate::gateway::resolve_public_webhook_base_url(config).map(|base| {
+        format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            crate::gateway::agent_menu::DINGTALK_MENU_CARD_CALLBACK_PATH
+        )
+    })
 }
 
 async fn send_dingtalk_session_webhook(webhook: &str, text: &str) -> Result<(), String> {
@@ -847,6 +1103,182 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_menu_card_send_payload_uses_session_webhook_action_card() {
+        let body = crate::gateway::agent_menu::render_agent_menu_as_dingtalk_session_action_card(
+            "https://gateway.example.test/api/v1/gateway/dingtalk/card/callback",
+        );
+        assert_eq!(body["msgtype"], "actionCard");
+        assert_eq!(body["actionCard"]["title"], "OmniNova Agent 功能菜单");
+        assert_eq!(body["actionCard"]["btnOrientation"], "0");
+        let buttons = body["actionCard"]["btns"].as_array().unwrap();
+        assert_eq!(buttons.len(), 5);
+        assert_eq!(buttons[0]["title"], "桌面监控 30 秒");
+        assert_eq!(buttons[4]["title"], "帮助说明");
+        for button in buttons {
+            assert!(button["actionURL"]
+                .as_str()
+                .is_some_and(|url| url.contains("/dingtalk/card/callback?action=")));
+        }
+    }
+
+    #[test]
+    fn test_agent_menu_callback_url_uses_public_base() {
+        let mut config = crate::config::Config::default();
+        assert_eq!(dingtalk_agent_menu_callback_url(&config), None);
+        config.gateway_public.public_webhook_base_url =
+            Some("https://gateway.example.test/".to_string());
+        assert_eq!(
+            dingtalk_agent_menu_callback_url(&config).as_deref(),
+            Some("https://gateway.example.test/api/v1/gateway/dingtalk/card/callback")
+        );
+    }
+
+    #[test]
+    fn test_agent_menu_card_allows_session_webhook_mode() {
+        assert_eq!(
+            validate_dingtalk_card_outbound_mode("session_webhook"),
+            Ok(())
+        );
+        assert_eq!(validate_dingtalk_card_outbound_mode("real"), Ok(()));
+        assert_eq!(
+            validate_dingtalk_card_outbound_mode("disabled"),
+            Err("card_outbound_mode_disabled".to_string())
+        );
+        assert_eq!(
+            validate_dingtalk_card_outbound_mode("mock"),
+            Err("card_outbound_mode_mock".to_string())
+        );
+    }
+
+    #[test]
+    fn http_menu_uses_capability_notice_without_card_delivery() {
+        use crate::gateway::dingtalk_card::DingtalkCardAvailability;
+
+        let plan = menu_delivery_plan(DingtalkCardAvailability::UnsupportedTransport);
+        assert_eq!(
+            plan,
+            DingtalkMenuDeliveryPlan::TextOnly(HTTP_CARD_UNAVAILABLE_TEXT)
+        );
+        let DingtalkMenuDeliveryPlan::TextOnly(message) = plan else {
+            panic!("HTTP transport must never select createAndDeliver");
+        };
+        assert!(message.contains("当前 DingTalk 连接使用 HTTP 模式"));
+        assert!(message.contains("仅在 Stream 模式下启用"));
+    }
+
+    #[test]
+    fn stream_menu_selects_card_only_when_availability_is_ready() {
+        use crate::gateway::dingtalk_card::DingtalkCardAvailability;
+
+        assert_eq!(
+            menu_delivery_plan(DingtalkCardAvailability::Available),
+            DingtalkMenuDeliveryPlan::InteractiveCard
+        );
+        assert_eq!(
+            menu_delivery_plan(DingtalkCardAvailability::MissingTemplate),
+            DingtalkMenuDeliveryPlan::TextOnly(MISSING_CARD_TEMPLATE_TEXT)
+        );
+        assert_eq!(
+            menu_delivery_plan(DingtalkCardAvailability::StreamDisconnected),
+            DingtalkMenuDeliveryPlan::TextOnly(CARD_STREAM_DISCONNECTED_TEXT)
+        );
+        assert_eq!(
+            menu_delivery_plan(DingtalkCardAvailability::MissingContext),
+            DingtalkMenuDeliveryPlan::TextOnly(MISSING_CARD_CONTEXT_TEXT)
+        );
+    }
+
+    #[test]
+    fn channel_transport_mode_overrides_typed_gateway_default() {
+        use crate::config::schema::{ChannelEntry, DingtalkTransportMode};
+
+        let mut config = crate::config::Config::default();
+        config.gateway.dingtalk.transport_mode = DingtalkTransportMode::Stream;
+        assert_eq!(
+            crate::gateway::resolve_dingtalk_transport_mode_for_worker(&config, None),
+            DingtalkTransportMode::Stream
+        );
+
+        let mut entry = ChannelEntry::default();
+        entry
+            .extra
+            .insert("transport_mode".into(), serde_json::json!("http"));
+        assert_eq!(
+            crate::gateway::resolve_dingtalk_transport_mode_for_worker(&config, Some(&entry)),
+            DingtalkTransportMode::Http
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_menu_card_success_skips_text_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let text_calls = Arc::new(AtomicUsize::new(0));
+        let text_calls_for_send = text_calls.clone();
+        let result = send_menu_card_with_text_fallback(
+            || async { Ok(()) },
+            move || async move {
+                text_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(text_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_agent_menu_card_failure_falls_back_to_text() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let text_calls = Arc::new(AtomicUsize::new(0));
+        let text_calls_for_send = text_calls.clone();
+        let result = send_menu_card_with_text_fallback(
+            || async { Err("card_send_error:test".to_string()) },
+            move || async move {
+                text_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(text_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_agent_menu_card_unavailable_or_invalid_falls_back_to_text() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for card_error in [
+            "missing_card_template_id",
+            "missing_app_key",
+            "missing_app_secret",
+            "missing_robot_code",
+            "missing_sender_staff_id",
+            "card_callback_url_not_configured",
+            "missing_session_webhook",
+            "invalid_session_webhook",
+            "invalid_session_webhook_host",
+        ] {
+            let text_calls = Arc::new(AtomicUsize::new(0));
+            let text_calls_for_send = text_calls.clone();
+            let result = send_menu_card_with_text_fallback(
+                || async { Err(card_error.to_string()) },
+                move || async move {
+                    text_calls_for_send.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+
+            assert!(result.is_ok(), "{card_error} must preserve text fallback");
+            assert_eq!(
+                text_calls.load(Ordering::SeqCst),
+                1,
+                "{card_error} must invoke text fallback once"
+            );
+        }
+    }
+
+    #[test]
     fn test_dingtalk_response_summary_accepts_both_api_success_shapes() {
         let session = summarize_dingtalk_response(200, r#"{"errcode":0,"errmsg":"ok"}"#);
         assert!(session.success);
@@ -870,6 +1302,30 @@ mod tests {
         assert_eq!(summary.err_msg_len, secret.chars().count());
         assert!(summary.log_id_present);
         assert!(!format!("{summary:?}").contains(secret));
+    }
+
+    #[test]
+    fn test_dingtalk_card_failure_log_is_structured_and_redacted() {
+        let secret = "must-not-appear-in-card-log";
+        let body = format!(
+            r#"{{"errCode":"InvalidParameter","errMsg":"{}","logId":"present"}}"#,
+            secret
+        );
+        let summary = summarize_dingtalk_response(400, &body);
+        let log = format_dingtalk_card_response_log(
+            summary.status,
+            &summary.err_code,
+            summary.err_msg_len,
+            summary.body_len,
+        );
+
+        assert!(log.contains("api_kind=sessionWebhook/actionCard"));
+        assert!(log.contains("http_status=400"));
+        assert!(log.contains("err_code=InvalidParameter"));
+        assert!(log.contains(&format!("err_msg_len={}", secret.chars().count())));
+        assert!(log.contains(&format!("body_len={}", body.len())));
+        assert!(!log.contains(secret));
+        assert!(!log.contains(&body));
     }
 
     #[tokio::test]

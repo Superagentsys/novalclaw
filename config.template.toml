@@ -222,6 +222,9 @@
 # app_secret_env = "OMNINOVA_DINGTALK_APP_SECRET"
 # robot_code = ""                                # robotCode (prefer env var)
 # robot_code_env = "OMNINOVA_DINGTALK_ROBOT_CODE"
+# card_template_id = ""                          # advanced card template id (optional)
+# card_template_id_env = "OMNINOVA_DINGTALK_CARD_TEMPLATE_ID"
+# transport_mode = "http"                       # http | stream (interactive cards require stream)
 # webhook_path = "/api/v1/gateway/dingtalk/events"  # informational
 # outbound_mode = "session_webhook"               # disabled | session_webhook | mock
 # redact_sensitive_logs = true                    # log redaction (always-on)

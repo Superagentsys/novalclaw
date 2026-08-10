@@ -1,17 +1,38 @@
+pub mod agent_menu;
+pub mod dingtalk_card;
+pub mod dingtalk_card_stream;
+pub mod dingtalk_commands;
+pub mod dingtalk_store;
+pub mod dingtalk_stream;
+pub mod dingtalk_worker;
+pub mod feishu_store;
+pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
-pub mod agent_menu;
-pub mod feishu_worker;
-pub mod feishu_store;
-pub mod dingtalk_worker;
-pub mod dingtalk_store;
-pub mod dingtalk_commands;
+
+/// Unified DingTalk Stream lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DingTalkStreamState {
+    /// Stream is not running.
+    #[default]
+    Disconnected,
+    /// Requesting endpoint/ticket from DingTalk gateway.
+    Connecting,
+    /// WebSocket TCP connection established.
+    Connected,
+    /// Stream is registered and ready to receive business messages.
+    Registered,
+    /// Attempting to reconnect after a failure.
+    Reconnecting,
+    /// Stream is shutting down and will not accept new messages.
+    Stopping,
+}
 
 #[cfg(test)]
 mod dingtalk_tests;
 
-use crate::gateway::feishu_store::FeishuStore;
 use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
+use crate::gateway::feishu_store::FeishuStore;
 use home;
 
 use crate::agent::sanitize_messages_for_provider;
@@ -57,8 +78,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 use tokio::sync::RwLock;
@@ -340,6 +360,9 @@ pub struct GatewayRuntime {
     dingtalk_queue_len: Arc<RwLock<usize>>,
     /// DingTalk in-memory store for job tracking
     dingtalk_store: Option<Arc<dingtalk_store::DingtalkStore>>,
+    /// Live DingTalk Stream connection state (unified for robot + card).
+    /// Replaces dingtalk_card_stream_connected for Stream mode.
+    dingtalk_stream_connected: Arc<AtomicBool>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
@@ -464,6 +487,7 @@ impl GatewayRuntime {
             dingtalk_job_sender: Arc::new(RwLock::new(None)),
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
             dingtalk_store: None,
+            dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
         }
@@ -486,6 +510,7 @@ impl GatewayRuntime {
             dingtalk_job_sender: Arc::new(RwLock::new(None)),
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
             dingtalk_store: None,
+            dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
         }
@@ -772,6 +797,23 @@ impl GatewayRuntime {
     pub async fn is_dingtalk_worker_initialized(&self) -> bool {
         let sender = self.dingtalk_job_sender.read().await;
         sender.as_ref().is_some_and(|sender| !sender.is_closed())
+    }
+
+    pub(crate) fn set_dingtalk_stream_connected(&self, connected: bool) {
+        self.dingtalk_stream_connected
+            .store(connected, Ordering::Release);
+    }
+
+    pub(crate) fn dingtalk_stream_connected(&self) -> bool {
+        self.dingtalk_stream_connected.load(Ordering::Acquire)
+    }
+
+    /// Check if DingTalk Stream is in Registered state (truly ready for business).
+    /// Note: This is currently a simplified check based on connected flag.
+    /// The full Registered state tracking is in the dingtalk_stream module.
+    pub fn is_dingtalk_stream_registered(&self) -> bool {
+        // For now, registered = connected. Full state machine in dingtalk_stream module.
+        self.dingtalk_stream_connected()
     }
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
@@ -2186,6 +2228,8 @@ impl GatewayRuntime {
 
         // Initialize DingTalk async worker
         self.init_dingtalk_worker().await;
+        // Start unified DingTalk Stream transport (handles both robot and card topics)
+        let _dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
 
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
@@ -2219,7 +2263,14 @@ impl GatewayRuntime {
             // Both routes point to the same handler so the documented
             // URL works end-to-end while the legacy `/webhook/dingtalk`
             // path keeps working for anyone already wired up.
-            .route("/api/v1/gateway/dingtalk/events", post(http_dingtalk_webhook))
+            .route(
+                "/api/v1/gateway/dingtalk/events",
+                post(http_dingtalk_webhook),
+            )
+            .route(
+                agent_menu::DINGTALK_MENU_CARD_CALLBACK_PATH,
+                get(http_dingtalk_card_callback_get).post(http_dingtalk_card_callback_post),
+            )
             .route("/webhook/feishu/card", post(http_feishu_card_callback))
             .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
@@ -5106,6 +5157,138 @@ async fn http_dingtalk_webhook(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DingtalkCardActionQuery {
+    action: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DingtalkCardActionResponse {
+    ok: bool,
+    action: Option<String>,
+    message: String,
+}
+
+async fn http_dingtalk_card_callback_get(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<DingtalkCardActionQuery>,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    process_dingtalk_card_action(&runtime, query.action.as_deref()).await
+}
+
+async fn http_dingtalk_card_callback_post(
+    State(runtime): State<GatewayRuntime>,
+    raw_body: String,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    let payload = match serde_json::from_str::<serde_json::Value>(&raw_body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            println!("[dingtalk-card-callback] rejected reason=invalid_json");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(DingtalkCardActionResponse {
+                    ok: false,
+                    action: None,
+                    message: "无效的卡片回调数据。".to_string(),
+                }),
+            );
+        }
+    };
+    let action = agent_menu::extract_dingtalk_agent_menu_action(&payload);
+    process_dingtalk_card_action(&runtime, action.as_deref()).await
+}
+
+async fn process_dingtalk_card_action(
+    runtime: &GatewayRuntime,
+    raw_action: Option<&str>,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    let Some(raw_action) = raw_action.map(str::trim).filter(|value| !value.is_empty()) else {
+        println!("[dingtalk-card-callback] action_present=false");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DingtalkCardActionResponse {
+                ok: false,
+                action: None,
+                message: "缺少卡片操作。".to_string(),
+            }),
+        );
+    };
+    let Some(action) = agent_menu::canonical_agent_menu_action(raw_action) else {
+        println!("[dingtalk-card-callback] action_present=true action=unknown");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DingtalkCardActionResponse {
+                ok: false,
+                action: None,
+                message: "未知操作，已忽略。".to_string(),
+            }),
+        );
+    };
+
+    println!(
+        "[dingtalk-card-callback] action_present=true action={} identifiers_logged=false",
+        action
+    );
+    let message = match action {
+        "monitor_30s" => "当前 DingTalk 端暂未启用桌面监控 30 秒操作。".to_string(),
+        "monitor_60s" => "当前 DingTalk 端暂未启用桌面监控 60 秒操作。".to_string(),
+        "gateway_status" => {
+            let config = runtime.get_config().await;
+            let worker_started = runtime.dingtalk_worker_started().await;
+            let queue_len = runtime.dingtalk_queue_len().await;
+            format!(
+                "Gateway 状态：运行中\nDingTalk：{}\nWorker：{}\n队列任务：{}",
+                if is_dingtalk_effectively_enabled(&config) {
+                    "已启用"
+                } else {
+                    "未启用"
+                },
+                if worker_started {
+                    "已启动"
+                } else {
+                    "未启动"
+                },
+                queue_len
+            )
+        }
+        "recent_jobs" => match runtime.dingtalk_store() {
+            Some(store) => {
+                let jobs = store.get_recent_jobs(5).await;
+                if jobs.is_empty() {
+                    "暂无最近任务。".to_string()
+                } else {
+                    let completed = jobs
+                        .iter()
+                        .filter(|job| job.status == dingtalk_store::JobStatus::Completed)
+                        .count();
+                    let failed = jobs
+                        .iter()
+                        .filter(|job| job.status == dingtalk_store::JobStatus::Failed)
+                        .count();
+                    format!(
+                        "最近任务：{} 条\n已完成：{}\n失败：{}",
+                        jobs.len(),
+                        completed,
+                        failed
+                    )
+                }
+            }
+            None => "暂无最近任务。".to_string(),
+        },
+        "help" => agent_menu::render_agent_menu_as_dingtalk_text(),
+        _ => unreachable!("canonical Agent menu action is exhaustive"),
+    };
+
+    (
+        StatusCode::OK,
+        Json(DingtalkCardActionResponse {
+            ok: true,
+            action: Some(action.to_string()),
+            message,
+        }),
+    )
+}
+
 async fn http_channel_webhook(
     runtime: GatewayRuntime,
     headers: HeaderMap,
@@ -6515,6 +6698,51 @@ fn resolve_dingtalk_robot_code(
     None
 }
 
+fn resolve_dingtalk_card_template(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(value) = entry
+            .extra
+            .get("card_template_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.card_template_id.trim().is_empty() {
+        return Some(cfg.card_template_id.trim().to_string());
+    }
+    if let Some(env_name) = cfg.card_template_id_env.as_deref() {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    std::env::var("OMNINOVA_DINGTALK_CARD_TEMPLATE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_dingtalk_transport_mode(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> crate::config::schema::DingtalkTransportMode {
+    entry
+        .and_then(|entry| entry.extra.get("transport_mode"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::config::schema::DingtalkTransportMode::from_config_value)
+        .unwrap_or(config.gateway.dingtalk.transport_mode)
+}
+
 /// Returns true if the top-level `gateway.dingtalk` block is enabled.
 /// Per-channel `channels_config.dingtalk.enabled` continues to be honored
 /// by `is_channel_enabled`; this helper is for master-switch checks.
@@ -6632,6 +6860,20 @@ pub(crate) fn resolve_dingtalk_robot_code_for_worker(
     resolve_dingtalk_robot_code(config, entry)
 }
 
+pub(crate) fn resolve_dingtalk_card_template_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_card_template(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_transport_mode_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> crate::config::schema::DingtalkTransportMode {
+    resolve_dingtalk_transport_mode(config, entry)
+}
+
 // ---------------------------------------------------------------------------
 // Test-only re-exports (used by `dingtalk_worker` wrappers in unit tests)
 // ---------------------------------------------------------------------------
@@ -6674,6 +6916,7 @@ pub(crate) fn dingtalk_known_route_paths_for_test() -> &'static [&'static str] {
     &[
         "/webhook/dingtalk",
         "/api/v1/gateway/dingtalk/events",
+        agent_menu::DINGTALK_MENU_CARD_CALLBACK_PATH,
     ]
 }
 
@@ -8134,23 +8377,23 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        check_dingtalk_public_route, check_gateway_public_health,
-        classify_dingtalk_route_response,
-        dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
-        feishu_public_callback_urls,
+        acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool,
+        check_dingtalk_public_route, check_gateway_public_health, classify_dingtalk_route_response,
+        create_tools_for_route, dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
+        feishu_public_callback_urls, http_dingtalk_card_callback_post,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
         normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
         resolve_public_webhook_base_url, split_session_key, DedupCache, GatewayRuntime,
-        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard,
-        SessionLineageMeta,
+        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{
         ChannelEntry, Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode,
     };
+    use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
+    use axum::Json;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -11637,5 +11880,44 @@ mod tests {
         );
         assert!(!serialized.contains("verification-token-must-not-leak"));
         assert!(!serialized.contains("app-secret-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_gateway_status_action() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"action": "gateway_status"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("gateway_status"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_recent_tasks_alias() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"params": {"actionKey": "recent_tasks"}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("recent_jobs"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_help_action() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"value": {"action": "help"}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("help"));
     }
 }

@@ -38,6 +38,12 @@ impl DingtalkCommand {
             DingtalkCommand::Monitor => "monitor",
         }
     }
+
+    /// Menu/help commands prefer the DingTalk ActionCard delivery path. The
+    /// worker retains the structured text reply as a fallback.
+    pub fn prefers_menu_card(self) -> bool {
+        matches!(self, DingtalkCommand::Help | DingtalkCommand::Menu)
+    }
 }
 
 /// Strip a leading `@bot` mention from a DingTalk text message so that

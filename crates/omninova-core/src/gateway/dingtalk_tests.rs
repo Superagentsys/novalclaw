@@ -8,14 +8,14 @@
 //! - session_webhook_failure_returns_platform_error
 //! - dingtalk_outbound_logs_redact_sensitive_values
 
-use axum::http::HeaderMap;
 use crate::channels::{ChannelKind, InboundMessage};
-use crate::config::{Config, GatewayDingtalkConfig};
 use crate::config::env::apply_env_overrides;
+use crate::config::{Config, GatewayDingtalkConfig};
 use crate::gateway::dingtalk_worker::{
-    fetch_dingtalk_access_token, hmac_sha256_base64, verify_dingtalk_signature,
-    verify_dingtalk_webhook_signature, send_dingtalk_text_message,
+    fetch_dingtalk_access_token, hmac_sha256_base64, send_dingtalk_text_message,
+    verify_dingtalk_signature, verify_dingtalk_webhook_signature,
 };
+use axum::http::HeaderMap;
 
 // =============================================================================
 // Environment-variable isolation helpers
@@ -216,7 +216,10 @@ fn dingtalk_signature_wrong_secret_rejected() {
     let sign_with_correct = hmac_sha256_base64(&sign_base, correct_secret);
 
     let result = verify_dingtalk_signature(timestamp, &sign_with_correct, wrong_secret);
-    assert!(result.is_err(), "Signature with wrong secret should be rejected");
+    assert!(
+        result.is_err(),
+        "Signature with wrong secret should be rejected"
+    );
 }
 
 /// Test: verify_dingtalk_webhook_signature passes when no secret (dev mode)
@@ -228,15 +231,24 @@ fn dingtalk_webhook_signature_dev_mode_passes() {
 
     // No secret = dev mode = skip verification
     let result = verify_dingtalk_webhook_signature(&headers, "{}", None);
-    assert!(result.is_ok(), "Dev mode (no secret) should accept any request");
+    assert!(
+        result.is_ok(),
+        "Dev mode (no secret) should accept any request"
+    );
 }
 
 /// Test: verify_dingtalk_webhook_signature fails with invalid signature when secret set
 #[test]
 fn dingtalk_webhook_signature_fails_with_invalid_sign() {
     let mut headers = HeaderMap::new();
-    headers.insert("x-dingtalk-signature-for-isv", "some-signature".parse().unwrap());
-    headers.insert("x-dingtalk-signature-for-isv-sign", "some-sign".parse().unwrap());
+    headers.insert(
+        "x-dingtalk-signature-for-isv",
+        "some-signature".parse().unwrap(),
+    );
+    headers.insert(
+        "x-dingtalk-signature-for-isv-sign",
+        "some-sign".parse().unwrap(),
+    );
     headers.insert("timestamp", "1234567890".parse().unwrap());
 
     let result = verify_dingtalk_webhook_signature(&headers, "{}", Some("test-secret"));
@@ -305,7 +317,10 @@ fn dingtalk_text_message_is_normalized() {
     assert_eq!(inbound.user_id.as_deref(), Some("manager1234"));
     assert_eq!(inbound.session_id.as_deref(), Some("cid_abc123"));
     assert_eq!(
-        inbound.metadata.get("sessionWebhook").and_then(|v| v.as_str()),
+        inbound
+            .metadata
+            .get("sessionWebhook")
+            .and_then(|v| v.as_str()),
         Some("https://oapi.dingtalk.com/robot/send?access_token=xxx")
     );
     assert_eq!(
@@ -313,7 +328,10 @@ fn dingtalk_text_message_is_normalized() {
         Some("msg_xyz789")
     );
     assert_eq!(
-        inbound.metadata.get("senderStaffId").and_then(|v| v.as_str()),
+        inbound
+            .metadata
+            .get("senderStaffId")
+            .and_then(|v| v.as_str()),
         Some("manager1234")
     );
     assert_eq!(
@@ -346,10 +364,7 @@ fn dingtalk_non_text_message_filtered() {
         "conversationId": "c123",
     });
 
-    let is_text = payload
-        .get("msgType")
-        .and_then(|v| v.as_str())
-        == Some("text");
+    let is_text = payload.get("msgType").and_then(|v| v.as_str()) == Some("text");
 
     assert!(!is_text, "Non-text message should not be treated as text");
 }
@@ -367,11 +382,22 @@ fn session_webhook_text_reply_payload_correct() {
     let sender_staff_id = Some("staff_456");
     let text = "Hello from agent!";
 
-    let body = build_dingtalk_send_payload(token, session_webhook, conversation_id, sender_staff_id, text);
+    let body = build_dingtalk_send_payload(
+        token,
+        session_webhook,
+        conversation_id,
+        sender_staff_id,
+        text,
+    );
 
-    assert_eq!(body.get("msgKey").and_then(|v| v.as_str()), Some("sampleText"));
     assert_eq!(
-        body.get("msgParam").and_then(|v| v.get("content")).and_then(|v| v.as_str()),
+        body.get("msgKey").and_then(|v| v.as_str()),
+        Some("sampleText")
+    );
+    assert_eq!(
+        body.get("msgParam")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_str()),
         Some("Hello from agent!")
     );
     assert_eq!(
@@ -396,7 +422,10 @@ async fn session_webhook_failure_returns_platform_error() {
     let result = fetch_dingtalk_access_token("invalid_app_key", "invalid_secret").await;
 
     // Should be an Err (either network error or API error)
-    assert!(result.is_err(), "Invalid credentials should produce an error");
+    assert!(
+        result.is_err(),
+        "Invalid credentials should produce an error"
+    );
     let err = result.unwrap_err();
 
     // Error should contain "token_error" or "http_error" or "network_error"
@@ -438,8 +467,7 @@ async fn dingtalk_send_api_error_is_captured() {
     let text = "test";
 
     // This will fail because the token is invalid.
-    let result =
-        send_dingtalk_text_message(token, &inbound, fallback_robot_code, text).await;
+    let result = send_dingtalk_text_message(token, &inbound, fallback_robot_code, text).await;
 
     assert!(result.is_err(), "Invalid token should produce an error");
     let err = result.unwrap_err();
@@ -469,8 +497,14 @@ fn dingtalk_outbound_logs_redact_sensitive_values() {
     );
 
     // The redacted log should NOT contain the full secrets
-    assert!(!log_line.contains("access_token_abcdef"), "Full access_token should be redacted");
-    assert!(!log_line.contains("session_webhook_token"), "Full sessionWebhook token should be redacted");
+    assert!(
+        !log_line.contains("access_token_abcdef"),
+        "Full access_token should be redacted"
+    );
+    assert!(
+        !log_line.contains("session_webhook_token"),
+        "Full sessionWebhook token should be redacted"
+    );
 
     // The redaction should produce something visible (not empty)
     assert!(
@@ -486,8 +520,14 @@ fn dingtalk_app_secret_not_printed_in_logs() {
 
     let log_output = format!("app_secret={}", redact_secret(&app_secret));
 
-    assert!(!log_output.contains("my_super_secret"), "Full secret should be redacted");
-    assert!(!log_output.contains("xyz"), "End of secret should also be redacted");
+    assert!(
+        !log_output.contains("my_super_secret"),
+        "Full secret should be redacted"
+    );
+    assert!(
+        !log_output.contains("xyz"),
+        "End of secret should also be redacted"
+    );
 }
 
 /// Test: senderStaffId is redacted in logs
@@ -496,7 +536,10 @@ fn dingtalk_sender_staff_id_redacted_in_logs() {
     let staff_id = "staff_1234567890";
     let log_output = format!("sender={}", redact_for_log_preview(staff_id));
 
-    assert!(!log_output.contains("1234567890"), "Full staff ID should be redacted");
+    assert!(
+        !log_output.contains("1234567890"),
+        "Full staff ID should be redacted"
+    );
 }
 
 /// Test: conversationId is redacted in logs
@@ -505,7 +548,10 @@ fn dingtalk_conversation_id_redacted_in_logs() {
     let cid = "cid_long_conversation_id_abc123xyz";
     let log_output = format!("conversation={}", redact_for_log_preview(cid));
 
-    assert!(!log_output.contains("long_conversation"), "Full conversationId should be redacted");
+    assert!(
+        !log_output.contains("long_conversation"),
+        "Full conversationId should be redacted"
+    );
 }
 
 // =============================================================================
@@ -639,8 +685,7 @@ fn dingtalk_config_defaults_disabled() {
         "DingTalk app_secret must default to empty"
     );
     assert_eq!(
-        cfg.gateway.dingtalk.outbound_mode,
-        "session_webhook",
+        cfg.gateway.dingtalk.outbound_mode, "session_webhook",
         "DingTalk outbound_mode must default to session_webhook"
     );
     assert!(
@@ -648,8 +693,7 @@ fn dingtalk_config_defaults_disabled() {
         "Sensitive log redaction must default to true"
     );
     assert_eq!(
-        cfg.gateway.dingtalk.webhook_path,
-        "/api/v1/gateway/dingtalk/events",
+        cfg.gateway.dingtalk.webhook_path, "/api/v1/gateway/dingtalk/events",
         "DingTalk webhook_path must default to /api/v1/gateway/dingtalk/events"
     );
 }
@@ -797,13 +841,19 @@ fn gateway_without_dingtalk_config_still_defaults_disabled() {
             &cfg,
             cfg.channels_config.dingtalk.as_ref(),
         );
-        assert!(resolved.is_none(), "No secret should resolve when nothing is set");
+        assert!(
+            resolved.is_none(),
+            "No secret should resolve when nothing is set"
+        );
 
         let resolved_key = crate::gateway::dingtalk_worker::resolve_dingtalk_app_key(
             &cfg,
             cfg.channels_config.dingtalk.as_ref(),
         );
-        assert!(resolved_key.is_none(), "No app_key should resolve when nothing is set");
+        assert!(
+            resolved_key.is_none(),
+            "No app_key should resolve when nothing is set"
+        );
     });
 }
 
@@ -950,11 +1000,10 @@ fn dingtalk_gateway_legacy_channel_enabled_compat() {
 // `dingtalk_commands::evaluate_dingtalk_command` and friends.
 
 use crate::gateway::dingtalk_commands::{
-    evaluate_dingtalk_command, parse_dingtalk_command, strip_bot_mention,
-    to_normalized_for_match, DingtalkCommand, DingtalkStatusInputs,
-    build_dingtalk_help_text, build_dingtalk_menu_text,
-    build_dingtalk_status_text, build_dingtalk_ping_text,
-    build_dingtalk_monitor_text,
+    build_dingtalk_help_text, build_dingtalk_menu_text, build_dingtalk_monitor_text,
+    build_dingtalk_ping_text, build_dingtalk_status_text, evaluate_dingtalk_command,
+    parse_dingtalk_command, strip_bot_mention, to_normalized_for_match, DingtalkCommand,
+    DingtalkStatusInputs,
 };
 
 /// Helper: a default `Config` for the command router. Phase 2 does not
@@ -995,11 +1044,7 @@ fn build_dingtalk_payload(text_content: &str) -> serde_json::Value {
 fn dingtalk_help_command_returns_help_text() {
     let cfg = cmd_test_config();
     let payload = build_dingtalk_payload("help");
-    let result = evaluate_dingtalk_command(
-        "help",
-        Some(&payload),
-        cmd_inputs(&cfg),
-    );
+    let result = evaluate_dingtalk_command("help", Some(&payload), cmd_inputs(&cfg));
     let (cmd, reply) = result.expect("help must be recognized as a command");
     assert_eq!(cmd, DingtalkCommand::Help);
     assert!(
@@ -1053,6 +1098,22 @@ fn dingtalk_menu_aliases_return_the_shared_menu() {
     }
 }
 
+#[test]
+fn dingtalk_menu_aliases_prefer_card_delivery() {
+    let cfg = cmd_test_config();
+    for alias in [
+        "menu", "/menu", "菜单", "panel", "/panel", "面板", "help", "帮助",
+    ] {
+        let payload = build_dingtalk_payload(alias);
+        let (command, _) = evaluate_dingtalk_command(alias, Some(&payload), cmd_inputs(&cfg))
+            .unwrap_or_else(|| panic!("{alias:?} must open the Agent menu"));
+        assert!(
+            command.prefers_menu_card(),
+            "{alias:?} must prefer the interactive card"
+        );
+    }
+}
+
 /// Test: `status` output is redacted — no app_secret, no access_token,
 /// no sessionWebhook URL, no sender/conversation/message/robot ids.
 #[test]
@@ -1084,13 +1145,17 @@ fn dingtalk_status_command_returns_redacted_status() {
         queue_len: 7,
     });
 
-    assert_does_not_leak(&reply, "status", &[
-        "super-secret-app-secret-value",
-        "super-secret-app-key-value",
-        "super-secret-robot-code",
-        "token-redact-me",
-        "webhook-redact-me",
-    ]);
+    assert_does_not_leak(
+        &reply,
+        "status",
+        &[
+            "super-secret-app-secret-value",
+            "super-secret-app-key-value",
+            "super-secret-robot-code",
+            "token-redact-me",
+            "webhook-redact-me",
+        ],
+    );
     // The redaction notice must explicitly call out that webhook URLs
     // are not shown, so operators can see at a glance that the output
     // is intentionally redacted.
@@ -1113,15 +1178,27 @@ fn dingtalk_status_command_returns_redacted_status() {
     );
     // Sanity: the redacted status must still mention the configured
     // counts and states.
-    assert!(reply.contains("enabled"), "status must report enabled/disabled");
-    assert!(reply.contains("present"), "status must report app_key present");
-    assert!(reply.contains("queue_count"), "status must report queue_count");
+    assert!(
+        reply.contains("enabled"),
+        "status must report enabled/disabled"
+    );
+    assert!(
+        reply.contains("present"),
+        "status must report app_key present"
+    );
+    assert!(
+        reply.contains("queue_count"),
+        "status must report queue_count"
+    );
     assert!(reply.contains("7"), "status must include the queue length");
-    assert_eq!(reply, build_dingtalk_status_text(DingtalkStatusInputs {
-        config: &cfg,
-        worker_initialized: true,
-        queue_len: 7,
-    }));
+    assert_eq!(
+        reply,
+        build_dingtalk_status_text(DingtalkStatusInputs {
+            config: &cfg,
+            worker_initialized: true,
+            queue_len: 7,
+        })
+    );
 }
 
 fn assert_does_not_leak(haystack: &str, label: &str, needles: &[&str]) {
@@ -1177,12 +1254,11 @@ fn dingtalk_command_strips_bot_mention() {
     // recognized as the help command.
     let cfg = cmd_test_config();
     let payload = build_dingtalk_payload("@bot help");
-    let result = evaluate_dingtalk_command(
-        "@bot help",
-        Some(&payload),
-        cmd_inputs(&cfg),
+    let result = evaluate_dingtalk_command("@bot help", Some(&payload), cmd_inputs(&cfg));
+    assert!(
+        result.is_some(),
+        "after mention strip, @bot help -> help must parse"
     );
-    assert!(result.is_some(), "after mention strip, @bot help -> help must parse");
     assert_eq!(result.unwrap().0, DingtalkCommand::Help);
 }
 
@@ -1221,7 +1297,10 @@ fn dingtalk_unknown_plain_text_still_flows_to_agent() {
         Some(&payload),
         cmd_inputs(&cfg),
     );
-    assert!(result.is_none(), "weather question must not parse as a command");
+    assert!(
+        result.is_none(),
+        "weather question must not parse as a command"
+    );
 }
 
 /// Test: Chinese aliases (`帮助`, `菜单`, `状态`) parse the same as the
@@ -1230,7 +1309,10 @@ fn dingtalk_unknown_plain_text_still_flows_to_agent() {
 fn dingtalk_chinese_command_aliases_parse() {
     assert_eq!(parse_dingtalk_command("帮助"), Some(DingtalkCommand::Help));
     assert_eq!(parse_dingtalk_command("菜单"), Some(DingtalkCommand::Menu));
-    assert_eq!(parse_dingtalk_command("状态"), Some(DingtalkCommand::Status));
+    assert_eq!(
+        parse_dingtalk_command("状态"),
+        Some(DingtalkCommand::Status)
+    );
 }
 
 /// Test: extra redaction coverage on top of the inline status tests.
@@ -1274,15 +1356,9 @@ fn dingtalk_status_does_not_leak_secret_or_webhook() {
 /// inbound metadata) — we only mutate a private copy.
 #[test]
 fn dingtalk_normalizer_does_not_mutate_known_plain_text() {
-    assert_eq!(
-        to_normalized_for_match("hello world"),
-        "hello world"
-    );
+    assert_eq!(to_normalized_for_match("hello world"), "hello world");
     // Chinese text stays as-is (we only ascii-case-fold).
-    assert_eq!(
-        to_normalized_for_match("今天天气怎么样"),
-        "今天天气怎么样"
-    );
+    assert_eq!(to_normalized_for_match("今天天气怎么样"), "今天天气怎么样");
     // Slash only trims; the remainder is left intact.
     assert_eq!(to_normalized_for_match("/hello"), "hello");
 }
@@ -1336,10 +1412,7 @@ fn dingtalk_extract_text_missing_returns_empty() {
         "msgType": "text",
         "msgId": "abc"
     });
-    assert_eq!(
-        crate::gateway::extract_dingtalk_text_for_test(&payload),
-        ""
-    );
+    assert_eq!(crate::gateway::extract_dingtalk_text_for_test(&payload), "");
 }
 
 /// Test: real DingTalk callbacks send `msgtype` (lowercase). The
@@ -1384,8 +1457,8 @@ fn dingtalk_url_verification_returns_challenge() {
         "eventType": "url_verification",
         "challenge": "test-challenge-token"
     });
-    let is_challenge = payload.get("eventType").and_then(|v| v.as_str())
-        == Some("url_verification");
+    let is_challenge =
+        payload.get("eventType").and_then(|v| v.as_str()) == Some("url_verification");
     let challenge = payload.get("challenge").and_then(|v| v.as_str());
     assert!(is_challenge);
     assert_eq!(challenge, Some("test-challenge-token"));
@@ -1554,7 +1627,10 @@ fn dingtalk_ping_command_recognized_from_legacy_shape() {
 fn dingtalk_default_gateway_port_is_10809() {
     use crate::config::GatewayConfig;
     let cfg = GatewayConfig::default();
-    assert_eq!(cfg.port, 10809, "gateway default port must match config.template.toml");
+    assert_eq!(
+        cfg.port, 10809,
+        "gateway default port must match config.template.toml"
+    );
     assert_eq!(
         cfg.host, "127.0.0.1",
         "default host must stay loopback; cloudflared forwards externally"
@@ -1585,4 +1661,55 @@ async fn dingtalk_worker_init_is_idempotent_and_keeps_the_same_channel() {
 
     assert!(first.same_channel(&second));
     assert!(!second.is_closed());
+}
+
+// =============================================================================
+// TLS / rustls CryptoProvider tests
+// =============================================================================
+
+/// Test: ensure_rustls_crypto_provider does not panic
+#[test]
+fn dingtalk_stream_tls_provider_init_does_not_panic() {
+    // Calling ensure multiple times should not panic
+    crate::gateway::dingtalk_stream::ensure_rustls_crypto_provider();
+    crate::gateway::dingtalk_stream::ensure_rustls_crypto_provider();
+    crate::gateway::dingtalk_stream::ensure_rustls_crypto_provider();
+}
+
+/// Test: ensure_rustls_crypto_provider can be called from multiple threads
+/// This simulates the tokio runtime spawning behavior
+#[test]
+fn dingtalk_stream_tls_provider_concurrent_init_does_not_panic() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let barrier = Arc::new(std::sync::Barrier::new(10));
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            let b = barrier.clone();
+            thread::spawn(move || {
+                b.wait();
+                crate::gateway::dingtalk_stream::ensure_rustls_crypto_provider();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread should not panic");
+    }
+}
+
+/// Test: after ensure_rustls_crypto_provider, a default CryptoProvider exists
+#[test]
+fn dingtalk_stream_tls_provider_ensures_default_exists() {
+    use rustls::crypto::CryptoProvider;
+
+    // Ensure initialization
+    crate::gateway::dingtalk_stream::ensure_rustls_crypto_provider();
+
+    // Verify a default provider is now installed
+    assert!(
+        CryptoProvider::get_default().is_some(),
+        "CryptoProvider::get_default() must be Some after ensure_rustls_crypto_provider()"
+    );
 }

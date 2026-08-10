@@ -2074,7 +2074,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         gateway_public,
         robot: config.robot.clone(),
         providers,
-        channels: Some(channels_from_core(&config.channels_config)),
+        channels: Some(channels_from_core(config)),
         multimodal: SetupMultimodalConfig {
             desktop_vision_enabled: config.multimodal.desktop_vision_enabled,
             desktop_vision_max_dimension_px: config.multimodal.desktop_vision_max_dimension_px,
@@ -2154,7 +2154,24 @@ fn channel_entry_from_core(entry: &Option<ChannelEntry>) -> Option<SetupChannelE
     })
 }
 
-fn channels_from_core(cfg: &ChannelsConfig) -> SetupChannelsConfig {
+fn channels_from_core(config: &Config) -> SetupChannelsConfig {
+    let cfg = &config.channels_config;
+    let mut dingtalk = channel_entry_from_core(&cfg.dingtalk);
+    if let Some(entry) = dingtalk.as_mut() {
+        entry
+            .extra
+            .entry("transport_mode".to_string())
+            .or_insert_with(|| serde_json::json!(config.gateway.dingtalk.transport_mode.as_str()));
+        if !config.gateway.dingtalk.card_template_id.trim().is_empty() {
+            entry
+                .extra
+                .entry("card_template_id".to_string())
+                .or_insert_with(|| {
+                    serde_json::json!(config.gateway.dingtalk.card_template_id.trim())
+                });
+        }
+    }
+
     SetupChannelsConfig {
         telegram: channel_entry_from_core(&cfg.telegram),
         discord: channel_entry_from_core(&cfg.discord),
@@ -2163,7 +2180,7 @@ fn channels_from_core(cfg: &ChannelsConfig) -> SetupChannelsConfig {
         wechat: channel_entry_from_core(&cfg.wechat),
         feishu: channel_entry_from_core(&cfg.feishu),
         lark: channel_entry_from_core(&cfg.lark),
-        dingtalk: channel_entry_from_core(&cfg.dingtalk),
+        dingtalk,
         matrix: channel_entry_from_core(&cfg.matrix),
         email: channel_entry_from_core(&cfg.email),
         msteams: channel_entry_from_core(&cfg.msteams),
@@ -3393,6 +3410,30 @@ mod channel_tests {
 
         assert!(setup.feishu.is_none());
         assert!(setup.dingtalk.is_some());
+    }
+
+    #[test]
+    fn setup_hydrates_dingtalk_transport_without_clearing_template() {
+        use omninova_core::config::schema::DingtalkTransportMode;
+
+        let mut config = Config::default();
+        config.gateway.dingtalk.transport_mode = DingtalkTransportMode::Stream;
+        config.gateway.dingtalk.card_template_id = "saved-template".to_string();
+        config.channels_config.dingtalk = Some(ChannelEntry {
+            enabled: true,
+            ..Default::default()
+        });
+
+        let setup = channels_from_core(&config);
+        let dingtalk = setup.dingtalk.expect("DingTalk setup entry");
+        assert_eq!(
+            dingtalk.extra.get("transport_mode"),
+            Some(&serde_json::json!("stream"))
+        );
+        assert_eq!(
+            dingtalk.extra.get("card_template_id"),
+            Some(&serde_json::json!("saved-template"))
+        );
     }
 
     #[test]

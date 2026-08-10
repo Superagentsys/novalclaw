@@ -198,6 +198,9 @@ export function ChannelConfigForm({
   ).map((preset) => preset.name);
 
   const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
+  const dingtalkTransportMode = selectedPreset?.id === "dingtalk"
+    ? entry.extra?.["transport_mode"] || "http"
+    : "http";
   const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
     ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
     : "";
@@ -480,6 +483,20 @@ export function ChannelConfigForm({
 
           <div className="setup-grid">
             {visibleFields.map((field) => {
+              if (field.key === "transport_mode" && selectedPreset.id === "dingtalk") {
+                return (
+                  <label key={field.key}>
+                    {field.label}
+                    <select
+                      value={getFieldValue(field) || "http"}
+                      onChange={(event) => handleFieldChange(field, event.target.value)}
+                    >
+                      <option value="http">HTTP（稳定文本 Bot）</option>
+                      <option value="stream">Stream（启用互动卡片）</option>
+                    </select>
+                  </label>
+                );
+              }
               // Special handling for outbound_mode - render as dropdown
               if (field.key === "outbound_mode") {
                 return (
@@ -541,6 +558,7 @@ export function ChannelConfigForm({
                     <input
                       type={field.type ?? "text"}
                       value={getFieldValue(field)}
+                      disabled={field.key === "card_template_id" && dingtalkTransportMode !== "stream"}
                       onChange={(event) =>
                         handleFieldChange(field, event.target.value)
                       }
@@ -553,6 +571,26 @@ export function ChannelConfigForm({
               );
             })}
           </div>
+
+          {selectedPreset.id === "dingtalk" && (
+            <div className="channel-guide">
+              <h3>互动卡片</h3>
+              {dingtalkTransportMode === "stream" ? (
+                <>
+                  <strong>Stream 模式已选择</strong>
+                  <p>互动卡片可用条件：Stream 已连接，且 Card Template ID 已配置。</p>
+                </>
+              ) : (
+                <>
+                  <strong>当前不可用</strong>
+                  <p>
+                    OmniNova 互动卡片需要 DingTalk Stream 模式。HTTP 模式仍支持普通文本消息和 Agent 对话。
+                    Card Template ID 会保留，切回 Stream 后无需重新填写。
+                  </p>
+                </>
+              )}
+            </div>
+          )}
 
           {selectedPreset.id === "feishu" && (
             <div className="channel-guide">
