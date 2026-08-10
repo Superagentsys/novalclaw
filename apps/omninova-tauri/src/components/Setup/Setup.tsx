@@ -3,6 +3,7 @@ import {
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type Config,
+  type GatewayPublicMode,
   type GatewayStatus,
 } from "../../types/config";
 import { ChannelConfigForm } from "./ChannelConfigForm";
@@ -14,6 +15,104 @@ import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 import { open } from "@tauri-apps/plugin-dialog";
 
+/** Sensitive field names that should be redacted in JSON preview */
+const SENSITIVE_KEYS = new Set([
+  "app_secret",
+  "app_secret_env",
+  "secret",
+  "signing_secret",
+  "signing_secret_env",
+  "encrypt_key",
+  "encrypt_key_env",
+  "verification_token",
+  "verification_token_env",
+  "authorization",
+  "token",
+  "token_env",
+  "password",
+  "api_key",
+  "api_key_env",
+]);
+
+const LARK_BLOCKER_MESSAGE = "Lark 已启用但缺少 App ID。请补全 Lark 配置或关闭 Lark。";
+
+function enabledChannelIds(config: Config): string[] {
+  return Object.entries(config.channels)
+    .filter(([, channel]) => channel?.enabled)
+    .map(([channelId]) => channelId);
+}
+
+function formatGatewayStartError(message: string): string {
+  return message.includes(LARK_BLOCKER_MESSAGE)
+    ? `网关启动被 Lark 配置阻止：${LARK_BLOCKER_MESSAGE}`
+    : message;
+}
+
+function normalizePublicBaseUrl(value: string | null | undefined): string | null {
+  const trimmed = value?.trim().split(/[?#]/, 1)[0]?.replace(/\/+$/, "") ?? "";
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.replace(/\/webhook\/feishu(?:\/card)?$/i, "");
+  const base = normalized.replace(/\/+$/, "");
+  if (/^https?:\/\//i.test(base)) {
+    try {
+      const parsed = new URL(base);
+      if (parsed.username || parsed.password) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return base || null;
+}
+
+function normalizeNamedTunnelHostname(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = new URL(
+      /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    );
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return null;
+    }
+    return parsed.hostname.replace(/\.$/, "").toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Redact sensitive values in a JSON object for display */
+function redactSensitiveFields(obj: unknown): unknown {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(redactSensitiveFields);
+  }
+  if (typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (SENSITIVE_KEYS.has(key.toLowerCase()) && typeof value === "string") {
+        result[key] = "********";
+      } else if (typeof value === "object" && value !== null) {
+        result[key] = redactSensitiveFields(value);
+      } else {
+        result[key] = value;
+      }
+    }
+    return result;
+  }
+  return obj;
+}
 export interface SetupProps {
   /** 配置完成且网关启动成功后调用，用于进入对话界面 */
   onConfigSuccess?: () => void;
@@ -35,6 +134,14 @@ const initialConfig: Config = {
     slack: { enabled: false },
     discord: { enabled: false },
     telegram: { enabled: false },
+    lark: { enabled: false },
+  },
+  gateway_public: {
+    mode: "external_public_url",
+    public_webhook_base_url: null,
+    cloudflared_path: null,
+    named_tunnel_name: null,
+    named_tunnel_hostname: null,
   },
   skills: {
     open_skills_enabled: true,
@@ -164,12 +271,34 @@ export function Setup({
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
     url: "http://127.0.0.1:10809",
+    gateway_host: "127.0.0.1",
+    gateway_port: 10809,
+    gateway_public_mode: "external_public_url",
+    quick_tunnel_non_production: false,
+    cloudflared_configured: false,
+    cloudflared_found: false,
+    named_tunnel_name_configured: false,
+    named_tunnel_hostname_configured: false,
+    named_tunnel_config_complete: false,
+    public_health: {
+      configured: false,
+      ok: false,
+      checked_at: null,
+      error_kind: "not_configured",
+      error: "Public Base URL 未配置。",
+    },
+    enabled_channels: [],
+    store_opened: false,
+    retry_worker_enabled: false,
+    health_ok: false,
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
-    "load" | "save" | "start" | "stop" | null
+    "load" | "save" | "start" | "stop" | "restart" | "health" | "public-health" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
+  const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
+  const [activeChannelId, setActiveChannelId] = useState("feishu");
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
@@ -200,10 +329,10 @@ export function Setup({
     }));
   }, [config.default_provider, enabledProviders]);
 
-  const jsonPreview = useMemo(
-    () => JSON.stringify(config, null, 2),
-    [config]
-  );
+  const jsonPreview = useMemo(() => {
+    const redacted = redactSensitiveFields(config);
+    return JSON.stringify(redacted, null, 2);
+  }, [config]);
 
   const handleProvidersChange = (providers: Config["providers"]) => {
     const { default_provider, default_model } = resolveDefaultProviderSelection(
@@ -259,6 +388,29 @@ export function Setup({
     }
   }, [activeTab, refreshCliInstall]);
 
+  useEffect(() => {
+    if (activeTab !== "channels") {
+      return;
+    }
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const status = await invokeTauri<GatewayStatus>("gateway_status");
+        if (!disposed) {
+          setGatewayStatus(status);
+        }
+      } catch {
+        // Keep the most recent snapshot. Explicit actions surface errors.
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [activeTab]);
+
   const loadSetupState = async () => {
     setBusyAction("load");
     try {
@@ -274,6 +426,10 @@ export function Setup({
         providers: nextConfig.providers ?? DEFAULT_PROVIDERS,
         skills: nextConfig.skills ?? initialConfig.skills,
         agent: nextConfig.agent ?? initialConfig.agent,
+        gateway_public: {
+          ...initialConfig.gateway_public!,
+          ...nextConfig.gateway_public,
+        },
       };
       const { default_provider, default_model } = resolveDefaultProviderSelection(
         merged.providers,
@@ -297,17 +453,29 @@ export function Setup({
     }
   };
 
-  const saveSetupConfig = async (): Promise<boolean> => {
-    const result = await invokeTauri<{ gateway_restarted: boolean }>("save_setup_config", { config });
+  const saveSetupConfig = async (
+    validateAllChannels: boolean,
+    configToSave = config,
+    channelId = activeChannelId,
+  ): Promise<boolean> => {
+    const result = await invokeTauri<{ gateway_restarted: boolean }>("save_setup_config", {
+      config: configToSave,
+      validateAllChannels,
+      activeChannelId: channelId,
+    });
     const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
     setGatewayStatus(nextGatewayStatus);
     return result?.gateway_restarted ?? false;
   };
 
   const handleSaveConfig = async () => {
+    if (channelValidationError) {
+      setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
     setBusyAction("save");
     try {
-      const restarted = await saveSetupConfig();
+      const restarted = await saveSetupConfig(false);
       if (restarted) {
         setActionMessage("Workspace 已切换，网关已重启。");
       } else {
@@ -323,30 +491,96 @@ export function Setup({
   };
 
   const handleSaveAndStartGateway = async () => {
+    if (channelValidationError) {
+      setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
     setBusyAction("start");
+    setActionMessage(""); // Clear previous errors
     try {
-      const restarted = await saveSetupConfig();
+      const restarted = await saveSetupConfig(true);
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
-      const msg = restarted
-        ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
-        : `网关已启动：${nextGatewayStatus.url}`;
-      setActionMessage(msg);
-      if (nextGatewayStatus.running && onConfigSuccess) {
-        onConfigSuccess();
+      if (nextGatewayStatus.running) {
+        const enabledChannels = enabledChannelIds(config);
+        const msg = restarted
+          ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
+          : `网关已启动：${nextGatewayStatus.url}`;
+        setActionMessage(`${msg}。已启用频道：${enabledChannels.join(", ") || "无"}`);
+        if (onConfigSuccess) {
+          onConfigSuccess();
+        }
+      } else {
+        // Gateway failed to start - show detailed error
+        const errorMsg = nextGatewayStatus.last_error || "网关启动失败，原因未知";
+        setActionMessage(formatGatewayStartError(errorMsg));
       }
     } catch (error) {
-      setActionMessage(
-        `启动网关失败：${error instanceof Error ? error.message : String(error)}`
-      );
-      const nextGatewayStatus = await invokeTauri<GatewayStatus>(
-        "gateway_status"
-      ).catch(() => gatewayStatus);
-      setGatewayStatus(nextGatewayStatus);
+      // Tauri returns the error message as a string
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setActionMessage(formatGatewayStartError(errorMsg));
+      // Refresh status
+      try {
+        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
+        setGatewayStatus(nextGatewayStatus);
+      } catch {
+        // Ignore status refresh errors
+      }
     } finally {
       setBusyAction(null);
     }
   };
+
+  const handleGoToLarkConfig = () => {
+    setActiveChannelId("lark");
+  };
+
+  const handleDisableLark = async () => {
+    const existingLark = config.channels.lark ?? { enabled: false };
+    const nextConfig: Config = {
+      ...config,
+      channels: {
+        ...config.channels,
+        // Preserve the existing credentials and extra fields; only disable it.
+        lark: { ...existingLark, enabled: false },
+      },
+    };
+
+    setBusyAction("save");
+    try {
+      await saveSetupConfig(false, nextConfig, "lark");
+      setConfig(nextConfig);
+      setChannelValidationError(undefined);
+      setActionMessage("Lark 已关闭，配置已保存。现在可以再次启动 Feishu Gateway。");
+    } catch (error) {
+      setActionMessage(
+        `关闭 Lark 失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const larkBlockerActions = actionMessage.includes(LARK_BLOCKER_MESSAGE) ? (
+    <div className="setup-embed-buttons" style={{ marginTop: "0.5rem" }}>
+      <button
+        type="button"
+        className="setup-btn setup-btn--secondary"
+        onClick={handleGoToLarkConfig}
+        disabled={busyAction !== null}
+      >
+        前往 Lark 配置
+      </button>
+      <button
+        type="button"
+        className="setup-btn setup-btn--secondary"
+        onClick={() => void handleDisableLark()}
+        disabled={busyAction !== null}
+      >
+        关闭 Lark
+      </button>
+    </div>
+  ) : null;
 
   const handleCliInstall = async () => {
     setCliBusy(true);
@@ -365,17 +599,105 @@ export function Setup({
 
   const handleStopGateway = async () => {
     setBusyAction("stop");
+    setActionMessage(""); // Clear previous errors
     try {
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("stop_gateway");
       setGatewayStatus(nextGatewayStatus);
-      setActionMessage("网关已停止。");
+      if (!nextGatewayStatus.running) {
+        setActionMessage("网关已停止。");
+      } else {
+        // Should not happen normally, but handle gracefully
+        setActionMessage("网关停止可能未完全成功，请检查状态。");
+      }
+    } catch (error) {
+      // Tauri returns the error message as a string
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      setActionMessage(errorMsg);
+      // Refresh status
+      try {
+        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
+        setGatewayStatus(nextGatewayStatus);
+      } catch {
+        // Ignore status refresh errors
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRestartGateway = async () => {
+    setBusyAction("restart");
+    setActionMessage("");
+    try {
+      await saveSetupConfig(true);
+      const nextGatewayStatus = await invokeTauri<GatewayStatus>("restart_gateway");
+      setGatewayStatus(nextGatewayStatus);
+      setActionMessage(
+        nextGatewayStatus.running
+          ? `Gateway 已重启：${nextGatewayStatus.url}`
+          : nextGatewayStatus.last_error || "Gateway 重启失败。"
+      );
     } catch (error) {
       setActionMessage(
-        `停止网关失败：${error instanceof Error ? error.message : String(error)}`
+        formatGatewayStartError(error instanceof Error ? error.message : String(error))
+      );
+      try {
+        setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+      } catch {
+        // Keep the last known status.
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleTestGatewayHealth = async () => {
+    setBusyAction("health");
+    try {
+      const result = await invokeTauri<{
+        ok: boolean;
+        status_code?: number | null;
+        message: string;
+      }>("test_gateway_health");
+      setActionMessage(result.message);
+      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+    } catch (error) {
+      setActionMessage(
+        `Gateway 健康检查失败：${error instanceof Error ? error.message : String(error)}`
       );
     } finally {
       setBusyAction(null);
     }
+  };
+
+  const handleTestGatewayPublicHealth = async () => {
+    setBusyAction("public-health");
+    try {
+      const result = await invokeTauri<GatewayStatus["public_health"]>(
+        "test_gateway_public_health"
+      );
+      setActionMessage(
+        result.ok
+          ? `公网 Health 检查通过：${result.checked_url ?? result.base_url ?? ""}`
+          : `公网 Health 检查失败：${result.error ?? "未知错误"}`
+      );
+      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+    } catch (error) {
+      setActionMessage(
+        `公网 Health 检查失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const copyGatewayUrl = (url: string | null | undefined, label: string) => {
+    if (!url) {
+      setActionMessage(`${label}尚未生成。`);
+      return;
+    }
+    void navigator.clipboard.writeText(url);
+    setActionMessage(`${label}已复制。`);
   };
 
   const handlePickWorkspaceDir = async () => {
@@ -400,6 +722,36 @@ export function Setup({
     setConfig({ ...config, workspace_dir: undefined });
     setActionMessage("Workspace 目录已清空。保存后 Agent 会要求先选择真实工作目录。");
   };
+
+  const namedTunnelMode =
+    config.gateway_public?.mode === "named_cloudflare_tunnel";
+  const draftNamedTunnelHostname = normalizeNamedTunnelHostname(
+    config.gateway_public?.named_tunnel_hostname
+  );
+  const draftNamedTunnelBase =
+    namedTunnelMode && draftNamedTunnelHostname
+      ? `https://${draftNamedTunnelHostname}`
+      : null;
+  const draftPublicBase = namedTunnelMode
+    ? draftNamedTunnelBase
+    : normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url);
+  const callbackBase = namedTunnelMode
+    ? draftNamedTunnelBase
+    : draftPublicBase ?? gatewayStatus.url?.replace(/\/$/, "") ?? null;
+  const namedTunnelNameConfigured =
+    Boolean(config.gateway_public?.named_tunnel_name?.trim());
+  const namedTunnelConfigComplete =
+    namedTunnelNameConfigured && Boolean(draftNamedTunnelHostname);
+  const runtimeWebhookUrl = callbackBase ? `${callbackBase}/webhook/feishu` : null;
+  const runtimeCardCallbackUrl = callbackBase
+    ? `${callbackBase}/webhook/feishu/card`
+    : null;
+  const lastStartedLabel = gatewayStatus.last_started_at
+    ? new Date(gatewayStatus.last_started_at * 1000).toLocaleString()
+    : "尚未记录";
+  const publicHealthCheckedLabel = gatewayStatus.public_health?.checked_at
+    ? new Date(gatewayStatus.public_health.checked_at * 1000).toLocaleString()
+    : "尚未检测";
 
   const renderTabContent = () => {
     switch (activeTab) {
@@ -740,7 +1092,276 @@ export function Setup({
       case "providers":
         return <ProviderConfigForm value={config.providers} onChange={handleProvidersChange} />;
       case "channels":
-        return <ChannelConfigForm value={config.channels} onChange={(channels) => setConfig({ ...config, channels })} />;
+        return (
+          <>
+            <section className="setup-section gateway-runtime-panel">
+              <div className="section-heading gateway-runtime-heading">
+                <div>
+                  <h2>Gateway 运行状态</h2>
+                  <div className="section-subtitle">
+                    运行态、回调地址和隐私安全信息均来自当前 Gateway 配置。
+                  </div>
+                </div>
+                <span
+                  className={`gateway-status-chip ${
+                    gatewayStatus.running ? "is-running" : "is-stopped"
+                  }`}
+                >
+                  {gatewayStatus.running ? "运行中" : "已停止"}
+                </span>
+              </div>
+              <div className="gateway-public-config">
+                <label>
+                  公网入口模式
+                  <select
+                    value={config.gateway_public?.mode ?? "external_public_url"}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        gateway_public: {
+                          ...initialConfig.gateway_public!,
+                          ...config.gateway_public,
+                          mode: event.target.value as GatewayPublicMode,
+                        },
+                      })
+                    }
+                  >
+                    <option value="external_public_url">外部 Public URL</option>
+                    <option value="named_cloudflare_tunnel">Cloudflare Named Tunnel</option>
+                    <option value="quick_tunnel">Cloudflare Quick Tunnel（临时）</option>
+                  </select>
+                </label>
+                <label>
+                  Public Base URL
+                  <input
+                    value={
+                      namedTunnelMode
+                        ? draftNamedTunnelBase ?? ""
+                        : config.gateway_public?.public_webhook_base_url ?? ""
+                    }
+                    readOnly={namedTunnelMode}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        gateway_public: {
+                          ...initialConfig.gateway_public!,
+                          ...config.gateway_public,
+                          public_webhook_base_url: event.target.value,
+                        },
+                      })
+                    }
+                    placeholder="https://gateway.example.com"
+                  />
+                  <small>
+                    {namedTunnelMode
+                      ? "由 Named Tunnel Hostname 自动生成并保存。"
+                      : "只填写域名 Base；保存时会自动移除 webhook 路径后缀。"}
+                  </small>
+                </label>
+                {config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
+                  <>
+                    <label>
+                      Named Tunnel 名称
+                      <input
+                        value={config.gateway_public.named_tunnel_name ?? ""}
+                        onChange={(event) =>
+                          setConfig({
+                            ...config,
+                            gateway_public: {
+                              ...initialConfig.gateway_public!,
+                              ...config.gateway_public,
+                              named_tunnel_name: event.target.value,
+                            },
+                          })
+                        }
+                        placeholder="omninova-gateway"
+                      />
+                    </label>
+                    <label>
+                      Named Tunnel Hostname
+                      <input
+                        value={config.gateway_public.named_tunnel_hostname ?? ""}
+                        onChange={(event) =>
+                          setConfig({
+                            ...config,
+                            gateway_public: {
+                              ...initialConfig.gateway_public!,
+                              ...config.gateway_public,
+                              named_tunnel_hostname: event.target.value,
+                            },
+                          })
+                        }
+                        placeholder="gateway.example.com"
+                      />
+                    </label>
+                  </>
+                ) : null}
+                {config.gateway_public?.mode === "quick_tunnel" ||
+                config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
+                  <label>
+                    cloudflared 路径
+                    <input
+                      value={config.gateway_public.cloudflared_path ?? ""}
+                      onChange={(event) =>
+                        setConfig({
+                          ...config,
+                          gateway_public: {
+                            ...initialConfig.gateway_public!,
+                            ...config.gateway_public,
+                            cloudflared_path: event.target.value,
+                          },
+                        })
+                      }
+                      placeholder="C:\Program Files\cloudflared\cloudflared.exe"
+                    />
+                    <small>用于检测固定或临时隧道运行环境，不保存隧道凭据。</small>
+                  </label>
+                ) : null}
+              </div>
+              <div className="gateway-runtime-grid">
+                <div><span>本地地址</span><code>{gatewayStatus.url}</code></div>
+                <div>
+                  <span>Public Base URL</span>
+                  <code>{draftPublicBase || "未配置"}</code>
+                </div>
+                <div>
+                  <span>公网入口模式</span>
+                  <strong>
+                    {config.gateway_public?.mode ?? gatewayStatus.gateway_public_mode}
+                  </strong>
+                </div>
+                {namedTunnelMode ? (
+                  <div>
+                    <span>Named Tunnel 配置</span>
+                    <strong>{namedTunnelConfigComplete ? "完整" : "缺失"}</strong>
+                  </div>
+                ) : null}
+                {namedTunnelMode ? (
+                  <div>
+                    <span>固定 Hostname</span>
+                    <strong>{draftNamedTunnelHostname || "未配置"}</strong>
+                  </div>
+                ) : null}
+                <div><span>安全模式</span><strong>{gatewayStatus.security_mode || "dev"}</strong></div>
+                <div><span>出站模式</span><strong>{gatewayStatus.outbound_mode || "disabled"}</strong></div>
+                <div><span>Store</span><strong>{gatewayStatus.store_opened ? "已打开" : "未打开"}</strong></div>
+                <div>
+                  <span>Retry worker</span>
+                  <strong>{gatewayStatus.retry_worker_enabled ? "已启动" : "未启动"}</strong>
+                </div>
+                <div><span>本地 Health</span><strong>{gatewayStatus.health_ok ? "正常" : "未就绪"}</strong></div>
+                <div>
+                  <span>公网 Health</span>
+                  <strong>
+                    {!gatewayStatus.public_health?.configured
+                      ? "未配置"
+                      : gatewayStatus.public_health.ok
+                        ? "正常"
+                        : "异常"}
+                  </strong>
+                </div>
+                <div><span>公网检测时间</span><strong>{publicHealthCheckedLabel}</strong></div>
+                <div><span>上次启动</span><strong>{lastStartedLabel}</strong></div>
+              </div>
+              <div className="gateway-runtime-url-list">
+                <div>
+                  <span>普通事件回调</span>
+                  <code>{runtimeWebhookUrl || "未生成"}</code>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => copyGatewayUrl(runtimeWebhookUrl, "普通事件回调 URL")}
+                    disabled={!runtimeWebhookUrl}
+                  >
+                    复制
+                  </button>
+                </div>
+                <div>
+                  <span>卡片交互回调</span>
+                  <code>{runtimeCardCallbackUrl || "未生成"}</code>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => copyGatewayUrl(runtimeCardCallbackUrl, "卡片交互回调 URL")}
+                    disabled={!runtimeCardCallbackUrl}
+                  >
+                    复制
+                  </button>
+                </div>
+              </div>
+              <div className="gateway-runtime-meta">
+                已启用频道：{gatewayStatus.enabled_channels?.join("、") || "无"}
+                {gatewayStatus.store_path ? ` · Store：${gatewayStatus.store_path}` : ""}
+                {` · cloudflared path：${gatewayStatus.cloudflared_configured ? "已配置" : "未配置"}`}
+                {` · cloudflared found：${gatewayStatus.cloudflared_found ? "true" : "false"}`}
+              </div>
+              <div className="gateway-runtime-health-actions">
+                <button
+                  type="button"
+                  className="setup-btn setup-btn--secondary"
+                  onClick={handleTestGatewayPublicHealth}
+                  disabled={busyAction !== null}
+                >
+                  {busyAction === "public-health" ? "检测中…" : "测试公网 Health"}
+                </button>
+                {gatewayStatus.public_health?.error &&
+                !["not_checked", "url_not_configured"].includes(
+                  gatewayStatus.public_health.error_kind ?? ""
+                ) ? (
+                  <span className="gateway-public-error">
+                    公网检测：{gatewayStatus.public_health.error}
+                  </span>
+                ) : null}
+              </div>
+              {(config.gateway_public?.mode === "quick_tunnel" ||
+                gatewayStatus.quick_tunnel_non_production) ? (
+                <div className="gateway-runtime-warning">
+                  Quick Tunnel 地址会变化，只适合临时开发测试，不适合正式环境。
+                </div>
+              ) : null}
+              {namedTunnelMode ? (
+                <div
+                  className={
+                    namedTunnelConfigComplete
+                      ? "gateway-runtime-info"
+                      : "gateway-runtime-warning"
+                  }
+                >
+                  {namedTunnelConfigComplete
+                    ? "Named Tunnel 使用固定公网入口，飞书回调地址不会随重启变化。"
+                    : "Named Tunnel 配置不完整，请填写 Tunnel Name 和有效 Hostname。"}
+                </div>
+              ) : null}
+              {(gatewayStatus.security_mode || "dev") === "dev" ? (
+                <div className="gateway-runtime-warning">
+                  dev 模式允许未校验 webhook，仅适合本地开发，不适合生产环境。
+                </div>
+              ) : null}
+              {gatewayStatus.last_error ? (
+                <div className="gateway-status-error">最近错误：{gatewayStatus.last_error}</div>
+              ) : null}
+            </section>
+            <ChannelConfigForm
+              value={config.channels}
+              onChange={(channels) => setConfig({ ...config, channels })}
+              validationError={channelValidationError}
+              onValidationChange={setChannelValidationError}
+              selectedChannelId={activeChannelId}
+              onSelectedChannelChange={setActiveChannelId}
+              gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
+              onHealthCheck={async () => {
+                const result = await invokeTauri<{
+                  ok: boolean;
+                  message: string;
+                }>("test_gateway_health");
+                return result;
+              }}
+              onCopyWebhookUrl={(url) => {
+                void navigator.clipboard.writeText(url);
+              }}
+            />
+          </>
+        );
       case "skills":
         return (
           <div className="setup-section">
@@ -796,23 +1417,42 @@ export function Setup({
             {busyAction === "start" ? "启动中…" : "保存并启动网关"}
           </button>
         ) : (
-          <button
-            type="button"
-            className="setup-btn setup-btn--danger"
-            onClick={handleStopGateway}
-            disabled={busyAction !== null}
-          >
-            {busyAction === "stop" ? "停止中…" : "停止网关"}
-          </button>
+          <>
+            <button
+              type="button"
+              className="setup-btn setup-btn--secondary"
+              onClick={handleRestartGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "restart" ? "重启中…" : "重启网关"}
+            </button>
+            <button
+              type="button"
+              className="setup-btn setup-btn--danger"
+              onClick={handleStopGateway}
+              disabled={busyAction !== null}
+            >
+              {busyAction === "stop" ? "停止中…" : "停止网关"}
+            </button>
+          </>
         )}
+        <button
+          type="button"
+          className="setup-btn setup-btn--secondary"
+          onClick={handleTestGatewayHealth}
+          disabled={busyAction !== null || !gatewayStatus.running}
+        >
+          {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+        </button>
       </div>
       {actionMessage ? <p className="setup-action-hint">{actionMessage}</p> : null}
+      {larkBlockerActions}
     </div>
   );
 
   const setupPreviewBlock = (
     <div className="setup-preview-wrap">
-      <div className="setup-preview">
+      <div className={`setup-preview${previewCollapsed ? " setup-preview--collapsed" : ""}`}>
         <div className="setup-preview-header">
           <span>配置预览 (JSON)</span>
           <div className="setup-preview-actions">
@@ -926,18 +1566,37 @@ export function Setup({
               {busyAction === "start" ? "启动中…" : "保存并启动网关"}
             </button>
           ) : (
-            <button
-              type="button"
-              className="setup-btn setup-btn--danger setup-btn--block"
-              onClick={handleStopGateway}
-              disabled={busyAction !== null}
-            >
-              {busyAction === "stop" ? "停止中…" : "停止网关"}
-            </button>
+            <>
+              <button
+                type="button"
+                className="setup-btn setup-btn--secondary setup-btn--block"
+                onClick={handleRestartGateway}
+                disabled={busyAction !== null}
+              >
+                {busyAction === "restart" ? "重启中…" : "重启网关"}
+              </button>
+              <button
+                type="button"
+                className="setup-btn setup-btn--danger setup-btn--block"
+                onClick={handleStopGateway}
+                disabled={busyAction !== null}
+              >
+                {busyAction === "stop" ? "停止中…" : "停止网关"}
+              </button>
+            </>
           )}
+          <button
+            type="button"
+            className="setup-btn setup-btn--secondary setup-btn--block"
+            onClick={handleTestGatewayHealth}
+            disabled={busyAction !== null || !gatewayStatus.running}
+          >
+            {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+          </button>
           {actionMessage ? (
             <p className="setup-action-hint">{actionMessage}</p>
           ) : null}
+          {larkBlockerActions}
         </div>
       </aside>
       <main className="setup-standalone-main">{setupMainInner}</main>

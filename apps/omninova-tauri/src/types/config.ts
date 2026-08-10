@@ -65,12 +65,17 @@ export interface ChannelEntryConfig {
   enabled: boolean;
   token?: string;
   token_env?: string;
-  app_id?: string;
-  app_secret?: string;
-  verification_token?: string;
-  encrypt_key?: string;
-  webhook_url?: string;
+  /** Extra channel-specific fields (e.g., app_id, app_secret, signing_secret, webhook_path) */
+  extra?: Record<string, string>;
+  /** Explicit flag to clear app_secret. When true, the backend removes app_secret from extra. */
+  clear_app_secret?: boolean;
 }
+
+/**
+ * Transient channel.extra key used only while saving Setup. It is consumed by
+ * the backend and is never persisted to config.toml.
+ */
+export const CLEAR_SENSITIVE_FIELDS_KEY = "__clear_sensitive_fields";
 
 export interface ChannelsConfig {
   telegram?: ChannelEntryConfig;
@@ -89,10 +94,13 @@ export interface ChannelsConfig {
 }
 
 export interface ChannelField {
-  key: keyof ChannelEntryConfig;
+  /** Field key: "token", "token_env", or extra field name like "app_id", "app_secret" */
+  key: string;
   label: string;
   placeholder: string;
   type?: "text" | "password";
+  /** If true, field is stored in channel.extra */
+  isExtra?: boolean;
 }
 
 export interface ChannelPreset {
@@ -109,6 +117,19 @@ const COMMON_TOKEN_FIELDS: ChannelField[] = [
   { key: "token_env", label: "Token 环境变量", placeholder: "", type: "text" },
 ];
 
+const FEISHU_LIKE_FIELDS: ChannelField[] = [
+  { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text", isExtra: true },
+  { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password", isExtra: true },
+  { key: "outbound_mode", label: "Outbound Mode", placeholder: "real/mock/disabled", type: "text", isExtra: true },
+];
+
+/** Feishu webhook security only. These values are persisted in channel.extra. */
+const FEISHU_SECURITY_FIELDS: ChannelField[] = [
+  { key: "security_mode", label: "Webhook Security Mode", placeholder: "dev/token/encrypted", isExtra: true },
+  { key: "verification_token", label: "Verification Token", placeholder: "Feishu Verification Token", type: "password", isExtra: true },
+  { key: "encrypt_key", label: "Encrypt Key", placeholder: "Feishu Encrypt Key", type: "password", isExtra: true },
+];
+
 export const CHANNEL_PRESETS: ChannelPreset[] = [
   {
     id: "feishu",
@@ -116,10 +137,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "FEISHU_APP_SECRET",
     isDefault: true,
-    fields: [
-      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "飞书应用密钥", type: "password" },
-    ],
+    fields: [...FEISHU_LIKE_FIELDS, ...FEISHU_SECURITY_FIELDS],
   },
   {
     id: "telegram",
@@ -155,10 +173,10 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "WECHAT_TOKEN",
     fields: [
-      { key: "app_id", label: "Corp ID / App ID", placeholder: "企业 ID 或应用 ID", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "应用密钥", type: "password" },
+      { key: "app_id", label: "Corp ID / App ID", placeholder: "企业 ID 或应用 ID", type: "text", isExtra: true },
+      { key: "app_secret", label: "App Secret", placeholder: "应用密钥", type: "password", isExtra: true },
       { key: "token", label: "Token", placeholder: "回调 Token", type: "password" },
-      { key: "encrypt_key", label: "EncodingAESKey", placeholder: "消息加解密密钥", type: "password" },
+      { key: "encrypt_key", label: "EncodingAESKey", placeholder: "消息加解密密钥", type: "password", isExtra: true },
       { key: "token_env", label: "Secret 环境变量", placeholder: "WECHAT_TOKEN", type: "text" },
     ],
   },
@@ -167,10 +185,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     name: "Lark (国际版飞书)",
     category: "im",
     tokenEnvHint: "LARK_APP_SECRET",
-    fields: [
-      { key: "app_id", label: "App ID", placeholder: "cli_xxxxxxxxxx", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "Lark 应用密钥", type: "password" },
-    ],
+    fields: FEISHU_LIKE_FIELDS,
   },
   {
     id: "dingtalk",
@@ -178,8 +193,8 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "DINGTALK_TOKEN",
     fields: [
-      { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text" },
-      { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password" },
+      { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text", isExtra: true },
+      { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password", isExtra: true },
       { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },
       { key: "token_env", label: "Secret 环境变量", placeholder: "DINGTALK_TOKEN", type: "text" },
     ],
@@ -219,7 +234,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     tokenEnvHint: "WEBHOOK_SECRET",
     fields: [
       { key: "token", label: "Signing Secret", placeholder: "Webhook 签名密钥", type: "password" },
-      { key: "webhook_url", label: "回调地址", placeholder: "https://your-domain/webhook", type: "text" },
+      { key: "webhook_url", label: "回调地址", placeholder: "https://your-domain/webhook", type: "text", isExtra: true },
       { key: "token_env", label: "Secret 环境变量", placeholder: "WEBHOOK_SECRET", type: "text" },
     ],
   },
@@ -229,6 +244,28 @@ export interface SkillsConfig {
   open_skills_enabled: boolean;
   open_skills_dir?: string;
   prompt_injection_mode?: string;
+}
+
+/** 单个 SkillHub 技能（来自 https://skillhub.cn） */
+export interface SkillHubItem {
+  name: string;
+  slug: string;
+  namespace?: string | null;
+  description: string;
+  iconUrl?: string | null;
+  downloads: number;
+  category?: string | null;
+}
+
+export interface SkillHubCategory {
+  key: string;
+  name: string;
+}
+
+export interface SkillHubInstallResult {
+  slug: string;
+  installed: number;
+  dir: string;
 }
 
 export interface AgentPersonaConfig {
@@ -264,6 +301,30 @@ export interface WorkspaceStatus {
   message: string;
 }
 
+export type GatewayPublicMode =
+  | "quick_tunnel"
+  | "named_cloudflare_tunnel"
+  | "external_public_url";
+
+export interface GatewayPublicConfig {
+  mode: GatewayPublicMode;
+  public_webhook_base_url?: string | null;
+  cloudflared_path?: string | null;
+  named_tunnel_name?: string | null;
+  named_tunnel_hostname?: string | null;
+}
+
+export interface GatewayPublicHealthStatus {
+  configured: boolean;
+  ok: boolean;
+  base_url?: string | null;
+  checked_url?: string | null;
+  checked_at?: number | null;
+  status_code?: number | null;
+  error_kind?: string | null;
+  error?: string | null;
+}
+
 export interface Config {
   api_key?: string;
   api_url?: string;
@@ -283,12 +344,36 @@ export interface Config {
   multimodal?: MultimodalConfig;
   observability?: ObservabilityConfig;
   audit?: AuditConfig;
+  gateway_public?: GatewayPublicConfig;
 }
 
 export interface GatewayStatus {
   running: boolean;
   url: string;
+  gateway_host: string;
+  gateway_port: number;
+  feishu_webhook_url?: string | null;
+  feishu_card_callback_url?: string | null;
+  public_webhook_base_url?: string | null;
+  gateway_public_mode: GatewayPublicMode;
+  quick_tunnel_non_production: boolean;
+  cloudflared_configured: boolean;
+  cloudflared_found: boolean;
+  named_tunnel_name_configured: boolean;
+  named_tunnel_hostname_configured: boolean;
+  named_tunnel_config_complete: boolean;
+  public_health: GatewayPublicHealthStatus;
+  enabled_channels: string[];
+  security_mode?: string | null;
+  outbound_mode?: string | null;
+  store_opened: boolean;
+  store_path?: string | null;
+  retry_worker_enabled: boolean;
+  last_started_at?: number | null;
+  health_ok: boolean;
   last_error?: string | null;
+  /** Error code for programmatic error handling */
+  error_code?: string | null;
 }
 
 export type ChannelKindValue =
