@@ -38,7 +38,8 @@
       "resources/agent-browser/macos",
       "resources/agent-browser/linux",
       "resources/agent-browser/windows",
-      "resources/cli"
+      "resources/cli",
+      "resources/THIRD_PARTY_NOTICES.md"
     ],
     "macOS": {
       "hardenedRuntime": true,

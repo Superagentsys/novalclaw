@@ -1,6 +1,7 @@
 import React, { useMemo, useCallback } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { type AgentPersonaConfig, MBTI_TYPES } from "../../types/config";
+import { UiIcon } from "../UiIcon";
 
 interface Props {
   config: AgentPersonaConfig;
@@ -62,51 +63,59 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-white/70 text-sm font-medium mb-2">
+    <div className="persona-form">
+      <div className="persona-form-grid">
+        <div className="persona-field">
+          <label className="persona-label" htmlFor="persona-agent-name">
             Agent 名称
           </label>
           <input
+            id="persona-agent-name"
             type="text"
             value={config.name}
             onChange={(e) => onChange({ ...config, name: e.target.value })}
             placeholder="omninova"
-            className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50"
+            className="persona-input"
           />
         </div>
-        
-        <div>
-          <label className="block text-white/70 text-sm font-medium mb-2">
+
+        <div className="persona-field">
+          <label className="persona-label" htmlFor="persona-max-tool-iterations">
             最大工具迭代次数
           </label>
           <input
+            id="persona-max-tool-iterations"
             type="number"
             value={config.max_tool_iterations || 20}
             onChange={(e) => onChange({ ...config, max_tool_iterations: parseInt(e.target.value) || 20 })}
-            className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50"
+            className="persona-input"
           />
         </div>
       </div>
 
       {/* Per-Agent Workspace */}
-      <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-4">
-        <h4 className="text-white font-medium flex items-center gap-2">
-          <span>📁</span> Workspace 目录
-        </h4>
-        <div className="flex items-center gap-2">
+      <section className="persona-panel" aria-labelledby="persona-workspace-heading">
+        <div className="persona-panel-head">
+          <h3 className="persona-panel-title" id="persona-workspace-heading">
+            <UiIcon name="folder" size={17} />
+            Workspace 目录
+          </h3>
+        </div>
+        <div className="persona-inline-row">
           <input
+            id="persona-workspace-dir"
             type="text"
             value={config.workspace_dir ?? ""}
             onChange={(e) => onChange({ ...config, workspace_dir: e.target.value || undefined })}
             placeholder="未设置，使用全局 Workspace"
-            className="flex-1 bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 text-sm focus:outline-none focus:border-blue-500/50"
+            className="persona-input"
+            aria-label="Agent Workspace 目录"
+            aria-describedby="persona-workspace-help"
           />
           <button
             type="button"
             onClick={() => void handlePickWorkspaceDir()}
-            className="setup-btn setup-btn--secondary whitespace-nowrap"
+            className="setup-btn setup-btn--secondary"
           >
             选择目录
           </button>
@@ -114,26 +123,29 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
             type="button"
             onClick={handleClearWorkspaceDir}
             disabled={!config.workspace_dir}
-            className="setup-btn setup-btn--ghost whitespace-nowrap disabled:opacity-30"
+            className="setup-btn setup-btn--ghost"
           >
             清空
           </button>
         </div>
-        <p className="text-white/30 text-xs">
+        <p className="persona-help" id="persona-workspace-help">
           未设置时，该 Agent 使用全局 Workspace 目录。设置后可让不同 Agent 操作不同目录。
         </p>
-      </div>
+      </section>
 
       {/* MBTI Selection */}
-      <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-4">
-        <div className="flex items-center justify-between">
-          <h4 className="text-white font-medium flex items-center gap-2">
-            <span>🧬</span> MBTI 人格构建
-          </h4>
+      <section className="persona-panel" aria-labelledby="persona-mbti-heading">
+        <div className="persona-panel-head">
+          <h3 className="persona-panel-title" id="persona-mbti-heading">
+            <UiIcon name="experiment" size={17} />
+            MBTI 人格构建
+          </h3>
           <select
+            id="persona-mbti-type"
             value={config.mbti_type || ""}
             onChange={handleMBTIChange}
-            className="bg-black/20 border border-white/10 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500/50"
+            className="persona-select"
+            aria-labelledby="persona-mbti-heading"
           >
             <option value="">自定义 / 无人格</option>
             <optgroup label="Analysts (分析家)">
@@ -164,30 +176,30 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
         </div>
 
         {selectedMBTI && (
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div className="space-y-2">
-              <div className="text-white/50 text-xs uppercase tracking-wider">认知栈</div>
-              <div className="flex gap-2">
+          <div className="persona-detail-grid">
+            <div className="persona-detail-card">
+              <div className="persona-detail-label">认知栈</div>
+              <div className="persona-tags">
                 {selectedMBTI.cognitive_stack.map((func: string) => (
-                  <span key={func} className="px-2 py-0.5 bg-blue-500/20 text-blue-300 rounded text-xs font-mono">
+                  <span key={func} className="persona-tag">
                     {func}
                   </span>
                 ))}
               </div>
             </div>
-            <div className="space-y-1">
-              <div className="text-white/50 text-xs uppercase tracking-wider">描述</div>
-              <p className="text-white/80">{selectedMBTI.description}</p>
+            <div className="persona-detail-card">
+              <div className="persona-detail-label">描述</div>
+              <p>{selectedMBTI.description}</p>
             </div>
-            <div className="space-y-1">
-              <div className="text-white/50 text-xs uppercase tracking-wider">交互风格</div>
-              <p className="text-white/80">{selectedMBTI.interaction_style}</p>
+            <div className="persona-detail-card">
+              <div className="persona-detail-label">交互风格</div>
+              <p>{selectedMBTI.interaction_style}</p>
             </div>
-            <div className="space-y-1">
-              <div className="text-white/50 text-xs uppercase tracking-wider">优势</div>
-              <div className="flex flex-wrap gap-1">
+            <div className="persona-detail-card">
+              <div className="persona-detail-label">优势</div>
+              <div className="persona-tags">
                 {selectedMBTI.strengths.map((s: string) => (
-                  <span key={s} className="px-1.5 py-0.5 bg-green-500/10 text-green-300 rounded text-xs">
+                  <span key={s} className="persona-tag">
                     {s}
                   </span>
                 ))}
@@ -195,42 +207,45 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
             </div>
           </div>
         )}
-      </div>
+      </section>
 
-      <div>
-        <label className="block text-white/70 text-sm font-medium mb-2">
+      <div className="persona-field">
+        <label className="persona-label" htmlFor="persona-system-prompt">
           System Prompt (人设/灵魂)
         </label>
         <textarea
+          id="persona-system-prompt"
           value={config.system_prompt || ""}
           onChange={(e) => onChange({ ...config, system_prompt: e.target.value })}
           placeholder="You are a helpful AI assistant..."
           rows={12}
-          className="w-full bg-white/5 border border-white/10 rounded-md px-4 py-2 text-white placeholder:text-white/20 focus:outline-none focus:border-blue-500/50 font-mono text-sm leading-relaxed"
+          className="persona-textarea"
+          aria-describedby="persona-system-prompt-help"
         />
-        <p className="mt-1 text-white/30 text-xs">
+        <p className="persona-help" id="persona-system-prompt-help">
           定义 Agent 的行为、语气和核心指令。选择 MBTI 类型会自动填充建议的 Prompt。
         </p>
       </div>
 
-      <div className="flex items-center justify-between p-4 bg-white/5 rounded-lg border border-white/10">
-        <div>
-          <h4 className="text-white font-medium">Compact Context</h4>
-          <p className="text-white/50 text-sm">压缩历史上下文以节省 Token</p>
+      <section className="persona-panel">
+        <div className="persona-switch-row">
+          <div>
+            <h3 className="persona-panel-title">Compact Context</h3>
+            <p id="persona-compact-context-help">压缩历史上下文以节省 Token</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={config.compact_context}
+            aria-label="压缩历史上下文"
+            aria-describedby="persona-compact-context-help"
+            onClick={() => onChange({ ...config, compact_context: !config.compact_context })}
+            className={`persona-switch${config.compact_context ? " is-on" : ""}`}
+          >
+            <span aria-hidden="true" />
+          </button>
         </div>
-        <button
-          onClick={() => onChange({ ...config, compact_context: !config.compact_context })}
-          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
-            config.compact_context ? "bg-blue-600" : "bg-white/10"
-          }`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-              config.compact_context ? "translate-x-6" : "translate-x-1"
-            }`}
-          />
-        </button>
-      </div>
+      </section>
     </div>
   );
 };

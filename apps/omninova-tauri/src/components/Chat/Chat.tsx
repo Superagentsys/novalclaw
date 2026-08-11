@@ -30,7 +30,9 @@ import {
   loadTaskHistory,
   patchTask,
   saveTaskHistory,
+  taskNeedsAttention,
   taskStatusLabel,
+  type TaskActivityEntry,
   type TaskHistoryEntry,
   type TaskStatus,
 } from "../../utils/taskHistory";
@@ -43,7 +45,16 @@ import type {
   RouteDecision,
   WorkspaceStatus,
 } from "../../types/config";
+import { UiIcon } from "../UiIcon";
 import { AgentRunTimeline } from "../AgentRun/AgentRunTimeline";
+import { SETUP_CONFIG_UPDATED_EVENT } from "../../utils/appEvents";
+import {
+  TaskDeliverable,
+  TaskInspector,
+  TaskOnboarding,
+  TaskStatusBar,
+  type InspectorTab,
+} from "./TaskWorkspace";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -300,9 +311,17 @@ type SidebarTab = "avatars" | "history";
 interface ChatProps {
   /** 初始侧栏分区：智能体列表或历史任务。 */
   initialSidebarTab?: SidebarTab;
+  /** Chat stays mounted across navigation; refresh configuration when visible. */
+  isActive?: boolean;
+  /** Open a related configuration surface from prerequisite/action prompts. */
+  onOpenSettings?: (target: "providers" | "general") => void;
 }
 
-export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
+export function Chat({
+  initialSidebarTab = "avatars",
+  isActive = true,
+  onOpenSettings,
+}: ChatProps) {
   const initialStorage = useMemo(() => loadChatStorage(), []);
   const [avatars, setAvatars] = useState<StoredAvatarSession[]>(initialStorage.avatars);
   const [activeAvatarId, setActiveAvatarId] = useState(initialStorage.activeAvatarId);
@@ -310,6 +329,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>(() =>
     loadTaskHistory()
   );
+  const [selectedTaskRunId, setSelectedTaskRunId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("process");
+  const [pendingDeleteAvatarId, setPendingDeleteAvatarId] = useState<string | null>(null);
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>(
     initialStorage.messagesBySession
   );
@@ -330,6 +353,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const [error, setError] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
+  const [gatewayStarting, setGatewayStarting] = useState(false);
   // bug#10：下拉选项来自实际已启用的 Provider（而非写死列表），选中值随消息发送生效。
   const [availableProviders, setAvailableProviders] = useState<
     { id: string; label: string }[]
@@ -406,10 +430,39 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   const activeRun = runs[activeAvatarId];
   const sending = Boolean(activeRun);
   const elapsedSec = activeRun?.elapsedSec ?? 0;
-  const activeSteps = activeRun?.steps ?? [];
+  const activeSteps = useMemo(() => activeRun?.steps ?? [], [activeRun?.steps]);
   const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
+  const activeTask = useMemo(() => {
+    const selected = selectedTaskRunId
+      ? taskHistory.find((task) => task.runId === selectedTaskRunId)
+      : null;
+    return selected ?? taskHistory.find((task) => task.avatarId === activeAvatarId) ?? null;
+  }, [activeAvatarId, selectedTaskRunId, taskHistory]);
+
+  const openInspector = useCallback((tab: InspectorTab = "process") => {
+    setInspectorTab(tab);
+    setInspectorOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!inspectorOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setInspectorOpen(false);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [inspectorOpen]);
+
+  useEffect(() => {
+    if (!pendingDeleteAvatarId) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPendingDeleteAvatarId(null);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [pendingDeleteAvatarId]);
 
   useEffect(() => {
     runsRef.current = runs;
@@ -593,7 +646,42 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   // 记录一次新任务（发送消息即视为一次任务）。
   const recordTaskStart = useCallback((entry: TaskHistoryEntry) => {
     setTaskHistory((prev) => addTask(prev, entry));
+    setSelectedTaskRunId(entry.runId);
   }, []);
+
+  const patchTaskProgress = useCallback(
+    (runId: string, patch: Partial<TaskHistoryEntry>) => {
+      setTaskHistory((prev) => patchTask(prev, runId, patch));
+    },
+    []
+  );
+
+  const appendTaskActivity = useCallback(
+    (
+      runId: string,
+      label: string,
+      tone: "info" | "success" | "warning" | "error" = "info",
+      process: Omit<TaskActivityEntry, "at" | "label" | "tone"> = {}
+    ) => {
+      setTaskHistory((prev) => {
+        const target = prev.find((task) => task.runId === runId);
+        if (!target) return prev;
+        const activity = [
+          ...(target.activity ?? []),
+          {
+            at: Date.now(),
+            label: label.slice(0, 180),
+            tone,
+            ...process,
+            detail: process.detail?.slice(0, 260),
+            path: process.path?.slice(0, 520),
+          },
+        ].slice(-120);
+        return patchTask(prev, runId, { activity });
+      });
+    },
+    []
+  );
 
   // 终态到达时更新任务状态/耗时/结果预览。使用函数式更新以保持回调稳定。
   const finalizeTask = useCallback(
@@ -607,8 +695,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           endedAt,
           durationMs: Math.max(0, endedAt - target.startedAt),
           resultPreview: resultPreview
-            ? resultPreview.slice(0, 200)
+            ? resultPreview.slice(0, 1600)
             : target.resultPreview,
+          attentionReason: status === "failed" ? resultPreview?.slice(0, 260) : undefined,
+          nextAction:
+            status === "completed"
+              ? "检查成果文件，确认无误后再提交或发布。"
+              : status === "failed"
+                ? "打开任务检查器查看最后步骤，修正配置后重新执行。"
+                : undefined,
         });
       });
     },
@@ -616,7 +711,14 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
   );
 
   const handleClearTaskHistory = useCallback(() => {
-    setTaskHistory((prev) => prev.filter((t) => t.status === "running"));
+    setTaskHistory((prev) =>
+      prev.filter(
+        (task) =>
+          task.status === "running" ||
+          task.status === "needs_approval" ||
+          task.status === "waiting_input"
+      )
+    );
   }, []);
 
   useEffect(() => {
@@ -655,8 +757,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     };
   }, [workspaceMenuOpen]);
 
-  useEffect(() => {
-    void invokeTauri<Config>("get_setup_config")
+  const refreshSetupConfig = useCallback(() => {
+    return invokeTauri<Config>("get_setup_config")
       .then((cfg) => {
         const master = cfg.multimodal?.desktop_vision_enabled ?? false;
         const maxPx = cfg.multimodal?.desktop_vision_max_dimension_px ?? 1280;
@@ -682,6 +784,18 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (isActive) void refreshSetupConfig();
+  }, [isActive, refreshSetupConfig]);
+
+  useEffect(() => {
+    const handleSetupConfigUpdated = () => void refreshSetupConfig();
+    window.addEventListener(SETUP_CONFIG_UPDATED_EVENT, handleSetupConfigUpdated);
+    return () => {
+      window.removeEventListener(SETUP_CONFIG_UPDATED_EVENT, handleSetupConfigUpdated);
+    };
+  }, [refreshSetupConfig]);
 
   const scrollMessagesToEnd = useCallback((behavior: ScrollBehavior = "auto") => {
     const container = messagesScrollRef.current;
@@ -780,9 +894,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
 
   useEffect(() => {
     const timers = elapsedTimersRef.current;
+    const safetyTimers = safetyTimersRef.current;
     return () => {
       Object.values(timers).forEach((timer) => clearInterval(timer));
-      Object.values(safetyTimersRef.current).forEach((timer) => clearTimeout(timer));
+      Object.values(safetyTimers).forEach((timer) => clearTimeout(timer));
     };
   }, []);
 
@@ -807,17 +922,157 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       }
       if (disposed || !runId) return;
 
-      const eventType = payload.type;
+      const eventType: string = payload.type ?? "";
+      const rawPayload = payload as unknown as Record<string, unknown>;
       const isTerminalEvent =
         eventType === "run_completed" ||
+        eventType === "runCompleted" ||
         eventType === "run_failed" ||
+        eventType === "runFailed" ||
         eventType === "run_cancelled" ||
+        eventType === "runCancelled" ||
         eventType === "error";
       if (terminalRunIdsRef.current.has(runId) && !isTerminalEvent) {
         if (import.meta.env.DEV && payload.type !== "model_delta") {
           console.debug("[chat-agent-run-event ignored after terminal]", payload);
         }
         return;
+      }
+
+      // Keep a compact, privacy-aware task record for the sidebar and inspector.
+      // Raw command output and model deltas are intentionally never persisted.
+      const stringValue = (...keys: string[]) => {
+        for (const key of keys) {
+          const value = rawPayload[key];
+          if (typeof value === "string" && value.trim()) return value.trim();
+        }
+        return "";
+      };
+
+      if (eventType === "approval_required" || eventType === "approvalRequired") {
+        const reason = typeof rawPayload.reason === "string"
+          ? rawPayload.reason
+          : "该工具需要人工确认后才能继续。";
+        const toolName = typeof rawPayload.tool_name === "string"
+          ? rawPayload.tool_name
+          : "受限工具";
+        patchTaskProgress(runId, {
+          status: "needs_approval",
+          attentionReason: reason.slice(0, 260),
+          approvalTool: toolName,
+          nextAction: "在任务检查器中核对工具与原因，再调整授权策略或重新执行。",
+        });
+        appendTaskActivity(runId, `需要授权：${toolName} · ${reason}`, "warning", {
+          kind: "approval",
+          status: "waiting",
+          toolName,
+          detail: reason,
+        });
+      } else if (eventType === "file_changed" || eventType === "fileChanged") {
+        const path = typeof rawPayload.path === "string" ? rawPayload.path : "";
+        if (path) {
+          setTaskHistory((prev) => {
+            const target = prev.find((task) => task.runId === runId);
+            if (!target) return prev;
+            const existing = target.changedFiles ?? [];
+            const nextFile = {
+              path,
+              additions: typeof rawPayload.additions === "number" ? rawPayload.additions : 0,
+              deletions: typeof rawPayload.deletions === "number" ? rawPayload.deletions : 0,
+              changeType:
+                typeof rawPayload.change_type === "string"
+                  ? rawPayload.change_type as NonNullable<TaskHistoryEntry["changedFiles"]>[number]["changeType"]
+                  : undefined,
+            };
+            const changedFiles = [
+              ...existing.filter((file) => file.path !== path),
+              nextFile,
+            ].slice(-80);
+            return patchTask(prev, runId, { changedFiles });
+          });
+          appendTaskActivity(runId, `文件变更：${path}`, "success", {
+            kind: "file",
+            status: "completed",
+            path,
+            detail: `+${typeof rawPayload.additions === "number" ? rawPayload.additions : 0} / -${typeof rawPayload.deletions === "number" ? rawPayload.deletions : 0}`,
+          });
+        }
+      } else if (eventType === "tool_started" || eventType === "toolStarted") {
+        const toolName = stringValue("tool_name", "toolName") || "工具";
+        const summary = stringValue("summary", "title") || "开始执行";
+        patchTaskProgress(runId, {
+          status: "running",
+          attentionReason: undefined,
+          approvalTool: undefined,
+          nextAction: undefined,
+        });
+        appendTaskActivity(runId, `${toolName}：${summary}`, "info", {
+          kind: "tool",
+          status: "running",
+          toolName,
+          detail: summary,
+        });
+      } else if (eventType === "tool_completed" || eventType === "toolCompleted") {
+        const toolName = stringValue("tool_name", "toolName") || "工具";
+        const success = rawPayload.success === true;
+        const summary = stringValue("result_summary", "resultSummary", "summary");
+        appendTaskActivity(runId, `${toolName}${success ? "已完成" : "执行失败"}`, success ? "success" : "error", {
+          kind: "tool",
+          status: success ? "completed" : "failed",
+          toolName,
+          detail: summary || undefined,
+        });
+      } else if (eventType === "model_started" || eventType === "modelStarted") {
+        const title = stringValue("title") || "模型开始分析";
+        appendTaskActivity(runId, title, "info", {
+          kind: "model",
+          status: "running",
+          detail: title,
+        });
+      } else if (eventType === "model_completed" || eventType === "modelCompleted") {
+        const title = stringValue("title") || "模型阶段已完成";
+        appendTaskActivity(runId, title, "success", {
+          kind: "model",
+          status: "completed",
+          detail: title,
+        });
+      } else if (eventType === "tool_call_created" || eventType === "toolCallCreated") {
+        const toolName = stringValue("tool_name", "toolName") || "工具";
+        const title = stringValue("title") || `准备调用 ${toolName}`;
+        appendTaskActivity(runId, title, "info", {
+          kind: "tool",
+          status: "waiting",
+          toolName,
+          detail: title,
+        });
+      } else if (eventType === "patch_started" || eventType === "patchStarted") {
+        const path = stringValue("path");
+        appendTaskActivity(runId, path ? `准备修改：${path}` : "准备修改文件", "info", {
+          kind: "file",
+          status: "running",
+          path: path || undefined,
+        });
+      } else if (eventType === "patch_applied" || eventType === "patchApplied") {
+        const path = stringValue("path");
+        appendTaskActivity(runId, path ? `修改已应用：${path}` : "文件修改已应用", "success", {
+          kind: "file",
+          status: "completed",
+          path: path || undefined,
+        });
+      } else if (eventType === "patch_failed" || eventType === "patchFailed") {
+        const path = stringValue("path");
+        appendTaskActivity(runId, path ? `修改失败：${path}` : "文件修改失败", "error", {
+          kind: "file",
+          status: "failed",
+          path: path || undefined,
+          detail: stringValue("error", "message") || undefined,
+        });
+      } else if (eventType === "run_started" || eventType === "runStarted") {
+        patchTaskProgress(runId, { status: "running" });
+        appendTaskActivity(runId, "任务已开始", "info", {
+          kind: "lifecycle",
+          status: "running",
+        });
       }
       if (
         !isTerminalEvent
@@ -832,16 +1087,17 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       }
       terminalRunIdsRef.current.add(runId);
 
-      if (eventType === "run_completed") {
+      if (eventType === "run_completed" || eventType === "runCompleted") {
         if (!completedRunIdsRef.current.has(runId)) {
           completedRunIdsRef.current.add(runId);
-          const finalReply = payload.reply || payload.reply_preview || "";
+          const finalReply = payload.reply || payload.reply_preview || stringValue("replyPreview") || "";
           if (import.meta.env.DEV) {
             console.log("[appendAssistantMessageOnce] run_id=" + runId + " reply_len=" + finalReply.length);
           }
           if (!cancelledRef.current[avatarId]) {
             appendAssistantMessageOnce(runId, finalReply, avatarId);
           }
+          appendTaskActivity(runId, "任务已完成", "success");
           finalizeTask(runId, "completed", finalReply);
         }
         if (import.meta.env.DEV) {
@@ -851,10 +1107,11 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         return;
       }
 
-      if (eventType === "run_cancelled") {
+      if (eventType === "run_cancelled" || eventType === "runCancelled") {
         if (!completedRunIdsRef.current.has(runId)) {
           completedRunIdsRef.current.add(runId);
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
+          appendTaskActivity(runId, "任务已取消", "warning");
           finalizeTask(runId, "cancelled");
         }
         finishRun(runId);
@@ -868,6 +1125,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
         if (!cancelledRef.current[avatarId]) {
           appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
         }
+        appendTaskActivity(runId, `任务失败：${rawError}`, "error");
         finalizeTask(runId, "failed", rawError);
       }
       finishRun(runId);
@@ -883,7 +1141,14 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       disposed = true;
       unlisten?.();
     };
-  }, [appendAssistantMessageOnce, findAvatarIdByRunId, finishRun, finalizeTask]);
+  }, [
+    appendAssistantMessageOnce,
+    appendTaskActivity,
+    findAvatarIdByRunId,
+    finishRun,
+    finalizeTask,
+    patchTaskProgress,
+  ]);
 
   const refreshGatewayStatus = async () => {
     try {
@@ -893,6 +1158,26 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     } catch {
       setGatewayUrl("");
       setGatewayStatus("disconnected");
+    }
+  };
+
+  const handleStartGateway = async () => {
+    if (gatewayStarting) return;
+    setGatewayStarting(true);
+    setError(null);
+    try {
+      const status = await invokeTauri<GatewayStatus>("start_gateway");
+      setGatewayUrl(status.url ?? "");
+      setGatewayStatus(status.running ? "connected" : "disconnected");
+      if (!status.running) {
+        setError("网关未能启动，请打开设置检查监听地址和端口占用。")
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setGatewayStatus("disconnected");
+      setError(`启动网关失败：${message}`);
+    } finally {
+      setGatewayStarting(false);
     }
   };
 
@@ -906,21 +1191,24 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     ]);
     setMessagesBySession((prev) => ({ ...prev, [id]: [] }));
     setActiveAvatarId(id);
+    setSelectedTaskRunId(null);
   };
 
   const handleDeleteAvatar = (id: string) => {
-    // bug#12：删除不可撤销（会同时删除网关侧会话），先让用户确认。
-    const name = avatars.find((a) => a.id === id)?.name ?? "该会话";
-    const running = Boolean(runs[id]);
-    const ok = window.confirm(
-      running
-        ? `「${name}」有任务正在执行，删除会终止任务并清空聊天记录，且无法恢复。确定删除吗？`
-        : `确定删除「${name}」吗？聊天记录将被清空且无法恢复。`
-    );
-    if (!ok) return;
+    setPendingDeleteAvatarId(id);
+  };
 
+  const confirmDeleteAvatar = (id: string, keepTaskRecords: boolean) => {
+    setPendingDeleteAvatarId(null);
     // 终止该会话可能正在进行的任务，并清理其计时器/运行态。
     cancelledRef.current[id] = true;
+    const deletingRunId = runs[id]?.runId;
+    if (deletingRunId) {
+      appendTaskActivity(deletingRunId, "会话被删除，任务已取消", "warning");
+      finalizeTask(deletingRunId, "cancelled", "会话已删除");
+      terminalRunIdsRef.current.add(deletingRunId);
+      delete runAvatarIdsRef.current[deletingRunId];
+    }
     const timer = elapsedTimersRef.current[id];
     if (timer) {
       clearInterval(timer);
@@ -947,6 +1235,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     }
 
     const remaining = avatars.filter((a) => a.id !== id);
+
+    if (!keepTaskRecords) {
+      setTaskHistory((prev) => prev.filter((task) => task.avatarId !== id));
+      setSelectedTaskRunId((selected) => {
+        if (!selected) return selected;
+        return taskHistory.some((task) => task.runId === selected && task.avatarId === id)
+          ? null
+          : selected;
+      });
+    }
 
     const dropMaps = (alsoSeed?: string) => {
       setMessagesBySession((prev) => {
@@ -1039,7 +1337,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       .join("\n\n");
     const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
     const displayText = pendingAttachments.length
-      ? `${text ? `${text}\n\n` : ""}📎 附件：${pendingAttachments.map((a) => a.name).join("、")}`
+      ? `${text ? `${text}\n\n` : ""}附件：${pendingAttachments.map((a) => a.name).join("、")}`
       : text;
     const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
     if (active && terminalRunIdsRef.current.has(active)) {
@@ -1122,8 +1420,16 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       avatarId,
       agentName: avatars.find((a) => a.id === avatarId)?.name ?? avatarId,
       sessionId: targetSessionId,
+      workspacePath: activeWorkspaceDir ?? undefined,
       status: "running",
       startedAt: Date.now(),
+      activity: [{
+        at: Date.now(),
+        label: "任务已提交，正在准备执行",
+        tone: "info",
+        kind: "lifecycle",
+        status: "waiting",
+      }],
     });
 
     elapsedTimersRef.current[avatarId] = setInterval(() => {
@@ -1171,6 +1477,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
           const msg = err instanceof Error ? err.message : String(err);
           updateStep("桌面视觉", "error", msg);
           setError(`桌面截图失败：${msg}`);
+          appendTaskActivity(runId, `桌面截图失败：${msg}`, "error");
+          finalizeTask(runId, "failed", `桌面截图失败：${msg}`);
           finishRun(runId);
           setMessagesBySession((prev) => ({
             ...prev,
@@ -1247,6 +1555,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
       if (import.meta.env.DEV) {
         console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
+      const message = e instanceof Error ? e.message : String(e);
+      setError(`任务启动失败：${message}`);
+      appendTaskActivity(runId, `任务启动失败：${message}`, "error");
+      finalizeTask(runId, "failed", message);
       finishRun(runId);
     } finally {
       // outer finally (safety timer cleanup)
@@ -1563,6 +1875,13 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
     { label: "持续执行", text: "请持续执行直到任务完成，中途如需确认请说明。" },
     { label: "多智能体并行", text: "请说明如何在本机配置多 Agent 并行与路由。" },
   ];
+  const modelReady = availableProviders.length > 0;
+  const workspaceReady = Boolean(activeWorkspaceDir);
+  const gatewayReady = gatewayStatus === "connected";
+  const showOnboarding =
+    taskHistory.length === 0 &&
+    messages.length === 0 &&
+    !(modelReady && workspaceReady && gatewayReady);
 
   return (
     <div className="chat-layout">
@@ -1573,7 +1892,8 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             className="chat-new-chat-pill"
             onClick={handleAddAvatar}
           >
-            + 新智能体
+            <UiIcon name="plus" size={15} />
+            <span>新智能体</span>
           </button>
           <section className="chat-sidebar-section">
             <h3 className="chat-sidebar-heading">智能体</h3>
@@ -1586,9 +1906,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   <button
                     type="button"
                     className={`chat-avatar-item ${a.id === activeAvatarId ? "is-active" : ""}`}
-                    onClick={() => setActiveAvatarId(a.id)}
+                    onClick={() => {
+                      setActiveAvatarId(a.id);
+                      setSelectedTaskRunId(null);
+                    }}
                   >
-                    <span className="chat-avatar-icon">◇</span>
+                    <span className="chat-avatar-icon"><UiIcon name="agent" size={15} /></span>
                     <span className="chat-avatar-name">{a.name}</span>
                     {runs[a.id] ? (
                       <span
@@ -1610,7 +1933,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                       handleDeleteAvatar(a.id);
                     }}
                   >
-                    ✕
+                    <UiIcon name="delete" size={14} />
                   </button>
                 </li>
               ))}
@@ -1622,21 +1945,26 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               className={sidebarTab === "avatars" ? "is-active" : ""}
               onClick={() => setSidebarTab("avatars")}
             >
-              分身
+              对话
             </button>
             <button
               type="button"
               className={sidebarTab === "history" ? "is-active" : ""}
               onClick={() => setSidebarTab("history")}
             >
-              历史任务
+              任务
             </button>
           </nav>
           {sidebarTab === "history" ? (
             <section className="chat-sidebar-section">
               <div className="chat-history-head">
-                <h3 className="chat-sidebar-heading">历史任务</h3>
-                {taskHistory.some((t) => t.status !== "running") ? (
+                <h3 className="chat-sidebar-heading">任务列表</h3>
+                {taskHistory.some(
+                  (task) =>
+                    task.status !== "running" &&
+                    task.status !== "needs_approval" &&
+                    task.status !== "waiting_input"
+                ) ? (
                   <button
                     type="button"
                     className="chat-history-clear"
@@ -1657,18 +1985,15 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                       <li key={task.runId}>
                         <button
                           type="button"
-                          className="chat-task-item"
-                          disabled={!exists}
+                          className={`chat-task-item${selectedTaskRunId === task.runId ? " is-selected" : ""}${taskNeedsAttention(task.status) ? " needs-attention" : ""}`}
                           title={
                             exists
                               ? "跳转到该任务所属会话"
-                              : "该会话已删除"
+                              : "原会话已删除，任务过程与成果记录仍可查看"
                           }
                           onClick={() => {
-                            if (exists) {
-                              setActiveAvatarId(task.avatarId);
-                              setSidebarTab("avatars");
-                            }
+                            if (exists) setActiveAvatarId(task.avatarId);
+                            setSelectedTaskRunId(task.runId);
                           }}
                         >
                           <div className="chat-task-row">
@@ -1691,6 +2016,22 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                                 ? ` · ${formatDuration(task.durationMs)}`
                                 : ""}
                             </span>
+                          </div>
+                          <div className="chat-task-result">
+                            {task.attentionReason || task.resultPreview || "尚未产生结果"}
+                          </div>
+                          <div className="chat-task-signals">
+                            <span>
+                              <UiIcon name="file" size={11} />
+                              {task.changedFiles?.length ?? 0} 个文件
+                            </span>
+                            {taskNeedsAttention(task.status) ? (
+                              <span className="chat-task-attention">
+                                <UiIcon name="warning" size={11} /> 需要处理
+                              </span>
+                            ) : (
+                              <span><UiIcon name="check" size={11} /> 无需确认</span>
+                            )}
                           </div>
                         </button>
                       </li>
@@ -1716,11 +2057,42 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               onClick={(e) => void handleChooseWorkspace(e)}
               disabled={sending}
             >
-              <span aria-hidden>📁</span>
+              <UiIcon name="folder" size={15} />
               <span className="chat-toolbar-workspace-path">
                 {activeWorkspaceDir ? `${workspaceLabel} · ${workspaceSummary}` : "未选择 Workspace"}
               </span>
             </button>
+            <label className="chat-toolbar-model" title="选择本次任务优先使用的模型服务">
+              <UiIcon name="apps" size={14} />
+              <select
+                value={selectedModel}
+                onChange={(event) => setSelectedModel(event.target.value)}
+                aria-label="任务模型"
+              >
+                <option value="auto">自动模型</option>
+                {availableProviders.map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
+              </select>
+            </label>
+            {!modelReady ? (
+              <button
+                type="button"
+                className="chat-toolbar-config-action"
+                onClick={() => onOpenSettings?.("providers")}
+              >
+                检查模型配置
+              </button>
+            ) : null}
+            <div className={`chat-toolbar-gateway chat-toolbar-gateway--${gatewayStatus}`}>
+              <span className={`chat-gateway-dot chat-gateway-dot--${gatewayStatus}`} aria-hidden />
+              <span>{gatewayStatus === "connected" ? "网关在线" : gatewayStatus === "connecting" ? "网关检查中" : "网关离线"}</span>
+              {gatewayStatus === "disconnected" ? (
+                <button type="button" onClick={() => void handleStartGateway()} disabled={gatewayStarting}>
+                  {gatewayStarting ? "启动中…" : "启动网关"}
+                </button>
+              ) : null}
+            </div>
             <div className="chat-main-toolbar-spacer" />
             <div className="chat-target-pill">
               <span className="chat-target-pill-icon" aria-hidden>
@@ -1734,19 +2106,31 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               <button
                 type="button"
                 className="chat-icon-btn"
+                title="打开任务检查器"
+                aria-label="打开任务检查器"
+                aria-expanded={inspectorOpen}
+                onClick={() => openInspector("process")}
+              >
+                <UiIcon name="menuUnfold" size={15} />
+              </button>
+              <button
+                type="button"
+                className="chat-icon-btn"
                 title="从网关重新加载当前会话历史"
+                aria-label="从网关重新加载当前会话历史"
                 disabled={historyLoading || gatewayStatus !== "connected"}
                 onClick={() => void handleRefreshHistory()}
               >
-                ⟳
+                <UiIcon name="history" size={15} />
               </button>
               <button
                 type="button"
                 className="chat-icon-btn"
                 title="刷新网关状态"
+                aria-label="刷新网关状态"
                 onClick={() => void refreshGatewayStatus()}
               >
-                ↻
+                <UiIcon name="reload" size={15} />
               </button>
               <span
                 className="chat-main-toolbar-status"
@@ -1767,6 +2151,12 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               </span>
             </div>
           </div>
+
+          <TaskStatusBar
+            task={activeTask}
+            elapsedSec={sending ? elapsedSec : undefined}
+            onOpenInspector={openInspector}
+          />
 
           {workspaceStatus && workspaceStatus.state !== "ok" && !sessionWorkspaceDir ? (
             <div
@@ -1794,7 +2184,24 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             className="chat-messages"
             onScroll={handleMessagesScroll}
           >
-            {historyLoading && messages.length === 0 ? (
+            {showOnboarding ? (
+              <TaskOnboarding
+                modelReady={modelReady}
+                workspaceReady={workspaceReady}
+                gatewayReady={gatewayReady}
+                selectedModel={selectedModel}
+                providers={availableProviders}
+                onModelChange={setSelectedModel}
+                onConfigureModel={() => onOpenSettings?.("providers")}
+                onChooseWorkspace={() => void handleChooseWorkspace()}
+                onStartGateway={() => void handleStartGateway()}
+                gatewayBusy={gatewayStarting}
+              />
+            ) : null}
+            {!showOnboarding ? (
+              <TaskDeliverable task={activeTask} onOpenInspector={openInspector} />
+            ) : null}
+            {showOnboarding ? null : historyLoading && messages.length === 0 ? (
               <div className="chat-hero">
                 <p className="chat-hero-sub">正在加载会话历史…</p>
               </div>
@@ -1862,9 +2269,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               <button
                 type="button"
                 className="chat-error-dismiss"
+                aria-label="关闭错误提示"
                 onClick={() => setError(null)}
               >
-                ✕
+                <UiIcon name="close" size={14} />
               </button>
             </div>
           )}
@@ -1900,7 +2308,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     }}
                     disabled={sending}
                   >
-                    <span aria-hidden>📁</span>
+                    <UiIcon name="folder" size={15} />
                     {activeWorkspaceDir ? (
                       <span className="chat-workspace-pill-scope">{workspaceLabel}</span>
                     ) : null}
@@ -1956,9 +2364,10 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                     className={`chat-attachment-chip chat-attachment-chip--${a.kind}`}
                     title={a.note ? `${a.name}（${a.note}）` : a.name}
                   >
-                    <span aria-hidden>
-                      {a.kind === "image" ? "🖼️" : a.kind === "text" ? "📄" : "📎"}
-                    </span>
+                    <UiIcon
+                      name={a.kind === "image" ? "fileImage" : a.kind === "text" ? "fileText" : "file"}
+                      size={14}
+                    />
                     <span className="chat-attachment-chip-name">{a.name}</span>
                     {a.note ? (
                       <span className="chat-attachment-chip-note">{a.note}</span>
@@ -1970,7 +2379,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                       onClick={() => removeAttachment(a.id)}
                       disabled={sending}
                     >
-                      ×
+                      <UiIcon name="close" size={11} />
                     </button>
                   </span>
                 ))}
@@ -1986,16 +2395,17 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
             >
               {sending ? (
                 <span className="chat-attach-btn chat-attach-btn--disabled" title="发送中暂不可添加附件">
-                  <span aria-hidden>📎</span>
+                  <UiIcon name="paperclip" size={17} />
                 </span>
               ) : isTauriEnvironment() ? (
                 <button
                   type="button"
                   className="chat-attach-btn"
                   title="添加附件（系统文件对话框；亦可拖入输入框）"
+                  aria-label="添加附件"
                   onClick={() => void handleAttachTauri()}
                 >
-                  <span aria-hidden>📎</span>
+                  <UiIcon name="paperclip" size={17} />
                 </button>
               ) : (
                 <label
@@ -2003,7 +2413,7 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   className="chat-attach-btn"
                   title="添加附件（点击选择文件；亦可拖入输入框）"
                 >
-                  <span aria-hidden>📎</span>
+                  <UiIcon name="paperclip" size={17} />
                 </label>
               )}
               <textarea
@@ -2041,28 +2451,11 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
                   }
                   aria-label="发送"
                 >
-                  ↑
+                  <UiIcon name="send" size={17} />
                 </button>
               )}
             </div>
             <div className="chat-composer-meta">
-              <select
-                className="chat-model-select"
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                title={
-                  availableProviders.length
-                    ? "选择本次对话优先使用的模型服务"
-                    : "尚未启用任何模型服务，请先在 设置 → 模型 中配置"
-                }
-              >
-                <option value="auto">自动模型</option>
-                {availableProviders.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label}
-                  </option>
-                ))}
-              </select>
               <label
                 className={`chat-vision-toggle${desktopVisionMaster ? "" : " chat-vision-toggle--disabled"}`}
                 title={
@@ -2098,8 +2491,62 @@ export function Chat({ initialSidebarTab = "avatars" }: ChatProps) {
               </span>
             </div>
           </div>
+
+          <TaskInspector
+            open={inspectorOpen}
+            tab={inspectorTab}
+            onTabChange={setInspectorTab}
+            onClose={() => setInspectorOpen(false)}
+            task={activeTask}
+            liveSessionId={activeRunId}
+            activeSteps={activeSteps}
+          />
         </main>
       </div>
+      {pendingDeleteAvatarId ? (
+        <div
+          className="chat-delete-dialog-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) setPendingDeleteAvatarId(null);
+          }}
+        >
+          <section
+            className="chat-delete-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="chat-delete-dialog-title"
+            aria-describedby="chat-delete-dialog-description"
+          >
+            <span className="chat-delete-dialog-icon"><UiIcon name="delete" size={18} /></span>
+            <div>
+              <h2 id="chat-delete-dialog-title">删除会话前，请选择任务记录的处理方式</h2>
+              <p id="chat-delete-dialog-description">
+                {runs[pendingDeleteAvatarId]
+                  ? "该会话仍有任务运行，继续删除会终止任务并清空对话。"
+                  : "对话记录会被清空，任务过程、成果与文件索引可以单独保留。"}
+              </p>
+            </div>
+            <div className="chat-delete-dialog-actions">
+              <button type="button" onClick={() => setPendingDeleteAvatarId(null)}>取消</button>
+              <button
+                type="button"
+                className="is-retain"
+                onClick={() => confirmDeleteAvatar(pendingDeleteAvatarId, true)}
+              >
+                删除会话，保留任务记录
+              </button>
+              <button
+                type="button"
+                className="is-danger"
+                onClick={() => confirmDeleteAvatar(pendingDeleteAvatarId, false)}
+              >
+                对话与任务记录一并删除
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2117,19 +2564,11 @@ function ExecutionSteps({ steps, liveSessionId }: { steps: ExecutionStep[]; live
 
   return (
     <div className="chat-execution-steps">
-      <div className="chat-execution-title">执行步骤</div>
-      {liveSessionId ? (
-        <div className="mt-1">
-          <AgentRunTimeline
-            events={[]}
-            isRunning={true}
-            defaultCollapsed={false}
-            liveSessionId={liveSessionId}
-          />
-        </div>
-      ) : null}
-      {/* bug#5：实时时间线已展示进度时，不再重复渲染脚手架步骤列表 */}
-      <ol className={liveSessionId ? "chat-execution-steps-hidden" : undefined}>
+      <div className="chat-execution-title">
+        {liveSessionId ? "当前进度（详细过程见任务检查器）" : "执行步骤"}
+      </div>
+      {/* 实时时间线只挂载在右侧任务检查器，避免重复订阅同一个 Tauri 事件。 */}
+      <ol>
         {steps.map((step, index) => (
           <li key={`${step.title}-${index}`} className={`chat-execution-step chat-execution-step--${step.status ?? "info"}`}>
             <span className="chat-execution-step-title">{step.title}</span>
