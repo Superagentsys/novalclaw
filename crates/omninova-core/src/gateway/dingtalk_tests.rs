@@ -1663,6 +1663,61 @@ async fn dingtalk_worker_init_is_idempotent_and_keeps_the_same_channel() {
     assert!(!second.is_closed());
 }
 
+#[tokio::test]
+async fn dingtalk_reused_worker_sender_keeps_one_store_for_panel_callback() {
+    use crate::gateway::dingtalk_store::{
+        DingtalkPanelContext, PanelContextLookup, now_for_tests,
+    };
+
+    let directory = std::env::temp_dir().join(format!(
+        "omninova-dingtalk-no-store-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut config = Config::default();
+    config.config_path = directory.join("config.toml");
+    let mut runtime = crate::gateway::GatewayRuntime::new(config);
+    let mut callback_runtime = runtime.clone();
+
+    // Reproduce the old early-return path: sender already exists on both
+    // runtime clones, while the clone-local Option store used to remain None.
+    let worker_state = crate::gateway::dingtalk_worker::DingtalkWorkerState::new();
+    let sender = worker_state.sender();
+    *runtime.dingtalk_job_sender.write().await = Some(sender);
+    assert!(runtime.dingtalk_store().is_none());
+    assert!(callback_runtime.dingtalk_store().is_none());
+
+    runtime.init_dingtalk_worker().await;
+    callback_runtime.init_dingtalk_worker().await;
+    let worker_store = runtime.dingtalk_store().expect("worker store initialized");
+    let callback_store = callback_runtime
+        .dingtalk_store()
+        .expect("callback store initialized");
+    assert!(std::sync::Arc::ptr_eq(&worker_store, &callback_store));
+
+    worker_store
+        .save_panel_context(DingtalkPanelContext::new(
+            "menu-track".to_string(),
+            Some("group-conversation".to_string()),
+            Some("robot".to_string()),
+            Some("https://example.invalid/session-webhook".to_string()),
+            Some("user".to_string()),
+            Some("dtv1.card//IM_GROUP.group-conversation".to_string()),
+            now_for_tests(),
+        ))
+        .await;
+    assert!(matches!(
+        callback_store.lookup_and_touch("menu-track").await,
+        PanelContextLookup::Hit(_)
+    ));
+
+    drop(callback_store);
+    drop(worker_store);
+    drop(callback_runtime);
+    drop(runtime);
+    drop(worker_state);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
 // =============================================================================
 // TLS / rustls CryptoProvider tests
 // =============================================================================

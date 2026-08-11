@@ -606,6 +606,7 @@ pub(crate) async fn process_panel_action(
         );
         return;
     }
+    println!("[dingtalk-panel] card_state=running action={action}");
     if let Err(error) = dingtalk_card::update_card(
         &token,
         &callback.out_track_id,
@@ -714,9 +715,9 @@ pub(crate) async fn process_panel_action(
     )
     .await
     {
-        Ok(()) => println!("[dingtalk-panel] card_restored=true"),
+        Ok(()) => println!("[dingtalk-panel] card_state=ready card_restored=true"),
         Err(error) => println!(
-            "[dingtalk-panel] card_restored=false reason={}",
+            "[dingtalk-panel] card_state=ready card_restored=false reason={}",
             safe_error_kind(&error)
         ),
     }
@@ -759,6 +760,7 @@ async fn execute_gateway_status(
     runtime: &GatewayRuntime,
     context: &crate::gateway::dingtalk_store::DingtalkPanelContext,
 ) -> PanelActionResult {
+    println!("[dingtalk-panel] action=gateway_status");
     let worker_ready = runtime.dingtalk_worker_started().await;
     let queue_len = runtime.dingtalk_queue_len().await;
     let stream_ready = runtime.is_dingtalk_stream_registered();
@@ -775,11 +777,14 @@ async fn execute_gateway_status(
         queue_len,
         if reply_target_ready { "正常" } else { "未就绪" }
     );
+    println!("[dingtalk-panel] business_result=success");
     PanelActionResult::success("gateway_status", "Gateway 状态读取完成", body)
 }
 
 async fn execute_recent_jobs(runtime: &GatewayRuntime) -> PanelActionResult {
+    println!("[dingtalk-panel] action=recent_jobs");
     let Some(store) = runtime.dingtalk_store() else {
+        println!("[dingtalk-panel] business_result=failed reason=no_store");
         return PanelActionResult::failed(
             "recent_jobs",
             "最近任务读取失败",
@@ -787,7 +792,12 @@ async fn execute_recent_jobs(runtime: &GatewayRuntime) -> PanelActionResult {
         );
     };
     let jobs = store.get_recent_jobs(5).await;
+    println!(
+        "[dingtalk-panel] action=recent_jobs jobs_count={}",
+        jobs.len()
+    );
     let body = format_recent_jobs_message(&jobs);
+    println!("[dingtalk-panel] business_result=success");
     PanelActionResult::success("recent_jobs", "最近任务已发送", body)
 }
 
@@ -824,8 +834,11 @@ pub(crate) fn format_recent_jobs_message(
 }
 
 fn execute_help() -> PanelActionResult {
-    let body = "OmniNova Agent 面板\n\nGateway 状态\n查看 Gateway 与 DingTalk 运行状态。\n\n最近任务\n查看最近执行的任务。\n\n监控 30 秒\n持续监控桌面变化 30 秒。\n\n监控 60 秒\n持续监控桌面变化 60 秒。\n\n帮助说明\n查看面板使用说明。\n\n高风险工具不在普通聊天中直接执行。";
-    PanelActionResult::success("help", "帮助说明已发送", body.to_string())
+    println!("[dingtalk-panel] action=help");
+    // Shared with Feishu: help content is the cross-channel help text.
+    let body = crate::gateway::feishu_worker::help_reply();
+    println!("[dingtalk-panel] business_result=success");
+    PanelActionResult::success("help", "帮助说明已发送", body)
 }
 
 async fn execute_monitor(
@@ -860,6 +873,7 @@ fn panel_monitor_result(
     result: &crate::desktop_capture::MonitorResult,
 ) -> PanelActionResult {
     if result.ok {
+        println!("[dingtalk-panel] action={action} business_result=success");
         let changed = result.changed.unwrap_or(false);
         let detail = if changed {
             "检测到桌面变化"
@@ -874,6 +888,7 @@ fn panel_monitor_result(
             ),
         )
     } else {
+        println!("[dingtalk-panel] action={action} business_result=failed");
         let reason = result
             .error_code
             .as_deref()
@@ -1265,18 +1280,85 @@ mod tests {
     }
 
     #[test]
-    fn help_result_is_detailed_but_card_summary_is_short() {
+    fn dingtalk_help_action_executes_with_feishu_content() {
         let result = execute_help();
         assert_eq!(result.card_summary, "帮助说明已发送");
         let body = result.message_body.unwrap();
-        assert!(body.contains("监控 30 秒"));
-        assert!(body.contains("监控 60 秒"));
+        assert_eq!(body, crate::gateway::feishu_worker::help_reply());
+        assert!(body.contains("OmniNova Agent 使用帮助"));
+        assert!(body.contains("/monitor"));
+    }
+
+    fn panel_test_context() -> crate::gateway::dingtalk_store::DingtalkPanelContext {
+        crate::gateway::dingtalk_store::DingtalkPanelContext::new(
+            "test-track".to_string(),
+            Some("test-conversation".to_string()),
+            Some("test-robot".to_string()),
+            Some("https://example.invalid/session-webhook".to_string()),
+            Some("test-user".to_string()),
+            Some("test-space".to_string()),
+            crate::gateway::dingtalk_store::now_for_tests(),
+        )
+    }
+
+    #[tokio::test]
+    async fn dingtalk_gateway_status_action_executes() {
+        let runtime = GatewayRuntime::new(crate::config::Config::default());
+        let result = execute_gateway_status(&runtime, &panel_test_context()).await;
+        assert!(result.success);
+        assert_eq!(result.action, "gateway_status");
+        assert!(result.message_body.as_deref().is_some_and(|body| body.contains("Gateway")));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_recent_jobs_empty_is_not_error() {
+        let runtime = GatewayRuntime::new(crate::config::Config::default());
+        assert!(runtime
+            .dingtalk_store
+            .set(Arc::new(crate::gateway::dingtalk_store::DingtalkStore::new()))
+            .is_ok());
+        let result = execute_recent_jobs(&runtime).await;
+        assert!(result.success);
+        assert_eq!(result.action, "recent_jobs");
+        assert!(result
+            .message_body
+            .as_deref()
+            .is_some_and(|body| body.contains("暂无最近任务")));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_recent_jobs_action_executes_with_real_store_data() {
+        let runtime = GatewayRuntime::new(crate::config::Config::default());
+        let store = Arc::new(crate::gateway::dingtalk_store::DingtalkStore::new());
+        assert!(runtime.dingtalk_store.set(store.clone()).is_ok());
+        store
+            .store_inbound(crate::gateway::dingtalk_store::DingtalkJob {
+                job_id: "private-job-id".to_string(),
+                inbound: crate::channels::InboundMessage {
+                    channel: crate::channels::ChannelKind::Dingtalk,
+                    user_id: Some("private-user-id".to_string()),
+                    session_id: Some("private-conversation-id".to_string()),
+                    text: "status".to_string(),
+                    metadata: Default::default(),
+                },
+                status: crate::gateway::dingtalk_store::JobStatus::Completed,
+                created_at: 100,
+                updated_at: 100,
+                error_message: None,
+            })
+            .await;
+
+        let result = execute_recent_jobs(&runtime).await;
+        let body = result.message_body.expect("recent jobs detail");
+        assert!(result.success);
         assert!(body.contains("Gateway 状态"));
-        assert!(body.contains("最近任务"));
+        for secret in ["private-job-id", "private-user-id", "private-conversation-id"] {
+            assert!(!body.contains(secret));
+        }
     }
 
     #[test]
-    fn monitor_result_keeps_details_out_of_card() {
+    fn dingtalk_monitor_30s_action_executes_with_shared_monitor_result() {
         let monitor = crate::desktop_capture::MonitorResult::success_no_detection(
             30,
             30_000,
@@ -1299,6 +1381,111 @@ mod tests {
         assert_eq!(result.card_summary, "桌面监控完成 · 30 秒");
         assert!(result.message_body.as_deref().unwrap().contains("监控时长：30 秒"));
         assert!(!result.card_summary.contains("监控时长"));
+    }
+
+    #[test]
+    fn dingtalk_monitor_60s_action_executes_with_shared_monitor_result() {
+        let monitor = crate::desktop_capture::MonitorResult::success_no_detection(
+            60,
+            60_000,
+            crate::desktop_capture::CaptureResult::success(
+                "start.png".to_string(),
+                1,
+                1,
+                1,
+                "start".to_string(),
+            ),
+            crate::desktop_capture::CaptureResult::success(
+                "end.png".to_string(),
+                1,
+                1,
+                1,
+                "end".to_string(),
+            ),
+        );
+        let result = panel_monitor_result("monitor_60s", 60, &monitor);
+        assert!(result.success);
+        assert_eq!(result.action, "monitor_60s");
+        assert!(result.card_summary.contains("60 秒"));
+    }
+
+    #[test]
+    fn dingtalk_monitor_failure_result_is_safe() {
+        let monitor = crate::desktop_capture::MonitorResult::failure(
+            30,
+            12,
+            "capture_failed",
+            "sensitive platform detail",
+        );
+        let result = panel_monitor_result("monitor_30s", 30, &monitor);
+        assert!(!result.success);
+        assert!(!result.busy);
+        assert_eq!(result.action, "monitor_30s");
+        let body = result.message_body.expect("failure detail");
+        assert!(body.contains("capture_failed"));
+        assert!(!body.contains("sensitive platform detail"));
+    }
+
+    async fn wait_for_monitor_reacquire(
+        guard: &Arc<crate::gateway::DingtalkMonitorGuard>,
+        track: &str,
+    ) -> String {
+        for _ in 0..50 {
+            if let Some(owner) = guard.try_acquire(track).await {
+                return owner;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("monitor guard was not released for {track}");
+    }
+
+    #[tokio::test]
+    async fn dingtalk_monitor_guard_releases_after_failure() {
+        let guard = Arc::new(crate::gateway::DingtalkMonitorGuard::new());
+        let owner_id = guard.try_acquire("failure-track").await.expect("first lease");
+        let lease = DingtalkMonitorLease {
+            guard: guard.clone(),
+            out_track_id: "failure-track".to_string(),
+            owner_id,
+        };
+
+        let failed = crate::desktop_capture::MonitorResult::failure(
+            30,
+            1,
+            "capture_failed",
+            "capture failed",
+        );
+        assert!(!panel_monitor_result("monitor_30s", 30, &failed).success);
+        drop(lease);
+
+        let replacement = wait_for_monitor_reacquire(&guard, "failure-track").await;
+        assert!(guard.release("failure-track", &replacement).await);
+    }
+
+    #[tokio::test]
+    async fn dingtalk_monitor_guard_releases_after_cancellation() {
+        let guard = Arc::new(crate::gateway::DingtalkMonitorGuard::new());
+        let guard_for_task = guard.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let owner_id = guard_for_task
+                .try_acquire("cancel-track")
+                .await
+                .expect("first lease");
+            let _lease = DingtalkMonitorLease {
+                guard: guard_for_task,
+                out_track_id: "cancel-track".to_string(),
+                owner_id,
+            };
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.expect("lease acquired");
+        task.abort();
+        let _ = task.await;
+
+        let replacement = wait_for_monitor_reacquire(&guard, "cancel-track").await;
+        assert!(guard.release("cancel-track", &replacement).await);
     }
 
     #[test]

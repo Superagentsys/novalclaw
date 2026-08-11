@@ -188,6 +188,19 @@ pub async fn start_dingtalk_worker(
                 text_len, has_conversation, has_webhook, has_robot_code
             );
 
+            // Record the job in the store so the Card "recent_jobs" action has
+            // a real data source instead of an always-empty in-memory map.
+            store
+                .store_inbound(crate::gateway::dingtalk_store::DingtalkJob {
+                    job_id: job.job_id.clone(),
+                    inbound: job.inbound.clone(),
+                    status: crate::gateway::dingtalk_store::JobStatus::Received,
+                    created_at: job.created_at,
+                    updated_at: job.created_at,
+                    error_message: None,
+                })
+                .await;
+
             let runtime_clone = runtime.clone();
             let store_clone = store.clone();
             let queue_len_clone = queue_len.clone();
@@ -1481,6 +1494,44 @@ mod tests {
         assert_eq!(job.channel, ChannelKind::Dingtalk);
         assert_eq!(job.inbound.text, "hello");
         assert!(job.job_id.starts_with("dt_job_"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_worker_records_received_job_for_recent_jobs() {
+        let state = DingtalkWorkerState::new();
+        let sender = state.sender();
+        let store = Arc::new(DingtalkStore::new());
+        let runtime = Arc::new(GatewayRuntime::new(crate::config::Config::default()));
+        start_dingtalk_worker(state, runtime, store.clone()).await;
+
+        let job = DingtalkAsyncJob::new(
+            InboundMessage {
+                channel: ChannelKind::Dingtalk,
+                user_id: None,
+                session_id: None,
+                text: "ping".to_string(),
+                metadata: Default::default(),
+            },
+            serde_json::json!({}),
+        );
+        let job_id = job.job_id.clone();
+        sender.send(job).await.expect("worker channel open");
+
+        let recorded = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .get_recent_jobs(5)
+                    .await
+                    .iter()
+                    .any(|stored| stored.job_id == job_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(recorded.is_ok(), "worker must populate recent_jobs data source");
     }
 
     #[test]

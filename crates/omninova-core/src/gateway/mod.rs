@@ -466,7 +466,7 @@ pub struct GatewayRuntime {
     /// DingTalk worker queue length tracker
     dingtalk_queue_len: Arc<RwLock<usize>>,
     /// DingTalk in-memory store for job tracking
-    dingtalk_store: Option<Arc<dingtalk_store::DingtalkStore>>,
+    dingtalk_store: Arc<OnceLock<Arc<dingtalk_store::DingtalkStore>>>,
     /// Live DingTalk Stream connection state (unified for robot + card).
     dingtalk_stream_connected: Arc<AtomicBool>,
     /// Stream owner lifecycle: owner generation counter + shutdown flag + mutex.
@@ -862,7 +862,7 @@ impl GatewayRuntime {
             feishu_store: None,
             dingtalk_job_sender: Arc::new(RwLock::new(None)),
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
-            dingtalk_store: None,
+            dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
@@ -887,7 +887,7 @@ impl GatewayRuntime {
             feishu_store: None,
             dingtalk_job_sender: Arc::new(RwLock::new(None)),
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
-            dingtalk_store: None,
+            dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
@@ -915,6 +915,30 @@ impl GatewayRuntime {
     }
 
     pub async fn init_dingtalk_worker(&mut self) {
+        // The OnceLock is shared by every GatewayRuntime clone. Initialize it
+        // before the idempotent sender check so a clone created before worker
+        // startup observes the exact same store as the worker and Card callback.
+        let store = if let Some(store) = self.dingtalk_store.get() {
+            store.clone()
+        } else {
+            let config = self.get_config().await;
+            let config_dir = config
+                .config_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .filter(|path| !path.as_os_str().is_empty())
+                .or_else(|| home::home_dir().map(|home| home.join(".omninova")))
+                .unwrap_or_else(|| std::path::PathBuf::from(".omninova"));
+            let candidate = Arc::new(
+                dingtalk_store::DingtalkStore::open(&config_dir).unwrap_or_else(|error| {
+                    println!("[dingtalk-panel] store_persistent=false reason={error}");
+                    dingtalk_store::DingtalkStore::new()
+                }),
+            );
+            self.dingtalk_store
+                .get_or_init(|| candidate)
+                .clone()
+        };
         // Keep initialization idempotent. Most importantly, never replace the
         // sender while the receiver from the same channel is still running.
         {
@@ -928,21 +952,6 @@ impl GatewayRuntime {
         let worker_state = dingtalk_worker::DingtalkWorkerState::with_queue_len(
             self.dingtalk_queue_len.clone(),
         );
-        let config = self.get_config().await;
-        let config_dir = config
-            .config_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .filter(|path| !path.as_os_str().is_empty())
-            .or_else(|| home::home_dir().map(|home| home.join(".omninova")))
-            .unwrap_or_else(|| std::path::PathBuf::from(".omninova"));
-        let store = Arc::new(
-            dingtalk_store::DingtalkStore::open(&config_dir).unwrap_or_else(|error| {
-                println!("[dingtalk-panel] store_persistent=false reason={error}");
-                dingtalk_store::DingtalkStore::new()
-            }),
-        );
-        self.dingtalk_store = Some(store.clone());
         let sender = worker_state.sender();
 
         // Check again under the write lock. A repeated init must not install a
@@ -1276,7 +1285,7 @@ impl GatewayRuntime {
     }
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
-        self.dingtalk_store.clone()
+        self.dingtalk_store.get().cloned()
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
