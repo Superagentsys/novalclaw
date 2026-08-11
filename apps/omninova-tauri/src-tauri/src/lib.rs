@@ -808,17 +808,25 @@ async fn save_setup_config(
     }
     let mut next = setup_config_to_core(current, config, validation_scope)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
-    let workspace_changed = current_workspace_dir != next.workspace_dir;
+    let workspace_changed = !workspace_paths_equivalent(&current_workspace_dir, &next.workspace_dir);
 
     save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
     let mut restarted = false;
-    if current_gateway_url != next_gateway_url || workspace_changed {
+    let gateway_url_changed = current_gateway_url != next_gateway_url;
+    if gateway_url_changed || workspace_changed {
+        println!(
+            "[gateway-lifecycle] restart_trigger=config_compare gateway_url_changed={} workspace_changed={} dingtalk_changed={} feishu_changed={}",
+            gateway_url_changed,
+            workspace_changed,
+            false,
+            false
+        );
         // Restart gateway so new workspace_dir takes effect and tools are recreated.
-        stop_gateway_inner(&state_ref).await;
+        stop_gateway_inner(&state_ref, "config_change").await;
         sleep(Duration::from_millis(200)).await;
-        if let Err(e) = start_gateway_inner(state_ref.clone()).await {
+        if let Err(e) = start_gateway_inner(state_ref.clone(), "config_change").await {
             return Err(format!("配置已保存但网关重启失败: {e}"));
         }
         restarted = true;
@@ -1301,7 +1309,11 @@ async fn preflight_gateway_bind(host: &str, port: u16) -> Result<(), (String, St
 }
 
 /// 启动本机 HTTP 网关（与 `omninova` CLI 使用同一配置与端口，便于后台常驻后命令行调用）。
-async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayStatusPayload, String> {
+async fn start_gateway_inner(
+    state_ref: Arc<Mutex<AppState>>,
+    reason: &'static str,
+) -> Result<GatewayStatusPayload, String> {
+    println!("[gateway-lifecycle] start reason={reason}");
     sync_gateway_task_state(&state_ref).await;
     let runtime = {
         let app_state = state_ref.lock().await;
@@ -1434,7 +1446,7 @@ async fn start_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    start_gateway_inner(state_ref).await
+    start_gateway_inner(state_ref, "user_command").await
 }
 
 #[tauri::command]
@@ -1442,7 +1454,7 @@ async fn stop_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    stop_gateway_inner(&state_ref).await;
+    stop_gateway_inner(&state_ref, "user_command").await;
     Ok(gateway_status_from_state(&state_ref).await)
 }
 
@@ -1451,9 +1463,9 @@ async fn restart_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    stop_gateway_inner(&state_ref).await;
+    stop_gateway_inner(&state_ref, "user_command").await;
     sleep(Duration::from_millis(100)).await;
-    start_gateway_inner(state_ref).await
+    start_gateway_inner(state_ref, "user_command").await
 }
 
 #[tauri::command]
@@ -1994,21 +2006,28 @@ fn extract_error_code(error: &str) -> Option<String> {
     }
 }
 
-async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
-    let task = {
+async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>, reason: &'static str) {
+    println!("[gateway-lifecycle] stop reason={reason}");
+    let (task, runtime) = {
         let mut app_state = state.lock().await;
         let task = app_state.gateway_task.take();
+        let runtime = app_state.runtime.clone();
         app_state.last_gateway_error = None;
         app_state.last_gateway_error_code = None;
         // A successful public probe is no longer authoritative after the
         // local origin stops. Clear it so restart cannot resurrect stale OK.
         app_state.last_public_health = None;
-        task
+        (task, runtime)
     };
     if let Some(task) = task {
+        // Stop the parent first so it cannot race by starting a child after an
+        // early NotRunning observation. Dropping serve_http signals the child.
         task.abort();
         let _ = task.await;
     }
+    // The Stream reconnect loop is independently spawned. Explicitly join it
+    // after the parent is gone so restart is physically 1 -> 0 -> 1.
+    runtime.shutdown_dingtalk_stream_and_join().await;
 }
 
 fn setup_config_from_core(config: &Config) -> SetupAppConfig {
@@ -2920,6 +2939,31 @@ fn expand_tilde_path(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+/// Semantic path comparison for gateway-restart decisions.
+///
+/// A frontend round-trip can normalize a path (trailing slash, `~` expansion,
+/// repeated separators) without the user changing anything. Treating those
+/// representations as "changed" would cause a false-positive gateway restart.
+/// Comparison is ASCII case-insensitive on Windows where the filesystem is.
+fn workspace_paths_equivalent<L, R>(left: L, right: R) -> bool
+where
+    L: AsRef<std::path::Path>,
+    R: AsRef<std::path::Path>,
+{
+    let normalize = |path: &std::path::Path| -> String {
+        let mut normalized = path.to_string_lossy().replace('\\', "/");
+        while normalized.ends_with('/') {
+            normalized.pop();
+        }
+        #[cfg(windows)]
+        {
+            normalized = normalized.to_ascii_lowercase();
+        }
+        normalized
+    };
+    normalize(left.as_ref()) == normalize(right.as_ref())
+}
+
 fn parse_gateway_url(value: &str) -> Result<(String, u16), String> {
     let normalized = value
         .trim()
@@ -3211,7 +3255,7 @@ pub fn run() {
             let state_autostart = state.clone();
             tauri::async_runtime::spawn(async move {
                 sleep(Duration::from_millis(500)).await;
-                match start_gateway_inner(state_autostart).await {
+                match start_gateway_inner(state_autostart, "startup_autostart").await {
                     Ok(s) => eprintln!("[gateway] background started: {}", s.url),
                     Err(e) => eprintln!("[gateway] auto-start failed: {e}"),
                 }
@@ -3328,6 +3372,54 @@ mod webview_startup_tests {
         ] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_paths_equivalent_ignores_trailing_slash_and_case() {
+        // A config round-trip must never decide "workspace changed" merely
+        // because the path lost its trailing slash or changed case.
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"D:\123\")
+        ));
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"d:\123")
+        ));
+        assert!(workspace_paths_equivalent(
+            PathBuf::from("/home/user/ws"),
+            PathBuf::from("/home/user/ws/")
+        ));
+        // A real change must still be detected.
+        assert!(!workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"D:\456")
+        ));
+        assert!(!workspace_paths_equivalent(
+            PathBuf::from(""),
+            PathBuf::from(r"D:\123")
+        ));
+    }
+
+    #[test]
+    fn workspace_paths_equivalent_empty_vs_empty() {
+        assert!(workspace_paths_equivalent(PathBuf::from(""), PathBuf::from("")));
+    }
+
+    #[test]
+    fn workspace_paths_equivalent_mixed_separators() {
+        // Frontend may send forward slashes while the stored value uses
+        // backslashes on Windows; both describe the same directory.
+        #[cfg(windows)]
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123\"),
+            PathBuf::from("D:/123")
+        ));
     }
 }
 

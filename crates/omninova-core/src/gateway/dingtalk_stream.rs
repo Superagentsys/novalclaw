@@ -14,15 +14,15 @@
 use crate::channels::ChannelKind;
 use crate::channels::InboundMessage;
 use crate::config::schema::DingtalkTransportMode;
-use crate::gateway::dingtalk_card;
 use crate::gateway::dingtalk_card_stream::ParsedCardCallback;
 use crate::gateway::dingtalk_worker::DingtalkAsyncJob;
 use crate::gateway::{DingTalkStreamState, GatewayRuntime};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// DingTalk Stream gateway endpoint
@@ -40,23 +40,48 @@ const QUEUE_CAPACITY: usize = 100;
 /// Max reconnection attempts before capping backoff
 const MAX_BACKOFF_ATTEMPTS: u32 = 6;
 
-/// Guard to manage the Stream lifecycle and enable graceful shutdown.
+/// Guard to manage the Stream lifecycle. Holds owner generation token that
+/// prevents old owners from clearing new owners (ABA-safe).
+///
+/// Drop semantics:
+/// - Cooperative shutdown (normal serve_http exit): Drop called → release_owner(gen)
+/// - Abort shutdown (task.abort()): Drop called after JoinHandle await → release_owner(gen)
+/// Both paths correctly release because tokio ensures future completion before JoinHandle returns.
 pub struct DingtalkStreamGuard {
-    shutdown_tx: Option<watch::Sender<bool>>,
+    /// Owner generation: only this owner may release.
+    owner_gen: u64,
+    /// Runtime reference for owner-scoped cleanup calls.
     runtime: Arc<GatewayRuntime>,
+    shutdown_complete: bool,
+}
+
+impl DingtalkStreamGuard {
+    pub async fn shutdown(&mut self) {
+        if self.shutdown_complete {
+            return;
+        }
+        let outcome = self
+            .runtime
+            .shutdown_dingtalk_stream_generation(self.owner_gen, Duration::from_secs(5))
+            .await;
+        println!("[dingtalk-stream] lifecycle_join outcome={outcome:?}");
+        self.shutdown_complete = true;
+    }
 }
 
 impl Drop for DingtalkStreamGuard {
     fn drop(&mut self) {
-        self.runtime.set_dingtalk_stream_connected(false);
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
+        if !self.shutdown_complete {
+            let _ = self
+                .runtime
+                .signal_dingtalk_stream_shutdown(self.owner_gen);
         }
     }
 }
 
 /// Start the unified DingTalk Stream transport.
-/// Returns None if Stream mode is not enabled or configuration is incomplete.
+/// Returns None if Stream mode is not enabled, configuration is incomplete,
+/// or another reconnect loop is already running on this runtime.
 pub async fn start(runtime: Arc<GatewayRuntime>) -> Option<DingtalkStreamGuard> {
     let config = runtime.get_config().await;
     let entry = config.channels_config.dingtalk.as_ref();
@@ -81,17 +106,23 @@ pub async fn start(runtime: Arc<GatewayRuntime>) -> Option<DingtalkStreamGuard> 
         return None;
     }
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(run_reconnect_loop(
-        runtime.clone(),
-        app_key.unwrap(),
-        app_secret.unwrap(),
-        shutdown_rx,
-    ));
+    // Acquire ownership and install the physical JoinHandle atomically.
+    let ak = app_key.unwrap();
+    let asec = app_secret.unwrap();
+    let rt = runtime.clone();
+    let owner_gen = runtime.try_start_dingtalk_stream_loop(move |owner_gen, rx| async move {
+        run_reconnect_loop_internal(rt, owner_gen, ak, asec, rx).await;
+    });
+    let Some(owner_gen) = owner_gen else {
+        println!("[dingtalk-stream] start_skipped reason=already_owned");
+        return None;
+    };
 
+    println!("[dingtalk-stream] owner_acquired gen={owner_gen}");
     Some(DingtalkStreamGuard {
-        shutdown_tx: Some(shutdown_tx),
+        owner_gen,
         runtime,
+        shutdown_complete: false,
     })
 }
 
@@ -99,36 +130,77 @@ pub async fn start(runtime: Arc<GatewayRuntime>) -> Option<DingtalkStreamGuard> 
 // Reconnect loop - single owner to prevent storm
 // ---------------------------------------------------------------------------
 
-async fn run_reconnect_loop(
+/// Owner-scoped cleanup: only releases if the current owner matches.
+/// This is a belt-and-suspenders safety net — the primary cleanup path
+/// is Guard::Drop. The loop calls this as it exits so that both cooperative
+/// and abort shutdown paths correctly release.
+fn stream_cleanup_on_exit(runtime: &Arc<GatewayRuntime>, owner_gen: u64) {
+    runtime.set_dingtalk_stream_connected(owner_gen, false);
+}
+
+async fn run_reconnect_loop_internal(
     runtime: Arc<GatewayRuntime>,
+    owner_gen: u64,
     app_key: String,
     app_secret: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut attempt = 0u32;
+    let mut throttle_until: Option<std::time::Instant> = None;
 
     loop {
         if *shutdown.borrow() {
             break;
         }
 
+        // Respect a 429 throttle: hold off until the retry-after window
+        // elapses instead of hammering the gateway endpoint.
+        if let Some(until) = throttle_until {
+            if std::time::Instant::now() < until {
+                let remaining = until.saturating_duration_since(std::time::Instant::now());
+                println!(
+                    "[dingtalk-stream] throttled=true remaining_ms={} owner_gen={}",
+                    remaining.as_millis(),
+                    owner_gen
+                );
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(remaining) => {}
+                }
+            }
+            throttle_until = None;
+        }
+
         println!("[dingtalk-stream] state=connecting");
 
-        match connect_and_run(&runtime, &app_key, &app_secret, shutdown.clone()).await {
+        match connect_and_run(&runtime, owner_gen, &app_key, &app_secret, shutdown.clone(), attempt).await {
             Ok(()) => {
                 attempt = 0;
             }
             Err(e) => {
                 let kind = stream_error_kind(&e);
                 attempt = attempt.saturating_add(1);
+                let delay = reconnect_delay(attempt);
+                if e.contains("websocket_connect_error:http:429") {
+                    throttle_until = Some(
+                        std::time::Instant::now()
+                            + delay.max(Duration::from_secs(30)),
+                    );
+                }
                 println!(
-                    "[dingtalk-stream] disconnected reason={} reconnect_attempt={}",
-                    kind, attempt
+                    "[dingtalk-stream] disconnected reason={} reconnect_attempt={} reconnect_delay_ms={}",
+                    kind,
+                    attempt,
+                    delay.as_millis()
                 );
             }
         }
 
-        runtime.set_dingtalk_stream_connected(false);
+        runtime.set_dingtalk_stream_connected(owner_gen, false);
 
         let delay = reconnect_delay(attempt);
         tokio::select! {
@@ -141,8 +213,9 @@ async fn run_reconnect_loop(
         }
     }
 
-    runtime.set_dingtalk_stream_connected(false);
-    println!("[dingtalk-stream] shutdown=true");
+    // Owner-scoped cleanup: releases only if gen still matches.
+    stream_cleanup_on_exit(&runtime, owner_gen);
+    println!("[dingtalk-stream] shutdown=true owner_gen={owner_gen}");
 }
 
 // ---------------------------------------------------------------------------
@@ -186,9 +259,11 @@ pub(crate) fn ensure_rustls_crypto_provider() {
 
 async fn connect_and_run(
     runtime: &Arc<GatewayRuntime>,
+    owner_gen: u64,
     app_key: &str,
     app_secret: &str,
     mut shutdown: watch::Receiver<bool>,
+    attempt: u32,
 ) -> Result<(), String> {
     // Ensure TLS provider is initialized before connecting
     ensure_rustls_crypto_provider();
@@ -202,17 +277,18 @@ async fn connect_and_run(
 
     let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
-        .map_err(|e| format!("websocket_connect_error:{}", e))?;
+        .map_err(|error| classify_ws_connect_error(&error, owner_gen, attempt))?;
 
     println!("[dingtalk-stream] websocket_open=true");
-    runtime.set_dingtalk_stream_connected(true);
+    runtime.set_dingtalk_stream_connected(owner_gen, true);
 
     // 3. Run socket loop until failure
-    run_socket_loop(runtime, &mut socket, shutdown).await
+    run_socket_loop(runtime, owner_gen, &mut socket, shutdown).await
 }
 
 async fn run_socket_loop<S>(
     runtime: &Arc<GatewayRuntime>,
+    owner_gen: u64,
     socket: &mut S,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), String>
@@ -221,7 +297,7 @@ where
         + futures_util::StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    runtime.set_dingtalk_stream_connected(true);
+    runtime.set_dingtalk_stream_connected(owner_gen, true);
     println!("[dingtalk-stream] state=connected");
     println!("[dingtalk-stream] read_loop_started=true");
 
@@ -243,7 +319,7 @@ where
                     Message::Text(text) => {
                         let bytes = text.len();
                         println!("[dingtalk-stream] frame_received kind=text bytes={}", bytes);
-                        if let Err(e) = handle_downstream_json(socket, runtime, text.as_ref()).await {
+                        if let Err(e) = handle_downstream_json(socket, runtime, owner_gen, text.as_ref()).await {
                             return Err(e);
                         }
                     }
@@ -252,7 +328,7 @@ where
                         println!("[dingtalk-stream] frame_received kind=binary bytes={}", byte_count);
                         match std::str::from_utf8(&bytes) {
                             Ok(text) => {
-                                if let Err(e) = handle_downstream_json(socket, runtime, text).await {
+                                if let Err(e) = handle_downstream_json(socket, runtime, owner_gen, text).await {
                                     return Err(e);
                                 }
                             }
@@ -287,6 +363,7 @@ where
 async fn handle_downstream_json<S>(
     socket: &mut S,
     runtime: &Arc<GatewayRuntime>,
+    owner_gen: u64,
     text: &str,
 ) -> Result<(), String>
 where
@@ -310,7 +387,10 @@ where
 
     match frame_type {
         "SYSTEM" => {
-            handle_system_frame(socket, runtime, &envelope).await?;
+            handle_system_frame(socket, runtime, owner_gen, &envelope).await?;
+        }
+        _ if !should_dispatch_business_frame(runtime, owner_gen) => {
+            println!("[dingtalk-stream] frame_skipped reason=stale_owner");
         }
         "EVENT" => {
             println!(
@@ -340,25 +420,21 @@ where
     Ok(())
 }
 
+pub(crate) fn should_dispatch_business_frame(
+    runtime: &GatewayRuntime,
+    owner_gen: u64,
+) -> bool {
+    runtime.is_current_stream_owner(owner_gen)
+}
+
 // ---------------------------------------------------------------------------
 // Frame handling
 // ---------------------------------------------------------------------------
 
-/// Handle text frame - delegates to shared downstream JSON handler
-async fn handle_text_frame<S>(
-    socket: &mut S,
-    runtime: &Arc<GatewayRuntime>,
-    text: &str,
-) -> Result<(), String>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    handle_downstream_json(socket, runtime, text).await
-}
-
 async fn handle_system_frame<S>(
     socket: &mut S,
     runtime: &Arc<GatewayRuntime>,
+    owner_gen: u64,
     envelope: &StreamEnvelope,
 ) -> Result<(), String>
 where
@@ -374,11 +450,11 @@ where
         }
         "REGISTERED" => {
             println!("[dingtalk-stream] system=REGISTERED");
-            runtime.set_dingtalk_stream_connected(true);
+            runtime.set_dingtalk_stream_connected(owner_gen, true);
         }
         "disconnect" => {
             println!("[dingtalk-stream] system=disconnect");
-            runtime.set_dingtalk_stream_connected(false);
+            runtime.set_dingtalk_stream_connected(owner_gen, false);
             // Ack and return error to trigger reconnect with new ticket
             // Use SYSTEM ACK to preserve original headers and data
             println!("[dingtalk-stream] system_ack topic=disconnect send_attempt=true");
@@ -434,16 +510,20 @@ where
     let payload = match parse_robot_payload(envelope) {
         Ok(p) => p,
         Err(e) => {
+            log_robot_payload_field_types(&envelope.data);
             println!(
                 "[dingtalk-stream] topic=robot parse_failed=true reason={}",
                 e
             );
-            // Still ACK to prevent redelivery
-            let ack = build_stream_ack(envelope, serde_json::json!({}));
-            let _ = socket.send(Message::Text(ack.to_string().into())).await;
+            // Do NOT ACK as success: an unparsed message must not be marked
+            // as processed. Leaving it unacked lets DingTalk retry delivery.
             return Ok(());
         }
     };
+    println!(
+        "[dingtalk-stream] topic=robot parse_ok=true msg_id_hash={}",
+        short_hash(&payload.msg_id)
+    );
 
     // Dedupe check
     let msg_id = payload.msg_id.clone();
@@ -461,7 +541,7 @@ where
     match runtime.try_enqueue_dingtalk_stream_job(payload).await {
         Ok(()) => {
             println!(
-                "[dingtalk-stream] topic=robot callback_received=true msg_id_hash={}",
+                "[dingtalk-stream] topic=robot enqueue=true msg_id_hash={}",
                 short_hash(&msg_id)
             );
             let ack = build_stream_ack(envelope, serde_json::json!({}));
@@ -469,8 +549,10 @@ where
             println!("[dingtalk-stream] topic=robot ack=true");
         }
         Err(_) => {
+            // Rollback dedupe reservation so DingTalk retry can succeed.
+            runtime.dedup_cache().remove(&format!("dt_stream:{}", msg_id)).await;
             println!(
-                "[dingtalk-stream] topic=robot queue_full=true msg_id_hash={}",
+                "[dingtalk-stream] topic=robot queue_full=true msg_id_hash={} dedupe_rollback=true",
                 short_hash(&msg_id)
             );
             // DO NOT ACK - let DingTalk retry later
@@ -509,12 +591,25 @@ where
         safe_action(&callback.action)
     );
 
-    // Phase 1: only allow gateway_status
-    if !crate::gateway::dingtalk_card_stream::is_allowed_phase1_action(&callback.action) {
+    // Check against canonical allow-list
+    if !crate::gateway::dingtalk_card_stream::is_allowed_action(&callback.action) {
         println!(
             "[dingtalk-stream] topic=card action_rejected action={}",
             safe_action(&callback.action)
         );
+        let ack = build_stream_ack(envelope, serde_json::json!({ "response": {} }));
+        let _ = socket.send(Message::Text(ack.to_string().into())).await;
+        return Ok(());
+    }
+
+    let dedupe_key = crate::gateway::dingtalk_card_stream::callback_dedupe_key(
+        callback.callback_id.as_deref(),
+        &callback.out_track_id,
+        &callback.action,
+        &envelope.data,
+    );
+    if !runtime.try_dingtalk_stream_dedupe(&dedupe_key).await {
+        println!("[dingtalk-stream] topic=card callback_duplicated=true");
         let ack = build_stream_ack(envelope, serde_json::json!({ "response": {} }));
         let _ = socket.send(Message::Text(ack.to_string().into())).await;
         return Ok(());
@@ -527,9 +622,8 @@ where
 
     // Process in background
     let runtime_clone = runtime.clone();
-    let out_track_id = callback.out_track_id;
     tokio::spawn(async move {
-        process_card_action(runtime_clone, out_track_id).await;
+        crate::gateway::dingtalk_card_stream::process_panel_action(runtime_clone, callback).await;
     });
 
     Ok(())
@@ -593,9 +687,19 @@ pub fn parse_card_callback_from_stream_envelope(
         .ok_or("missing_action")?
         .to_string();
 
+    let callback_id = ["callbackId", "messageId", "eventId"]
+        .iter()
+        .find_map(|key| request.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| envelope.headers.message_id.clone())
+        .or_else(|| envelope.headers.time.clone());
+
     Ok(ParsedCardCallback {
         out_track_id,
         action,
+        callback_id,
         user_id,
         space_id,
     })
@@ -631,23 +735,71 @@ struct StreamHeaders {
     topic: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct RobotPayload {
     #[serde(rename = "msgId")]
     msg_id: String,
-    #[serde(rename = "conversationType")]
+    #[serde(
+        rename = "conversationType",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     conversation_type: String,
+    #[serde(rename = "senderNick", default, deserialize_with = "deserialize_opt_string_or_number")]
     sender_nick: Option<String>,
+    #[serde(rename = "senderStaffId", default, deserialize_with = "deserialize_opt_string_or_number")]
     sender_staff_id: Option<String>,
+    #[serde(rename = "senderId", default, deserialize_with = "deserialize_opt_string_or_number")]
     sender_id: Option<String>,
+    #[serde(rename = "conversationId", default, deserialize_with = "deserialize_opt_string_or_number")]
     conversation_id: Option<String>,
+    #[serde(rename = "robotCode", default, deserialize_with = "deserialize_opt_string_or_number")]
     robot_code: Option<String>,
+    #[serde(rename = "sessionWebhook", default, deserialize_with = "deserialize_opt_string_or_number")]
     session_webhook: Option<String>,
-    #[serde(rename = "sessionWebhookExpiredTime")]
-    session_webhook_expired_time: Option<String>,
+    #[serde(
+        rename = "sessionWebhookExpiredTime",
+        default,
+        deserialize_with = "deserialize_opt_i64_string_or_number"
+    )]
+    session_webhook_expired_time: Option<i64>,
+    #[serde(
+        rename = "createAt",
+        default,
+        deserialize_with = "deserialize_opt_i64_string_or_number"
+    )]
+    create_at: Option<i64>,
     #[serde(rename = "msgtype", default)]
     msg_type: Option<String>,
     text: Option<RobotText>,
+}
+
+impl std::fmt::Debug for RobotPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RobotPayload")
+            .field("msg_id_present", &!self.msg_id.trim().is_empty())
+            .field(
+                "conversation_type_present",
+                &!self.conversation_type.trim().is_empty(),
+            )
+            .field("sender_nick_present", &self.sender_nick.is_some())
+            .field("sender_staff_id_present", &self.sender_staff_id.is_some())
+            .field("sender_id_present", &self.sender_id.is_some())
+            .field("conversation_id_present", &self.conversation_id.is_some())
+            .field("robot_code_present", &self.robot_code.is_some())
+            .field("session_webhook_present", &self.session_webhook.is_some())
+            .field(
+                "session_webhook_expired_time",
+                &self.session_webhook_expired_time,
+            )
+            .field("create_at", &self.create_at)
+            .field("msg_type", &self.msg_type)
+            .field("text_present", &self.text.is_some())
+            .field(
+                "text_len",
+                &self.text.as_ref().map(|text| text.content.chars().count()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -655,10 +807,144 @@ struct RobotText {
     content: String,
 }
 
+// ---------------------------------------------------------------------------
+// Compatible scalar deserializers
+//
+// DingTalk delivers robot callback metadata on different paths/versions with
+// drifting JSON types: timestamps arrive as integer milliseconds or as string
+// numbers, and identity-like fields occasionally appear as numbers. These
+// helpers normalize number | string-number | null | missing into a single
+// Rust type so a single metadata field can never drop the whole message.
+// ---------------------------------------------------------------------------
+
+/// Optional i64 accepting `1786437210268`, `"1786437210268"`, null, missing.
+fn deserialize_opt_i64_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum I64OrString {
+        Integer(i64),
+        Unsigned(u64),
+        Text(String),
+    }
+
+    let value = Option::<I64OrString>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        I64OrString::Integer(n) => Some(n),
+        I64OrString::Unsigned(n) => i64::try_from(n).ok(),
+        I64OrString::Text(s) => s.trim().parse().ok(),
+    }))
+}
+
+/// Optional String accepting text, integer, unsigned, null, missing.
+fn deserialize_opt_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        Text(String),
+        Integer(i64),
+        Unsigned(u64),
+    }
+
+    let value = Option::<StringOrNumber>::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        StringOrNumber::Text(s) => s,
+        StringOrNumber::Integer(n) => n.to_string(),
+        StringOrNumber::Unsigned(n) => n.to_string(),
+    }))
+}
+
+/// Required String accepting text or numeric scalars.
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        Text(String),
+        Integer(i64),
+        Unsigned(u64),
+    }
+
+    match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::Text(s) => Ok(s),
+        StringOrNumber::Integer(n) => Ok(n.to_string()),
+        StringOrNumber::Unsigned(n) => Ok(n.to_string()),
+    }
+}
+
+/// Log only JSON field *types* (never values) of a robot callback payload.
+/// Used on parse failure so a future type drift is visible in one line.
+fn log_robot_payload_field_types(data: &str) {
+    if let Some(summary) = build_robot_payload_field_types(data) {
+        println!("[dingtalk-stream] robot_payload_types {}", summary);
+    }
+}
+
+/// Build a `key=type ...` summary of the payload fields. Never includes values.
+fn build_robot_payload_field_types(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let obj = value.as_object()?;
+    const DIAGNOSTIC_FIELDS: &[&str] = &[
+        "msgId",
+        "msgtype",
+        "text",
+        "conversationType",
+        "createAt",
+        "sessionWebhookExpiredTime",
+        "isAdmin",
+        "isInAtList",
+    ];
+
+    let parts: Vec<String> = DIAGNOSTIC_FIELDS
+        .iter()
+        .filter_map(|key| obj.get(*key).map(|v| (*key, v)))
+        .map(|(key, v)| {
+            let ty = match v {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            };
+            format!("{}={}", key, ty)
+        })
+        .collect();
+    Some(parts.join(" "))
+}
+
 fn parse_robot_payload(envelope: &StreamEnvelope) -> Result<RobotPayload, String> {
     let data_str = &envelope.data;
+    let payload: RobotPayload =
+        serde_json::from_str(data_str).map_err(|e| format!("parse_error:{}", e))?;
 
-    serde_json::from_str(data_str).map_err(|e| format!("parse_error:{}", e))
+    if payload.msg_id.trim().is_empty() {
+        return Err("core_error:empty_msg_id".to_string());
+    }
+    if payload.conversation_type.trim().is_empty() {
+        return Err("core_error:empty_conversation_type".to_string());
+    }
+    if payload
+        .msg_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("text"))
+        && payload.text.is_none()
+    {
+        return Err("core_error:missing_text".to_string());
+    }
+
+    Ok(payload)
 }
 
 fn short_hash(s: &str) -> String {
@@ -767,92 +1053,12 @@ async fn request_stream_connection(
         .ok_or("missing_ticket")?
         .to_string();
 
-    println!("[dingtalk-stream] endpoint_acquired=true");
+    println!(
+        "[dingtalk-stream] endpoint_acquired=true endpoint_hash={} ticket_hash={}",
+        opaque_sha256(&endpoint),
+        opaque_sha256(&ticket)
+    );
     Ok((endpoint, ticket))
-}
-
-// ---------------------------------------------------------------------------
-// Card action processing (reuse Phase 1 logic)
-// ---------------------------------------------------------------------------
-
-async fn process_card_action(runtime: Arc<GatewayRuntime>, out_track_id: String) {
-    println!("[dingtalk-card-action] action=gateway_status status=started");
-
-    let config = runtime.get_config().await;
-    let entry = config.channels_config.dingtalk.as_ref();
-    let app_key = crate::gateway::resolve_dingtalk_app_key_for_worker(&config, entry);
-    let app_secret = crate::gateway::resolve_dingtalk_secret_for_worker(&config, entry);
-
-    let (Some(app_key), Some(app_secret)) = (app_key, app_secret) else {
-        println!("[dingtalk-card-stream] action_failed reason=missing_credentials");
-        return;
-    };
-
-    let token =
-        match crate::gateway::dingtalk_worker::fetch_dingtalk_access_token(&app_key, &app_secret)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                println!(
-                    "[dingtalk-card-stream] action_failed reason={}",
-                    stream_error_kind(&e)
-                );
-                return;
-            }
-        };
-
-    // Update to RUNNING
-    if let Err(e) = dingtalk_card::update_card(
-        &token,
-        &out_track_id,
-        "RUNNING",
-        "正在读取状态",
-        "",
-        "gateway_status",
-    )
-    .await
-    {
-        println!(
-            "[dingtalk-card-stream] action_failed stage=running reason={}",
-            stream_error_kind(&e)
-        );
-        return;
-    }
-
-    // Get status
-    let status =
-        crate::gateway::dingtalk_worker::build_runtime_dingtalk_status_text(&runtime).await;
-
-    match dingtalk_card::update_card(
-        &token,
-        &out_track_id,
-        "SUCCESS",
-        "状态读取完成",
-        &status,
-        "gateway_status",
-    )
-    .await
-    {
-        Ok(()) => {
-            println!("[dingtalk-card-action] action=gateway_status status=success");
-        }
-        Err(e) => {
-            println!(
-                "[dingtalk-card-stream] action_failed stage=success reason={}",
-                stream_error_kind(&e)
-            );
-            let _ = dingtalk_card::update_card(
-                &token,
-                &out_track_id,
-                "FAILED",
-                "状态更新失败",
-                "请稍后重试",
-                "gateway_status",
-            )
-            .await;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +1068,99 @@ async fn process_card_action(runtime: Arc<GatewayRuntime>, out_track_id: String)
 fn reconnect_delay(attempt: u32) -> Duration {
     let exp = attempt.min(MAX_BACKOFF_ATTEMPTS);
     Duration::from_secs(2u64.saturating_pow(exp).min(60))
+}
+
+/// Opaque SHA-256 digest (first 6 bytes hex) for diagnostics. Never reveals
+/// the original endpoint/ticket/identifier value.
+fn opaque_sha256(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(&digest[..6])
+}
+
+/// Classified category of a WebSocket connect failure. The raw tungstenite
+/// error string may embed the endpoint/ticket, so only the category and safe
+/// scalars (HTTP status, IO kind) are ever logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DingtalkWsConnectErrorKind {
+    Http,
+    Io,
+    Tls,
+    Protocol,
+    Url,
+    Capacity,
+    Other,
+}
+
+impl DingtalkWsConnectErrorKind {
+    fn classify(error: &tokio_tungstenite::tungstenite::Error) -> Self {
+        use tokio_tungstenite::tungstenite::Error;
+        match error {
+            Error::Http(_) => Self::Http,
+            Error::Io(_) => Self::Io,
+            Error::Tls(_) => Self::Tls,
+            Error::Protocol(_) => Self::Protocol,
+            Error::Url(_) => Self::Url,
+            Error::Capacity(_) => Self::Capacity,
+            _ => Self::Other,
+        }
+    }
+
+    const fn log_value(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Io => "io",
+            Self::Tls => "tls",
+            Self::Protocol => "protocol",
+            Self::Url => "url",
+            Self::Capacity => "capacity",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Classify a WebSocket connect error and log only safe diagnostics:
+/// error_kind, http_status (when present), io_error_kind (when present),
+/// retry-after presence. Returns a safe reason string for the reconnect loop.
+fn classify_ws_connect_error(
+    error: &tokio_tungstenite::tungstenite::Error,
+    owner_gen: u64,
+    attempt: u32,
+) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    let kind = DingtalkWsConnectErrorKind::classify(error);
+    match error {
+        Error::Http(response) => {
+            let http_status = response.status().as_u16();
+            let retry_after_present = response.headers().contains_key("retry-after");
+            println!(
+                "[dingtalk-stream] websocket_connect_failed=true error_kind=http http_status={} retry_after_present={} owner_gen={} attempt={}",
+                http_status, retry_after_present, owner_gen, attempt
+            );
+            if http_status == 429 {
+                "websocket_connect_error:http:429".to_string()
+            } else {
+                format!("websocket_connect_error:http:{}", http_status)
+            }
+        }
+        Error::Io(io_error) => {
+            println!(
+                "[dingtalk-stream] websocket_connect_failed=true error_kind=io io_kind={:?} owner_gen={} attempt={}",
+                io_error.kind(),
+                owner_gen,
+                attempt
+            );
+            "websocket_connect_error:io".to_string()
+        }
+        _ => {
+            println!(
+                "[dingtalk-stream] websocket_connect_failed=true error_kind={} owner_gen={} attempt={}",
+                kind.log_value(),
+                owner_gen,
+                attempt
+            );
+            format!("websocket_connect_error:{}", kind.log_value())
+        }
+    }
 }
 
 fn safe_action(action: &str) -> String {
@@ -924,6 +1223,16 @@ impl GatewayRuntime {
         if let Some(ref code) = robot_code {
             metadata.insert("robotCode".to_string(), serde_json::json!(code));
         }
+        // Robot callback conversationType must reach the card target builder:
+        // "1" = single chat, "2" = group chat. Without this, `from_inbound`
+        // sees an empty type and falls back to a Direct (single-chat) target,
+        // misrouting group cards into the user's private chat.
+        metadata.insert(
+            "conversationType".to_string(),
+            serde_json::json!(payload.conversation_type.clone()),
+        );
+        let raw_payload = serde_json::json!(payload);
+        metadata.insert("raw_payload".to_string(), raw_payload.clone());
         metadata.insert("source".to_string(), serde_json::json!("dingtalk"));
         metadata.insert("stream_msg_id".to_string(), serde_json::json!(msg_id));
 
@@ -935,7 +1244,7 @@ impl GatewayRuntime {
             metadata,
         };
 
-        let job = DingtalkAsyncJob::new(inbound, serde_json::json!(payload));
+        let job = DingtalkAsyncJob::new(inbound, raw_payload);
 
         self.try_send_dingtalk_job(job)
             .await
@@ -958,6 +1267,50 @@ impl GatewayRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::task::{Context, Poll};
+
+    struct RecordingSink {
+        sent: StdArc<StdMutex<Vec<Message>>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> (Self, StdArc<StdMutex<Vec<Message>>>) {
+            let sent = StdArc::new(StdMutex::new(Vec::new()));
+            (Self { sent: sent.clone() }, sent)
+        }
+    }
+
+    impl futures_util::Sink<Message> for RecordingSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent.lock().unwrap().push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_stream_state_serialization() {
@@ -979,6 +1332,83 @@ mod tests {
         assert_eq!(reconnect_delay(5), Duration::from_secs(32));
         assert_eq!(reconnect_delay(6), Duration::from_secs(60));
         assert_eq!(reconnect_delay(99), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn ws_connect_error_http_is_classified_with_status() {
+        // HTTP handshake rejection (e.g. 403/409) must be classified as
+        // error_kind=http and carry the status in the returned reason.
+        use tokio_tungstenite::tungstenite::Error;
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(403)
+            .body(Some(Vec::<u8>::new()))
+            .unwrap();
+        let error = Error::Http(Box::new(response));
+
+        let kind = DingtalkWsConnectErrorKind::classify(&error);
+        assert_eq!(kind, DingtalkWsConnectErrorKind::Http);
+        let reason = classify_ws_connect_error(&error, 2, 1);
+        assert_eq!(reason, "websocket_connect_error:http:403");
+    }
+
+    #[test]
+    fn ws_connect_error_http_429_is_classified_with_status() {
+        use tokio_tungstenite::tungstenite::Error;
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .header("retry-after", "30")
+            .body(Some(Vec::<u8>::new()))
+            .unwrap();
+        let error = Error::Http(Box::new(response));
+
+        let kind = DingtalkWsConnectErrorKind::classify(&error);
+        assert_eq!(kind, DingtalkWsConnectErrorKind::Http);
+        let reason = classify_ws_connect_error(&error, 2, 1);
+        assert_eq!(reason, "websocket_connect_error:http:429");
+    }
+
+    #[test]
+    fn ws_connect_error_io_is_classified() {
+        use std::io;
+        use tokio_tungstenite::tungstenite::Error;
+        let error = Error::Io(io::Error::from(io::ErrorKind::ConnectionReset));
+        let kind = DingtalkWsConnectErrorKind::classify(&error);
+        assert_eq!(kind, DingtalkWsConnectErrorKind::Io);
+        let reason = classify_ws_connect_error(&error, 2, 1);
+        assert_eq!(reason, "websocket_connect_error:io");
+    }
+
+    #[test]
+    fn ws_connect_error_protocol_is_classified() {
+        use tokio_tungstenite::tungstenite::Error;
+        let error = Error::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        );
+        let kind = DingtalkWsConnectErrorKind::classify(&error);
+        assert_eq!(kind, DingtalkWsConnectErrorKind::Protocol);
+        let reason = classify_ws_connect_error(&error, 2, 1);
+        assert_eq!(reason, "websocket_connect_error:protocol");
+    }
+
+    #[test]
+    fn ws_connect_error_url_is_classified() {
+        use tokio_tungstenite::tungstenite::Error;
+        let error = Error::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName);
+        let kind = DingtalkWsConnectErrorKind::classify(&error);
+        assert_eq!(kind, DingtalkWsConnectErrorKind::Url);
+    }
+
+    #[test]
+    fn opaque_sha256_never_reveals_original_value() {
+        let digest = opaque_sha256("https://api.dingtalk.com/stream?ticket=secret-abc");
+        assert_eq!(digest.len(), 12);
+        assert!(!digest.contains("dingtalk"));
+        assert!(!digest.contains("secret"));
+        // Deterministic: same input produces same digest.
+        assert_eq!(
+            digest,
+            opaque_sha256("https://api.dingtalk.com/stream?ticket=secret-abc")
+        );
     }
 
     #[test]
@@ -1045,6 +1475,355 @@ mod tests {
         // msg_type comes from msgtype in JSON (optional field)
         assert_eq!(payload.msg_type.as_deref(), Some("text"));
         assert_eq!(payload.text.as_ref().unwrap().content, "hello");
+    }
+
+    #[test]
+    fn robot_callback_integer_timestamp_parses() {
+        // Real DingTalk delivers timestamps as integer milliseconds.
+        let json = serde_json::json!({
+            "msgId": "msg-ts-int",
+            "conversationType": "2",
+            "senderStaffId": "staff1",
+            "conversationId": "conv1",
+            "sessionWebhookExpiredTime": 1786437210268i64,
+            "createAt": 1786437348372i64,
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.session_webhook_expired_time, Some(1786437210268));
+        assert_eq!(payload.create_at, Some(1786437348372));
+        assert_eq!(payload.text.as_ref().unwrap().content, "hello");
+    }
+
+    #[test]
+    fn robot_callback_string_timestamp_parses() {
+        // Some DingTalk paths deliver the same timestamps as string numbers.
+        let json = serde_json::json!({
+            "msgId": "msg-ts-str",
+            "conversationType": "2",
+            "senderStaffId": "staff1",
+            "conversationId": "conv1",
+            "sessionWebhookExpiredTime": "1786437210268",
+            "createAt": "1786437348372",
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.session_webhook_expired_time, Some(1786437210268));
+        assert_eq!(payload.create_at, Some(1786437348372));
+    }
+
+    #[test]
+    fn robot_callback_optional_timestamp_missing_parses() {
+        // Timestamps are optional metadata: missing must not fail parsing.
+        let json = serde_json::json!({
+            "msgId": "msg-ts-none",
+            "conversationType": "2",
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.session_webhook_expired_time, None);
+        assert_eq!(payload.create_at, None);
+        assert_eq!(payload.msg_id, "msg-ts-none");
+    }
+
+    #[test]
+    fn robot_callback_null_timestamp_parses() {
+        // Null metadata must parse as None rather than failing the message.
+        let json = serde_json::json!({
+            "msgId": "msg-ts-null",
+            "conversationType": "2",
+            "sessionWebhookExpiredTime": null,
+            "createAt": null,
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.session_webhook_expired_time, None);
+        assert_eq!(payload.create_at, None);
+    }
+
+    #[test]
+    fn robot_callback_invalid_optional_timestamp_does_not_drop_message() {
+        let json = serde_json::json!({
+            "msgId": "msg-ts-invalid",
+            "conversationType": "2",
+            "sessionWebhookExpiredTime": "not-a-timestamp",
+            "createAt": "",
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.session_webhook_expired_time, None);
+        assert_eq!(payload.create_at, None);
+        assert_eq!(payload.text.as_ref().unwrap().content, "hello");
+    }
+
+    #[test]
+    fn robot_callback_numeric_metadata_fields_parse() {
+        // Identity-ish metadata can arrive as numbers on some delivery paths.
+        let json = serde_json::json!({
+            "msgId": "msg-num-meta",
+            "conversationType": 2,
+            "senderStaffId": 123456789,
+            "senderId": 987654321,
+            "conversationId": 1122334455,
+            "msgtype": "text",
+            "text": { "content": "hello" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.conversation_type, "2");
+        assert_eq!(payload.sender_staff_id.as_deref(), Some("123456789"));
+        assert_eq!(payload.sender_id.as_deref(), Some("987654321"));
+        assert_eq!(payload.conversation_id.as_deref(), Some("1122334455"));
+    }
+
+    #[test]
+    fn robot_callback_realistic_text_payload_parses() {
+        // Full realistic DingTalk text callback with timestamps as integers.
+        let data = serde_json::json!({
+            "msgId": "msg-real-1",
+            "senderNick": "tester",
+            "isAdmin": false,
+            "chatbotCorpId": "dingcorp",
+            "senderStaffId": "staff-real",
+            "sessionWebhookExpiredTime": 1786437210268i64,
+            "createAt": 1786437348372i64,
+            "senderCorpId": "corp-real",
+            "conversationType": "2",
+            "senderId": "uid-real",
+            "conversationTitle": "test group",
+            "isInAtList": true,
+            "conversationId": "cid-real",
+            "atUsers": [],
+            "chatbotUserId": "bot-real",
+            "msgtype": "text",
+            "text": { "content": "@OmniNova 123" }
+        });
+
+        let envelope = StreamEnvelope {
+            spec_version: None,
+            frame_type: "CALLBACK".to_string(),
+            headers: StreamHeaders {
+                app_id: None,
+                connection_id: None,
+                content_type: Some("application/json".to_string()),
+                message_id: Some("stream-envelope-1".to_string()),
+                time: None,
+                topic: TOPIC_ROBOT.to_string(),
+            },
+            data: data.to_string(),
+        };
+        let payload = parse_robot_payload(&envelope).unwrap();
+        assert_eq!(payload.msg_id, "msg-real-1");
+        assert_eq!(payload.sender_nick.as_deref(), Some("tester"));
+        assert_eq!(payload.sender_staff_id.as_deref(), Some("staff-real"));
+        assert_eq!(payload.conversation_id.as_deref(), Some("cid-real"));
+        assert_eq!(payload.session_webhook_expired_time, Some(1786437210268));
+        assert_eq!(payload.create_at, Some(1786437348372));
+        assert_eq!(payload.msg_type.as_deref(), Some("text"));
+        assert_eq!(payload.text.as_ref().unwrap().content, "@OmniNova 123");
+    }
+
+    #[tokio::test]
+    async fn parsed_robot_callback_reaches_enqueue() {
+        let json = serde_json::json!({
+            "msgId": "msg-enqueue-1",
+            "conversationType": "2",
+            "senderStaffId": "staff-enq",
+            "conversationId": "conv-enq",
+            "sessionWebhookExpiredTime": 1786437210268i64,
+            "msgtype": "text",
+            "text": { "content": "hello worker" }
+        });
+        let envelope = StreamEnvelope {
+            spec_version: None,
+            frame_type: "CALLBACK".to_string(),
+            headers: StreamHeaders {
+                app_id: None,
+                connection_id: None,
+                content_type: Some("application/json".to_string()),
+                message_id: Some("stream-enqueue-1".to_string()),
+                time: None,
+                topic: TOPIC_ROBOT.to_string(),
+            },
+            data: json.to_string(),
+        };
+        let runtime = Arc::new(crate::gateway::GatewayRuntime::new(
+            crate::config::Config::default(),
+        ));
+        let (sender, mut receiver) = mpsc::channel(4);
+        *runtime.dingtalk_job_sender.write().await = Some(sender);
+        let (mut socket, sent) = RecordingSink::new();
+
+        handle_robot_callback(&mut socket, &runtime, &envelope)
+            .await
+            .unwrap();
+
+        let job = receiver.try_recv().expect("parsed callback must reach queue");
+        assert_eq!(job.inbound.text, "hello worker");
+        assert_eq!(sent.lock().unwrap().len(), 1, "enqueue success must ACK");
+    }
+
+    #[test]
+    fn malformed_core_text_payload_still_rejected() {
+        fn envelope(data: serde_json::Value) -> StreamEnvelope {
+            StreamEnvelope {
+                spec_version: None,
+                frame_type: "CALLBACK".to_string(),
+                headers: StreamHeaders {
+                    app_id: None,
+                    connection_id: None,
+                    content_type: Some("application/json".to_string()),
+                    message_id: Some("malformed-core".to_string()),
+                    time: None,
+                    topic: TOPIC_ROBOT.to_string(),
+                },
+                data: data.to_string(),
+            }
+        }
+
+        let missing_content = envelope(serde_json::json!({
+            "msgId": "msg-bad-text",
+            "conversationType": "2",
+            "msgtype": "text",
+            "text": {}
+        }));
+        assert!(
+            parse_robot_payload(&missing_content).is_err(),
+            "missing text.content must be rejected"
+        );
+
+        let missing_text = envelope(serde_json::json!({
+            "msgId": "msg-no-text",
+            "conversationType": "2",
+            "msgtype": "text"
+        }));
+        assert_eq!(
+            parse_robot_payload(&missing_text).unwrap_err(),
+            "core_error:missing_text"
+        );
+
+        // Missing required msgId must also fail.
+        let missing_id = envelope(serde_json::json!({
+            "conversationType": "2",
+            "msgtype": "text",
+            "text": { "content": "no id" }
+        }));
+        assert!(
+            parse_robot_payload(&missing_id).is_err(),
+            "missing msgId must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_robot_callback_is_not_acked_as_success() {
+        let envelope = StreamEnvelope {
+            spec_version: None,
+            frame_type: "CALLBACK".to_string(),
+            headers: StreamHeaders {
+                app_id: None,
+                connection_id: None,
+                content_type: Some("application/json".to_string()),
+                message_id: Some("stream-malformed-1".to_string()),
+                time: None,
+                topic: TOPIC_ROBOT.to_string(),
+            },
+            data: serde_json::json!({
+                "msgId": "msg-malformed-1",
+                "conversationType": "2",
+                "msgtype": "text"
+            })
+            .to_string(),
+        };
+        let runtime = Arc::new(crate::gateway::GatewayRuntime::new(
+            crate::config::Config::default(),
+        ));
+        let (mut socket, sent) = RecordingSink::new();
+
+        handle_robot_callback(&mut socket, &runtime, &envelope)
+            .await
+            .unwrap();
+
+        assert!(sent.lock().unwrap().is_empty(), "parse failure must not ACK");
+    }
+
+    #[test]
+    fn sensitive_fields_not_visible_in_debug() {
+        // Debug formatting must never expose sessionWebhook / senderId /
+        // conversationId / robotCode raw values.
+        let json = serde_json::json!({
+            "msgId": "SECRET_MESSAGE_ID",
+            "conversationType": "2",
+            "senderNick": "SECRET_NICK",
+            "senderStaffId": "SECRET_STAFF_ID",
+            "senderId": "SECRET_SENDER_123",
+            "conversationId": "SECRET_CONV_456",
+            "robotCode": "SECRET_ROBOT_789",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/send?access_token=SECRET_TOKEN_ABC",
+            "sessionWebhookExpiredTime": 1786437210268i64,
+            "msgtype": "text",
+            "text": { "content": "SECRET_MESSAGE_BODY" }
+        });
+
+        let payload: RobotPayload = serde_json::from_value(json).unwrap();
+        let debug_str = format!("{:?}", payload);
+
+        assert!(!debug_str.contains("SECRET_MESSAGE_ID"));
+        assert!(!debug_str.contains("SECRET_NICK"));
+        assert!(!debug_str.contains("SECRET_STAFF_ID"));
+        assert!(!debug_str.contains("SECRET_SENDER_123"));
+        assert!(!debug_str.contains("SECRET_CONV_456"));
+        assert!(!debug_str.contains("SECRET_ROBOT_789"));
+        assert!(!debug_str.contains("SECRET_TOKEN_ABC"));
+        assert!(!debug_str.contains("oapi.dingtalk.com"));
+        assert!(!debug_str.contains("SECRET_MESSAGE_BODY"));
+    }
+
+    #[test]
+    fn robot_payload_field_types_logger_is_safe() {
+        // Type logger outputs key=type pairs only; no values, no secrets.
+        let data = r#"{
+            "msgId": "msg-log-1",
+            "SECRET_FIELD_WITH_VALUE": "must-not-appear",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/send?access_token=TOP_SECRET",
+            "sessionWebhookExpiredTime": 1786437210268,
+            "createAt": 1786437348372,
+            "conversationType": "2",
+            "text": { "content": "hello" }
+        }"#;
+
+        let summary = build_robot_payload_field_types(data)
+            .expect("valid payload must produce a type summary");
+
+        assert!(summary.contains("sessionWebhookExpiredTime=number"), "summary: {summary}");
+        assert!(summary.contains("createAt=number"), "summary: {summary}");
+        assert!(summary.contains("conversationType=string"), "summary: {summary}");
+        assert!(summary.contains("text=object"), "summary: {summary}");
+        assert!(!summary.contains("SECRET_FIELD_WITH_VALUE"));
+        assert!(
+            !summary.contains("TOP_SECRET"),
+            "type logger leaked a secret: {summary}"
+        );
+        assert!(
+            !summary.contains("oapi.dingtalk.com"),
+            "type logger leaked a URL: {summary}"
+        );
+    }
+
+    #[test]
+    fn log_robot_payload_field_types_does_not_panic_on_bad_json() {
+        assert_eq!(build_robot_payload_field_types("not-json"), None);
+        assert_eq!(build_robot_payload_field_types(""), None);
+        assert_eq!(build_robot_payload_field_types("[]"), None);
     }
 
     #[test]

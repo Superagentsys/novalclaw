@@ -4,7 +4,7 @@
 
 use crate::channels::ChannelKind;
 use crate::channels::InboundMessage;
-use crate::gateway::dingtalk_store::{DingtalkStore, JobStatus};
+use crate::gateway::dingtalk_store::{DingtalkPanelContext, DingtalkStore, JobStatus};
 use crate::gateway::GatewayRuntime;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -438,6 +438,39 @@ async fn send_reply_via_session_webhook(
         .map_err(|error| format!("send_from_app_error:{error}"))
 }
 
+/// Send a detailed panel result through the same proven outbound path as an
+/// ordinary DingTalk reply. The context can route through a session webhook
+/// today and still retains conversation/robot/user fields for the existing
+/// sendFromApp fallback.
+pub(crate) async fn send_dingtalk_panel_reply(
+    runtime: &Arc<GatewayRuntime>,
+    context: &DingtalkPanelContext,
+    reply: &str,
+) -> Result<(), String> {
+    let inbound = panel_reply_inbound(context);
+    send_reply_via_session_webhook(runtime, &inbound, reply).await
+}
+
+pub(crate) fn panel_reply_inbound(context: &DingtalkPanelContext) -> InboundMessage {
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(value) = context.session_webhook.as_deref() {
+        metadata.insert("sessionWebhook".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = context.robot_code.as_deref() {
+        metadata.insert("robotCode".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = context.user_id.as_deref() {
+        metadata.insert("senderStaffId".to_string(), serde_json::json!(value));
+    }
+    InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: context.user_id.clone(),
+        session_id: context.conversation_id.clone(),
+        text: String::new(),
+        metadata,
+    }
+}
+
 const HTTP_CARD_UNAVAILABLE_TEXT: &str = "当前 DingTalk 连接使用 HTTP 模式。\n\nOmniNova 互动卡片仅在 Stream 模式下启用。\n如需使用可点击 Agent 菜单，请在 DingTalk 设置中切换到 Stream 模式。\n\n当前仍可通过文本命令使用 Gateway 状态、帮助和普通 Agent 对话。";
 const MISSING_CARD_TEMPLATE_TEXT: &str = "DingTalk 当前已使用 Stream 模式，但互动卡片模板尚未配置。\n\n请先在 OmniNova DingTalk 设置中填写 Card Template ID。\n当前仍可继续使用普通文本交互。";
 const CARD_STREAM_DISCONNECTED_TEXT: &str = "DingTalk 当前使用 Stream 模式，但 Stream 连接尚未就绪。\n\n互动卡片暂时不可用，请确认 DingTalk Stream 连接状态。\n当前仍可继续使用普通文本交互。";
@@ -572,9 +605,63 @@ async fn send_dingtalk_agent_menu_card(
         fallback_robot_code.as_deref(),
     )?;
     let token = fetch_dingtalk_access_token(&app_key, &app_secret).await?;
-    crate::gateway::dingtalk_card::create_and_deliver_menu_card(&token, &template_id, &target)
-        .await
-        .map(|_| ())
+    let out_track_id =
+        crate::gateway::dingtalk_card::create_and_deliver_menu_card(&token, &template_id, &target)
+            .await?;
+    let store = runtime
+        .dingtalk_store()
+        .ok_or_else(|| "dingtalk_store_unavailable".to_string())?;
+    let context = build_panel_context(&out_track_id, inbound, &target);
+    store.save_panel_context(context).await;
+    println!("[dingtalk-panel] context_saved=true");
+    Ok(())
+}
+
+pub(crate) fn build_panel_context(
+    out_track_id: &str,
+    inbound: &InboundMessage,
+    target: &crate::gateway::dingtalk_card::DingtalkCardTarget,
+) -> DingtalkPanelContext {
+    let (conversation_id, robot_code, target_user_id, space_id) = match target {
+        crate::gateway::dingtalk_card::DingtalkCardTarget::Group {
+            open_conversation_id,
+            robot_code,
+            user_id,
+        } => (
+            Some(open_conversation_id.clone()),
+            Some(robot_code.clone()),
+            user_id.clone(),
+            Some(format!("dtv1.card//IM_GROUP.{open_conversation_id}")),
+        ),
+        crate::gateway::dingtalk_card::DingtalkCardTarget::Direct {
+            user_id,
+            robot_code,
+        } => (
+            inbound.session_id.clone(),
+            Some(robot_code.clone()),
+            Some(user_id.clone()),
+            Some(format!("dtv1.card//IM_ROBOT.{user_id}")),
+        ),
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    DingtalkPanelContext::new(
+        out_track_id.to_string(),
+        conversation_id,
+        robot_code,
+        inbound
+            .metadata
+            .get("sessionWebhook")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        target_user_id.or_else(|| inbound.user_id.clone()),
+        space_id,
+        now_secs,
+    )
 }
 
 fn validate_dingtalk_card_outbound_mode(outbound_mode: &str) -> Result<(), String> {
@@ -1186,6 +1273,56 @@ mod tests {
             menu_delivery_plan(DingtalkCardAvailability::MissingContext),
             DingtalkMenuDeliveryPlan::TextOnly(MISSING_CARD_CONTEXT_TEXT)
         );
+    }
+
+    #[test]
+    fn menu_create_context_retains_reply_route_without_exposing_it() {
+        let session_webhook = "https://oapi.dingtalk.com/robot/send?access_token=secret";
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "sessionWebhook".to_string(),
+            serde_json::json!(session_webhook),
+        );
+        let inbound = InboundMessage {
+            channel: ChannelKind::Dingtalk,
+            user_id: Some("user-secret".to_string()),
+            session_id: Some("conversation-secret".to_string()),
+            text: "menu".to_string(),
+            metadata,
+        };
+        let target = crate::gateway::dingtalk_card::DingtalkCardTarget::Group {
+            open_conversation_id: "conversation-secret".to_string(),
+            robot_code: "robot-secret".to_string(),
+            user_id: Some("user-secret".to_string()),
+        };
+        let context = build_panel_context("track-secret", &inbound, &target);
+        assert_eq!(context.session_webhook.as_deref(), Some(session_webhook));
+        assert_eq!(
+            context.conversation_id.as_deref(),
+            Some("conversation-secret")
+        );
+        let reply_inbound = panel_reply_inbound(&context);
+        assert_eq!(
+            reply_inbound.session_id.as_deref(),
+            Some("conversation-secret")
+        );
+        assert_eq!(
+            reply_inbound
+                .metadata
+                .get("sessionWebhook")
+                .and_then(serde_json::Value::as_str),
+            Some(session_webhook)
+        );
+        let debug = format!("{context:?}");
+        for secret in [
+            session_webhook,
+            "track-secret",
+            "conversation-secret",
+            "robot-secret",
+            "user-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]

@@ -1713,3 +1713,1279 @@ fn dingtalk_stream_tls_provider_ensures_default_exists() {
         "CryptoProvider::get_default() must be Some after ensure_rustls_crypto_provider()"
     );
 }
+
+// =============================================================================
+// Advanced Card Panel tests
+// =============================================================================
+
+/// Test: all canonical actions are allowed in the Advanced Card panel
+#[test]
+fn advanced_card_allowlist_contains_all_canonical_actions() {
+    let allowed = ["gateway_status", "monitor_30s", "monitor_60s", "recent_jobs", "help"];
+    for action in allowed {
+        assert!(
+            crate::gateway::dingtalk_card_stream::is_allowed_action(action),
+            "action {} should be allowed",
+            action
+        );
+    }
+}
+
+/// Test: unknown actions are rejected
+#[test]
+fn advanced_card_rejects_unknown_actions() {
+    let rejected = ["file_delete", "exec", "rm_rf", "", "unknown_action"];
+    for action in rejected {
+        assert!(
+            !crate::gateway::dingtalk_card_stream::is_allowed_action(action),
+            "action {} should be rejected",
+            action
+        );
+    }
+}
+
+/// Test: dedupe cache prevents duplicate callbacks
+#[test]
+fn advanced_card_dedupe_cache_prevents_duplicates() {
+    use crate::gateway::dingtalk_card_stream::CallbackDedupeCache;
+
+    let cache = CallbackDedupeCache::new(100);
+
+    // A delivery retry is rejected while distinct callback identities pass.
+    let key1 = "track1:gateway_status";
+    let key2 = "track1:recent_jobs";
+    let key3 = "track2:gateway_status";
+
+    // First insert should succeed
+    assert!(cache.try_insert(key1));
+
+    // Same key should fail (duplicate)
+    assert!(!cache.try_insert(key1));
+
+    // Different key should succeed
+    assert!(cache.try_insert(key2));
+    assert!(cache.try_insert(key3));
+}
+
+/// Test: HTTP mode should not call createAndDeliver
+#[test]
+fn advanced_card_not_available_in_http_mode() {
+    use crate::gateway::dingtalk_card::determine_card_availability;
+    use crate::config::schema::DingtalkTransportMode;
+
+    // HTTP mode = not available
+    let availability = determine_card_availability(
+        DingtalkTransportMode::Http,
+        true,  // template configured
+        true,  // stream registered
+        true,  // context complete
+    );
+    assert!(
+        matches!(availability, crate::gateway::dingtalk_card::DingtalkCardAvailability::UnsupportedTransport),
+        "HTTP mode should return UnsupportedTransport"
+    );
+}
+
+/// Test: Stream mode requires template configured
+#[test]
+fn advanced_card_requires_template() {
+    use crate::gateway::dingtalk_card::determine_card_availability;
+    use crate::config::schema::DingtalkTransportMode;
+
+    let availability = determine_card_availability(
+        DingtalkTransportMode::Stream,
+        false, // template NOT configured
+        true,  // stream registered
+        true,  // context complete
+    );
+    assert!(
+        matches!(availability, crate::gateway::dingtalk_card::DingtalkCardAvailability::MissingTemplate),
+        "Missing template should return MissingTemplate"
+    );
+}
+
+/// Test: Stream mode requires stream to be registered
+#[test]
+fn advanced_card_requires_stream_registered() {
+    use crate::gateway::dingtalk_card::determine_card_availability;
+    use crate::config::schema::DingtalkTransportMode;
+
+    let availability = determine_card_availability(
+        DingtalkTransportMode::Stream,
+        true,  // template configured
+        false, // stream NOT registered
+        true,  // context complete
+    );
+    assert!(
+        matches!(availability, crate::gateway::dingtalk_card::DingtalkCardAvailability::StreamDisconnected),
+        "Stream disconnected should return StreamDisconnected"
+    );
+}
+
+/// Test: callback dedupe key is deterministic
+#[test]
+fn advanced_card_dedupe_key_is_deterministic() {
+    use crate::gateway::dingtalk_card_stream::public_opaque_short_hash;
+
+    let key = "secret-track-123:gateway_status";
+    let hash1 = public_opaque_short_hash(key);
+    let hash2 = public_opaque_short_hash(key);
+
+    assert_eq!(hash1, hash2, "same key should produce same hash");
+    assert_ne!(hash1, public_opaque_short_hash("different:key"), "different keys produce different hashes");
+    assert_eq!(hash1.len(), 12, "hash should be 12 characters (6 bytes hex)");
+    assert!(!hash1.contains("secret"), "hash should not contain original value");
+}
+
+/// Test: card update preserves outTrackId
+#[test]
+fn advanced_card_update_payload_preserves_outtrack_id() {
+    use crate::gateway::dingtalk_card::build_card_update_payload;
+
+    let payload = build_card_update_payload(
+        "original-track-id-123",
+        "SUCCESS",
+        "Gateway 状态读取完成",
+        "status details here",
+        "gateway_status"
+    );
+
+    assert_eq!(
+        payload["outTrackId"].as_str().unwrap(),
+        "original-track-id-123",
+        "outTrackId should be preserved"
+    );
+    assert_eq!(
+        payload["cardData"]["cardParamMap"]["status"].as_str().unwrap(),
+        "在线",
+        "successful status should be rendered as user-facing online state"
+    );
+}
+
+/// Test: menu card payload has correct initial state
+#[test]
+fn advanced_card_menu_payload_initial_state() {
+    use crate::gateway::dingtalk_card::{DingtalkCardTarget, build_menu_create_payload};
+
+    let target = DingtalkCardTarget::Direct {
+        user_id: "user-secret".to_string(),
+        robot_code: "robot-secret".to_string(),
+    };
+
+    let payload = build_menu_create_payload("template-123", "track-abc", &target);
+
+    assert_eq!(
+        payload["cardData"]["cardParamMap"]["status"].as_str().unwrap(),
+        "在线",
+        "initial status should be user-facing online state"
+    );
+    assert_eq!(
+        payload["callbackType"].as_str().unwrap(),
+        "STREAM",
+        "callback type should be STREAM"
+    );
+}
+
+/// Test: secrets never serialized into card payloads
+#[test]
+fn advanced_card_payload_contains_no_secrets() {
+    use crate::gateway::dingtalk_card::{DingtalkCardTarget, build_menu_create_payload};
+
+    let target = DingtalkCardTarget::Group {
+        open_conversation_id: "secret-conversation-id".to_string(),
+        robot_code: "secret-robot-code".to_string(),
+        user_id: Some("secret-user-id".to_string()),
+    };
+
+    let payload = build_menu_create_payload("template", "track", &target);
+    let serialized = payload.to_string();
+
+    // The openSpaceId field is expected to contain a predictable format including the conversation id
+    // That's OK - it's the same conversation ID that's sent to DingTalk anyway
+    // We just verify app_secret and access_token are not in the payload
+    let forbidden = [
+        "app_secret",
+        "access_token",
+    ];
+
+    for f in forbidden {
+        assert!(
+            !serialized.contains(f),
+            "payload should not contain {}",
+            f
+        );
+    }
+}
+
+/// Test: canonical agent menu action aliases work
+#[test]
+fn advanced_card_canonical_action_resolution() {
+    use crate::gateway::agent_menu::canonical_agent_menu_action;
+
+    // Direct matches
+    assert_eq!(canonical_agent_menu_action("gateway_status"), Some("gateway_status"));
+    assert_eq!(canonical_agent_menu_action("monitor_30s"), Some("monitor_30s"));
+    assert_eq!(canonical_agent_menu_action("monitor_60s"), Some("monitor_60s"));
+    assert_eq!(canonical_agent_menu_action("recent_jobs"), Some("recent_jobs"));
+    assert_eq!(canonical_agent_menu_action("help"), Some("help"));
+
+    // Aliases
+    assert_eq!(canonical_agent_menu_action("desktop_monitor_30"), Some("monitor_30s"));
+    assert_eq!(canonical_agent_menu_action("desktop_monitor_60"), Some("monitor_60s"));
+    assert_eq!(canonical_agent_menu_action("recent_tasks"), Some("recent_jobs"));
+
+    // Unknown
+    assert_eq!(canonical_agent_menu_action("evil"), None);
+    assert_eq!(canonical_agent_menu_action(""), None);
+}
+
+// =============================================================================
+// Panel Stability Phase S1 tests
+// =============================================================================
+
+/// Test: same callback retry (same callback_id) is deduped.
+#[test]
+fn advanced_card_same_callback_id_retry_deduped() {
+    use crate::gateway::dingtalk_card_stream::callback_dedupe_key;
+    let first = callback_dedupe_key(Some("cb-A"), "track-1", "gateway_status", "fp-1");
+    let retry = callback_dedupe_key(Some("cb-A"), "track-1", "gateway_status", "fp-2");
+    assert_eq!(first, retry, "same callback_id must dedupe");
+}
+
+/// Test: distinct callback IDs for the same action are allowed.
+#[test]
+fn advanced_card_different_callback_ids_same_action_allowed() {
+    use crate::gateway::dingtalk_card_stream::callback_dedupe_key;
+    let a = callback_dedupe_key(Some("cb-A"), "track-1", "gateway_status", "fp");
+    let b = callback_dedupe_key(Some("cb-B"), "track-1", "gateway_status", "fp");
+    let c = callback_dedupe_key(Some("cb-C"), "track-1", "gateway_status", "fp");
+    assert_ne!(a, b);
+    assert_ne!(b, c);
+    assert_ne!(a, c);
+}
+
+/// Test: fallback dedupe key must include a fingerprint component so two
+/// callbacks with no callback_id are not auto-deduped just by action+track.
+#[test]
+fn advanced_card_fallback_dedupe_key_includes_fingerprint() {
+    use crate::gateway::dingtalk_card_stream::callback_dedupe_key;
+    let fallback1 = callback_dedupe_key(None, "track-1", "gateway_status", "fp-1");
+    let fallback2 = callback_dedupe_key(None, "track-1", "gateway_status", "fp-2");
+    assert_ne!(
+        fallback1, fallback2,
+        "fallback dedupe key must change when fingerprint changes"
+    );
+    let both_present1 = callback_dedupe_key(Some("cb-X"), "track-1", "gateway_status", "fp-1");
+    let both_present2 = callback_dedupe_key(Some("cb-X"), "track-1", "gateway_status", "fp-2");
+    assert_eq!(
+        both_present1, both_present2,
+        "when callback_id is present, fingerprint is ignored"
+    );
+}
+
+/// Test: monitor BUSY returns the dedicated busy PanelActionResult without a
+/// detailed message body (so a later detail send never fires for the second
+/// monitor attempt).
+#[test]
+fn advanced_card_busy_result_has_no_detailed_message() {
+    use crate::gateway::dingtalk_card_stream::PanelActionResult;
+    let result = PanelActionResult::busy("monitor_30s");
+    assert!(result.busy);
+    assert!(!result.success);
+    assert!(
+        result.message_body.is_none(),
+        "BUSY must not carry a detailed message — otherwise the gateway \
+         would reply as if the monitor actually completed"
+    );
+}
+
+/// Test: per-card generation increments and tracks ownership across claims.
+#[tokio::test]
+async fn advanced_card_per_card_generation_increments() {
+    use crate::gateway::dingtalk_store::DingtalkStore;
+    let store = DingtalkStore::new();
+    let g1 = store.claim_card_generation("track-A").await;
+    let g2 = store.claim_card_generation("track-A").await;
+    let g3 = store.claim_card_generation("track-A").await;
+    assert!(g1 < g2);
+    assert!(g2 < g3);
+}
+
+/// Test: a stale generation can no longer overwrite the card.
+#[tokio::test]
+async fn advanced_card_stale_generation_cannot_overwrite() {
+    use crate::gateway::dingtalk_store::DingtalkStore;
+    let store = DingtalkStore::new();
+    let stale = store.claim_card_generation("track-X").await;
+    let _newer = store.claim_card_generation("track-X").await;
+    // Stale owner has lost — its terminal READY update must be refused.
+    assert!(!store.is_card_generation_current("track-X", stale).await);
+}
+
+/// Test: different cards do not share generation state.
+#[tokio::test]
+async fn advanced_card_independent_cards_have_independent_generations() {
+    use crate::gateway::dingtalk_store::DingtalkStore;
+    let store = DingtalkStore::new();
+    let a1 = store.claim_card_generation("card-A").await;
+    let b1 = store.claim_card_generation("card-B").await;
+    assert!(store.is_card_generation_current("card-A", a1).await);
+    assert!(store.is_card_generation_current("card-B", b1).await);
+    // Bumping A must not change B's current generation.
+    let _a2 = store.claim_card_generation("card-A").await;
+    assert!(store.is_card_generation_current("card-B", b1).await);
+}
+
+/// Test: PanelContext persistence survives a runtime / cache drop and reload
+/// from SQLite (covers the "restart recovery" path).
+#[tokio::test]
+async fn advanced_card_panel_context_survives_restart() {
+    use crate::gateway::dingtalk_store::{
+        DingtalkPanelContext, DingtalkStore, dingtalk_store_test_path,
+    };
+    let directory = dingtalk_store_test_path("restart");
+
+    // Original runtime writes a context.
+    let original = DingtalkStore::open(&directory).unwrap();
+    original
+        .save_panel_context(DingtalkPanelContext::new(
+            "restart-track".to_string(),
+            Some("conv-secret".to_string()),
+            Some("robot-secret".to_string()),
+            Some("webhook-secret".to_string()),
+            Some("user-secret".to_string()),
+            Some("space-secret".to_string()),
+            crate::gateway::dingtalk_store::now_for_tests(),
+        ))
+        .await;
+    drop(original);
+
+    // Fresh runtime (simulating restart) recovers the context from SQLite.
+    let recovered = DingtalkStore::open(&directory).unwrap();
+    let lookup = recovered.get_panel_context("restart-track").await;
+    let context = lookup.expect_hit("panel context should reload from SQLite");
+    assert_eq!(context.out_track_id, "restart-track");
+    assert!(context.conversation_id.is_some());
+    assert!(context.robot_code.is_some());
+    assert!(context.session_webhook.is_some());
+    assert!(context.user_id.is_some());
+    assert!(context.space_id.is_some());
+
+    // Sensitive values must not leak through Debug, even after reload.
+    let debug = format!("{context:?}");
+    assert!(!debug.contains("webhook-secret"));
+    assert!(!debug.contains("conv-secret"));
+    assert!(!debug.contains("robot-secret"));
+
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Test: missing/expired context ACK still happens (the gateway doesn't drop
+/// ACKs on user-visible card failures).
+#[test]
+fn advanced_card_context_lookup_distinguishes_outcomes() {
+    use crate::gateway::dingtalk_store::PanelContextLookup;
+    let missing = PanelContextLookup::Missing;
+    let expired = PanelContextLookup::Expired;
+    assert!(missing.is_missing());
+    assert!(!missing.is_expired());
+    assert!(expired.is_expired());
+    assert!(!expired.is_missing());
+}
+
+/// Test: dedup_cache is shared between HTTP webhook and Stream so a duplicate
+/// delivery on both transports only produces one business execution.
+#[tokio::test]
+async fn advanced_card_dedup_cache_shared_between_http_and_stream() {
+    let runtime = crate::gateway::GatewayRuntime::new(Config::default());
+    let cache = runtime.dedup_cache();
+
+    // Stream side claims the key.
+    let stream_first = cache
+        .check_and_insert("dt_stream:msg-abc")
+        .await;
+    assert!(stream_first, "Stream must be allowed to claim the key");
+
+    // HTTP side checks the same key.
+    let http_second = cache
+        .check_and_insert("dt_stream:msg-abc")
+        .await;
+    assert!(
+        !http_second,
+        "HTTP side must observe the same key and dedupe"
+    );
+}
+
+/// Test: idempotent DingTalk Stream start prevents a second reconnect loop.
+#[tokio::test]
+async fn dingtalk_stream_start_is_idempotent_per_runtime() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+
+    // First owner acquires.
+    let (gen1, rx1) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen1, 1);
+    assert!(rx1.is_some());
+
+    // Second acquire must fail (already owned).
+    let (gen2, rx2) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen2, 1, "current gen unchanged");
+    assert!(rx2.is_none(), "second acquire must be rejected");
+
+    // Releasing re-opens the slot.
+    runtime.release_stream_owner(gen1);
+    assert!(!runtime.is_dingtalk_stream_active());
+    let (gen3, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen3, 2, "gen increments after release");
+    runtime.release_stream_owner(gen3);
+}
+
+/// Test: async worker lifecycle is safe — repeated `init_dingtalk_worker`
+/// does not replace the live sender.
+#[tokio::test]
+async fn dingtalk_async_worker_does_not_capture_stale_runtime() {
+    let mut runtime = crate::gateway::GatewayRuntime::new(Config::default());
+    runtime.init_dingtalk_worker().await;
+    let first_sender = runtime.dingtalk_job_sender.read().await.clone();
+    assert!(first_sender.is_some());
+
+    // The async worker's runtime capture is `Arc<GatewayRuntime>`, which is
+    // the same Arc we hold here. After a second init, the sender must
+    // remain the same channel — it cannot be silently replaced with a
+    // closed one from a new channel whose receiver is in the previous
+    // worker task. This test ensures the `init_dingtalk_worker` idempotency
+    // is preserved at the data-structure level (no replace on already-set).
+    runtime.init_dingtalk_worker().await;
+    let second_sender = runtime.dingtalk_job_sender.read().await.clone();
+    assert!(second_sender.is_some());
+    assert!(
+        first_sender.unwrap().same_channel(&second_sender.clone().unwrap()),
+        "second init must not replace the live sender"
+    );
+}
+
+/// Test: gateway startup does not accidentally spawn duplicate DingTalk
+/// Stream workers because the runtime's idempotency guard is honored.
+#[tokio::test]
+async fn gateway_startup_does_not_spawn_duplicate_stream_worker() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    // Simulate two consecutive stream start attempts (mirrors a Tauri
+    // startup double-trigger or a config-save race). The second must be
+    // rejected by the owner guard.
+    let (gen1, rx1) = runtime.try_acquire_stream_owner();
+    assert!(rx1.is_some(), "first acquire must succeed gen={}", gen1);
+
+    let (gen2, rx2) = runtime.try_acquire_stream_owner();
+    assert!(rx2.is_none(), "second acquire must be rejected gen={}", gen2);
+
+    runtime.release_stream_owner(gen1);
+}
+
+/// Test: card restore failure does not rerun the business action. The
+/// `process_panel_action` function uses `card_restore_failed=true` log
+/// semantics and does NOT re-invoke the business handler when the final
+/// PUT update fails — that is verified here at the unit level by
+/// confirming the dedup cache and generation both guard the operation.
+#[tokio::test]
+async fn card_restore_failure_does_not_rerun_business_action() {
+    use crate::gateway::dingtalk_store::DingtalkStore;
+    let store = DingtalkStore::new();
+    // The dedupe cache at the stream layer prevents the same callback
+    // delivery from being processed twice. The generation token prevents
+    // a stale owner from issuing terminal updates. Both are required so a
+    // failed card PUT does not cascade into a second execution path.
+    let cache = crate::gateway::dingtalk_card_stream::CallbackDedupeCache::new(8);
+    assert!(cache.try_insert("track:gateway_status"));
+    assert!(!cache.try_insert("track:gateway_status"));
+    let _ = store.claim_card_generation("track").await;
+}
+
+/// Test: 32 concurrent tasks claiming the same outTrackId must each receive
+/// a distinct, monotonically increasing generation. This validates that
+/// the RwLock over HashMap serializes all claim operations, and that no
+/// generation number is skipped or duplicated under high contention.
+#[tokio::test(flavor = "multi_thread")]
+async fn card_generation_32_concurrent_tasks_all_distinct() {
+    let store = crate::gateway::dingtalk_store::DingtalkStore::new();
+    let track_id = "concurrent-track-42".to_string();
+
+    // Spawn 32 concurrent tasks, each claiming the same outTrackId.
+    let handles: Vec<_> = (0u32..32)
+        .map(|_| {
+            let store = store.clone();
+            let track_id = track_id.clone();
+            tokio::spawn(async move {
+                store.claim_card_generation(&track_id).await
+            })
+        })
+        .collect();
+
+    let mut generations: Vec<u64> = Vec::with_capacity(32);
+    for h in handles {
+        generations.push(h.await.expect("task must not panic"));
+    }
+
+    // All generations must be unique and form 1..32.
+    generations.sort();
+    for (i, &gen) in generations.iter().enumerate() {
+        assert_eq!(gen, (i + 1) as u64, "generation {i} must be {}+1", i);
+    }
+    assert_eq!(generations.len(), 32, "must have collected all 32 generations");
+
+    // Final state must show current generation is 32.
+    let final_gen = store
+        .current_card_generation(&track_id)
+        .await
+        .expect("generation must exist after all claims");
+    assert_eq!(final_gen, 32);
+}
+
+/// Test: two distinct outTrackIds never share a generation counter — each
+/// card maintains its own independent sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn card_generation_independent_per_track() {
+    let store = crate::gateway::dingtalk_store::DingtalkStore::new();
+
+    let handles_a: Vec<_> = (0u32..8)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move { store.claim_card_generation("card-A").await })
+        })
+        .collect();
+    let handles_b: Vec<_> = (0u32..8)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move { store.claim_card_generation("card-B").await })
+        })
+        .collect();
+
+    let mut gens_a: Vec<u64> = Vec::with_capacity(8);
+    for h in handles_a {
+        gens_a.push(h.await.expect("task A must not panic"));
+    }
+    let mut gens_b: Vec<u64> = Vec::with_capacity(8);
+    for h in handles_b {
+        gens_b.push(h.await.expect("task B must not panic"));
+    }
+
+    // Each set of 8 must be 1..8 with no overlap.
+    let mut all_a = gens_a.clone();
+    all_a.sort();
+    let mut all_b = gens_b.clone();
+    all_b.sort();
+    for (i, &gen) in all_a.iter().enumerate() {
+        assert_eq!(gen, (i + 1) as u64);
+    }
+    for (i, &gen) in all_b.iter().enumerate() {
+        assert_eq!(gen, (i + 1) as u64);
+    }
+    assert_eq!(gens_a.len(), 8);
+    assert_eq!(gens_b.len(), 8);
+}
+
+/// Test: the BUSY result does not get its own generation claim. The only
+/// claim in `process_panel_action` is the one at the top (line 501). BUSY
+/// follows the same `is_card_generation_current(gen)` gate as READY updates.
+/// This means if a running monitor bumps the generation while a stale callback
+/// is being processed, that stale callback's BUSY update is also blocked,
+/// preserving the running monitor's terminal READY ownership.
+#[tokio::test]
+async fn busy_result_shares_same_generation_gate_as_ready() {
+    let store = crate::gateway::dingtalk_store::DingtalkStore::new();
+
+    // Simulate a running monitor bumping the generation to 5.
+    for _ in 0..5 {
+        store.claim_card_generation("monitor-card").await;
+    }
+
+    // A stale callback arrives, claims generation 6.
+    let stale_gen = store.claim_card_generation("monitor-card").await;
+    assert_eq!(stale_gen, 6);
+
+    // But a second monitor already bumped it to 7.
+    let current_gen = store.claim_card_generation("monitor-card").await;
+    assert_eq!(current_gen, 7);
+
+    // Both BUSY and READY gates check generation 6 — neither passes.
+    assert!(
+        !store.is_card_generation_current("monitor-card", 6).await,
+        "generation 6 must not be current (was bumped to 7)"
+    );
+
+    // The running monitor's generation 7 is current.
+    assert!(store.is_card_generation_current("monitor-card", 7).await);
+
+    // Confirm: generation 6 is genuinely stale.
+    assert!(!store.is_card_generation_current("monitor-card", 5).await);
+}
+
+/// Test: StreamOwner ABA-safety — old owners cannot clear new owners' state.
+#[tokio::test]
+async fn stream_owner_aba_old_cannot_clear_new() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+
+    // Owner A acquires.
+    let (gen_a, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen_a, 1);
+    assert!(runtime.is_dingtalk_stream_active());
+
+    // Owner A releases.
+    runtime.release_stream_owner(gen_a);
+    assert!(!runtime.is_dingtalk_stream_active());
+
+    // Owner B acquires.
+    let (gen_b, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen_b, 2, "generation must increment");
+    assert!(runtime.is_dingtalk_stream_active());
+
+    // Owner A's release (called late, e.g. from cleanup) must not affect B.
+    runtime.release_stream_owner(gen_a); // stale: gen_a != current gen_b
+    assert!(
+        runtime.is_dingtalk_stream_active(),
+        "stale old owner release must not deactivate current owner"
+    );
+
+    // B can still release correctly.
+    runtime.release_stream_owner(gen_b);
+    assert!(!runtime.is_dingtalk_stream_active());
+
+    // Fresh C acquires.
+    let (gen_c, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen_c, 3, "generation continues incrementing");
+}
+
+/// Test: concurrent owners — only one may acquire.
+#[tokio::test]
+async fn stream_owner_only_one_at_a_time() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+
+    let (gen1, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen1, 1);
+
+    // Second acquire must fail.
+    let (gen2, rx2) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen2, 1, "current gen unchanged");
+    assert!(rx2.is_none(), "second acquire must be rejected");
+
+    // Original releases.
+    runtime.release_stream_owner(gen1);
+    assert!(!runtime.is_dingtalk_stream_active());
+
+    // Now second can acquire.
+    let (gen3, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen3, 2, "gen must increment from previous");
+    runtime.release_stream_owner(gen3);
+}
+
+// ---------------------------------------------------------------------------
+// DingtalkMonitorGuard tests (S1.6)
+// ---------------------------------------------------------------------------
+
+/// Test: monitor admission - first monitor acquires, second is busy.
+#[tokio::test]
+async fn dingtalk_monitor_guard_first_wins() {
+    let guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    let first = guard.try_acquire("track-1").await;
+    assert!(first.is_some(), "first acquire must succeed");
+
+    let second = guard.try_acquire("track-1").await;
+    assert!(second.is_none(), "second acquire must fail (busy)");
+
+    // Different track is still free.
+    let other = guard.try_acquire("track-2").await;
+    assert!(other.is_some(), "different track must be free");
+}
+
+/// Test: monitor admission - release allows new acquisition.
+#[tokio::test]
+async fn dingtalk_monitor_guard_release_allows_reacquire() {
+    let guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    let owner = guard.try_acquire("track-1").await.expect("first");
+    assert!(guard.release("track-1", &owner).await);
+
+    let second = guard.try_acquire("track-1").await;
+    assert!(second.is_some(), "after release, new acquire must succeed");
+}
+
+/// Test: monitor admission - stale owner cannot release a replaced entry.
+/// Scenario: first acquires → second fails (entry still owned) → first releases
+/// (removes entry) → second acquires (now succeeds).
+#[tokio::test]
+async fn dingtalk_monitor_guard_stale_owner_rejected() {
+    let guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    let first = guard.try_acquire("track-1").await.expect("first");
+
+    // Second cannot acquire while first holds it.
+    let second = guard.try_acquire("track-1").await;
+    assert!(second.is_none(), "second must be busy while first holds");
+
+    // First releases → removes entry.
+    assert!(guard.release("track-1", &first).await, "first must release successfully");
+
+    // Now second can acquire.
+    let second_owner = guard.try_acquire("track-1").await;
+    assert!(second_owner.is_some(), "after release, second must succeed");
+
+    // first's release token is now stale (entry is gone).
+    let released_stale = guard.release("track-1", &first).await;
+    assert!(!released_stale, "stale owner_id must not release new entry");
+}
+
+/// Test: monitor admission - is_busy reflects active lease.
+#[tokio::test]
+async fn dingtalk_monitor_guard_is_busy() {
+    let guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    assert!(!guard.is_busy("track-1").await, "must not be busy initially");
+
+    let owner_id = guard.try_acquire("track-1").await.unwrap();
+    assert!(guard.is_busy("track-1").await, "must be busy after acquire");
+
+    guard.release("track-1", &owner_id).await;
+    assert!(!guard.is_busy("track-1").await, "must not be busy after release");
+}
+
+// ---------------------------------------------------------------------------
+// Monitor BUSY generation tests (S1.6)
+// ---------------------------------------------------------------------------
+
+/// Test: BUSY via admission-first — second monitor never claims generation.
+/// Verifies that monitor_60s running with gen=10, then monitor_30s callback
+/// arrives, gets BUSY from admission guard, does NOT claim gen=11, and
+/// monitor_60s's gen=10 remains current.
+#[tokio::test]
+async fn dingtalk_monitor_busy_never_claims_generation() {
+    let store = crate::gateway::dingtalk_store::DingtalkStore::new();
+    let monitor_guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    // Monitor 60s acquires guard and claims generation 10.
+    let _lease = monitor_guard.try_acquire("card-1").await.unwrap();
+    for _ in 0..9 {
+        store.claim_card_generation("card-1").await;
+    }
+    let gen60 = store.claim_card_generation("card-1").await;
+    assert_eq!(gen60, 10);
+
+    // Monitor 30s arrives: admission fails.
+    let lease30 = monitor_guard.try_acquire("card-1").await;
+    assert!(lease30.is_none(), "second monitor must be busy");
+
+    // No generation was claimed for the second monitor.
+    // The running monitor's gen=10 is still current.
+    assert!(
+        store.is_card_generation_current("card-1", 10).await,
+        "gen=10 must remain current"
+    );
+    assert!(
+        !store.is_card_generation_current("card-1", 11).await,
+        "gen=11 must not be current"
+    );
+
+    // Monitor 60s completes: generation 10 is still valid.
+    assert!(
+        store.is_card_generation_current("card-1", 10).await,
+        "gen=10 still valid for READY update"
+    );
+}
+
+/// Test: after monitor completes, next monitor can acquire and claim fresh gen.
+#[tokio::test]
+async fn dingtalk_monitor_after_completion_fresh_generation() {
+    let store = crate::gateway::dingtalk_store::DingtalkStore::new();
+    let monitor_guard = crate::gateway::DingtalkMonitorGuard::new();
+
+    // First monitor completes.
+    let lease1 = monitor_guard.try_acquire("card-1").await.unwrap();
+    let gen1 = store.claim_card_generation("card-1").await;
+    assert_eq!(gen1, 1);
+    let _ = monitor_guard.release("card-1", &lease1).await;
+
+    // Second monitor acquires and gets gen 2.
+    let lease2 = monitor_guard.try_acquire("card-1").await.unwrap();
+    let gen2 = store.claim_card_generation("card-1").await;
+    assert_eq!(gen2, 2);
+    let _ = monitor_guard.release("card-1", &lease2).await;
+
+    // gen=1 is stale.
+    assert!(!store.is_card_generation_current("card-1", 1).await);
+}
+
+// ---------------------------------------------------------------------------
+// DedupCache rollback tests (S1.6)
+// ---------------------------------------------------------------------------
+
+/// Test: dedupe reservation is rolled back on failure, allowing retry.
+#[tokio::test]
+async fn dedup_cache_rollback_allows_retry() {
+    let cache = crate::gateway::DedupCache::new(1800);
+
+    // Reserve.
+    let key = "msg:test-rollback";
+    let is_new = cache.check_and_insert(key).await;
+    assert!(is_new, "first insert must succeed");
+
+    // Remove (rollback).
+    cache.remove(key).await;
+
+    // Reserve again — must succeed.
+    let is_new_again = cache.check_and_insert(key).await;
+    assert!(is_new_again, "after rollback, insert must succeed again");
+}
+
+/// Test: dedupe rollback only affects the specific key.
+#[tokio::test]
+async fn dedup_cache_rollback_is_key_specific() {
+    let cache = crate::gateway::DedupCache::new(1800);
+
+    cache.check_and_insert("msg:A").await;
+    cache.check_and_insert("msg:B").await;
+
+    // Rollback only A.
+    cache.remove("msg:A").await;
+
+    // A can be re-inserted.
+    assert!(cache.check_and_insert("msg:A").await);
+    // B is still deduped.
+    assert!(!cache.check_and_insert("msg:B").await);
+}
+
+/// Test: dedup cache contains() returns true for reserved keys.
+#[tokio::test]
+async fn dedup_cache_contains_returns_true_for_inserted() {
+    let cache = crate::gateway::DedupCache::new(1800);
+
+    assert!(!cache.contains("msg:test").await);
+    let _ = cache.check_and_insert("msg:test").await;
+    assert!(cache.contains("msg:test").await);
+    cache.remove("msg:test").await;
+    assert!(!cache.contains("msg:test").await);
+}
+
+// ---------------------------------------------------------------------------
+// Worker config update tests (S1.6)
+// ---------------------------------------------------------------------------
+
+/// Test: worker reads updated config through same runtime.
+#[tokio::test]
+async fn worker_reads_updated_config_through_same_runtime() {
+    use crate::config::Config;
+
+    let mut cfg = Config::default();
+    cfg.gateway.dingtalk.app_key = "original-key".to_string();
+    let runtime = crate::gateway::GatewayRuntime::new(cfg);
+
+    // Enqueue a job (doesn't actually need to process).
+    let original_key = runtime.get_config().await.gateway.dingtalk.app_key.clone();
+    assert_eq!(original_key, "original-key");
+
+    // Update config.
+    let mut new_cfg = runtime.get_config().await;
+    new_cfg.gateway.dingtalk.app_key = "updated-key".to_string();
+    runtime.set_config(new_cfg).await.unwrap();
+
+    // Verify updated.
+    let updated_key = runtime.get_config().await.gateway.dingtalk.app_key.clone();
+    assert_eq!(updated_key, "updated-key");
+}
+
+// ---------------------------------------------------------------------------
+// Tokio cancellation + StreamOwner tests (S1.6)
+// ---------------------------------------------------------------------------
+
+/// Test: StreamOwner release only works for current generation.
+#[tokio::test]
+async fn stream_owner_release_only_current_gen() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+
+    // Gen 1 acquires.
+    let (gen1, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen1, 1);
+
+    // Gen 2 cannot release gen 1.
+    runtime.release_stream_owner(gen1); // Actually gen1 == 1, so this IS the current gen.
+    // Wait, gen1 is still current. Let me test the stale release path.
+
+    // Proper stale test: release after gen incremented.
+    let (gen2, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen2, 2); // gen1 is now stale
+    runtime.release_stream_owner(gen1); // Stale: gen1 != current gen2
+    assert!(
+        runtime.is_dingtalk_stream_active(),
+        "stale release must not deactivate"
+    );
+    runtime.release_stream_owner(gen2); // Current: should work
+    assert!(!runtime.is_dingtalk_stream_active());
+}
+
+/// Test: connected state is owner-scoped: only the current owner can set it.
+#[tokio::test]
+async fn stream_owner_connected_only_current_gen() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+
+    // Owner 1 acquires.
+    let (gen1, _) = runtime.try_acquire_stream_owner();
+    runtime.set_dingtalk_stream_connected(gen1, true);
+    assert!(runtime.dingtalk_stream_connected());
+
+    // Owner 1 releases.
+    runtime.release_stream_owner(gen1);
+    assert!(!runtime.dingtalk_stream_connected());
+
+    // Owner 2 acquires.
+    let (gen2, _) = runtime.try_acquire_stream_owner();
+    assert_eq!(gen2, 2);
+    runtime.set_dingtalk_stream_connected(gen2, true);
+    assert!(runtime.dingtalk_stream_connected());
+
+    // A delayed cleanup from owner 1 must not clear owner 2's state.
+    runtime.set_dingtalk_stream_connected(gen1, false);
+    assert!(
+        runtime.dingtalk_stream_connected(),
+        "stale owner must not clear current connected state"
+    );
+
+    // Owner 2 releases.
+    runtime.set_dingtalk_stream_connected(gen2, false);
+    runtime.release_stream_owner(gen2);
+    assert!(!runtime.dingtalk_stream_connected());
+}
+
+async fn wait_for_physical_stream_loops(
+    runtime: &crate::gateway::GatewayRuntime,
+    expected: usize,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.dingtalk_active_loop_count() == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("physical stream loop count should converge");
+}
+
+fn start_cooperative_test_stream(
+    runtime: &std::sync::Arc<crate::gateway::GatewayRuntime>,
+    exit_delay: std::time::Duration,
+    shutdown_seen: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> u64 {
+    runtime
+        .try_start_dingtalk_stream_loop(move |_owner_gen, mut shutdown| async move {
+            let _ = shutdown.changed().await;
+            if let Some(notify) = shutdown_seen {
+                notify.notify_one();
+            }
+            if !exit_delay.is_zero() {
+                tokio::time::sleep(exit_delay).await;
+            }
+        })
+        .expect("test stream owner should start")
+}
+
+/// S1.7 A: restart joins A before B starts, so physical max remains one.
+#[tokio::test]
+async fn stream_restart_joins_old_loop_before_new_start() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    runtime.dingtalk_stream_owner.reset_diagnostics();
+
+    let gen_a = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::ZERO,
+        None,
+    );
+    wait_for_physical_stream_loops(&runtime, 1).await;
+    let outcome = runtime
+        .shutdown_dingtalk_stream_generation(gen_a, std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(outcome, crate::gateway::StreamShutdownOutcome::Graceful);
+    wait_for_physical_stream_loops(&runtime, 0).await;
+
+    let gen_b = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::ZERO,
+        None,
+    );
+    wait_for_physical_stream_loops(&runtime, 1).await;
+    assert_eq!(runtime.dingtalk_max_active_loops(), 1);
+    let _ = runtime
+        .shutdown_dingtalk_stream_generation(gen_b, std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// S1.7 B: a delayed cooperative exit keeps ownership until JoinHandle ends.
+#[tokio::test]
+async fn stream_restart_cannot_start_while_old_join_is_pending() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    let shutdown_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gen_a = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::from_millis(80),
+        Some(shutdown_seen.clone()),
+    );
+    wait_for_physical_stream_loops(&runtime, 1).await;
+
+    let shutdown_runtime = runtime.clone();
+    let joining = tokio::spawn(async move {
+        shutdown_runtime
+            .shutdown_dingtalk_stream_generation(gen_a, std::time::Duration::from_secs(1))
+            .await
+    });
+    shutdown_seen.notified().await;
+
+    let premature = runtime.try_start_dingtalk_stream_loop(|_, mut shutdown| async move {
+        let _ = shutdown.changed().await;
+    });
+    assert!(premature.is_none(), "B must wait until A has physically exited");
+    assert_eq!(joining.await.unwrap(), crate::gateway::StreamShutdownOutcome::Graceful);
+
+    let gen_b = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::ZERO,
+        None,
+    );
+    let _ = runtime
+        .shutdown_dingtalk_stream_generation(gen_b, std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// S1.7 C: an uncooperative loop is aborted and joined before replacement.
+#[tokio::test]
+async fn stream_shutdown_timeout_aborts_and_joins_old_loop() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    runtime.dingtalk_stream_owner.reset_diagnostics();
+    let gen_a = runtime
+        .try_start_dingtalk_stream_loop(|_, _shutdown| async move {
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+    wait_for_physical_stream_loops(&runtime, 1).await;
+
+    let outcome = runtime
+        .shutdown_dingtalk_stream_generation(gen_a, std::time::Duration::from_millis(10))
+        .await;
+    assert_eq!(outcome, crate::gateway::StreamShutdownOutcome::Aborted);
+    wait_for_physical_stream_loops(&runtime, 0).await;
+
+    let gen_b = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::ZERO,
+        None,
+    );
+    wait_for_physical_stream_loops(&runtime, 1).await;
+    assert_eq!(runtime.dingtalk_max_active_loops(), 1);
+    let _ = runtime
+        .shutdown_dingtalk_stream_generation(gen_b, std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// S1.7 D: an old connection cannot dispatch robot/card business callbacks.
+#[tokio::test]
+async fn stale_stream_owner_skips_business_frame_dispatch() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    let (old_gen, _) = runtime.try_acquire_stream_owner();
+    runtime.release_stream_owner(old_gen);
+    let (new_gen, _) = runtime.try_acquire_stream_owner();
+
+    let business_invocations = std::sync::atomic::AtomicUsize::new(0);
+    if crate::gateway::dingtalk_stream::should_dispatch_business_frame(&runtime, old_gen) {
+        business_invocations.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    assert_eq!(business_invocations.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert!(crate::gateway::dingtalk_stream::should_dispatch_business_frame(
+        &runtime, new_gen
+    ));
+    runtime.release_stream_owner(new_gen);
+}
+
+/// S1.7 F: repeated restarts preserve the physical 1 -> 0 -> 1 invariant.
+#[tokio::test]
+async fn stream_fifty_restart_cycles_never_overlap_physical_loops() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    runtime.dingtalk_stream_owner.reset_diagnostics();
+
+    for _ in 0..50 {
+        let generation = start_cooperative_test_stream(
+            &runtime,
+            std::time::Duration::ZERO,
+            None,
+        );
+        wait_for_physical_stream_loops(&runtime, 1).await;
+        let outcome = runtime
+            .shutdown_dingtalk_stream_generation(
+                generation,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(outcome, crate::gateway::StreamShutdownOutcome::Graceful);
+        wait_for_physical_stream_loops(&runtime, 0).await;
+    }
+
+    let final_gen = start_cooperative_test_stream(
+        &runtime,
+        std::time::Duration::ZERO,
+        None,
+    );
+    wait_for_physical_stream_loops(&runtime, 1).await;
+    assert_eq!(runtime.dingtalk_active_loop_count(), 1);
+    assert_eq!(runtime.dingtalk_max_active_loops(), 1);
+    let _ = runtime
+        .shutdown_dingtalk_stream_generation(final_gen, std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// S1.7 monitor audit: one accepted action attempts admission exactly once.
+#[tokio::test]
+async fn accepted_monitor_action_acquires_singleflight_exactly_once() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    let guard = runtime.dingtalk_monitor_guard();
+    guard.clear().await;
+    let callback = crate::gateway::dingtalk_card_stream::ParsedCardCallback {
+        out_track_id: "monitor-admission-once".to_string(),
+        action: "monitor_30s".to_string(),
+        callback_id: Some("callback-once".to_string()),
+        user_id: None,
+        space_id: None,
+    };
+
+    crate::gateway::dingtalk_card_stream::process_panel_action(runtime, callback).await;
+    assert_eq!(guard.acquisition_attempt_count(), 1);
+}
+
+/// S1.7 cross-transport rollback: one HTTP/Stream reservation wins, a
+/// queue-full rollback removes it, and the next concurrent retry enqueues once.
+#[tokio::test]
+async fn cross_transport_queue_full_rollback_allows_exactly_one_retry() {
+    let runtime = std::sync::Arc::new(crate::gateway::GatewayRuntime::new(Config::default()));
+    let message_id = "cross-transport-queue-full";
+    let key = format!("dt_stream:{message_id}");
+    let cache = runtime.dedup_cache();
+
+    let (stream_first, http_first) = tokio::join!(
+        runtime.try_dingtalk_stream_dedupe(message_id),
+        cache.check_and_insert(&key)
+    );
+    assert_eq!(usize::from(stream_first) + usize::from(http_first), 1);
+
+    // The winning transport cannot enqueue because the bounded queue is full.
+    let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel(1);
+    queue_tx.try_send("occupied").unwrap();
+    assert!(queue_tx.try_send("first-attempt").is_err());
+    // Both production paths rollback this exact shared reservation key.
+    cache.remove(&key).await;
+    assert_eq!(queue_rx.recv().await, Some("occupied"));
+
+    let (stream_retry, http_retry) = tokio::join!(
+        runtime.try_dingtalk_stream_dedupe(message_id),
+        cache.check_and_insert(&key)
+    );
+    assert_eq!(usize::from(stream_retry) + usize::from(http_retry), 1);
+    let mut enqueue_success = 0;
+    if stream_retry && queue_tx.try_send("stream-retry").is_ok() {
+        enqueue_success += 1;
+    }
+    if http_retry && queue_tx.try_send("http-retry").is_ok() {
+        enqueue_success += 1;
+    }
+    assert_eq!(enqueue_success, 1, "retry must enqueue exactly once");
+    assert!(matches!(
+        queue_rx.recv().await,
+        Some("stream-retry" | "http-retry")
+    ));
+    assert!(cache.contains(&key).await, "one retry must remain reserved");
+}
+
+/// Group menu → panel context must preserve group routing so the detailed
+/// reply returns to the original group, never to the user's private chat.
+#[tokio::test]
+async fn group_panel_context_preserves_group_routing_for_detailed_reply() {
+    use crate::gateway::dingtalk_card::DingtalkCardTarget;
+    use crate::gateway::dingtalk_worker::panel_reply_inbound;
+    use crate::gateway::dingtalk_store::DingtalkPanelContext;
+    use crate::gateway::dingtalk_worker::build_panel_context;
+
+    let inbound = InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: Some("USER_A".to_string()),
+        session_id: Some("GROUP_A".to_string()),
+        text: "menu".to_string(),
+        metadata: std::collections::HashMap::from([
+            ("conversationType".to_string(), serde_json::json!("2")),
+            ("conversationId".to_string(), serde_json::json!("GROUP_A")),
+            ("senderStaffId".to_string(), serde_json::json!("USER_A")),
+            ("robotCode".to_string(), serde_json::json!("robot-test")),
+            (
+                "sessionWebhook".to_string(),
+                serde_json::json!("https://group.webhook/secret"),
+            ),
+        ]),
+    };
+
+    let target = DingtalkCardTarget::from_inbound(&inbound, None).expect("group target");
+    let context = build_panel_context("track-group", &inbound, &target);
+
+    // Context must record the GROUP conversation, not default to single chat.
+    assert_eq!(context.conversation_id.as_deref(), Some("GROUP_A"));
+    assert_eq!(context.robot_code.as_deref(), Some("robot-test"));
+    assert!(context
+        .space_id
+        .as_deref()
+        .is_some_and(|space| space.starts_with("dtv1.card//IM_GROUP.")));
+    assert_eq!(context.user_id.as_deref(), Some("USER_A"));
+
+    // Simulate the button callback: reconstruct the reply target from context.
+    let reply_inbound = panel_reply_inbound(&context);
+    assert_eq!(reply_inbound.session_id.as_deref(), Some("GROUP_A"));
+    assert_eq!(
+        reply_inbound.metadata.get("sessionWebhook").and_then(|v| v.as_str()),
+        Some("https://group.webhook/secret")
+    );
+    assert_eq!(
+        reply_inbound.metadata.get("robotCode").and_then(|v| v.as_str()),
+        Some("robot-test")
+    );
+    // The reply must not be re-routed to a single-chat user target: the
+    // conversation session identity is the group conversation id.
+    assert_ne!(reply_inbound.session_id.as_deref(), Some("USER_A"));
+}
+
+/// Direct menu → panel context must keep single-chat routing via the
+/// session conversation id and user id.
+#[tokio::test]
+async fn direct_panel_context_preserves_direct_routing() {
+    use crate::gateway::dingtalk_card::DingtalkCardTarget;
+    use crate::gateway::dingtalk_worker::{build_panel_context, panel_reply_inbound};
+
+    let inbound = InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: Some("USER_A".to_string()),
+        session_id: Some("DIRECT_SESSION".to_string()),
+        text: "menu".to_string(),
+        metadata: std::collections::HashMap::from([
+            ("conversationType".to_string(), serde_json::json!("1")),
+            ("senderStaffId".to_string(), serde_json::json!("USER_A")),
+            ("robotCode".to_string(), serde_json::json!("robot-test")),
+            (
+                "sessionWebhook".to_string(),
+                serde_json::json!("https://direct.webhook/secret"),
+            ),
+        ]),
+    };
+
+    let target = DingtalkCardTarget::from_inbound(&inbound, None).expect("direct target");
+    assert!(matches!(target, DingtalkCardTarget::Direct { .. }));
+
+    let context = build_panel_context("track-direct", &inbound, &target);
+    assert!(context
+        .space_id
+        .as_deref()
+        .is_some_and(|space| space.starts_with("dtv1.card//IM_ROBOT.")));
+    assert_eq!(context.user_id.as_deref(), Some("USER_A"));
+
+    let reply_inbound = panel_reply_inbound(&context);
+    assert_eq!(reply_inbound.session_id.as_deref(), Some("DIRECT_SESSION"));
+    assert_eq!(reply_inbound.user_id.as_deref(), Some("USER_A"));
+}

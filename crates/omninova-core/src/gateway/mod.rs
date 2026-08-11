@@ -79,9 +79,9 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +132,21 @@ impl DedupCache {
 
         cache.insert(key.to_string(), now + Duration::from_secs(ttl_secs));
         true // New event
+    }
+
+    /// Remove a key from the dedup cache. Used to rollback a reservation when
+    /// enqueue fails (e.g. queue full), allowing retry without permanent dedupe.
+    async fn remove(&self, key: &str) {
+        let mut cache = self.inner.write().await;
+        cache.remove(key);
+    }
+
+    /// Check if a key is present (without modifying state).
+    async fn contains(&self, key: &str) -> bool {
+        let mut cache = self.inner.write().await;
+        let now = Instant::now();
+        cache.retain(|_, &mut expiry| now < expiry);
+        cache.contains_key(key)
     }
 
     /// Clear all cached entries. Intended for unit tests.
@@ -226,6 +241,98 @@ pub(crate) struct MonitorFlightGuard {
     inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, MonitorFlightEntry>>>,
     /// Minimum TTL for any guard entry
     min_ttl_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DingTalk Monitor single-flight guard
+// ---------------------------------------------------------------------------
+
+/// Per-card single-flight guard for DingTalk monitor actions. Prevents concurrent
+/// monitor executions on the same card: a second monitor callback sees BUSY
+/// and returns without claiming a card generation or starting a second monitor.
+#[derive(Debug, Clone)]
+pub(crate) struct DingtalkMonitorGuard {
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DingtalkMonitorEntry>>>,
+    #[cfg(test)]
+    acquisition_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct DingtalkMonitorEntry {
+    /// Opaque owner token: only this owner may release.
+    owner_id: String,
+    /// Absolute expiry instant.
+    expires_at: std::time::Instant,
+}
+
+impl DingtalkMonitorGuard {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            acquisition_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Try to acquire the single-flight slot for `out_track_id` with a 90s TTL.
+    /// Returns `Some(owner_token)` if free, `None` if busy.
+    async fn try_acquire(&self, out_track_id: &str) -> Option<String> {
+        #[cfg(test)]
+        self.acquisition_attempts.fetch_add(1, Ordering::AcqRel);
+        let owner_id = uuid::Uuid::new_v4().to_string();
+        let ttl = std::time::Duration::from_secs(90);
+        let now = std::time::Instant::now();
+        let mut guard = self.inner.write().await;
+        guard.retain(|_, entry| now < entry.expires_at);
+        if guard.contains_key(out_track_id) {
+            return None;
+        }
+        guard.insert(
+            out_track_id.to_string(),
+            DingtalkMonitorEntry {
+                owner_id: owner_id.clone(),
+                expires_at: now + ttl,
+            },
+        );
+        Some(owner_id)
+    }
+
+    /// Release the slot. Returns `true` only if the caller is still the owner.
+    async fn release(&self, out_track_id: &str, owner_id: &str) -> bool {
+        let mut guard = self.inner.write().await;
+        guard.retain(|_, entry| {
+            std::time::Instant::now() < entry.expires_at
+        });
+        let is_owner = guard
+            .get(out_track_id)
+            .is_some_and(|e| e.owner_id == owner_id);
+        if is_owner {
+            guard.remove(out_track_id);
+        }
+        is_owner
+    }
+
+    /// Check if a card is currently busy without changing state.
+    async fn is_busy(&self, out_track_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let guard = self.inner.read().await;
+        guard
+            .get(out_track_id)
+            .is_some_and(|e| now < e.expires_at)
+    }
+
+    /// Clear all entries. For tests.
+    #[cfg(test)]
+    pub(crate) async fn clear(&self) {
+        let mut guard = self.inner.write().await;
+        guard.clear();
+        self.acquisition_attempts.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquisition_attempt_count(&self) -> usize {
+        self.acquisition_attempts.load(Ordering::Acquire)
+    }
 }
 
 fn monitor_flight_key(chat_id: &str) -> String {
@@ -361,12 +468,281 @@ pub struct GatewayRuntime {
     /// DingTalk in-memory store for job tracking
     dingtalk_store: Option<Arc<dingtalk_store::DingtalkStore>>,
     /// Live DingTalk Stream connection state (unified for robot + card).
-    /// Replaces dingtalk_card_stream_connected for Stream mode.
     dingtalk_stream_connected: Arc<AtomicBool>,
+    /// Stream owner lifecycle: owner generation counter + shutdown flag + mutex.
+    /// The counter prevents old owners from clearing new owners' state (ABA race).
+    /// Only the current owner may call release (Drop or explicit cleanup).
+    dingtalk_stream_owner: Arc<StreamOwner>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
     monitor_flights: Arc<MonitorFlightGuard>,
+    /// Per-card DingTalk monitor single-flight guard.
+    dingtalk_monitor_guard: Arc<DingtalkMonitorGuard>,
+}
+
+// ---------------------------------------------------------------------------
+// DingTalk Stream owner lifecycle
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DingTalk Stream owner lifecycle
+// ---------------------------------------------------------------------------
+
+/// Owner-aware Stream lifecycle guard using a generation counter to prevent
+/// ABA races: an old owner cannot clear a new owner's state because each
+/// start increments the generation. Only the current owner may release.
+pub(crate) struct StreamOwner {
+    /// Incremented on each start. Guards against the ABA pattern where
+    /// old_owner releases → new_owner starts (CAS succeeds) → old_owner cleanup
+    /// incorrectly clears new_owner.
+    generation: AtomicU64,
+    /// Set true when a stream is currently active on this runtime.
+    active: AtomicBool,
+    /// Business frames are accepted only while the current owner is running
+    /// and has not entered shutdown.
+    accepting_frames: AtomicBool,
+    connected: AtomicBool,
+    /// Physical loop counter for diagnostics: incremented when a loop starts,
+    /// decremented when a loop exits. Never goes above 1 in normal operation.
+    active_loops: AtomicUsize,
+    /// Maximum physical active loops observed (diagnostic).
+    max_active_loops: AtomicUsize,
+    /// The active reconnect loop's JoinHandle, if spawned.
+    /// Uses parking_lot::Mutex because shutdown is called from sync Drop.
+    loop_handle: parking_lot::Mutex<Option<OwnedStreamLoop>>,
+    /// Used to signal the reconnect loop to stop. Shared with the child task.
+    shutdown_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+}
+
+struct OwnedStreamLoop {
+    owner_gen: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamShutdownOutcome {
+    NotRunning,
+    StaleOwner,
+    Graceful,
+    Aborted,
+    JoinFailed,
+}
+
+struct PhysicalStreamLoopGuard {
+    owner: Arc<StreamOwner>,
+    owner_gen: u64,
+}
+
+impl PhysicalStreamLoopGuard {
+    fn new(owner: Arc<StreamOwner>, owner_gen: u64) -> Self {
+        let current = owner.active_loops.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut max = owner.max_active_loops.load(Ordering::Acquire);
+        while current > max {
+            match owner.max_active_loops.compare_exchange(
+                max,
+                current,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => max = observed,
+            }
+        }
+        Self { owner, owner_gen }
+    }
+}
+
+impl Drop for PhysicalStreamLoopGuard {
+    fn drop(&mut self) {
+        self.owner.active_loops.fetch_sub(1, Ordering::AcqRel);
+        self.owner.finish_loop(self.owner_gen);
+    }
+}
+
+impl StreamOwner {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            accepting_frames: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            active_loops: AtomicUsize::new(0),
+            max_active_loops: AtomicUsize::new(0),
+            loop_handle: parking_lot::Mutex::new(None),
+            shutdown_tx: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Atomically acquire the owner, create its cancellation channel, spawn
+    /// the reconnect loop, and retain the JoinHandle. There is no interval in
+    /// which an active owner exists without a lifecycle handle.
+    fn try_start_loop<F, Fut>(self: &Arc<Self>, build: F) -> Option<u64>
+    where
+        F: FnOnce(u64, watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tx_guard = self.shutdown_tx.lock();
+        let mut handle_guard = self.loop_handle.lock();
+        if self.active.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // A naturally completed task may leave a completed JoinHandle behind.
+        // Physical activity is already zero before active becomes false.
+        let _ = handle_guard.take();
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (tx, rx) = watch::channel(false);
+        self.active.store(true, Ordering::Release);
+        self.accepting_frames.store(true, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        *tx_guard = Some(tx);
+
+        let owner = self.clone();
+        let future = build(gen, rx);
+        let handle = tokio::spawn(async move {
+            let _physical_loop = PhysicalStreamLoopGuard::new(owner, gen);
+            future.await;
+        });
+        *handle_guard = Some(OwnedStreamLoop {
+            owner_gen: gen,
+            handle,
+        });
+        Some(gen)
+    }
+
+    /// Try to become the current owner and spawn the reconnect loop.
+    /// Returns (owner_gen, shutdown_rx) on success, or (current_gen, None) if
+    /// another owner is already active.
+    /// ABA-safe: increments generation so old owners cannot clear new owners.
+    fn try_acquire(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        let mut tx_guard = self.shutdown_tx.lock();
+        if self.active.load(Ordering::Acquire) {
+            return (self.generation.load(Ordering::Acquire), None);
+        }
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active.store(true, Ordering::Release);
+        self.accepting_frames.store(true, Ordering::Release);
+        let (tx, rx) = watch::channel(false);
+        *tx_guard = Some(tx);
+        (gen, Some(rx))
+    }
+
+    /// Signal cancellation without releasing ownership. Drop uses this only as
+    /// a last-resort safety net; normal stop/restart calls shutdown_and_join.
+    fn signal_shutdown(&self, owner_gen: u64) -> bool {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return false;
+        }
+        self.accepting_frames.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        if let Some(tx) = self.shutdown_tx.lock().as_ref() {
+            let _ = tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn shutdown_and_join(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        if !self.active.load(Ordering::Acquire) {
+            return StreamShutdownOutcome::NotRunning;
+        }
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        self.signal_shutdown(owner_gen);
+        let owned = self.loop_handle.lock().take();
+        let Some(mut owned) = owned else {
+            return StreamShutdownOutcome::JoinFailed;
+        };
+        if owned.owner_gen != owner_gen {
+            *self.loop_handle.lock() = Some(owned);
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        let outcome = match tokio::time::timeout(wait, &mut owned.handle).await {
+            Ok(Ok(())) => StreamShutdownOutcome::Graceful,
+            Ok(Err(_)) => StreamShutdownOutcome::JoinFailed,
+            Err(_) => {
+                owned.handle.abort();
+                let _ = owned.handle.await;
+                StreamShutdownOutcome::Aborted
+            }
+        };
+        // PhysicalStreamLoopGuard performs the normal/abort cleanup. Keep this
+        // idempotent fallback for a panicking child.
+        self.finish_loop(owner_gen);
+        outcome
+    }
+
+    fn finish_loop(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.accepting_frames.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.shutdown_tx.lock().take();
+    }
+
+    /// Release this owner. Only called from Guard::Drop as a safety net.
+    /// The primary shutdown path is shutdown_and_join().
+    fn release(&self, owner_gen: u64) {
+        self.finish_loop(owner_gen);
+    }
+
+    /// Set connected=true. Only succeeds if caller is the current owner.
+    fn set_connected(&self, owner_gen: u64, value: bool) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        if value && !self.accepting_frames.load(Ordering::Acquire) {
+            return;
+        }
+        self.connected.store(value, Ordering::Release);
+    }
+
+    /// Returns true only for the current owner.
+    fn is_owner(&self, owner_gen: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == owner_gen
+            && self.active.load(Ordering::Acquire)
+            && self.accepting_frames.load(Ordering::Acquire)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Returns the current number of physical active loops (diagnostic).
+    pub(crate) fn active_loop_count(&self) -> usize {
+        self.active_loops.load(Ordering::Acquire)
+    }
+
+    /// Returns the maximum observed active loops (diagnostic).
+    pub(crate) fn max_active_loop_count(&self) -> usize {
+        self.max_active_loops.load(Ordering::Acquire)
+    }
+
+    /// Reset diagnostic counters. For tests only.
+    #[cfg(test)]
+    pub(crate) fn reset_diagnostics(&self) {
+        self.active_loops.store(0, Ordering::Release);
+        self.max_active_loops.store(0, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -488,8 +864,10 @@ impl GatewayRuntime {
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
             dingtalk_store: None,
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
+            dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
+            dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
         }
     }
 
@@ -511,8 +889,10 @@ impl GatewayRuntime {
             dingtalk_queue_len: Arc::new(RwLock::new(0)),
             dingtalk_store: None,
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
+            dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
+            dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
         }
     }
 
@@ -522,6 +902,10 @@ impl GatewayRuntime {
 
     pub(crate) fn monitor_flight_guard(&self) -> Arc<MonitorFlightGuard> {
         self.monitor_flights.clone()
+    }
+
+    pub(crate) fn dingtalk_monitor_guard(&self) -> Arc<DingtalkMonitorGuard> {
+        self.dingtalk_monitor_guard.clone()
     }
     
     /// Initialize the Feishu async worker with the given queue
@@ -544,7 +928,20 @@ impl GatewayRuntime {
         let worker_state = dingtalk_worker::DingtalkWorkerState::with_queue_len(
             self.dingtalk_queue_len.clone(),
         );
-        let store = Arc::new(dingtalk_store::DingtalkStore::new());
+        let config = self.get_config().await;
+        let config_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| home::home_dir().map(|home| home.join(".omninova")))
+            .unwrap_or_else(|| std::path::PathBuf::from(".omninova"));
+        let store = Arc::new(
+            dingtalk_store::DingtalkStore::open(&config_dir).unwrap_or_else(|error| {
+                println!("[dingtalk-panel] store_persistent=false reason={error}");
+                dingtalk_store::DingtalkStore::new()
+            }),
+        );
         self.dingtalk_store = Some(store.clone());
         let sender = worker_state.sender();
 
@@ -799,21 +1196,83 @@ impl GatewayRuntime {
         sender.as_ref().is_some_and(|sender| !sender.is_closed())
     }
 
-    pub(crate) fn set_dingtalk_stream_connected(&self, connected: bool) {
-        self.dingtalk_stream_connected
-            .store(connected, Ordering::Release);
+    /// Try to acquire Stream ownership. Returns (owner_gen, Some(shutdown_rx)) if
+    /// no other owner is active, or (current_gen, None) if already owned.
+    /// ABA-safe: increments generation counter so old owners cannot clear new owners.
+    pub(crate) fn try_acquire_stream_owner(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        self.dingtalk_stream_owner.try_acquire()
+    }
+
+    pub(crate) fn try_start_dingtalk_stream_loop<F, Fut>(&self, build: F) -> Option<u64>
+    where
+        F: FnOnce(u64, watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.dingtalk_stream_owner.try_start_loop(build)
+    }
+
+    /// Release Stream ownership. ABA-safe: only releases if `owner_gen` matches
+    /// the current owner, preventing old owners from clearing new ones.
+    pub(crate) fn release_stream_owner(&self, owner_gen: u64) {
+        self.dingtalk_stream_owner.release(owner_gen);
+    }
+
+    pub(crate) fn is_current_stream_owner(&self, owner_gen: u64) -> bool {
+        self.dingtalk_stream_owner.is_owner(owner_gen)
+    }
+
+    /// Check if a Stream is currently active on this runtime.
+    pub(crate) fn is_dingtalk_stream_active(&self) -> bool {
+        self.dingtalk_stream_owner.is_active()
+    }
+
+    /// Set connected state. Only the current owner (matching `owner_gen`) may set this.
+    pub(crate) fn set_dingtalk_stream_connected(&self, owner_gen: u64, value: bool) {
+        self.dingtalk_stream_owner.set_connected(owner_gen, value);
     }
 
     pub(crate) fn dingtalk_stream_connected(&self) -> bool {
-        self.dingtalk_stream_connected.load(Ordering::Acquire)
+        self.dingtalk_stream_owner.is_connected()
     }
 
     /// Check if DingTalk Stream is in Registered state (truly ready for business).
-    /// Note: This is currently a simplified check based on connected flag.
-    /// The full Registered state tracking is in the dingtalk_stream module.
     pub fn is_dingtalk_stream_registered(&self) -> bool {
-        // For now, registered = connected. Full state machine in dingtalk_stream module.
         self.dingtalk_stream_connected()
+    }
+
+    /// Signal the active reconnect loop to shut down without releasing its
+    /// physical ownership. Used only by Drop as a cancellation safety net.
+    pub(crate) fn signal_dingtalk_stream_shutdown(&self, owner_gen: u64) -> bool {
+        self.dingtalk_stream_owner.signal_shutdown(owner_gen)
+    }
+
+    pub(crate) async fn shutdown_dingtalk_stream_generation(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        self.dingtalk_stream_owner
+            .shutdown_and_join(owner_gen, wait)
+            .await
+    }
+
+    pub async fn shutdown_dingtalk_stream_and_join(&self) {
+        const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        let owner_gen = self.dingtalk_stream_owner.current_generation();
+        let outcome = self
+            .shutdown_dingtalk_stream_generation(owner_gen, STREAM_SHUTDOWN_TIMEOUT)
+            .await;
+        println!("[dingtalk-stream] lifecycle_join outcome={outcome:?}");
+    }
+
+    /// Number of physical active stream loops (diagnostic, should be 0 or 1).
+    pub(crate) fn dingtalk_active_loop_count(&self) -> usize {
+        self.dingtalk_stream_owner.active_loop_count()
+    }
+
+    /// Maximum observed active stream loops (diagnostic).
+    pub(crate) fn dingtalk_max_active_loops(&self) -> usize {
+        self.dingtalk_stream_owner.max_active_loop_count()
     }
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
@@ -2229,7 +2688,7 @@ impl GatewayRuntime {
         // Initialize DingTalk async worker
         self.init_dingtalk_worker().await;
         // Start unified DingTalk Stream transport (handles both robot and card topics)
-        let _dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
+        let mut dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
 
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
@@ -2329,7 +2788,11 @@ impl GatewayRuntime {
         }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        let serve_result = axum::serve(listener, app).await;
+        if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
+            stream_guard.shutdown().await;
+        }
+        serve_result?;
         Ok(())
     }
 }
@@ -5002,6 +5465,34 @@ async fn http_dingtalk_webhook(
         metadata,
     };
 
+    // 8a. Cross-transport dedupe: if DingTalk also delivered this message via
+    // the Stream transport (or via a retry), the Stream-side `try_dingtalk_stream_dedupe`
+    // call already inserted `dt_stream:<msgId>` into the shared `dedup_cache`.
+    // Re-check from the HTTP side so a duplicate delivery does not produce
+    // two replies. Without this guard, an HTTP+Stream hybrid setup would
+    // double-process every regular robot message.
+    if let Some(ref mid) = message_id {
+        let dedup_key = format!("dt_stream:{}", mid);
+        let dedup_cache = runtime.dedup_cache();
+        let is_new = dedup_cache.check_and_insert(&dedup_key).await;
+        if !is_new {
+            println!(
+                "[dingtalk-webhook] dedupe_shared=true msg_id_hash={}",
+                mid.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(12)
+                    .collect::<String>()
+                    .len()
+            );
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "deduped",
+                "reason": "stream_dedupe_hit"
+            })));
+        }
+    }
+
     // 9. Check if DingTalk worker is initialized
     let is_async_available = runtime.is_dingtalk_worker_initialized().await;
 
@@ -5038,9 +5529,15 @@ async fn http_dingtalk_webhook(
                 })));
             }
             Err(_) => {
+                // CRITICAL: rollback dedupe reservation so DingTalk can retry without
+                // permanent dedupe hit. This prevents message loss when queue is full.
+                if let Some(ref mid) = message_id {
+                    let dedup_key = format!("dt_stream:{}", mid);
+                    runtime.dedup_cache().remove(&dedup_key).await;
+                }
                 let queue_len = runtime.dingtalk_queue_len().await;
                 println!(
-                    "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={} result=failed",
+                    "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={} result=failed dedupe_rollback=true",
                     text_len,
                     queue_len
                 );
