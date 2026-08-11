@@ -1,6 +1,7 @@
 import React, { memo, useMemo, useState } from "react";
 import type { AgentRunStep } from "./types";
 import { getToolLabel } from "./types";
+import { UiIcon } from "../UiIcon";
 
 interface AgentRunEventCardProps {
   step: AgentRunStep;
@@ -77,9 +78,9 @@ function parseFileListCount(summary?: string): string | null {
 
 function StepIcon({ status }: { status: AgentRunStep["status"] }) {
   if (status === "running") return <span className="agent-run-step-spinner" aria-hidden />;
-  if (status === "error") return <span className="agent-run-step-icon agent-run-step-icon--error" aria-hidden>×</span>;
-  if (status === "warning") return <span className="agent-run-step-icon agent-run-step-icon--warning" aria-hidden>!</span>;
-  return <span className="agent-run-step-icon agent-run-step-icon--success" aria-hidden>✓</span>;
+  if (status === "error") return <span className="agent-run-step-icon agent-run-step-icon--error"><UiIcon name="close" size={11} /></span>;
+  if (status === "warning") return <span className="agent-run-step-icon agent-run-step-icon--warning"><UiIcon name="warning" size={11} /></span>;
+  return <span className="agent-run-step-icon agent-run-step-icon--success"><UiIcon name="check" size={11} /></span>;
 }
 
 function OutputBlock({ outputs, kind = "tool" }: { outputs: string[]; kind?: "tool" | "model" }) {

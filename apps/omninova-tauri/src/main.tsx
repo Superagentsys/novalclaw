@@ -2,6 +2,13 @@ import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import { ThemeProvider } from './theme/ThemeProvider.tsx'
+import { initializeTheme } from './theme/themeState.ts'
+
+initializeTheme()
+document.documentElement.dataset.terraFaction = 'rhine-lab'
+document.documentElement.dataset.terraDepth = 'moderate'
+document.documentElement.dataset.terraTemplate = 'dashboard'
 
 interface StartupErrorBoundaryState {
   errorMessage: string | null
@@ -57,7 +64,9 @@ if (!rootElement) {
   createRoot(rootElement).render(
     <StrictMode>
       <StartupErrorBoundary>
-        <App />
+        <ThemeProvider>
+          <App />
+        </ThemeProvider>
       </StartupErrorBoundary>
     </StrictMode>,
   )

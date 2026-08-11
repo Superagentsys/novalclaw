@@ -363,6 +363,20 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
       step.title = completedTitle(step.title, toolName, success, resultSummary);
       return;
     }
+
+    if (type === "approval_required") {
+      const id = stepIdFor(event, index);
+      const reason = stringField(event, "reason") || "该工具需要人工确认后才能继续。";
+      const step = ensureStep(
+        id,
+        toolName,
+        stringField(event, "title") || `需要授权：${toolName || "受限工具"}`
+      );
+      step.status = "warning";
+      step.title = stringField(event, "title") || `需要授权：${toolName || "受限工具"}`;
+      step.result_summary = reason;
+      return;
+    }
   });
 
   return steps.map((step) => {
@@ -403,19 +417,25 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
     const terminalRunIdsRef = useRef<Set<string>>(new Set());
 
     useEffect(() => {
+      let disposed = false;
+
       if (liveTimerRef.current) {
         clearInterval(liveTimerRef.current);
         liveTimerRef.current = null;
       }
 
       if (!liveSessionId) {
-        setLiveEvents([]);
-        setIsLiveRunning(false);
-        setLiveElapsed(0);
-        return;
+        queueMicrotask(() => {
+          if (disposed) return;
+          setLiveEvents([]);
+          setIsLiveRunning(false);
+          setLiveElapsed(0);
+        });
+        return () => {
+          disposed = true;
+        };
       }
 
-      let disposed = false;
       let unlisten: (() => void) | undefined;
       const pendingModelDeltas = new Map<string, AgentRunEvent>();
       let deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -436,9 +456,12 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
         }, 150);
       };
 
-      setLiveEvents([]);
-      setIsLiveRunning(true);
-      setLiveElapsed(0);
+      queueMicrotask(() => {
+        if (disposed) return;
+        setLiveEvents([]);
+        setIsLiveRunning(true);
+        setLiveElapsed(0);
+      });
       liveTimerRef.current = setInterval(() => {
         setLiveElapsed((Date.now() - startTime) / 1000);
       }, 250);

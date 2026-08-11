@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OmniNova 通話助理</string>
+    <string name="notif_channel_call">通話助理</string>
+    <string name="notif_channel_call_desc">手機本機通話處理和工作階段記錄</string>
+    <string name="notif_title_in_call">通話進行中 · OmniNova</string>
+    <string name="notif_text_in_call">本機助理正在處理通話</string>
+    <string name="notif_title_screening">已封鎖騷擾電話</string>
+    <string name="status_local_ready">本機模式已啟用</string>
+    <string name="status_local_hint">不需要電腦、閘道、API 金鑰或網路連線。</string>
+    <string name="listening">正在聆聽</string>
+    <string name="content_settings">設定</string>
+    <string name="content_start_voice_test">開始語音測試</string>
+    <string name="local_text_label">輸入文字測試本機助理</string>
+    <string name="local_text_hint">手機語音辨識服務無法使用時，可使用文字測試。</string>
+    <string name="local_text_submit">傳送本機測試</string>
+    <string name="no_conversations">尚無工作階段</string>
+    <string name="no_conversations_hint">可進行文字測試或語音測試；記錄只保存在這支手機上。</string>
+    <string name="start_voice_test">開始語音測試</string>
+    <string name="conversation_turns">%1$d 輪對話</string>
+    <string name="no_content">無內容</string>
+    <string name="settings_title">設定</string>
+    <string name="language_title">應用程式語言</string>
+    <string name="language_simplified">简体中文</string>
+    <string name="language_traditional">繁體中文</string>
+    <string name="language_english">English</string>
+    <string name="local_mode_title">手機本機模式</string>
+    <string name="local_mode_description">語音辨識和播報使用 Android 系統服務；騷擾規則、回覆和通話記錄均在此手機上執行和保存。</string>
+    <string name="auto_answer">自動接聽來電</string>
+    <string name="auto_answer_hint">僅當 Android 將此應用程式設為預設電話應用程式時生效。</string>
+    <string name="spam_screening">啟用騷擾電話篩選</string>
+    <string name="enable_screening">啟用 Android 通話篩選</string>
+    <string name="grant_permissions">授予麥克風和電話權限</string>
+    <string name="version">OmniNova 通話助理 v0.2.0</string>
+    <string name="permission_microphone_required">語音測試需要麥克風權限。</string>
+    <string name="screening_enabled">已啟用通話篩選。</string>
+    <string name="screening_not_enabled">未啟用通話篩選。</string>
+    <string name="screening_android_10">通話篩選角色僅適用於 Android 10 及以上版本。</string>
+    <string name="screening_not_supported">此裝置不支援通話篩選。</string>
+    <string name="screening_already_enabled">通話篩選已經啟用。</string>
+</resources>

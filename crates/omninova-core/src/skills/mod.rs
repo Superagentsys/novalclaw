@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use tracing::warn;
 
@@ -179,6 +180,8 @@ pub struct SkillHubItem {
     pub icon_url: Option<String>,
     pub downloads: u64,
     pub category: Option<String>,
+    /// Marketplace version/tag when the API exposes one.
+    pub version: Option<String>,
 }
 
 /// A SkillHub category (level-1 taxonomy).
@@ -192,6 +195,7 @@ pub struct SkillHubCategory {
 fn skillhub_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("OmniNovaClaw/1.0 (+https://skillhub.cn)")
+        .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to build SkillHub HTTP client")
 }
@@ -234,6 +238,13 @@ fn parse_skillhub_item(v: &serde_json::Value) -> Option<SkillHubItem> {
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let version = v
+        .get("version")
+        .or_else(|| v.get("latestVersion"))
+        .or_else(|| v.get("tag"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     Some(SkillHubItem {
         name,
         slug,
@@ -242,6 +253,7 @@ fn parse_skillhub_item(v: &serde_json::Value) -> Option<SkillHubItem> {
         icon_url,
         downloads,
         category,
+        version,
     })
 }
 
@@ -368,9 +380,7 @@ pub async fn skillhub_install(
     namespace: Option<&str>,
     version: Option<&str>,
 ) -> Result<(String, usize)> {
-    if slug.trim().is_empty() {
-        anyhow::bail!("skill slug must not be empty");
-    }
+    validate_skillhub_slug(slug)?;
     let mut url = format!(
         "{SKILLHUB_API_BASE}/api/v1/download?slug={}",
         urlencoding::encode(slug)
@@ -390,44 +400,145 @@ pub async fn skillhub_install(
         .context("SkillHub download request failed")?
         .error_for_status()
         .context("SkillHub download returned an error status")?;
+    const MAX_PACKAGE_BYTES: u64 = 25 * 1024 * 1024;
+    if resp.content_length().is_some_and(|size| size > MAX_PACKAGE_BYTES) {
+        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
+    }
     let bytes = resp
         .bytes()
         .await
         .context("Failed to read SkillHub package bytes")?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
+    }
 
     fs::create_dir_all(target_dir)?;
     let dest_root = target_dir.join(slug);
-    if dest_root.exists() {
-        fs::remove_dir_all(&dest_root)
-            .with_context(|| format!("Failed to clear existing skill dir: {:?}", dest_root))?;
-    }
-    fs::create_dir_all(&dest_root)?;
+    let backup_root = target_dir.join(format!("{slug}.omninova-backup"));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let stage_root = target_dir.join(format!(".omninova-install-{slug}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&stage_root)?;
 
-    let reader = std::io::Cursor::new(bytes);
-    let mut archive =
-        zip::ZipArchive::new(reader).context("Downloaded package is not a valid zip archive")?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let Some(rel) = entry.enclosed_name() else {
-            continue; // skip unsafe (path traversal) entries
-        };
-        let outpath = dest_root.join(rel);
-        if entry.is_dir() {
-            fs::create_dir_all(&outpath)?;
-            continue;
+    let extraction = (|| -> Result<usize> {
+        let reader = std::io::Cursor::new(bytes);
+        let mut archive =
+            zip::ZipArchive::new(reader).context("Downloaded package is not a valid zip archive")?;
+        if archive.len() > 2048 {
+            anyhow::bail!("SkillHub package contains too many files");
         }
-        if let Some(parent) = outpath.parent() {
-            fs::create_dir_all(parent)?;
+        const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
+        let mut extracted_bytes = 0_u64;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let Some(rel) = entry.enclosed_name() else {
+                anyhow::bail!("SkillHub package contains an unsafe path");
+            };
+            extracted_bytes = extracted_bytes.saturating_add(entry.size());
+            if extracted_bytes > MAX_EXTRACTED_BYTES {
+                anyhow::bail!("SkillHub package exceeds the 64 MiB extraction limit");
+            }
+            let outpath = stage_root.join(rel);
+            if entry.is_dir() {
+                fs::create_dir_all(&outpath)?;
+                continue;
+            }
+            if let Some(parent) = outpath.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = fs::File::create(&outpath)
+                .with_context(|| format!("Failed to write skill file: {:?}", outpath))?;
+            std::io::copy(&mut entry, &mut out)?;
         }
-        let mut out = fs::File::create(&outpath)
-            .with_context(|| format!("Failed to write skill file: {:?}", outpath))?;
-        std::io::copy(&mut entry, &mut out)?;
-    }
 
+        let count = discover_skill_files(&stage_root)?.len();
+        if count == 0 {
+            anyhow::bail!("Package contains no SKILL.md; existing version was kept");
+        }
+        Ok(count)
+    })();
+
+    let count = match extraction {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage_root);
+            return Err(error);
+        }
+    };
+
+    if backup_root.exists() {
+        if let Err(error) = fs::remove_dir_all(&backup_root) {
+            let _ = fs::remove_dir_all(&stage_root);
+            return Err(error).with_context(|| {
+                format!("Failed to clear previous skill backup: {:?}", backup_root)
+            });
+        }
+    }
+    let had_previous = dest_root.exists();
+    if had_previous {
+        if let Err(error) = fs::rename(&dest_root, &backup_root) {
+            let _ = fs::remove_dir_all(&stage_root);
+            return Err(error).with_context(|| {
+                format!("Failed to preserve existing skill version: {:?}", dest_root)
+            });
+        }
+    }
+    if let Err(error) = fs::rename(&stage_root, &dest_root) {
+        if had_previous && backup_root.exists() {
+            let _ = fs::rename(&backup_root, &dest_root);
+        }
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err(error).context("Failed to activate the validated SkillHub package");
+    }
+    Ok((slug.to_string(), count))
+}
+
+fn validate_skillhub_slug(slug: &str) -> Result<()> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        anyhow::bail!("skill slug must not be empty");
+    }
+    if slug.len() > 128
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        anyhow::bail!("skill slug contains unsupported path characters");
+    }
+    Ok(())
+}
+
+/// Swap the active skill directory with the one-version backup kept by install.
+/// Calling rollback again toggles back to the previously active version.
+pub fn skillhub_rollback(target_dir: &Path, slug: &str) -> Result<(String, usize)> {
+    validate_skillhub_slug(slug)?;
+    let dest_root = target_dir.join(slug);
+    let backup_root = target_dir.join(format!("{slug}.omninova-backup"));
+    if !dest_root.exists() {
+        anyhow::bail!("Cannot roll back a skill that is not installed");
+    }
+    if !backup_root.exists() {
+        anyhow::bail!("No previous version is available for rollback");
+    }
+    let swap_root = target_dir.join(format!(".omninova-rollback-{slug}-{}", std::process::id()));
+    if swap_root.exists() {
+        fs::remove_dir_all(&swap_root)?;
+    }
+    fs::rename(&dest_root, &swap_root).context("Failed to prepare the current skill for rollback")?;
+    if let Err(error) = fs::rename(&backup_root, &dest_root) {
+        let _ = fs::rename(&swap_root, &dest_root);
+        return Err(error).context("Failed to restore the previous skill version");
+    }
+    if let Err(error) = fs::rename(&swap_root, &backup_root) {
+        // Restore the pre-rollback layout so an error never leaves the UI and
+        // filesystem disagreeing about which version is active.
+        let _ = fs::rename(&dest_root, &backup_root);
+        let _ = fs::rename(&swap_root, &dest_root);
+        return Err(error).context("Rollback was reverted because the replaced version could not be preserved");
+    }
     let count = discover_skill_files(&dest_root)?.len();
-    if count == 0 {
-        anyhow::bail!("Package installed but contains no SKILL.md");
-    }
     Ok((slug.to_string(), count))
 }
 
@@ -437,7 +548,10 @@ pub fn installed_skill_slugs(dir: &Path) -> Result<Vec<String>> {
     for skill_file in discover_skill_files(dir)? {
         if let Ok(rel) = skill_file.strip_prefix(dir) {
             if let Some(first) = rel.components().next() {
-                slugs.insert(first.as_os_str().to_string_lossy().to_string());
+                let slug = first.as_os_str().to_string_lossy().to_string();
+                if !slug.ends_with(".omninova-backup") && !slug.starts_with(".omninova-") {
+                    slugs.insert(slug);
+                }
             }
         }
     }

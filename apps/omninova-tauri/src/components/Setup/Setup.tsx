@@ -14,6 +14,8 @@ import { PersonaConfigForm } from "./PersonaConfigForm";
 import { invokeTauri } from "../../utils/tauri";
 import omninovalLogo from "../../assets/omninoval-logo.png";
 import { open } from "@tauri-apps/plugin-dialog";
+import { UiIcon, type UiIconName } from "../UiIcon";
+import { notifySetupConfigUpdated } from "../../utils/appEvents";
 
 /** Sensitive field names that should be redacted in JSON preview */
 const SENSITIVE_KEYS = new Set([
@@ -180,15 +182,15 @@ interface CliInstallStatus {
 type SetupTabItem = {
   id: SetupTab;
   label: string;
-  icon: string;
+  icon: UiIconName;
 };
 
 const setupTabs: SetupTabItem[] = [
-  { id: "general", label: "通用设置", icon: "⚙️" },
-  { id: "providers", label: "模型服务", icon: "🤖" },
-  { id: "channels", label: "渠道接入", icon: "🔌" },
-  { id: "skills", label: "技能扩展", icon: "🛠️" },
-  { id: "persona", label: "Agent 人设", icon: "🧠" },
+  { id: "general", label: "通用设置", icon: "settings" },
+  { id: "providers", label: "模型服务", icon: "apps" },
+  { id: "channels", label: "渠道接入", icon: "connections" },
+  { id: "skills", label: "技能扩展", icon: "tool" },
+  { id: "persona", label: "Agent 人设", icon: "agent" },
 ];
 
 /** 当仅启用一个 provider 时，自动设为 default_provider / default_model。 */
@@ -476,6 +478,7 @@ export function Setup({
     setBusyAction("save");
     try {
       const restarted = await saveSetupConfig(false);
+      notifySetupConfigUpdated();
       if (restarted) {
         setActionMessage("Workspace 已切换，网关已重启。");
       } else {
@@ -499,6 +502,7 @@ export function Setup({
     setActionMessage(""); // Clear previous errors
     try {
       const restarted = await saveSetupConfig(true);
+      notifySetupConfigUpdated();
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
       if (nextGatewayStatus.running) {
@@ -549,6 +553,7 @@ export function Setup({
     setBusyAction("save");
     try {
       await saveSetupConfig(false, nextConfig, "lark");
+      notifySetupConfigUpdated();
       setConfig(nextConfig);
       setChannelValidationError(undefined);
       setActionMessage("Lark 已关闭，配置已保存。现在可以再次启动 Feishu Gateway。");
@@ -630,6 +635,7 @@ export function Setup({
     setActionMessage("");
     try {
       await saveSetupConfig(true);
+      notifySetupConfigUpdated();
       const nextGatewayStatus = await invokeTauri<GatewayStatus>("restart_gateway");
       setGatewayStatus(nextGatewayStatus);
       setActionMessage(
@@ -1364,19 +1370,21 @@ export function Setup({
         );
       case "skills":
         return (
-          <div className="setup-section">
-            <h2>技能扩展</h2>
-            <SkillsConfigForm 
-              config={config.skills || { open_skills_enabled: true }}
-              onChange={(skills) => setConfig({ ...config, skills })}
-            />
-          </div>
+          <SkillsConfigForm
+            config={config.skills || { open_skills_enabled: true }}
+            onChange={(skills) => setConfig({ ...config, skills })}
+          />
         );
       case "persona":
         return (
           <div className="setup-section">
-            <h2>Agent 人设 (灵魂系统)</h2>
-            <PersonaConfigForm 
+            <div className="section-heading">
+              <div>
+                <h2>行为与人格</h2>
+                <div className="section-subtitle">管理名称、工作区、提示词与上下文策略。</div>
+              </div>
+            </div>
+            <PersonaConfigForm
               config={config.agent || { name: "omninova", max_tool_iterations: 20, compact_context: true }}
               onChange={(agent) => setConfig({ ...config, agent })}
             />
@@ -1536,7 +1544,7 @@ export function Setup({
               }`}
               onClick={() => setActiveTab(tab.id)}
             >
-              <span>{tab.icon}</span>
+              <UiIcon name={tab.icon} size={17} />
               <span>{tab.label}</span>
             </button>
           ))}

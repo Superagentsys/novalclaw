@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import omninovalLogo from "../assets/omninoval-logo.png";
+import { ThemeSwitcher } from "./ThemeSwitcher";
+import { UiIcon, type UiIconName } from "./UiIcon";
 
 export type AppNavId =
   | "chat"
@@ -12,92 +14,76 @@ export type AppNavId =
 interface NavItem {
   id: AppNavId;
   label: string;
-  icon: "chat" | "grid" | "bot" | "nodes" | "puzzle" | "clock" | "gear";
+  description: string;
+  icon: UiIconName;
 }
 
-const PRIMARY_NAV: NavItem[] = [
-  { id: "chat", label: "新对话", icon: "chat" },
-  { id: "providers", label: "模型", icon: "grid" },
-  { id: "persona", label: "Agents", icon: "bot" },
-  { id: "channels", label: "频道", icon: "nodes" },
-  { id: "skills", label: "技能", icon: "puzzle" },
+const WORKSPACE_NAV: NavItem[] = [
+  { id: "chat", label: "任务中心", description: "对话、执行与任务历史", icon: "message" },
 ];
 
-function NavIcon({ name }: { name: NavItem["icon"] }) {
-  const common = { width: 18, height: 18, strokeWidth: 1.6, stroke: "currentColor", fill: "none" };
-  switch (name) {
-    case "chat":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <path d="M4 6h16v10H8l-4 4v-14z" strokeLinejoin="round" />
-        </svg>
-      );
-    case "grid":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <rect x="4" y="4" width="6" height="6" rx="1" />
-          <rect x="14" y="4" width="6" height="6" rx="1" />
-          <rect x="4" y="14" width="6" height="6" rx="1" />
-          <rect x="14" y="14" width="6" height="6" rx="1" />
-        </svg>
-      );
-    case "bot":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <rect x="5" y="8" width="14" height="10" rx="2" />
-          <circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" />
-          <circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" />
-          <path d="M9 5v3M15 5v3" strokeLinecap="round" />
-        </svg>
-      );
-    case "nodes":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <circle cx="6" cy="6" r="2" />
-          <circle cx="18" cy="6" r="2" />
-          <circle cx="12" cy="18" r="2" />
-          <path d="M6 8v6l6 4M18 8v6l-6 4" />
-        </svg>
-      );
-    case "puzzle":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <path
-            d="M8 4h4a2 2 0 012 2v2h2a2 2 0 012 2v4h-2a2 2 0 00-2 2v2H8v-2a2 2 0 00-2-2H4V8h2a2 2 0 002-2V4z"
-            strokeLinejoin="round"
-          />
-        </svg>
-      );
-    case "clock":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <circle cx="12" cy="12" r="8" />
-          <path d="M12 8v4l3 2" strokeLinecap="round" />
-        </svg>
-      );
-    case "gear":
-      return (
-        <svg viewBox="0 0 24 24" aria-hidden {...common}>
-          <circle cx="12" cy="12" r="3" />
-          <path
-            strokeLinecap="round"
-            d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"
-          />
-        </svg>
-      );
-    default:
-      return null;
-  }
-}
+const RESOURCE_NAV: NavItem[] = [
+  { id: "providers", label: "模型服务", description: "Provider 与默认模型", icon: "apps" },
+  { id: "persona", label: "Agents", description: "人设、Workspace 与行为", icon: "agent" },
+  { id: "skills", label: "技能市场", description: "安装与管理技能", icon: "tool" },
+  { id: "channels", label: "渠道连接", description: "飞书、Webhook 等入口", icon: "connections" },
+];
+
+const SIDEBAR_STORAGE_KEY = "omninova.ui.sidebarCollapsed.v1";
 
 interface AppShellProps {
   activeNav: AppNavId;
   onNavigate: (id: AppNavId) => void;
-  children: React.ReactNode;
+  children: ReactNode;
+}
+
+function readSidebarPreference(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
 }
 
 export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(readSidebarPreference);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, collapsed ? "1" : "0");
+    } catch {
+      // Keep the in-memory preference when WebView storage is unavailable.
+    }
+  }, [collapsed]);
+
+  const renderNavGroup = (heading: string, items: NavItem[]) => (
+    <section className="app-shell-nav-section" aria-label={heading}>
+      {!collapsed ? <h2 className="app-shell-nav-heading">{heading}</h2> : null}
+      <div className="app-shell-nav-list">
+        {items.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`app-shell-nav-item ${activeNav === item.id ? "is-active" : ""}`}
+            onClick={() => onNavigate(item.id)}
+            aria-current={activeNav === item.id ? "page" : undefined}
+            aria-label={collapsed ? item.label : undefined}
+            title={collapsed ? item.label : item.description}
+          >
+            <span className="app-shell-nav-icon">
+              <UiIcon name={item.icon} />
+            </span>
+            {!collapsed ? (
+              <span className="app-shell-nav-copy">
+                <span className="app-shell-nav-label">{item.label}</span>
+                <span className="app-shell-nav-description">{item.description}</span>
+              </span>
+            ) : null}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
 
   return (
     <div className={`app-shell-root ${collapsed ? "app-shell-root--collapsed" : ""}`}>
@@ -105,60 +91,60 @@ export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
         <div className="app-shell-sidebar-head">
           <div className="app-shell-brand">
             <img src={omninovalLogo} alt="" className="app-shell-logo" />
-            {!collapsed && (
-              <span className="app-shell-brand-text">
-                OmniNova <strong>Claw</strong>
+            {!collapsed ? (
+              <span className="app-shell-brand-copy">
+                <span className="app-shell-brand-kicker">LOCAL AGENT DESKTOP</span>
+                <span className="app-shell-brand-text">
+                  OmniNova <strong>Claw</strong>
+                </span>
               </span>
-            )}
+            ) : null}
           </div>
           <button
             type="button"
             className="app-shell-collapse"
-            onClick={() => setCollapsed((c) => !c)}
+            onClick={() => setCollapsed((value) => !value)}
             title={collapsed ? "展开侧栏" : "收起侧栏"}
-            aria-label="切换侧栏"
+            aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
+            aria-expanded={!collapsed}
           >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              {collapsed ? <path d="M9 18l6-6-6-6" /> : <path d="M15 18l-6-6 6-6" />}
-            </svg>
+            <UiIcon name={collapsed ? "menuUnfold" : "menuFold"} size={16} />
           </button>
         </div>
 
         <nav className="app-shell-nav" aria-label="主导航">
-          {PRIMARY_NAV.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={`app-shell-nav-item ${activeNav === item.id ? "is-active" : ""}`}
-              onClick={() => onNavigate(item.id)}
-            >
-              <span className="app-shell-nav-icon">
-                <NavIcon name={item.icon} />
-              </span>
-              {!collapsed && <span className="app-shell-nav-label">{item.label}</span>}
-            </button>
-          ))}
+          {renderNavGroup("工作台", WORKSPACE_NAV)}
+          {renderNavGroup("能力与连接", RESOURCE_NAV)}
         </nav>
 
         <div className="app-shell-sidebar-foot">
+          {!collapsed ? (
+            <div className="app-shell-local-status" role="status">
+              <span aria-hidden />
+              <div>
+                <strong>本地优先</strong>
+                <small>配置与任务保存在本机</small>
+              </div>
+            </div>
+          ) : null}
+          <ThemeSwitcher collapsed={collapsed} />
           <button
             type="button"
             className={`app-shell-nav-item ${activeNav === "general" ? "is-active" : ""}`}
             onClick={() => onNavigate("general")}
+            aria-current={activeNav === "general" ? "page" : undefined}
+            aria-label={collapsed ? "设置" : undefined}
+            title={collapsed ? "设置" : "应用、网关与隐私设置"}
           >
             <span className="app-shell-nav-icon">
-              <NavIcon name="gear" />
+              <UiIcon name="settings" />
             </span>
-            {!collapsed && <span className="app-shell-nav-label">设置</span>}
+            {!collapsed ? (
+              <span className="app-shell-nav-copy">
+                <span className="app-shell-nav-label">设置</span>
+                <span className="app-shell-nav-description">应用、网关与隐私</span>
+              </span>
+            ) : null}
           </button>
         </div>
       </aside>

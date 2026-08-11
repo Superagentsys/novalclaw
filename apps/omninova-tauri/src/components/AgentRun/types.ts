@@ -52,6 +52,7 @@ export type AgentRunEvent =
   | AgentRunEventToolCallCreated
   | AgentRunEventToolStarted
   | AgentRunEventToolCompleted
+  | AgentRunEventApprovalRequired
   | AgentRunEventCommandOutput
   | AgentRunEventFileChanged
   | AgentRunEventPatchStarted
@@ -117,6 +118,16 @@ export interface AgentRunEventToolCompleted {
   duration_ms: number;
   result_summary: string;
   diff_stats: RunDiffStats | null;
+}
+
+export interface AgentRunEventApprovalRequired {
+  type: "approval_required";
+  run_id: string;
+  step_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  title: string;
+  reason: string;
 }
 
 export interface AgentRunEventCommandOutput {
@@ -271,6 +282,8 @@ export function getEventStatusLabel(
     case "toolStarted":
     case "commandOutput":
       return "running";
+    case "approval_required":
+      return "warning";
     case "run_completed":
     case "model_completed":
     case "fileChanged":

@@ -6,26 +6,41 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
 import mermaid from "mermaid";
+import { useTheme } from "../../theme/themeState";
 
 import "katex/dist/katex.min.css";
-import "highlight.js/styles/github-dark.css";
 import "./MarkdownMessage.css";
 
-let mermaidInitialized = false;
+function cssThemeValue(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
 
-function ensureMermaid() {
-  if (mermaidInitialized) return;
+function configureMermaid() {
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: "strict",
-    theme: "dark",
+    theme: "base",
     fontFamily: "inherit",
+    themeVariables: {
+      background: cssThemeValue("--ui-surface-1", "#ffffff"),
+      primaryColor: cssThemeValue("--ui-accent-soft", "#e7edff"),
+      primaryTextColor: cssThemeValue("--ui-text", "#192132"),
+      primaryBorderColor: cssThemeValue("--ui-accent", "#335eea"),
+      lineColor: cssThemeValue("--ui-text-muted", "#66758f"),
+      secondaryColor: cssThemeValue("--ui-surface-2", "#f7f9fc"),
+      tertiaryColor: cssThemeValue("--ui-surface-3", "#eef2f8"),
+      noteBkgColor: cssThemeValue("--ui-warning-soft", "#fff4d9"),
+      noteTextColor: cssThemeValue("--ui-text", "#192132"),
+      noteBorderColor: cssThemeValue("--ui-warning", "#a86100"),
+      fontFamily: "inherit",
+    },
   });
-  mermaidInitialized = true;
 }
 
 /** Renders a Mermaid diagram from its source, with graceful fallback to code. */
 function MermaidDiagram({ code }: { code: string }) {
+  const { resolvedTheme } = useTheme();
   const [svg, setSvg] = useState<string>("");
   const [failed, setFailed] = useState(false);
   const [renderId] = useState(
@@ -34,9 +49,9 @@ function MermaidDiagram({ code }: { code: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    ensureMermaid();
+    configureMermaid();
     mermaid
-      .render(renderId, code)
+      .render(`${renderId}-${resolvedTheme}`, code)
       .then(({ svg }) => {
         if (!cancelled) {
           setSvg(svg);
@@ -49,7 +64,7 @@ function MermaidDiagram({ code }: { code: string }) {
     return () => {
       cancelled = true;
     };
-  }, [code, renderId]);
+  }, [code, renderId, resolvedTheme]);
 
   if (failed) {
     return (
