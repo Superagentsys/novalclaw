@@ -248,6 +248,28 @@ export interface SkillsConfig {
   prompt_injection_mode?: string;
 }
 
+/** 单个 SkillHub 技能（来自 https://skillhub.cn） */
+export interface SkillHubItem {
+  name: string;
+  slug: string;
+  namespace?: string | null;
+  description: string;
+  iconUrl?: string | null;
+  downloads: number;
+  category?: string | null;
+}
+
+export interface SkillHubCategory {
+  key: string;
+  name: string;
+}
+
+export interface SkillHubInstallResult {
+  slug: string;
+  installed: number;
+  dir: string;
+}
+
 export interface AgentPersonaConfig {
   name: string;
   system_prompt?: string;
