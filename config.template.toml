@@ -207,6 +207,27 @@
 # webhook_signature_strict_priority = false
 # webhook_signing_include_timestamp = false
 # webhook_signing_require_timestamp = false
+#
+# --- Gateway DingTalk (企业内部应用机器人) ---
+# Default disabled. When enabled=false the /api/v1/gateway/dingtalk/events
+# route is registered but every webhook is rejected and no outbound calls
+# are made. Real secrets MUST be supplied via environment variables
+# (OMNINOVA_DINGTALK_APP_KEY / OMNINOVA_DINGTALK_APP_SECRET) and never
+# committed to this file.
+# [gateway.dingtalk]
+# enabled = false
+# app_key = ""                                    # AppKey (prefer env var)
+# app_key_env = "OMNINOVA_DINGTALK_APP_KEY"       # override env var name
+# app_secret = ""                                 # AppSecret (prefer env var, NEVER commit)
+# app_secret_env = "OMNINOVA_DINGTALK_APP_SECRET"
+# robot_code = ""                                # robotCode (prefer env var)
+# robot_code_env = "OMNINOVA_DINGTALK_ROBOT_CODE"
+# card_template_id = ""                          # advanced card template id (optional)
+# card_template_id_env = "OMNINOVA_DINGTALK_CARD_TEMPLATE_ID"
+# transport_mode = "http"                       # http | stream (interactive cards require stream)
+# webhook_path = "/api/v1/gateway/dingtalk/events"  # informational
+# outbound_mode = "session_webhook"               # disabled | session_webhook | mock
+# redact_sensitive_logs = true                    # log redaction (always-on)
 
 # --- Proxy ---
 # [proxy]

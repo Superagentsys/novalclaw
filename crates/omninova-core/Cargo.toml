@@ -49,6 +49,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 url.workspace = true
 axum = { version = "0.8.8", features = ["ws"] }
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"

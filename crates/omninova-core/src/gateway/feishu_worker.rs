@@ -6,6 +6,7 @@
 use crate::channels::ChannelKind;
 use crate::channels::adapters::outbound::OutboundResult;
 use crate::desktop_capture::{self, CaptureResult, MonitorResult};
+use crate::gateway::agent_menu::{build_agent_menu_panel, AgentMenuAction};
 use crate::gateway::feishu_store::{FeishuStore, EventStatus, JobStatus, ReplyKind, chrono_timestamp};
 use crate::gateway::OutboundMsgCache;
 use crate::gateway::{GatewayRuntime, MonitorFlightLease};
@@ -221,6 +222,26 @@ pub const ALLOWED_CARD_ACTIONS: &[&str] = &[
 
 /// Build the command palette interactive card JSON.
 pub fn build_command_palette_card() -> serde_json::Value {
+    let panel = build_agent_menu_panel();
+    let render_actions = |actions: &[AgentMenuAction]| {
+        actions
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "tag": "button",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": item.label
+                    },
+                    "type": item.style.as_feishu_button_type(),
+                    "value": {
+                        "action": item.action
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
     serde_json::json!({
         "config": {
             "wide_screen_mode": true
@@ -229,7 +250,7 @@ pub fn build_command_palette_card() -> serde_json::Value {
             "template": "blue",
             "title": {
                 "tag": "plain_text",
-                "content": "OmniNova Agent 功能菜单"
+                "content": panel.title
             }
         },
         "elements": [
@@ -237,7 +258,7 @@ pub fn build_command_palette_card() -> serde_json::Value {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": "请选择要执行的操作。普通聊天可以直接发送文字；工具任务请使用按钮或 slash 命令。"
+                    "content": panel.introduction
                 }
             },
             {
@@ -247,80 +268,23 @@ pub fn build_command_palette_card() -> serde_json::Value {
                 "tag": "div",
                 "text": {
                     "tag": "plain_text",
-                    "content": "🟢 普通聊天说明"
+                    "content": panel.ordinary_chat_label
                 }
             },
             {
                 "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "桌面监控 30 秒"
-                        },
-                        "type": "primary",
-                        "value": {
-                            "action": "monitor_30s"
-                        }
-                    },
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "桌面监控 60 秒"
-                        },
-                        "type": "primary",
-                        "value": {
-                            "action": "monitor_60s"
-                        }
-                    }
-                ]
+                "actions": render_actions(panel.primary_actions)
             },
             {
                 "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "Gateway 状态"
-                        },
-                        "type": "default",
-                        "value": {
-                            "action": "gateway_status"
-                        }
-                    },
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "最近任务"
-                        },
-                        "type": "default",
-                        "value": {
-                            "action": "recent_jobs"
-                        }
-                    },
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "帮助说明"
-                        },
-                        "type": "default",
-                        "value": {
-                            "action": "help"
-                        }
-                    }
-                ]
+                "actions": render_actions(panel.secondary_actions)
             },
             {
                 "tag": "note",
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": "高风险工具不在普通聊天中直接执行。"
+                        "content": panel.safety_note
                     }
                 ]
             }

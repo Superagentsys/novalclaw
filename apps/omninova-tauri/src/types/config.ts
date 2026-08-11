@@ -193,6 +193,8 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "DINGTALK_TOKEN",
     fields: [
+      { key: "transport_mode", label: "连接模式", placeholder: "http/stream", type: "text", isExtra: true },
+      { key: "card_template_id", label: "Card Template ID", placeholder: "DingTalk advanced card template ID (optional)", type: "text", isExtra: true },
       { key: "app_id", label: "App Key", placeholder: "钉钉应用 AppKey", type: "text", isExtra: true },
       { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password", isExtra: true },
       { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },
@@ -375,6 +377,67 @@ export interface GatewayStatus {
   last_error?: string | null;
   /** Error code for programmatic error handling */
   error_code?: string | null;
+}
+
+export interface DingtalkDiagnostics {
+  dingtalk_enabled: boolean;
+  app_key_present: boolean;
+  app_secret_present: boolean;
+  robot_code_present: boolean;
+  webhook_path: string;
+  local_gateway_running: boolean;
+  local_health: "ok" | "failed" | "not_ready";
+  public_base_url_present: boolean;
+  public_base_url?: string | null;
+  public_health: "ok" | "failed" | "not_checked" | "not_configured";
+  public_health_status_code?: number | null;
+  public_health_error?: string | null;
+  final_dingtalk_callback_url?: string | null;
+  worker_started: boolean;
+  outbound_mode: string;
+  public_mode: GatewayPublicMode | string;
+  quick_tunnel: boolean;
+  next_steps: string[];
+}
+
+export interface FeishuDiagnostics {
+  feishu_enabled: boolean;
+  app_id_present: boolean;
+  app_secret_present: boolean;
+  verification_token_present: boolean;
+  encrypt_key_present: boolean;
+  security_mode: string;
+  outbound_mode: string;
+  store_opened: boolean;
+  retry_worker_started: boolean;
+  local_gateway_running: boolean;
+  local_health: "ok" | "failed" | "not_ready";
+  public_base_url_present: boolean;
+  public_base_url?: string | null;
+  public_health: "ok" | "failed" | "not_checked" | "not_configured";
+  public_health_status_code?: number | null;
+  public_health_error?: string | null;
+  final_feishu_event_callback_url?: string | null;
+  final_feishu_card_callback_url?: string | null;
+  quick_tunnel: boolean;
+  next_steps: string[];
+}
+
+export interface DingtalkPublicRouteProbe {
+  configured: boolean;
+  reachable: boolean;
+  status_code?: number | null;
+  result_kind:
+    | "ok"
+    | "missing_timestamp"
+    | "signature_mismatch"
+    | "tunnel_unreachable"
+    | "not_configured"
+    | "timeout"
+    | "network_error"
+    | "client_error"
+    | "http_error";
+  message: string;
 }
 
 export type ChannelKindValue =

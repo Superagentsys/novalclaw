@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  CHANNEL_PRESETS,
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type Config,
+  type DingtalkDiagnostics,
+  type DingtalkPublicRouteProbe,
+  type FeishuDiagnostics,
   type GatewayPublicMode,
   type GatewayStatus,
 } from "../../types/config";
@@ -38,10 +42,43 @@ const SENSITIVE_KEYS = new Set([
 
 const LARK_BLOCKER_MESSAGE = "Lark 已启用但缺少 App ID。请补全 Lark 配置或关闭 Lark。";
 
-function enabledChannelIds(config: Config): string[] {
-  return Object.entries(config.channels)
-    .filter(([, channel]) => channel?.enabled)
-    .map(([channelId]) => channelId);
+type HealthUiStatus = "not_configured" | "not_ready" | "idle" | "ok" | "error";
+
+interface LocalHealthResult {
+  ok: boolean;
+  status_code?: number | null;
+  message: string;
+}
+
+const CHANNEL_LABELS = new Map<string, string>(
+  CHANNEL_PRESETS.map((preset) => [preset.id, preset.name])
+);
+
+function formatEnabledChannels(channelIds: string[]): string {
+  return channelIds
+    .map((channelId) => CHANNEL_LABELS.get(channelId) ?? channelId)
+    .join("、");
+}
+
+function channelIdIsKnown(channelId: string | null | undefined): channelId is string {
+  return Boolean(channelId && CHANNEL_LABELS.has(channelId));
+}
+
+function readRememberedChannelId(): string | null {
+  try {
+    const remembered = window.sessionStorage.getItem("omninova.setup.activeChannel");
+    return channelIdIsKnown(remembered) ? remembered : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberChannelId(channelId: string): void {
+  try {
+    window.sessionStorage.setItem("omninova.setup.activeChannel", channelId);
+  } catch {
+    // Storage can be unavailable in privacy-restricted browser contexts.
+  }
 }
 
 function formatGatewayStartError(message: string): string {
@@ -55,7 +92,10 @@ function normalizePublicBaseUrl(value: string | null | undefined): string | null
   if (!trimmed) {
     return null;
   }
-  const normalized = trimmed.replace(/\/webhook\/feishu(?:\/card)?$/i, "");
+  const normalized = trimmed
+    .replace(/\/api\/v1\/gateway\/dingtalk\/events$/i, "")
+    .replace(/\/webhook\/dingtalk$/i, "")
+    .replace(/\/webhook\/feishu(?:\/card)?$/i, "");
   const base = normalized.replace(/\/+$/, "");
   if (/^https?:\/\//i.test(base)) {
     try {
@@ -90,6 +130,16 @@ function normalizeNamedTunnelHostname(value: string | null | undefined): string 
   } catch {
     return null;
   }
+}
+
+function resolveDraftPublicBase(
+  gatewayPublic: Config["gateway_public"]
+): string | null {
+  if (gatewayPublic?.mode === "named_cloudflare_tunnel") {
+    const hostname = normalizeNamedTunnelHostname(gatewayPublic.named_tunnel_hostname);
+    return hostname ? `https://${hostname}` : null;
+  }
+  return normalizePublicBaseUrl(gatewayPublic?.public_webhook_base_url);
 }
 
 /** Redact sensitive values in a JSON object for display */
@@ -269,6 +319,10 @@ export function Setup({
     }
   };
   const [config, setConfig] = useState<Config>(initialConfig);
+  const gatewayPublicDraftRef = useRef<string | null>(
+    resolveDraftPublicBase(initialConfig.gateway_public)
+  );
+  gatewayPublicDraftRef.current = resolveDraftPublicBase(config.gateway_public);
   const [previewCollapsed, setPreviewCollapsed] = useState(true);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>({
     running: false,
@@ -296,11 +350,33 @@ export function Setup({
     last_error: null,
   });
   const [busyAction, setBusyAction] = useState<
-    "load" | "save" | "start" | "stop" | "restart" | "health" | "public-health" | null
+    "load" | "save" | "start" | "stop" | "restart" | null
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
-  const [activeChannelId, setActiveChannelId] = useState("feishu");
+  const [activeChannelId, setActiveChannelIdState] = useState("");
+  const dirtyChannelIdsRef = useRef<Set<string>>(new Set());
+  const [localHealthStatus, setLocalHealthStatus] = useState<HealthUiStatus>("not_ready");
+  const [localHealthMessage, setLocalHealthMessage] = useState("Gateway 未运行。");
+  const [localHealthStatusCode, setLocalHealthStatusCode] = useState<number | null>(null);
+  const [localHealthLoading, setLocalHealthLoading] = useState(false);
+  const [publicHealthStatus, setPublicHealthStatus] = useState<HealthUiStatus>(
+    "not_configured"
+  );
+  const [publicHealthMessage, setPublicHealthMessage] = useState(
+    "Public Base URL 未配置。"
+  );
+  const [publicHealthStatusCode, setPublicHealthStatusCode] = useState<number | null>(null);
+  const [publicHealthLoading, setPublicHealthLoading] = useState(false);
+  const [feishuDiagnostics, setFeishuDiagnostics] =
+    useState<FeishuDiagnostics | null>(null);
+  const [feishuDiagnosticsLoading, setFeishuDiagnosticsLoading] = useState(false);
+  const [dingtalkDiagnostics, setDingtalkDiagnostics] =
+    useState<DingtalkDiagnostics | null>(null);
+  const [dingtalkDiagnosticsLoading, setDingtalkDiagnosticsLoading] = useState(false);
+  const [dingtalkRouteProbe, setDingtalkRouteProbe] =
+    useState<DingtalkPublicRouteProbe | null>(null);
+  const [dingtalkRouteLoading, setDingtalkRouteLoading] = useState(false);
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const enabledProviders = useMemo(
@@ -371,6 +447,93 @@ export function Setup({
       ? `${config.default_provider}::${config.default_model}`
       : "";
 
+  const setActiveChannelId = useCallback((channelId: string) => {
+    if (!channelIdIsKnown(channelId)) {
+      return;
+    }
+    setActiveChannelIdState(channelId);
+    rememberChannelId(channelId);
+  }, []);
+
+  const syncHealthFromGatewayStatus = useCallback((
+    status: GatewayStatus,
+    syncPublicHealth = true,
+  ) => {
+    if (!status.running) {
+      setLocalHealthStatus("not_ready");
+      setLocalHealthMessage("Gateway 未运行，本地 Health 未就绪。");
+      setLocalHealthStatusCode(null);
+    } else if (status.health_ok) {
+      setLocalHealthStatus("ok");
+      setLocalHealthMessage("Gateway 运行中，本地 Health 正常。");
+      setLocalHealthStatusCode(200);
+    } else {
+      setLocalHealthStatus("idle");
+      setLocalHealthMessage("Gateway 已启动，尚未完成本地 Health 检测。");
+      setLocalHealthStatusCode(null);
+    }
+
+    const health = status.public_health;
+    if (!status.running) {
+      setPublicHealthStatus(health?.configured ? "not_ready" : "not_configured");
+      setPublicHealthMessage(
+        health?.configured
+          ? "Gateway 已停止，之前的公网 Health 结果已失效。"
+          : "Public Base URL 未配置。"
+      );
+      setPublicHealthStatusCode(null);
+      return;
+    }
+    if (!syncPublicHealth) {
+      return;
+    }
+    if (!health?.configured) {
+      setPublicHealthStatus("not_configured");
+      setPublicHealthMessage("Public Base URL 未配置。");
+      setPublicHealthStatusCode(null);
+    } else if (health.ok && health.status_code === 200) {
+      setPublicHealthStatus("ok");
+      setPublicHealthMessage("公网 Health 正常。");
+      setPublicHealthStatusCode(200);
+    } else if (health.error_kind === "not_checked") {
+      setPublicHealthStatus("idle");
+      setPublicHealthMessage("公网 Health 尚未检测。");
+      setPublicHealthStatusCode(null);
+    } else {
+      setPublicHealthStatus("error");
+      setPublicHealthMessage(health.error ?? "公网 Health 异常。");
+      setPublicHealthStatusCode(health.status_code ?? null);
+    }
+  }, []);
+
+  const refreshGatewayStatus = useCallback(async (): Promise<GatewayStatus> => {
+    const status = await invokeTauri<GatewayStatus>("gateway_status");
+    const draftBase = gatewayPublicDraftRef.current;
+    const statusBase = normalizePublicBaseUrl(status.public_webhook_base_url);
+    const syncPublicHealth = !draftBase || draftBase === statusBase;
+    setGatewayStatus((current) => syncPublicHealth
+      ? status
+      : {
+          ...status,
+          public_webhook_base_url: draftBase,
+          public_health: current.public_health,
+        });
+    syncHealthFromGatewayStatus(status, syncPublicHealth);
+    return status;
+  }, [syncHealthFromGatewayStatus]);
+
+  const refreshDingtalkDiagnostics = useCallback(async () => {
+    const diagnostics = await invokeTauri<DingtalkDiagnostics>("dingtalk_diagnostics");
+    setDingtalkDiagnostics(diagnostics);
+    return diagnostics;
+  }, []);
+
+  const refreshFeishuDiagnostics = useCallback(async () => {
+    const diagnostics = await invokeTauri<FeishuDiagnostics>("feishu_diagnostics");
+    setFeishuDiagnostics(diagnostics);
+    return diagnostics;
+  }, []);
+
   const refreshCliInstall = useCallback(async () => {
     try {
       const s = await invokeTauri<CliInstallStatus>("cli_install_status");
@@ -397,10 +560,7 @@ export function Setup({
     let disposed = false;
     const refresh = async () => {
       try {
-        const status = await invokeTauri<GatewayStatus>("gateway_status");
-        if (!disposed) {
-          setGatewayStatus(status);
-        }
+        if (!disposed) await refreshGatewayStatus();
       } catch {
         // Keep the most recent snapshot. Explicit actions surface errors.
       }
@@ -411,7 +571,25 @@ export function Setup({
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [activeTab]);
+  }, [activeTab, refreshGatewayStatus]);
+
+  useEffect(() => {
+    if (activeTab !== "channels" || activeChannelId !== "feishu") {
+      return;
+    }
+    void refreshFeishuDiagnostics().catch(() => {
+      // Explicit button actions surface Tauri/browser errors to the user.
+    });
+  }, [activeTab, activeChannelId, refreshFeishuDiagnostics]);
+
+  useEffect(() => {
+    if (activeTab !== "channels" || activeChannelId !== "dingtalk") {
+      return;
+    }
+    void refreshDingtalkDiagnostics().catch(() => {
+      // Explicit button actions surface Tauri/browser errors to the user.
+    });
+  }, [activeTab, activeChannelId, refreshDingtalkDiagnostics]);
 
   const loadSetupState = async () => {
     setBusyAction("load");
@@ -445,6 +623,26 @@ export function Setup({
         default_model,
       });
       setGatewayStatus(nextGatewayStatus);
+      syncHealthFromGatewayStatus(nextGatewayStatus);
+      dirtyChannelIdsRef.current.clear();
+      setActiveChannelIdState((currentChannelId) => {
+        if (channelIdIsKnown(currentChannelId)) {
+          return currentChannelId;
+        }
+        const enabledChannels = nextGatewayStatus.enabled_channels.filter(channelIdIsKnown);
+        const remembered = readRememberedChannelId();
+        const rememberedEnabled = remembered && enabledChannels.includes(remembered)
+          ? remembered
+          : null;
+        const firstEnabled = enabledChannels[0]
+          ?? Object.entries(merged.channels).find(([, entry]) => entry?.enabled)?.[0];
+        const nextChannelId = rememberedEnabled
+          ?? (channelIdIsKnown(firstEnabled) ? firstEnabled : null)
+          ?? remembered
+          ?? "feishu";
+        rememberChannelId(nextChannelId);
+        return nextChannelId;
+      });
       setActionMessage("已加载当前配置。");
     } catch (error) {
       setActionMessage(
@@ -459,14 +657,18 @@ export function Setup({
     validateAllChannels: boolean,
     configToSave = config,
     channelId = activeChannelId,
+    changedChannelIds = [...dirtyChannelIdsRef.current],
   ): Promise<boolean> => {
     const result = await invokeTauri<{ gateway_restarted: boolean }>("save_setup_config", {
       config: configToSave,
       validateAllChannels,
       activeChannelId: channelId,
+      changedChannelIds,
     });
-    const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
-    setGatewayStatus(nextGatewayStatus);
+    for (const changedChannelId of changedChannelIds) {
+      dirtyChannelIdsRef.current.delete(changedChannelId);
+    }
+    await refreshGatewayStatus();
     return result?.gateway_restarted ?? false;
   };
 
@@ -503,15 +705,15 @@ export function Setup({
     try {
       const restarted = await saveSetupConfig(true);
       notifySetupConfigUpdated();
-      const nextGatewayStatus = await invokeTauri<GatewayStatus>("start_gateway");
-      setGatewayStatus(nextGatewayStatus);
+      await invokeTauri<GatewayStatus>("start_gateway");
+      const nextGatewayStatus = await refreshGatewayStatus();
       if (nextGatewayStatus.running) {
-        const enabledChannels = enabledChannelIds(config);
+        const enabledChannels = formatEnabledChannels(nextGatewayStatus.enabled_channels);
         const msg = restarted
           ? `Workspace 已切换，网关已重启：${nextGatewayStatus.url}`
           : `网关已启动：${nextGatewayStatus.url}`;
-        setActionMessage(`${msg}。已启用频道：${enabledChannels.join(", ") || "无"}`);
-        if (onConfigSuccess) {
+        setActionMessage(`${msg}。已启用频道：${enabledChannels || "无"}`);
+        if (onConfigSuccess && !embedded) {
           onConfigSuccess();
         }
       } else {
@@ -525,8 +727,7 @@ export function Setup({
       setActionMessage(formatGatewayStartError(errorMsg));
       // Refresh status
       try {
-        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
-        setGatewayStatus(nextGatewayStatus);
+        await refreshGatewayStatus();
       } catch {
         // Ignore status refresh errors
       }
@@ -552,7 +753,7 @@ export function Setup({
 
     setBusyAction("save");
     try {
-      await saveSetupConfig(false, nextConfig, "lark");
+      await saveSetupConfig(false, nextConfig, "lark", ["lark"]);
       notifySetupConfigUpdated();
       setConfig(nextConfig);
       setChannelValidationError(undefined);
@@ -606,8 +807,8 @@ export function Setup({
     setBusyAction("stop");
     setActionMessage(""); // Clear previous errors
     try {
-      const nextGatewayStatus = await invokeTauri<GatewayStatus>("stop_gateway");
-      setGatewayStatus(nextGatewayStatus);
+      await invokeTauri<GatewayStatus>("stop_gateway");
+      const nextGatewayStatus = await refreshGatewayStatus();
       if (!nextGatewayStatus.running) {
         setActionMessage("网关已停止。");
       } else {
@@ -620,8 +821,7 @@ export function Setup({
       setActionMessage(errorMsg);
       // Refresh status
       try {
-        const nextGatewayStatus = await invokeTauri<GatewayStatus>("gateway_status");
-        setGatewayStatus(nextGatewayStatus);
+        await refreshGatewayStatus();
       } catch {
         // Ignore status refresh errors
       }
@@ -636,8 +836,8 @@ export function Setup({
     try {
       await saveSetupConfig(true);
       notifySetupConfigUpdated();
-      const nextGatewayStatus = await invokeTauri<GatewayStatus>("restart_gateway");
-      setGatewayStatus(nextGatewayStatus);
+      await invokeTauri<GatewayStatus>("restart_gateway");
+      const nextGatewayStatus = await refreshGatewayStatus();
       setActionMessage(
         nextGatewayStatus.running
           ? `Gateway 已重启：${nextGatewayStatus.url}`
@@ -648,7 +848,7 @@ export function Setup({
         formatGatewayStartError(error instanceof Error ? error.message : String(error))
       );
       try {
-        setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+        await refreshGatewayStatus();
       } catch {
         // Keep the last known status.
       }
@@ -658,42 +858,152 @@ export function Setup({
   };
 
   const handleTestGatewayHealth = async () => {
-    setBusyAction("health");
+    setLocalHealthLoading(true);
     try {
-      const result = await invokeTauri<{
-        ok: boolean;
-        status_code?: number | null;
-        message: string;
-      }>("test_gateway_health");
+      const result = await invokeTauri<LocalHealthResult>("test_gateway_health");
       setActionMessage(result.message);
-      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
+      const status = await refreshGatewayStatus();
+      if (!status.running) {
+        setLocalHealthStatus("not_ready");
+      } else {
+        setLocalHealthStatus(result.ok ? "ok" : "error");
+      }
+      setLocalHealthMessage(result.message);
+      setLocalHealthStatusCode(result.status_code ?? null);
     } catch (error) {
-      setActionMessage(
-        `Gateway 健康检查失败：${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      setLocalHealthStatus("error");
+      setLocalHealthMessage(message);
+      setLocalHealthStatusCode(null);
+      setActionMessage(`Gateway 健康检查失败：${message}`);
     } finally {
-      setBusyAction(null);
+      setLocalHealthLoading(false);
     }
   };
 
   const handleTestGatewayPublicHealth = async () => {
-    setBusyAction("public-health");
+    setPublicHealthLoading(true);
     try {
+      const latestStatus = await refreshGatewayStatus();
+      const currentInputBase = resolveDraftPublicBase(config.gateway_public);
+      const baseUrl = currentInputBase
+        ?? normalizePublicBaseUrl(latestStatus.public_webhook_base_url);
+      if (!baseUrl) {
+        setPublicHealthStatus("not_configured");
+        setPublicHealthMessage("Public Base URL 未配置。");
+        setPublicHealthStatusCode(null);
+        setActionMessage("Public Base URL 未配置。");
+        return;
+      }
       const result = await invokeTauri<GatewayStatus["public_health"]>(
-        "test_gateway_public_health"
+        "test_gateway_public_health",
+        { baseUrl }
       );
+      setPublicHealthStatus(result.ok && result.status_code === 200 ? "ok" : "error");
+      setPublicHealthMessage(
+        result.ok ? "公网 Health 正常。" : result.error ?? "公网 Health 异常。"
+      );
+      setPublicHealthStatusCode(result.status_code ?? null);
+      setGatewayStatus((current) => ({
+        ...current,
+        public_webhook_base_url: result.base_url ?? baseUrl,
+        public_health: result,
+      }));
       setActionMessage(
         result.ok
-          ? `公网 Health 检查通过：${result.checked_url ?? result.base_url ?? ""}`
+          ? `公网 Health 检查通过（HTTP ${result.status_code ?? 200}）。`
           : `公网 Health 检查失败：${result.error ?? "未知错误"}`
       );
-      setGatewayStatus(await invokeTauri<GatewayStatus>("gateway_status"));
     } catch (error) {
-      setActionMessage(
-        `公网 Health 检查失败：${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      setPublicHealthStatus("error");
+      setPublicHealthMessage(message);
+      setPublicHealthStatusCode(null);
+      setActionMessage(`公网 Health 检查失败：${message}`);
     } finally {
-      setBusyAction(null);
+      setPublicHealthLoading(false);
+    }
+  };
+
+  const handleRunDingtalkDiagnostics = async () => {
+    setDingtalkDiagnosticsLoading(true);
+    try {
+      await refreshGatewayStatus();
+      const diagnostics = await refreshDingtalkDiagnostics();
+      setActionMessage(
+        diagnostics.next_steps.length === 0
+          ? "钉钉本地诊断通过，建议继续测试公网路由。"
+          : `钉钉诊断完成：发现 ${diagnostics.next_steps.length} 项待处理。`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setActionMessage(`钉钉诊断失败：${message}`);
+    } finally {
+      setDingtalkDiagnosticsLoading(false);
+    }
+  };
+
+  const handleRunFeishuDiagnostics = async () => {
+    setFeishuDiagnosticsLoading(true);
+    try {
+      await refreshGatewayStatus();
+      const diagnostics = await refreshFeishuDiagnostics();
+      setActionMessage(
+        diagnostics.next_steps.length === 0
+          ? "飞书诊断通过；公网连通性请使用 Public Health 检测。"
+          : `飞书诊断完成：发现 ${diagnostics.next_steps.length} 项待处理。`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setActionMessage(`飞书诊断失败：${message}`);
+    } finally {
+      setFeishuDiagnosticsLoading(false);
+    }
+  };
+
+  const handleTestFeishuPublicHealth = async () => {
+    await handleTestGatewayPublicHealth();
+    await refreshFeishuDiagnostics().catch(() => {
+      // The shared Public Health result remains visible even if refresh fails.
+    });
+  };
+
+  const handleTestDingtalkPublicRoute = async () => {
+    const baseUrl = resolveDraftPublicBase(config.gateway_public)
+      ?? normalizePublicBaseUrl(gatewayStatus.public_webhook_base_url);
+    if (!baseUrl) {
+      const result: DingtalkPublicRouteProbe = {
+        configured: false,
+        reachable: false,
+        status_code: null,
+        result_kind: "not_configured",
+        message: "Public Base URL 未配置。",
+      };
+      setDingtalkRouteProbe(result);
+      setActionMessage(result.message);
+      return;
+    }
+
+    setDingtalkRouteLoading(true);
+    try {
+      const result = await invokeTauri<DingtalkPublicRouteProbe>(
+        "test_dingtalk_public_route",
+        { baseUrl }
+      );
+      setDingtalkRouteProbe(result);
+      setActionMessage(result.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDingtalkRouteProbe({
+        configured: true,
+        reachable: false,
+        status_code: null,
+        result_kind: "network_error",
+        message,
+      });
+      setActionMessage(`钉钉公网路由检测失败：${message}`);
+    } finally {
+      setDingtalkRouteLoading(false);
     }
   };
 
@@ -740,10 +1050,13 @@ export function Setup({
       : null;
   const draftPublicBase = namedTunnelMode
     ? draftNamedTunnelBase
-    : normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url);
-  const callbackBase = namedTunnelMode
-    ? draftNamedTunnelBase
-    : draftPublicBase ?? gatewayStatus.url?.replace(/\/$/, "") ?? null;
+    : normalizePublicBaseUrl(config.gateway_public?.public_webhook_base_url)
+      ?? normalizePublicBaseUrl(gatewayStatus.public_webhook_base_url);
+  const callbackBase = draftPublicBase;
+  const rawPublicBaseInput = config.gateway_public?.public_webhook_base_url?.trim() ?? "";
+  const publicBaseContainsDingtalkPath =
+    /\/api\/v1\/gateway\/dingtalk\/events\/?(?:[?#].*)?$/i.test(rawPublicBaseInput)
+    || /\/webhook\/dingtalk\/?(?:[?#].*)?$/i.test(rawPublicBaseInput);
   const namedTunnelNameConfigured =
     Boolean(config.gateway_public?.named_tunnel_name?.trim());
   const namedTunnelConfigComplete =
@@ -752,12 +1065,29 @@ export function Setup({
   const runtimeCardCallbackUrl = callbackBase
     ? `${callbackBase}/webhook/feishu/card`
     : null;
+  const runtimeDingtalkCallbackUrl = callbackBase
+    ? `${callbackBase}/api/v1/gateway/dingtalk/events`
+    : null;
   const lastStartedLabel = gatewayStatus.last_started_at
     ? new Date(gatewayStatus.last_started_at * 1000).toLocaleString()
     : "尚未记录";
   const publicHealthCheckedLabel = gatewayStatus.public_health?.checked_at
     ? new Date(gatewayStatus.public_health.checked_at * 1000).toLocaleString()
     : "尚未检测";
+  const enabledChannelLabel = formatEnabledChannels(gatewayStatus.enabled_channels);
+
+  useEffect(() => {
+    const statusBase = normalizePublicBaseUrl(gatewayStatus.public_webhook_base_url);
+    if (!draftPublicBase) {
+      setPublicHealthStatus("not_configured");
+      setPublicHealthMessage("Public Base URL 未配置。");
+      setPublicHealthStatusCode(null);
+    } else if (draftPublicBase !== statusBase) {
+      setPublicHealthStatus("idle");
+      setPublicHealthMessage("Public Base URL 已修改，等待重新检测。");
+      setPublicHealthStatusCode(null);
+    }
+  }, [draftPublicBase, gatewayStatus.public_webhook_base_url]);
 
   const renderTabContent = () => {
     switch (activeTab) {
@@ -1163,6 +1493,11 @@ export function Setup({
                       ? "由 Named Tunnel Hostname 自动生成并保存。"
                       : "只填写域名 Base；保存时会自动移除 webhook 路径后缀。"}
                   </small>
+                  {publicBaseContainsDingtalkPath ? (
+                    <small className="gateway-public-error">
+                      请只填写公网根地址；保存时会移除钉钉回调路径。
+                    </small>
+                  ) : null}
                 </label>
                 {config.gateway_public?.mode === "named_cloudflare_tunnel" ? (
                   <>
@@ -1255,15 +1590,36 @@ export function Setup({
                   <span>Retry worker</span>
                   <strong>{gatewayStatus.retry_worker_enabled ? "已启动" : "未启动"}</strong>
                 </div>
-                <div><span>本地 Health</span><strong>{gatewayStatus.health_ok ? "正常" : "未就绪"}</strong></div>
+                <div>
+                  <span>本地 Health</span>
+                  <strong>
+                    {localHealthLoading
+                      ? "检测中…"
+                      : localHealthStatus === "ok"
+                        ? "正常"
+                        : localHealthStatus === "error"
+                          ? "异常"
+                          : gatewayStatus.running
+                            ? "未检测"
+                            : "未运行"}
+                    {localHealthStatusCode ? ` · HTTP ${localHealthStatusCode}` : ""}
+                  </strong>
+                </div>
                 <div>
                   <span>公网 Health</span>
                   <strong>
-                    {!gatewayStatus.public_health?.configured
-                      ? "未配置"
-                      : gatewayStatus.public_health.ok
-                        ? "正常"
-                        : "异常"}
+                    {publicHealthLoading
+                      ? "检测中…"
+                      : publicHealthStatus === "not_configured"
+                        ? "未配置"
+                      : publicHealthStatus === "ok"
+                          ? "正常"
+                          : publicHealthStatus === "not_ready"
+                            ? "未运行"
+                          : publicHealthStatus === "error"
+                            ? "异常"
+                            : "未检测"}
+                    {publicHealthStatusCode ? ` · HTTP ${publicHealthStatusCode}` : ""}
                   </strong>
                 </div>
                 <div><span>公网检测时间</span><strong>{publicHealthCheckedLabel}</strong></div>
@@ -1296,7 +1652,7 @@ export function Setup({
                 </div>
               </div>
               <div className="gateway-runtime-meta">
-                已启用频道：{gatewayStatus.enabled_channels?.join("、") || "无"}
+                已启用频道：{enabledChannelLabel || "无"}
                 {gatewayStatus.store_path ? ` · Store：${gatewayStatus.store_path}` : ""}
                 {` · cloudflared path：${gatewayStatus.cloudflared_configured ? "已配置" : "未配置"}`}
                 {` · cloudflared found：${gatewayStatus.cloudflared_found ? "true" : "false"}`}
@@ -1306,16 +1662,18 @@ export function Setup({
                   type="button"
                   className="setup-btn setup-btn--secondary"
                   onClick={handleTestGatewayPublicHealth}
-                  disabled={busyAction !== null}
+                  disabled={publicHealthLoading || busyAction !== null}
                 >
-                  {busyAction === "public-health" ? "检测中…" : "测试公网 Health"}
+                  {publicHealthLoading ? "检测中…" : "测试公网 Health"}
                 </button>
-                {gatewayStatus.public_health?.error &&
-                !["not_checked", "url_not_configured"].includes(
-                  gatewayStatus.public_health.error_kind ?? ""
-                ) ? (
+                {publicHealthMessage ? (
                   <span className="gateway-public-error">
-                    公网检测：{gatewayStatus.public_health.error}
+                    公网检测：{publicHealthMessage}
+                  </span>
+                ) : null}
+                {localHealthMessage ? (
+                  <span className="gateway-public-error">
+                    本地检测：{localHealthMessage}
                   </span>
                 ) : null}
               </div>
@@ -1349,23 +1707,266 @@ export function Setup({
             </section>
             <ChannelConfigForm
               value={config.channels}
-              onChange={(channels) => setConfig({ ...config, channels })}
+              onChange={(channels) => {
+                if (activeChannelId) {
+                  dirtyChannelIdsRef.current.add(activeChannelId);
+                }
+                setConfig({ ...config, channels });
+              }}
               validationError={channelValidationError}
               onValidationChange={setChannelValidationError}
               selectedChannelId={activeChannelId}
               onSelectedChannelChange={setActiveChannelId}
+              enabledChannelIds={gatewayStatus.enabled_channels}
+              publicBaseUrl={draftPublicBase ?? undefined}
               gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
               onHealthCheck={async () => {
-                const result = await invokeTauri<{
-                  ok: boolean;
-                  message: string;
-                }>("test_gateway_health");
-                return result;
+                setLocalHealthLoading(true);
+                try {
+                  const result = await invokeTauri<LocalHealthResult>("test_gateway_health");
+                  setLocalHealthStatus(result.ok ? "ok" : "error");
+                  setLocalHealthMessage(result.message);
+                  setLocalHealthStatusCode(result.status_code ?? null);
+                  return result;
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  setLocalHealthStatus("error");
+                  setLocalHealthMessage(message);
+                  setLocalHealthStatusCode(null);
+                  throw error;
+                } finally {
+                  setLocalHealthLoading(false);
+                }
               }}
               onCopyWebhookUrl={(url) => {
                 void navigator.clipboard.writeText(url);
               }}
             />
+            {activeChannelId === "feishu" ? (
+              <section className="setup-section gateway-runtime-panel">
+                <div className="section-heading gateway-runtime-heading">
+                  <div>
+                    <h2>飞书诊断</h2>
+                    <div className="section-subtitle">
+                      只读检查配置、Gateway、Store、Retry worker 与 Public Health，不模拟飞书签名请求。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleRunFeishuDiagnostics()}
+                    disabled={feishuDiagnosticsLoading}
+                  >
+                    {feishuDiagnosticsLoading ? "诊断中…" : "刷新飞书诊断"}
+                  </button>
+                </div>
+
+                <div className="gateway-runtime-url-list">
+                  <div>
+                    <span>普通事件回调</span>
+                    <code>{runtimeWebhookUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(runtimeWebhookUrl, "飞书普通事件回调 URL")}
+                      disabled={!runtimeWebhookUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                  <div>
+                    <span>卡片交互回调</span>
+                    <code>{runtimeCardCallbackUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(runtimeCardCallbackUrl, "飞书卡片交互回调 URL")}
+                      disabled={!runtimeCardCallbackUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                </div>
+
+                {feishuDiagnostics ? (
+                  <div className="gateway-runtime-grid">
+                    <div><span>Feishu</span><strong>{feishuDiagnostics.feishu_enabled ? "enabled" : "disabled"}</strong></div>
+                    <div><span>App ID</span><strong>{feishuDiagnostics.app_id_present ? "present" : "missing"}</strong></div>
+                    <div><span>App Secret</span><strong>{feishuDiagnostics.app_secret_present ? "present" : "missing"}</strong></div>
+                    <div><span>Verification Token</span><strong>{feishuDiagnostics.verification_token_present ? "present" : "missing"}</strong></div>
+                    <div><span>Encrypt Key</span><strong>{feishuDiagnostics.encrypt_key_present ? "present" : "missing"}</strong></div>
+                    <div><span>Security</span><strong>{feishuDiagnostics.security_mode}</strong></div>
+                    <div><span>Outbound</span><strong>{feishuDiagnostics.outbound_mode}</strong></div>
+                    <div><span>Gateway</span><strong>{feishuDiagnostics.local_gateway_running ? "running" : "stopped"}</strong></div>
+                    <div><span>Local Health</span><strong>{feishuDiagnostics.local_health}</strong></div>
+                    <div><span>Public Base URL</span><strong>{feishuDiagnostics.public_base_url_present ? "present" : "missing"}</strong></div>
+                    <div>
+                      <span>Public Health</span>
+                      <strong>
+                        {feishuDiagnostics.public_health}
+                        {feishuDiagnostics.public_health_status_code
+                          ? ` · HTTP ${feishuDiagnostics.public_health_status_code}`
+                          : ""}
+                      </strong>
+                    </div>
+                    <div><span>Store</span><strong>{feishuDiagnostics.store_opened ? "opened" : "not_opened"}</strong></div>
+                    <div><span>Retry worker</span><strong>{feishuDiagnostics.retry_worker_started ? "started" : "not_started"}</strong></div>
+                  </div>
+                ) : (
+                  <p className="setup-action-hint">正在读取飞书诊断状态…</p>
+                )}
+
+                <div className="gateway-runtime-health-actions">
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleTestFeishuPublicHealth()}
+                    disabled={publicHealthLoading || !draftPublicBase}
+                  >
+                    {publicHealthLoading ? "检测中…" : "测试 Public Health"}
+                  </button>
+                  <span className={
+                    publicHealthStatus === "ok"
+                      ? "gateway-runtime-info"
+                      : publicHealthStatus === "error"
+                        ? "gateway-public-error"
+                        : "setup-action-hint"
+                  }>
+                    {publicHealthMessage}
+                    {publicHealthStatusCode ? `（HTTP ${publicHealthStatusCode}）` : ""}
+                  </span>
+                </div>
+
+                {(config.gateway_public?.mode === "quick_tunnel"
+                  || feishuDiagnostics?.quick_tunnel) ? (
+                  <div className="gateway-runtime-warning">
+                    Quick Tunnel 地址可能变化；重启 cloudflared 后，需要更新飞书后台两个回调地址。
+                  </div>
+                ) : null}
+                {feishuDiagnostics?.next_steps.length ? (
+                  <div className="gateway-runtime-warning">
+                    <strong>建议下一步</strong>
+                    <ul>
+                      {feishuDiagnostics.next_steps.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
+            {activeChannelId === "dingtalk" ? (
+              <section className="setup-section gateway-runtime-panel">
+                <div className="section-heading gateway-runtime-heading">
+                  <div>
+                    <h2>钉钉诊断</h2>
+                    <div className="section-subtitle">
+                      只读检查本地配置、Gateway、worker 与公网路由，不调用钉钉平台 API。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleRunDingtalkDiagnostics()}
+                    disabled={dingtalkDiagnosticsLoading}
+                  >
+                    {dingtalkDiagnosticsLoading ? "诊断中…" : "刷新钉钉诊断"}
+                  </button>
+                </div>
+
+                <div className="gateway-runtime-url-list">
+                  <div>
+                    <span>钉钉消息接收地址</span>
+                    <code>{runtimeDingtalkCallbackUrl || "Public Base URL 未配置"}</code>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      onClick={() => copyGatewayUrl(
+                        runtimeDingtalkCallbackUrl,
+                        "钉钉消息接收地址"
+                      )}
+                      disabled={!runtimeDingtalkCallbackUrl}
+                    >
+                      复制
+                    </button>
+                  </div>
+                </div>
+
+                {dingtalkDiagnostics ? (
+                  <div className="gateway-runtime-grid">
+                    <div>
+                      <span>DingTalk</span>
+                      <strong>{dingtalkDiagnostics.dingtalk_enabled ? "enabled" : "disabled"}</strong>
+                    </div>
+                    <div><span>App Key</span><strong>{dingtalkDiagnostics.app_key_present ? "present" : "missing"}</strong></div>
+                    <div><span>App Secret</span><strong>{dingtalkDiagnostics.app_secret_present ? "present" : "missing"}</strong></div>
+                    <div><span>RobotCode</span><strong>{dingtalkDiagnostics.robot_code_present ? "present" : "missing"}</strong></div>
+                    <div><span>Gateway</span><strong>{dingtalkDiagnostics.local_gateway_running ? "running" : "stopped"}</strong></div>
+                    <div><span>Local Health</span><strong>{dingtalkDiagnostics.local_health}</strong></div>
+                    <div><span>Public Base URL</span><strong>{dingtalkDiagnostics.public_base_url_present ? "present" : "missing"}</strong></div>
+                    <div>
+                      <span>Public Health</span>
+                      <strong>
+                        {dingtalkDiagnostics.public_health}
+                        {dingtalkDiagnostics.public_health_status_code
+                          ? ` · HTTP ${dingtalkDiagnostics.public_health_status_code}`
+                          : ""}
+                      </strong>
+                    </div>
+                    <div><span>Worker</span><strong>{dingtalkDiagnostics.worker_started ? "started" : "not_started"}</strong></div>
+                    <div><span>Outbound</span><strong>{dingtalkDiagnostics.outbound_mode || "missing"}</strong></div>
+                    <div><span>Webhook Path</span><code>{dingtalkDiagnostics.webhook_path}</code></div>
+                  </div>
+                ) : (
+                  <p className="setup-action-hint">正在读取钉钉诊断状态…</p>
+                )}
+
+                <div className="gateway-runtime-health-actions">
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void handleTestDingtalkPublicRoute()}
+                    disabled={dingtalkRouteLoading}
+                  >
+                    {dingtalkRouteLoading ? "检测中…" : "测试公网路由"}
+                  </button>
+                  {dingtalkRouteProbe ? (
+                    <span className={
+                      dingtalkRouteProbe.reachable
+                        ? "gateway-runtime-info"
+                        : "gateway-public-error"
+                    }>
+                      {dingtalkRouteProbe.message}
+                      {dingtalkRouteProbe.status_code
+                        ? `（HTTP ${dingtalkRouteProbe.status_code}）`
+                        : ""}
+                    </span>
+                  ) : null}
+                </div>
+
+                {(config.gateway_public?.mode === "quick_tunnel"
+                  || dingtalkDiagnostics?.quick_tunnel) ? (
+                  <div className="gateway-runtime-warning">
+                    Quick Tunnel 地址可能变化；重启 cloudflared 后，需要更新钉钉后台回调地址并重新发布应用。
+                  </div>
+                ) : null}
+                {dingtalkDiagnostics?.public_health === "failed" ? (
+                  <div className="gateway-runtime-warning">
+                    本地 Gateway 正常但公网检测失败时，请优先检查 cloudflared 是否运行以及公网地址是否过期。
+                  </div>
+                ) : null}
+                {dingtalkDiagnostics?.next_steps.length ? (
+                  <div className="gateway-runtime-warning">
+                    <strong>建议下一步</strong>
+                    <ul>
+                      {dingtalkDiagnostics.next_steps.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
           </>
         );
       case "skills":
@@ -1448,9 +2049,9 @@ export function Setup({
           type="button"
           className="setup-btn setup-btn--secondary"
           onClick={handleTestGatewayHealth}
-          disabled={busyAction !== null || !gatewayStatus.running}
+          disabled={busyAction !== null || localHealthLoading}
         >
-          {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+          {localHealthLoading ? "检测中…" : "测试本地 Health"}
         </button>
       </div>
       {actionMessage ? <p className="setup-action-hint">{actionMessage}</p> : null}
@@ -1597,9 +2198,9 @@ export function Setup({
             type="button"
             className="setup-btn setup-btn--secondary setup-btn--block"
             onClick={handleTestGatewayHealth}
-            disabled={busyAction !== null || !gatewayStatus.running}
+            disabled={busyAction !== null || localHealthLoading}
           >
-            {busyAction === "health" ? "检测中…" : "测试本地 Health"}
+            {localHealthLoading ? "检测中…" : "测试本地 Health"}
           </button>
           {actionMessage ? (
             <p className="setup-action-hint">{actionMessage}</p>

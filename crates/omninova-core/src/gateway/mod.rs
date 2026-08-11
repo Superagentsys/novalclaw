@@ -1,8 +1,37 @@
+pub mod agent_menu;
+pub mod dingtalk_card;
+pub mod dingtalk_card_stream;
+pub mod dingtalk_commands;
+pub mod dingtalk_store;
+pub mod dingtalk_stream;
+pub mod dingtalk_worker;
+pub mod feishu_store;
+pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
-pub mod feishu_worker;
-pub mod feishu_store;
 
+/// Unified DingTalk Stream lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DingTalkStreamState {
+    /// Stream is not running.
+    #[default]
+    Disconnected,
+    /// Requesting endpoint/ticket from DingTalk gateway.
+    Connecting,
+    /// WebSocket TCP connection established.
+    Connected,
+    /// Stream is registered and ready to receive business messages.
+    Registered,
+    /// Attempting to reconnect after a failure.
+    Reconnecting,
+    /// Stream is shutting down and will not accept new messages.
+    Stopping,
+}
+
+#[cfg(test)]
+mod dingtalk_tests;
+
+use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
 use crate::gateway::feishu_store::FeishuStore;
 use home;
 
@@ -49,11 +78,10 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
 static SESSION_LOCK_WAIT_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -104,6 +132,21 @@ impl DedupCache {
 
         cache.insert(key.to_string(), now + Duration::from_secs(ttl_secs));
         true // New event
+    }
+
+    /// Remove a key from the dedup cache. Used to rollback a reservation when
+    /// enqueue fails (e.g. queue full), allowing retry without permanent dedupe.
+    async fn remove(&self, key: &str) {
+        let mut cache = self.inner.write().await;
+        cache.remove(key);
+    }
+
+    /// Check if a key is present (without modifying state).
+    async fn contains(&self, key: &str) -> bool {
+        let mut cache = self.inner.write().await;
+        let now = Instant::now();
+        cache.retain(|_, &mut expiry| now < expiry);
+        cache.contains_key(key)
     }
 
     /// Clear all cached entries. Intended for unit tests.
@@ -198,6 +241,98 @@ pub(crate) struct MonitorFlightGuard {
     inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, MonitorFlightEntry>>>,
     /// Minimum TTL for any guard entry
     min_ttl_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DingTalk Monitor single-flight guard
+// ---------------------------------------------------------------------------
+
+/// Per-card single-flight guard for DingTalk monitor actions. Prevents concurrent
+/// monitor executions on the same card: a second monitor callback sees BUSY
+/// and returns without claiming a card generation or starting a second monitor.
+#[derive(Debug, Clone)]
+pub(crate) struct DingtalkMonitorGuard {
+    inner: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DingtalkMonitorEntry>>>,
+    #[cfg(test)]
+    acquisition_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct DingtalkMonitorEntry {
+    /// Opaque owner token: only this owner may release.
+    owner_id: String,
+    /// Absolute expiry instant.
+    expires_at: std::time::Instant,
+}
+
+impl DingtalkMonitorGuard {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            acquisition_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Try to acquire the single-flight slot for `out_track_id` with a 90s TTL.
+    /// Returns `Some(owner_token)` if free, `None` if busy.
+    async fn try_acquire(&self, out_track_id: &str) -> Option<String> {
+        #[cfg(test)]
+        self.acquisition_attempts.fetch_add(1, Ordering::AcqRel);
+        let owner_id = uuid::Uuid::new_v4().to_string();
+        let ttl = std::time::Duration::from_secs(90);
+        let now = std::time::Instant::now();
+        let mut guard = self.inner.write().await;
+        guard.retain(|_, entry| now < entry.expires_at);
+        if guard.contains_key(out_track_id) {
+            return None;
+        }
+        guard.insert(
+            out_track_id.to_string(),
+            DingtalkMonitorEntry {
+                owner_id: owner_id.clone(),
+                expires_at: now + ttl,
+            },
+        );
+        Some(owner_id)
+    }
+
+    /// Release the slot. Returns `true` only if the caller is still the owner.
+    async fn release(&self, out_track_id: &str, owner_id: &str) -> bool {
+        let mut guard = self.inner.write().await;
+        guard.retain(|_, entry| {
+            std::time::Instant::now() < entry.expires_at
+        });
+        let is_owner = guard
+            .get(out_track_id)
+            .is_some_and(|e| e.owner_id == owner_id);
+        if is_owner {
+            guard.remove(out_track_id);
+        }
+        is_owner
+    }
+
+    /// Check if a card is currently busy without changing state.
+    async fn is_busy(&self, out_track_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let guard = self.inner.read().await;
+        guard
+            .get(out_track_id)
+            .is_some_and(|e| now < e.expires_at)
+    }
+
+    /// Clear all entries. For tests.
+    #[cfg(test)]
+    pub(crate) async fn clear(&self) {
+        let mut guard = self.inner.write().await;
+        guard.clear();
+        self.acquisition_attempts.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquisition_attempt_count(&self) -> usize {
+        self.acquisition_attempts.load(Ordering::Acquire)
+    }
 }
 
 fn monitor_flight_key(chat_id: &str) -> String {
@@ -326,10 +461,288 @@ pub struct GatewayRuntime {
     feishu_queue_len: Arc<RwLock<usize>>,
     /// Feishu SQLite store for event/job/outbox persistence
     feishu_store: Option<Arc<FeishuStore>>,
+    /// DingTalk async job queue sender (for background worker processing)
+    dingtalk_job_sender: Arc<RwLock<Option<dingtalk_worker::DingtalkJobSender>>>,
+    /// DingTalk worker queue length tracker
+    dingtalk_queue_len: Arc<RwLock<usize>>,
+    /// DingTalk in-memory store for job tracking
+    dingtalk_store: Arc<OnceLock<Arc<dingtalk_store::DingtalkStore>>>,
+    /// Live DingTalk Stream connection state (unified for robot + card).
+    dingtalk_stream_connected: Arc<AtomicBool>,
+    /// Stream owner lifecycle: owner generation counter + shutdown flag + mutex.
+    /// The counter prevents old owners from clearing new owners' state (ABA race).
+    /// Only the current owner may call release (Drop or explicit cleanup).
+    dingtalk_stream_owner: Arc<StreamOwner>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
     monitor_flights: Arc<MonitorFlightGuard>,
+    /// Per-card DingTalk monitor single-flight guard.
+    dingtalk_monitor_guard: Arc<DingtalkMonitorGuard>,
+}
+
+// ---------------------------------------------------------------------------
+// DingTalk Stream owner lifecycle
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DingTalk Stream owner lifecycle
+// ---------------------------------------------------------------------------
+
+/// Owner-aware Stream lifecycle guard using a generation counter to prevent
+/// ABA races: an old owner cannot clear a new owner's state because each
+/// start increments the generation. Only the current owner may release.
+pub(crate) struct StreamOwner {
+    /// Incremented on each start. Guards against the ABA pattern where
+    /// old_owner releases → new_owner starts (CAS succeeds) → old_owner cleanup
+    /// incorrectly clears new_owner.
+    generation: AtomicU64,
+    /// Set true when a stream is currently active on this runtime.
+    active: AtomicBool,
+    /// Business frames are accepted only while the current owner is running
+    /// and has not entered shutdown.
+    accepting_frames: AtomicBool,
+    connected: AtomicBool,
+    /// Physical loop counter for diagnostics: incremented when a loop starts,
+    /// decremented when a loop exits. Never goes above 1 in normal operation.
+    active_loops: AtomicUsize,
+    /// Maximum physical active loops observed (diagnostic).
+    max_active_loops: AtomicUsize,
+    /// The active reconnect loop's JoinHandle, if spawned.
+    /// Uses parking_lot::Mutex because shutdown is called from sync Drop.
+    loop_handle: parking_lot::Mutex<Option<OwnedStreamLoop>>,
+    /// Used to signal the reconnect loop to stop. Shared with the child task.
+    shutdown_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+}
+
+struct OwnedStreamLoop {
+    owner_gen: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamShutdownOutcome {
+    NotRunning,
+    StaleOwner,
+    Graceful,
+    Aborted,
+    JoinFailed,
+}
+
+struct PhysicalStreamLoopGuard {
+    owner: Arc<StreamOwner>,
+    owner_gen: u64,
+}
+
+impl PhysicalStreamLoopGuard {
+    fn new(owner: Arc<StreamOwner>, owner_gen: u64) -> Self {
+        let current = owner.active_loops.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut max = owner.max_active_loops.load(Ordering::Acquire);
+        while current > max {
+            match owner.max_active_loops.compare_exchange(
+                max,
+                current,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => max = observed,
+            }
+        }
+        Self { owner, owner_gen }
+    }
+}
+
+impl Drop for PhysicalStreamLoopGuard {
+    fn drop(&mut self) {
+        self.owner.active_loops.fetch_sub(1, Ordering::AcqRel);
+        self.owner.finish_loop(self.owner_gen);
+    }
+}
+
+impl StreamOwner {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            accepting_frames: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            active_loops: AtomicUsize::new(0),
+            max_active_loops: AtomicUsize::new(0),
+            loop_handle: parking_lot::Mutex::new(None),
+            shutdown_tx: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Atomically acquire the owner, create its cancellation channel, spawn
+    /// the reconnect loop, and retain the JoinHandle. There is no interval in
+    /// which an active owner exists without a lifecycle handle.
+    fn try_start_loop<F, Fut>(self: &Arc<Self>, build: F) -> Option<u64>
+    where
+        F: FnOnce(u64, watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tx_guard = self.shutdown_tx.lock();
+        let mut handle_guard = self.loop_handle.lock();
+        if self.active.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // A naturally completed task may leave a completed JoinHandle behind.
+        // Physical activity is already zero before active becomes false.
+        let _ = handle_guard.take();
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (tx, rx) = watch::channel(false);
+        self.active.store(true, Ordering::Release);
+        self.accepting_frames.store(true, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        *tx_guard = Some(tx);
+
+        let owner = self.clone();
+        let future = build(gen, rx);
+        let handle = tokio::spawn(async move {
+            let _physical_loop = PhysicalStreamLoopGuard::new(owner, gen);
+            future.await;
+        });
+        *handle_guard = Some(OwnedStreamLoop {
+            owner_gen: gen,
+            handle,
+        });
+        Some(gen)
+    }
+
+    /// Try to become the current owner and spawn the reconnect loop.
+    /// Returns (owner_gen, shutdown_rx) on success, or (current_gen, None) if
+    /// another owner is already active.
+    /// ABA-safe: increments generation so old owners cannot clear new owners.
+    fn try_acquire(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        let mut tx_guard = self.shutdown_tx.lock();
+        if self.active.load(Ordering::Acquire) {
+            return (self.generation.load(Ordering::Acquire), None);
+        }
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active.store(true, Ordering::Release);
+        self.accepting_frames.store(true, Ordering::Release);
+        let (tx, rx) = watch::channel(false);
+        *tx_guard = Some(tx);
+        (gen, Some(rx))
+    }
+
+    /// Signal cancellation without releasing ownership. Drop uses this only as
+    /// a last-resort safety net; normal stop/restart calls shutdown_and_join.
+    fn signal_shutdown(&self, owner_gen: u64) -> bool {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return false;
+        }
+        self.accepting_frames.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        if let Some(tx) = self.shutdown_tx.lock().as_ref() {
+            let _ = tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn shutdown_and_join(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        if !self.active.load(Ordering::Acquire) {
+            return StreamShutdownOutcome::NotRunning;
+        }
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        self.signal_shutdown(owner_gen);
+        let owned = self.loop_handle.lock().take();
+        let Some(mut owned) = owned else {
+            return StreamShutdownOutcome::JoinFailed;
+        };
+        if owned.owner_gen != owner_gen {
+            *self.loop_handle.lock() = Some(owned);
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        let outcome = match tokio::time::timeout(wait, &mut owned.handle).await {
+            Ok(Ok(())) => StreamShutdownOutcome::Graceful,
+            Ok(Err(_)) => StreamShutdownOutcome::JoinFailed,
+            Err(_) => {
+                owned.handle.abort();
+                let _ = owned.handle.await;
+                StreamShutdownOutcome::Aborted
+            }
+        };
+        // PhysicalStreamLoopGuard performs the normal/abort cleanup. Keep this
+        // idempotent fallback for a panicking child.
+        self.finish_loop(owner_gen);
+        outcome
+    }
+
+    fn finish_loop(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.accepting_frames.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.shutdown_tx.lock().take();
+    }
+
+    /// Release this owner. Only called from Guard::Drop as a safety net.
+    /// The primary shutdown path is shutdown_and_join().
+    fn release(&self, owner_gen: u64) {
+        self.finish_loop(owner_gen);
+    }
+
+    /// Set connected=true. Only succeeds if caller is the current owner.
+    fn set_connected(&self, owner_gen: u64, value: bool) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        if value && !self.accepting_frames.load(Ordering::Acquire) {
+            return;
+        }
+        self.connected.store(value, Ordering::Release);
+    }
+
+    /// Returns true only for the current owner.
+    fn is_owner(&self, owner_gen: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == owner_gen
+            && self.active.load(Ordering::Acquire)
+            && self.accepting_frames.load(Ordering::Acquire)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Returns the current number of physical active loops (diagnostic).
+    pub(crate) fn active_loop_count(&self) -> usize {
+        self.active_loops.load(Ordering::Acquire)
+    }
+
+    /// Returns the maximum observed active loops (diagnostic).
+    pub(crate) fn max_active_loop_count(&self) -> usize {
+        self.max_active_loops.load(Ordering::Acquire)
+    }
+
+    /// Reset diagnostic counters. For tests only.
+    #[cfg(test)]
+    pub(crate) fn reset_diagnostics(&self) {
+        self.active_loops.store(0, Ordering::Release);
+        self.max_active_loops.store(0, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -447,8 +860,14 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dingtalk_job_sender: Arc::new(RwLock::new(None)),
+            dingtalk_queue_len: Arc::new(RwLock::new(0)),
+            dingtalk_store: Arc::new(OnceLock::new()),
+            dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
+            dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
+            dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
         }
     }
 
@@ -466,8 +885,14 @@ impl GatewayRuntime {
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
+            dingtalk_job_sender: Arc::new(RwLock::new(None)),
+            dingtalk_queue_len: Arc::new(RwLock::new(0)),
+            dingtalk_store: Arc::new(OnceLock::new()),
+            dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
+            dingtalk_stream_owner: Arc::new(StreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
+            dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
         }
     }
 
@@ -478,11 +903,80 @@ impl GatewayRuntime {
     pub(crate) fn monitor_flight_guard(&self) -> Arc<MonitorFlightGuard> {
         self.monitor_flights.clone()
     }
+
+    pub(crate) fn dingtalk_monitor_guard(&self) -> Arc<DingtalkMonitorGuard> {
+        self.dingtalk_monitor_guard.clone()
+    }
     
     /// Initialize the Feishu async worker with the given queue
     pub async fn init_feishu_worker(&self, sender: FeishuJobSender) {
         let mut lock = self.feishu_job_sender.write().await;
         *lock = Some(sender);
+    }
+
+    pub async fn init_dingtalk_worker(&mut self) {
+        // The OnceLock is shared by every GatewayRuntime clone. Initialize it
+        // before the idempotent sender check so a clone created before worker
+        // startup observes the exact same store as the worker and Card callback.
+        let store = if let Some(store) = self.dingtalk_store.get() {
+            store.clone()
+        } else {
+            let config = self.get_config().await;
+            let config_dir = config
+                .config_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .filter(|path| !path.as_os_str().is_empty())
+                .or_else(|| home::home_dir().map(|home| home.join(".omninova")))
+                .unwrap_or_else(|| std::path::PathBuf::from(".omninova"));
+            let candidate = Arc::new(
+                dingtalk_store::DingtalkStore::open(&config_dir).unwrap_or_else(|error| {
+                    println!("[dingtalk-panel] store_persistent=false reason={error}");
+                    dingtalk_store::DingtalkStore::new()
+                }),
+            );
+            self.dingtalk_store
+                .get_or_init(|| candidate)
+                .clone()
+        };
+        // Keep initialization idempotent. Most importantly, never replace the
+        // sender while the receiver from the same channel is still running.
+        {
+            let sender = self.dingtalk_job_sender.read().await;
+            if sender.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                println!("[dingtalk-async-worker] already_started=true");
+                return;
+            }
+        }
+
+        let worker_state = dingtalk_worker::DingtalkWorkerState::with_queue_len(
+            self.dingtalk_queue_len.clone(),
+        );
+        let sender = worker_state.sender();
+
+        // Check again under the write lock. A repeated init must not install a
+        // sender from a new channel whose receiver will never be started.
+        {
+            let mut lock = self.dingtalk_job_sender.write().await;
+            if lock.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                println!("[dingtalk-async-worker] already_started=true");
+                return;
+            }
+            *lock = Some(sender);
+        }
+
+        let runtime = Arc::new(self.clone());
+        dingtalk_worker::start_dingtalk_worker(worker_state, runtime, store).await;
+    }
+
+    /// Read-only diagnostic state. This does not start, stop, or replace the
+    /// worker channel and never exposes queued payloads or platform IDs.
+    pub async fn dingtalk_worker_started(&self) -> bool {
+        self.dingtalk_job_sender
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
     }
     
     /// Get approximate queue length
@@ -673,6 +1167,125 @@ impl GatewayRuntime {
     pub async fn is_feishu_worker_initialized(&self) -> bool {
         let sender = self.feishu_job_sender.read().await;
         sender.is_some()
+    }
+
+    // -------------------------------------------------------------------------
+    // DingTalk async worker methods
+    // -------------------------------------------------------------------------
+
+    pub async fn dingtalk_queue_len(&self) -> usize {
+        *self.dingtalk_queue_len.read().await
+    }
+
+    pub async fn try_send_dingtalk_job(&self, job: dingtalk_worker::DingtalkAsyncJob) -> Result<(), dingtalk_worker::EnqueueError> {
+        let sender = self
+            .dingtalk_job_sender
+            .read()
+            .await
+            .as_ref()
+            .filter(|sender| !sender.is_closed())
+            .cloned()
+            .ok_or(dingtalk_worker::EnqueueError::QueueFull)?;
+        {
+            // Increment before send so a fast receiver cannot decrement from
+            // zero and leave the approximate count permanently stale.
+            let mut queue_len = self.dingtalk_queue_len.write().await;
+            *queue_len += 1;
+        }
+        if sender.send(job).await.is_err() {
+            let mut queue_len = self.dingtalk_queue_len.write().await;
+            *queue_len = queue_len.saturating_sub(1);
+            return Err(dingtalk_worker::EnqueueError::QueueFull);
+        }
+        Ok(())
+    }
+
+    pub async fn is_dingtalk_worker_initialized(&self) -> bool {
+        let sender = self.dingtalk_job_sender.read().await;
+        sender.as_ref().is_some_and(|sender| !sender.is_closed())
+    }
+
+    /// Try to acquire Stream ownership. Returns (owner_gen, Some(shutdown_rx)) if
+    /// no other owner is active, or (current_gen, None) if already owned.
+    /// ABA-safe: increments generation counter so old owners cannot clear new owners.
+    pub(crate) fn try_acquire_stream_owner(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        self.dingtalk_stream_owner.try_acquire()
+    }
+
+    pub(crate) fn try_start_dingtalk_stream_loop<F, Fut>(&self, build: F) -> Option<u64>
+    where
+        F: FnOnce(u64, watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.dingtalk_stream_owner.try_start_loop(build)
+    }
+
+    /// Release Stream ownership. ABA-safe: only releases if `owner_gen` matches
+    /// the current owner, preventing old owners from clearing new ones.
+    pub(crate) fn release_stream_owner(&self, owner_gen: u64) {
+        self.dingtalk_stream_owner.release(owner_gen);
+    }
+
+    pub(crate) fn is_current_stream_owner(&self, owner_gen: u64) -> bool {
+        self.dingtalk_stream_owner.is_owner(owner_gen)
+    }
+
+    /// Check if a Stream is currently active on this runtime.
+    pub(crate) fn is_dingtalk_stream_active(&self) -> bool {
+        self.dingtalk_stream_owner.is_active()
+    }
+
+    /// Set connected state. Only the current owner (matching `owner_gen`) may set this.
+    pub(crate) fn set_dingtalk_stream_connected(&self, owner_gen: u64, value: bool) {
+        self.dingtalk_stream_owner.set_connected(owner_gen, value);
+    }
+
+    pub(crate) fn dingtalk_stream_connected(&self) -> bool {
+        self.dingtalk_stream_owner.is_connected()
+    }
+
+    /// Check if DingTalk Stream is in Registered state (truly ready for business).
+    pub fn is_dingtalk_stream_registered(&self) -> bool {
+        self.dingtalk_stream_connected()
+    }
+
+    /// Signal the active reconnect loop to shut down without releasing its
+    /// physical ownership. Used only by Drop as a cancellation safety net.
+    pub(crate) fn signal_dingtalk_stream_shutdown(&self, owner_gen: u64) -> bool {
+        self.dingtalk_stream_owner.signal_shutdown(owner_gen)
+    }
+
+    pub(crate) async fn shutdown_dingtalk_stream_generation(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        self.dingtalk_stream_owner
+            .shutdown_and_join(owner_gen, wait)
+            .await
+    }
+
+    pub async fn shutdown_dingtalk_stream_and_join(&self) {
+        const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        let owner_gen = self.dingtalk_stream_owner.current_generation();
+        let outcome = self
+            .shutdown_dingtalk_stream_generation(owner_gen, STREAM_SHUTDOWN_TIMEOUT)
+            .await;
+        println!("[dingtalk-stream] lifecycle_join outcome={outcome:?}");
+    }
+
+    /// Number of physical active stream loops (diagnostic, should be 0 or 1).
+    pub(crate) fn dingtalk_active_loop_count(&self) -> usize {
+        self.dingtalk_stream_owner.active_loop_count()
+    }
+
+    /// Maximum observed active stream loops (diagnostic).
+    pub(crate) fn dingtalk_max_active_loops(&self) -> usize {
+        self.dingtalk_stream_owner.max_active_loop_count()
+    }
+
+    pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
+        self.dingtalk_store.get().cloned()
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
@@ -2080,7 +2693,12 @@ impl GatewayRuntime {
         let runtime = self.clone();
         let _worker_handle = spawn_worker(receiver, runtime.clone(), queue_len);
         println!("[gateway] feishu_async_worker started");
-        
+
+        // Initialize DingTalk async worker
+        self.init_dingtalk_worker().await;
+        // Start unified DingTalk Stream transport (handles both robot and card topics)
+        let mut dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
+
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
         crate::gateway::feishu_worker::run_retry_worker_once(&runtime).await;
@@ -2107,6 +2725,20 @@ impl GatewayRuntime {
             .route("/webhook/feishu", post(http_feishu_webhook))
             .route("/webhook/lark", post(http_lark_webhook))
             .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            // Alias documented in `config.template.toml` and used by the
+            // real DingTalk enterprise app bot callback wizard:
+            //   `https://<public-host>/api/v1/gateway/dingtalk/events`.
+            // Both routes point to the same handler so the documented
+            // URL works end-to-end while the legacy `/webhook/dingtalk`
+            // path keeps working for anyone already wired up.
+            .route(
+                "/api/v1/gateway/dingtalk/events",
+                post(http_dingtalk_webhook),
+            )
+            .route(
+                agent_menu::DINGTALK_MENU_CARD_CALLBACK_PATH,
+                get(http_dingtalk_card_callback_get).post(http_dingtalk_card_callback_post),
+            )
             .route("/webhook/feishu/card", post(http_feishu_card_callback))
             .route("/sessions/tree", get(http_sessions_tree))
             .route("/estop/status", get(http_estop_status))
@@ -2165,7 +2797,11 @@ impl GatewayRuntime {
         }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        let serve_result = axum::serve(listener, app).await;
+        if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
+            stream_guard.shutdown().await;
+        }
+        serve_result?;
         Ok(())
     }
 }
@@ -2479,10 +3115,17 @@ pub fn normalize_public_webhook_base_url(value: &str) -> Option<String> {
         return None;
     }
 
-    let without_endpoint = trimmed
-        .strip_suffix("/webhook/feishu/card")
-        .or_else(|| trimmed.strip_suffix("/webhook/feishu"))
-        .unwrap_or(trimmed)
+    let lower = trimmed.to_ascii_lowercase();
+    let endpoint_len = [
+        "/api/v1/gateway/dingtalk/events",
+        "/webhook/feishu/card",
+        "/webhook/feishu",
+        "/webhook/dingtalk",
+    ]
+    .iter()
+    .find_map(|suffix| lower.ends_with(suffix).then_some(suffix.len()))
+    .unwrap_or(0);
+    let without_endpoint = trimmed[..trimmed.len().saturating_sub(endpoint_len)]
         .trim_end_matches('/');
 
     if without_endpoint.is_empty()
@@ -2754,6 +3397,112 @@ pub async fn check_gateway_public_health(config: &Config) -> GatewayPublicHealth
         status_code: last_status,
         error_kind: Some("health_endpoint_not_found".to_string()),
         error: Some("公网入口可达，但未找到 Health 接口。".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DingtalkPublicRouteProbe {
+    pub configured: bool,
+    pub reachable: bool,
+    pub status_code: Option<u16>,
+    pub result_kind: String,
+    pub message: String,
+}
+
+fn classify_dingtalk_route_response(status_code: u16, body: &str) -> DingtalkPublicRouteProbe {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("1033") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: false,
+            status_code: Some(status_code),
+            result_kind: "tunnel_unreachable".to_string(),
+            message: "公网隧道不可达或地址已过期。".to_string(),
+        };
+    }
+    if lower.contains("missing_timestamp") || lower.contains("missing_sign") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "missing_timestamp".to_string(),
+            message: "路由可达，缺少签名头；这是手动空请求的预期结果。".to_string(),
+        };
+    }
+    if lower.contains("signature_mismatch") || lower.contains("invalid_sign") {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "signature_mismatch".to_string(),
+            message: "路由可达，签名未通过；这是无有效签名手动请求的预期结果。".to_string(),
+        };
+    }
+    if (200..300).contains(&status_code) {
+        return DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: true,
+            status_code: Some(status_code),
+            result_kind: "ok".to_string(),
+            message: "钉钉公网回调路由可达。".to_string(),
+        };
+    }
+    DingtalkPublicRouteProbe {
+        configured: true,
+        reachable: false,
+        status_code: Some(status_code),
+        result_kind: "http_error".to_string(),
+        message: format!("钉钉公网回调路由返回 HTTP {status_code}。"),
+    }
+}
+
+/// Probe only route reachability with an empty JSON body. No platform secret,
+/// signature, user message, or identifier is sent or retained.
+pub async fn check_dingtalk_public_route(base_url: &str) -> DingtalkPublicRouteProbe {
+    let Some(base_url) = normalize_public_webhook_base_url(base_url) else {
+        return DingtalkPublicRouteProbe {
+            configured: false,
+            reachable: false,
+            status_code: None,
+            result_kind: "not_configured".to_string(),
+            message: "Public Base URL 未配置。".to_string(),
+        };
+    };
+    let callback_url = format!("{base_url}/api/v1/gateway/dingtalk/events");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return DingtalkPublicRouteProbe {
+                configured: true,
+                reachable: false,
+                status_code: None,
+                result_kind: "client_error".to_string(),
+                message: "无法创建公网路由检测客户端。".to_string(),
+            };
+        }
+    };
+
+    match client.post(callback_url).json(&serde_json::json!({})).send().await {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            classify_dingtalk_route_response(status_code, &body)
+        }
+        Err(error) => DingtalkPublicRouteProbe {
+            configured: true,
+            reachable: false,
+            status_code: None,
+            result_kind: if error.is_timeout() {
+                "timeout"
+            } else {
+                "network_error"
+            }
+            .to_string(),
+            message: "公网隧道不可达或地址已过期，请检查 cloudflared。".to_string(),
+        },
     }
 }
 
@@ -3872,6 +4621,30 @@ async fn process_feishu_card_action_callback(
         }
     };
 
+    // Feishu validates the dedicated card callback URL with the same
+    // top-level url_verification payload used by the normal event endpoint.
+    // This must return before card action extraction because the challenge
+    // intentionally has no event/action object.
+    if payload.get("type").and_then(serde_json::Value::as_str)
+        == Some("url_verification")
+    {
+        println!("[feishu-card] url_verification_detected");
+        let challenge = payload
+            .get("challenge")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(GatewayError {
+                        message: "missing_challenge".to_string(),
+                    }),
+                )
+            })?;
+        println!("[feishu-card] challenge_response_sent");
+        return Ok(Json(serde_json::json!({ "challenge": challenge })));
+    }
+
     println!(
         "[feishu-card] payload_shape top_keys={:?} event_keys={:?}",
         safe_json_object_keys(Some(&payload)),
@@ -4508,7 +5281,518 @@ async fn http_dingtalk_webhook(
     headers: HeaderMap,
     raw_body: String,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<GatewayError>)> {
-    http_channel_webhook(runtime, headers, raw_body, ChannelKind::Dingtalk).await
+    let cfg = runtime.get_config().await;
+
+    // ==== DingTalk-specific security checks ====
+    // 1. Enabled check.
+    //
+    // Effective state = `gateway.dingtalk.enabled` (preferred new master
+    // switch) OR legacy `channels_config.dingtalk.enabled` (kept for
+    // backwards compatibility). When both are unset (the default), the
+    // route returns `channel_disabled` and no further work is done.
+    if !is_dingtalk_effectively_enabled(&cfg) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": false,
+            "processing": "skipped",
+            "reason": "channel_disabled"
+        })));
+    }
+
+    // 2. Parse JSON payload early for signature verification
+    let payload: serde_json::Value = match serde_json::from_str(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[dingtalk-webhook] rejected reason=invalid_json parse_error={}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError {
+                    message: "invalid_json".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // 3. Signature verification (DingTalk uses HMAC-SHA256 with timestamp+app_secret)
+    let dingtalk_entry = cfg.channels_config.dingtalk.as_ref();
+    let app_secret = resolve_dingtalk_secret(&cfg, dingtalk_entry);
+    if app_secret.is_some() {
+        match verify_dingtalk_webhook_signature(&headers, &raw_body, app_secret.as_deref()) {
+            Ok(()) => {
+                println!("[dingtalk-security] signature_verified");
+            }
+            Err(reason) => {
+                println!("[dingtalk-security] rejected reason={}", reason);
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(GatewayError {
+                        message: reason,
+                    }),
+                ));
+            }
+        }
+    } else {
+        // Dev mode - no app_secret configured
+        if std::sync::atomic::AtomicU64::new(0)
+            .fetch_add(0, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {}
+        // Low-frequency dev mode warning (every 100th request)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DEV_WARNING_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let count = DEV_WARNING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count % 100 == 0 {
+            println!("[dingtalk-security] insecure_webhook_allowed mode=dev");
+        }
+    }
+
+    // 4. Extract key fields for filtering.
+    //
+    // Real DingTalk enterprise app bot v1 callbacks send:
+    //   - `msgtype` (lowercase) for the message-type discriminator
+    //   - `text.content` (nested) for the user-visible text
+    //   - `msgId` (camelCase) for the platform message id
+    //
+    // Some DingTalk client SDKs and proxies still emit `msgType`,
+    // `text` as a flat string, or `messageId`. We accept both for
+    // forward compatibility without changing the Phase 1 internal model.
+    let msg_type = payload
+        .get("msgType")
+        .or_else(|| payload.get("msgtype"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let is_text_message = msg_type.as_deref() == Some("text");
+
+    // URL verification challenge (real DingTalk sends this once at
+    // first connection). Phase 1 silently dropped these; Phase 3 must
+    // echo `challenge` back so the platform registers our URL.
+    if payload.get("eventType").and_then(|v| v.as_str())
+        == Some("url_verification")
+    {
+        if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
+            println!(
+                "[dingtalk-webhook] url_verification_ok challenge_len={}",
+                challenge.len()
+            );
+            return Ok(Json(serde_json::json!({ "challenge": challenge })));
+        }
+        println!("[dingtalk-webhook] url_verification_missing_challenge");
+    }
+
+    // 5. Extract sender info (DingTalk corpid/userid)
+    let sender_staff_id = payload
+        .get("senderStaffId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let sender_nick = payload
+        .get("senderNick")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let conversation_id = payload
+        .get("conversationId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let session_webhook = payload
+        .get("sessionWebhook")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let message_id = payload
+        .get("messageId")
+        .or_else(|| payload.get("msgId"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let robot_code = payload
+        .get("robotCode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Log inbound (presence flags and length only — never the values).
+    println!(
+        "[dingtalk-webhook] received msg_type={:?} has_sender={} has_conversation={} has_webhook={} has_msgid={} has_robot_code={} text_len={}",
+        msg_type,
+        sender_staff_id.as_ref().map(|_| true).unwrap_or(false),
+        conversation_id.as_ref().map(|_| true).unwrap_or(false),
+        session_webhook.as_ref().map(|_| true).unwrap_or(false),
+        message_id.as_ref().map(|_| true).unwrap_or(false),
+        robot_code.as_ref().map(|_| true).unwrap_or(false),
+        extract_dingtalk_text_len(&payload)
+    );
+
+    // 6. Filter: only handle text messages (Phase 1)
+    if !is_text_message {
+        println!("[dingtalk-webhook] skip_unsupported_message_type msg_type={:?}", msg_type);
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "skipped",
+            "reason": "unsupported_message_type"
+        })));
+    }
+
+    // 7. Extract text content. Accept both nested `text.content` (real
+    // DingTalk) and flat `text` (some proxies / SDKs). `text.content`
+    // wins when both are present.
+    let text = extract_dingtalk_text(&payload);
+    if text.trim().is_empty() {
+        println!("[dingtalk-webhook] skip_empty_text");
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "skipped",
+            "reason": "empty_text"
+        })));
+    }
+
+    // 8. Build InboundMessage with DingTalk-specific metadata
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(ref sid) = sender_staff_id {
+        metadata.insert("senderStaffId".to_string(), serde_json::json!(sid));
+    }
+    if let Some(ref nick) = sender_nick {
+        metadata.insert("senderNick".to_string(), serde_json::json!(nick));
+    }
+    if let Some(ref cid) = conversation_id {
+        metadata.insert("conversationId".to_string(), serde_json::json!(cid));
+    }
+    if let Some(ref webhook) = session_webhook {
+        metadata.insert("sessionWebhook".to_string(), serde_json::json!(webhook));
+    }
+    if let Some(ref mid) = message_id {
+        metadata.insert("messageId".to_string(), serde_json::json!(mid));
+    }
+    if let Some(ref rc) = robot_code {
+        metadata.insert("robotCode".to_string(), serde_json::json!(rc));
+    }
+    metadata.insert("source".to_string(), serde_json::json!("dingtalk"));
+    metadata.insert("raw_payload".to_string(), payload.clone());
+
+    let inbound = InboundMessage {
+        channel: ChannelKind::Dingtalk,
+        user_id: sender_staff_id,
+        session_id: conversation_id,
+        text,
+        metadata,
+    };
+
+    // 8a. Cross-transport dedupe: if DingTalk also delivered this message via
+    // the Stream transport (or via a retry), the Stream-side `try_dingtalk_stream_dedupe`
+    // call already inserted `dt_stream:<msgId>` into the shared `dedup_cache`.
+    // Re-check from the HTTP side so a duplicate delivery does not produce
+    // two replies. Without this guard, an HTTP+Stream hybrid setup would
+    // double-process every regular robot message.
+    if let Some(ref mid) = message_id {
+        let dedup_key = format!("dt_stream:{}", mid);
+        let dedup_cache = runtime.dedup_cache();
+        let is_new = dedup_cache.check_and_insert(&dedup_key).await;
+        if !is_new {
+            println!(
+                "[dingtalk-webhook] dedupe_shared=true msg_id_hash={}",
+                mid.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(12)
+                    .collect::<String>()
+                    .len()
+            );
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "deduped",
+                "reason": "stream_dedupe_hit"
+            })));
+        }
+    }
+
+    // 9. Check if DingTalk worker is initialized
+    let is_async_available = runtime.is_dingtalk_worker_initialized().await;
+
+    if is_async_available {
+        // Queue job for background processing
+        let text_len = inbound.text.chars().count();
+        let queue_len_before = runtime.dingtalk_queue_len().await;
+        println!(
+            "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={}",
+            text_len,
+            queue_len_before
+        );
+
+        let job = dingtalk_worker::DingtalkAsyncJob::new(inbound, payload);
+        let job_id = job.job_id.clone();
+
+        match runtime.try_send_dingtalk_job(job).await {
+            Ok(()) => {
+                let queue_len = runtime.dingtalk_queue_len().await;
+                println!(
+                    "[dingtalk-webhook] enqueue_success=true queue_len={}",
+                    queue_len
+                );
+                println!(
+                    "[dingtalk-webhook] ack_queued ack_ms={} queue_len={}",
+                    0,
+                    queue_len
+                );
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "queued",
+                    "job_id": job_id
+                })));
+            }
+            Err(_) => {
+                // CRITICAL: rollback dedupe reservation so DingTalk can retry without
+                // permanent dedupe hit. This prevents message loss when queue is full.
+                if let Some(ref mid) = message_id {
+                    let dedup_key = format!("dt_stream:{}", mid);
+                    runtime.dedup_cache().remove(&dedup_key).await;
+                }
+                let queue_len = runtime.dingtalk_queue_len().await;
+                println!(
+                    "[dingtalk-webhook] enqueue_attempt=true text_len={} queue_len={} result=failed dedupe_rollback=true",
+                    text_len,
+                    queue_len
+                );
+                println!("[dingtalk-worker] queue_full capacity=100");
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "accepted": false,
+                    "processing": "queue_full",
+                    "retryable": true
+                })));
+            }
+        }
+    }
+
+    // 10. Fallback: sync processing via Runtime + outbound
+    println!("[dingtalk-webhook] sync_mode reason=worker_not_initialized");
+
+    // Phase 2: short-circuit commands (help/menu/status/ping/monitor)
+    // even in the sync fallback path. Non-command text continues into
+    // the agent exactly like Phase 1.
+    let sync_command_inputs = crate::gateway::dingtalk_commands::DingtalkStatusInputs {
+        config: &cfg,
+        worker_initialized: false,
+        queue_len: runtime.dingtalk_queue_len().await,
+    };
+    let command_decision = crate::gateway::dingtalk_commands::evaluate_dingtalk_command(
+        &inbound.text,
+        Some(&payload),
+        sync_command_inputs,
+    );
+    if let Some((cmd, command_reply)) = command_decision {
+        println!(
+            "[dingtalk-webhook] command_reply command={}",
+            cmd.name()
+        );
+        if command_reply.trim().is_empty() {
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed",
+                "reply": ""
+            })));
+        }
+        let result = deliver_dingtalk_reply(&cfg, &inbound, &command_reply).await;
+        match result {
+            Ok(_) => {
+                println!(
+                    "[dingtalk-webhook] outbound_ok reply_len={}",
+                    command_reply.len()
+                );
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "completed",
+                    "reply": ""
+                })));
+            }
+            Err(e) => {
+                println!("[dingtalk-webhook] outbound_failed error={}", e);
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "accepted": true,
+                    "processing": "completed_with_error",
+                    "reply": "",
+                    "platform_error": e
+                })));
+            }
+        }
+    }
+
+    let response = match runtime.process_inbound(&inbound).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[dingtalk-webhook] runtime_failed error={}", e);
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "error": "agent_runtime_failed",
+                "message": e.to_string()
+            })));
+        }
+    };
+
+    if response.reply.trim().is_empty() {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "accepted": true,
+            "processing": "completed",
+            "reply": ""
+        })));
+    }
+
+    // Deliver reply via sessionWebhook
+    let result = deliver_dingtalk_reply(&cfg, &inbound, &response.reply).await;
+    match result {
+        Ok(_) => {
+            println!("[dingtalk-webhook] outbound_ok reply_len={}", response.reply.len());
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed",
+                "reply": ""
+            })))
+        }
+        Err(e) => {
+            println!("[dingtalk-webhook] outbound_failed error={}", e);
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "processing": "completed_with_error",
+                "reply": "",
+                "platform_error": e
+            })))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DingtalkCardActionQuery {
+    action: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DingtalkCardActionResponse {
+    ok: bool,
+    action: Option<String>,
+    message: String,
+}
+
+async fn http_dingtalk_card_callback_get(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<DingtalkCardActionQuery>,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    process_dingtalk_card_action(&runtime, query.action.as_deref()).await
+}
+
+async fn http_dingtalk_card_callback_post(
+    State(runtime): State<GatewayRuntime>,
+    raw_body: String,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    let payload = match serde_json::from_str::<serde_json::Value>(&raw_body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            println!("[dingtalk-card-callback] rejected reason=invalid_json");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(DingtalkCardActionResponse {
+                    ok: false,
+                    action: None,
+                    message: "无效的卡片回调数据。".to_string(),
+                }),
+            );
+        }
+    };
+    let action = agent_menu::extract_dingtalk_agent_menu_action(&payload);
+    process_dingtalk_card_action(&runtime, action.as_deref()).await
+}
+
+async fn process_dingtalk_card_action(
+    runtime: &GatewayRuntime,
+    raw_action: Option<&str>,
+) -> (StatusCode, Json<DingtalkCardActionResponse>) {
+    let Some(raw_action) = raw_action.map(str::trim).filter(|value| !value.is_empty()) else {
+        println!("[dingtalk-card-callback] action_present=false");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DingtalkCardActionResponse {
+                ok: false,
+                action: None,
+                message: "缺少卡片操作。".to_string(),
+            }),
+        );
+    };
+    let Some(action) = agent_menu::canonical_agent_menu_action(raw_action) else {
+        println!("[dingtalk-card-callback] action_present=true action=unknown");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DingtalkCardActionResponse {
+                ok: false,
+                action: None,
+                message: "未知操作，已忽略。".to_string(),
+            }),
+        );
+    };
+
+    println!(
+        "[dingtalk-card-callback] action_present=true action={} identifiers_logged=false",
+        action
+    );
+    let message = match action {
+        "monitor_30s" => "当前 DingTalk 端暂未启用桌面监控 30 秒操作。".to_string(),
+        "monitor_60s" => "当前 DingTalk 端暂未启用桌面监控 60 秒操作。".to_string(),
+        "gateway_status" => {
+            let config = runtime.get_config().await;
+            let worker_started = runtime.dingtalk_worker_started().await;
+            let queue_len = runtime.dingtalk_queue_len().await;
+            format!(
+                "Gateway 状态：运行中\nDingTalk：{}\nWorker：{}\n队列任务：{}",
+                if is_dingtalk_effectively_enabled(&config) {
+                    "已启用"
+                } else {
+                    "未启用"
+                },
+                if worker_started {
+                    "已启动"
+                } else {
+                    "未启动"
+                },
+                queue_len
+            )
+        }
+        "recent_jobs" => match runtime.dingtalk_store() {
+            Some(store) => {
+                let jobs = store.get_recent_jobs(5).await;
+                if jobs.is_empty() {
+                    "暂无最近任务。".to_string()
+                } else {
+                    let completed = jobs
+                        .iter()
+                        .filter(|job| job.status == dingtalk_store::JobStatus::Completed)
+                        .count();
+                    let failed = jobs
+                        .iter()
+                        .filter(|job| job.status == dingtalk_store::JobStatus::Failed)
+                        .count();
+                    format!(
+                        "最近任务：{} 条\n已完成：{}\n失败：{}",
+                        jobs.len(),
+                        completed,
+                        failed
+                    )
+                }
+            }
+            None => "暂无最近任务。".to_string(),
+        },
+        "help" => agent_menu::render_agent_menu_as_dingtalk_text(),
+        _ => unreachable!("canonical Agent menu action is exhaustive"),
+    };
+
+    (
+        StatusCode::OK,
+        Json(DingtalkCardActionResponse {
+            ok: true,
+            action: Some(action.to_string()),
+            message,
+        }),
+    )
 }
 
 async fn http_channel_webhook(
@@ -5714,6 +6998,439 @@ async fn deliver_platform_reply(
     }
 }
 
+/// Resolve DingTalk app_secret from channel config (extra or env var) OR
+/// the new top-level `gateway.dingtalk` config block.
+///
+/// Order (first non-empty wins):
+/// 1. Channel entry's `app_secret` field in `extra`
+/// 2. `gateway.dingtalk.app_secret` (inline)
+/// 3. `gateway.dingtalk.app_secret_env` env var
+/// 4. `OMNINOVA_DINGTALK_APP_SECRET` env var directly
+fn resolve_dingtalk_secret(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("app_secret")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.app_secret.trim().is_empty() {
+        return Some(cfg.app_secret.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.app_secret_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_APP_SECRET") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Deliver reply via DingTalk sessionWebhook (Phase 1 outbound)
+async fn deliver_dingtalk_reply(
+    config: &Config,
+    inbound: &InboundMessage,
+    reply: &str,
+) -> Result<(), String> {
+    let entry = config.channels_config.dingtalk.as_ref();
+
+    // Outbound mode priority:
+    //   1. `gateway.dingtalk.outbound_mode`  (new top-level, default `session_webhook`)
+    //   2. legacy `channels_config.dingtalk.extra["outbound_mode"]`
+    // Treat absent / empty as `"disabled"` so the legacy "did not set a mode"
+    // behavior keeps working.
+    let outbound_mode = {
+        let top = config.gateway.dingtalk.outbound_mode.trim();
+        if !top.is_empty() {
+            top.to_string()
+        } else {
+            entry
+                .and_then(|e| e.extra.get("outbound_mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("disabled")
+                .to_string()
+        }
+    };
+
+    if outbound_mode == "disabled" {
+        println!("[dingtalk-webhook] outbound_skip reason=disabled");
+        return Ok(());
+    }
+
+    if outbound_mode == "mock" {
+        println!("[dingtalk-webhook] outbound_selected sender=mock");
+        return Ok(());
+    }
+
+    // real mode: use sessionWebhook
+    let session_webhook_present = inbound
+        .metadata
+        .get("sessionWebhook")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !session_webhook_present {
+        println!(
+            "[dingtalk-webhook] session_webhook_missing fallback=robot_code_required \
+             inbound_session_id_present={}",
+            inbound.session_id.is_some()
+        );
+    }
+
+    let app_key = resolve_dingtalk_app_key(config, entry)
+        .ok_or_else(|| "missing_app_key".to_string())?;
+    let app_secret = resolve_dingtalk_secret(config, entry)
+        .ok_or_else(|| "missing_app_secret".to_string())?;
+
+    let token = dingtalk_worker::fetch_dingtalk_access_token(&app_key, &app_secret)
+        .await
+        .map_err(|e| format!("token_fetch_error: {}", e))?;
+
+    // Fallback robot_code comes from the gateway top-level config so
+    // the send path can build a valid `sendFromApp` body even when the
+    // inbound payload does not carry a `robotCode` field.
+    let fallback_robot_code = resolve_dingtalk_robot_code(config, entry);
+
+    dingtalk_worker::send_dingtalk_text_message(
+        &token,
+        inbound,
+        fallback_robot_code.as_deref(),
+        reply,
+    )
+    .await
+}
+
+/// Resolve DingTalk app_key from channel config (extra) OR the top-level
+/// `gateway.dingtalk` config. Order: channel extra, gateway.dingtalk.app_key,
+/// gateway.dingtalk.app_key_env, `OMNINOVA_DINGTALK_APP_KEY` env var.
+fn resolve_dingtalk_app_key(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("app_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.app_key.trim().is_empty() {
+        return Some(cfg.app_key.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.app_key_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_APP_KEY") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Resolve DingTalk robot_code with the same precedence as app_key.
+fn resolve_dingtalk_robot_code(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(v) = entry
+            .extra
+            .get("robot_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.robot_code.trim().is_empty() {
+        return Some(cfg.robot_code.trim().to_string());
+    }
+
+    if let Some(ref env_name) = cfg.robot_code_env {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(v) = std::env::var("OMNINOVA_DINGTALK_ROBOT_CODE") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn resolve_dingtalk_card_template(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if let Some(value) = entry
+            .extra
+            .get("card_template_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    let cfg = &config.gateway.dingtalk;
+    if !cfg.card_template_id.trim().is_empty() {
+        return Some(cfg.card_template_id.trim().to_string());
+    }
+    if let Some(env_name) = cfg.card_template_id_env.as_deref() {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    std::env::var("OMNINOVA_DINGTALK_CARD_TEMPLATE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_dingtalk_transport_mode(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> crate::config::schema::DingtalkTransportMode {
+    entry
+        .and_then(|entry| entry.extra.get("transport_mode"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::config::schema::DingtalkTransportMode::from_config_value)
+        .unwrap_or(config.gateway.dingtalk.transport_mode)
+}
+
+/// Returns true if the top-level `gateway.dingtalk` block is enabled.
+/// Per-channel `channels_config.dingtalk.enabled` continues to be honored
+/// by `is_channel_enabled`; this helper is for master-switch checks.
+fn is_dingtalk_gateway_enabled(config: &Config) -> bool {
+    config.gateway.dingtalk.enabled
+}
+
+/// Effective DingTalk enablement: top-level master switch OR legacy
+/// channel entry. Either being on is sufficient to accept inbound
+/// webhooks; the per-channel flag exists for backwards compatibility with
+/// existing config.toml files that only set `channels.dingtalk.enabled`.
+/// Both default to disabled, so a Config with neither set yields false.
+fn is_dingtalk_effectively_enabled(config: &Config) -> bool {
+    if is_dingtalk_gateway_enabled(config) {
+        return true;
+    }
+    if is_channel_enabled(config, &ChannelKind::Dingtalk) {
+        return true;
+    }
+    false
+}
+
+/// Sanitized DingTalk configuration snapshot used by desktop diagnostics.
+/// It deliberately exposes only presence booleans and non-secret mode/path
+/// labels while reusing the same resolvers as the live outbound path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DingtalkDiagnosticConfigState {
+    pub enabled: bool,
+    pub app_key_present: bool,
+    pub app_secret_present: bool,
+    pub robot_code_present: bool,
+    pub webhook_path: String,
+    pub outbound_mode: String,
+}
+
+pub fn dingtalk_diagnostic_config_state(config: &Config) -> DingtalkDiagnosticConfigState {
+    let entry = config.channels_config.dingtalk.as_ref();
+    let top_level_mode = config.gateway.dingtalk.outbound_mode.trim();
+    let outbound_mode = if top_level_mode.is_empty() {
+        entry
+            .and_then(|entry| entry.extra.get("outbound_mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("disabled")
+            .to_string()
+    } else {
+        top_level_mode.to_string()
+    };
+
+    DingtalkDiagnosticConfigState {
+        enabled: is_dingtalk_effectively_enabled(config),
+        app_key_present: resolve_dingtalk_app_key(config, entry).is_some(),
+        app_secret_present: resolve_dingtalk_secret(config, entry).is_some(),
+        robot_code_present: resolve_dingtalk_robot_code(config, entry).is_some(),
+        webhook_path: "/api/v1/gateway/dingtalk/events".to_string(),
+        outbound_mode,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DingTalk payload parsing helpers (Phase 3 — real-platform compatibility)
+// ---------------------------------------------------------------------------
+//
+// Real DingTalk enterprise app bot v1 callbacks deliver the user-visible
+// text under `text.content`, not as a flat `text` string. The same body
+// shape, however, also travels through some proxies / SDKs as a flat
+// `text` field. Both shapes are accepted here so the same handler can
+// process real production callbacks AND the synthetic payloads used in
+// tests.
+
+/// Extract the user-visible text from a DingTalk callback payload,
+/// preferring the nested `text.content` shape and falling back to a
+/// flat `text` string when only that one is present.
+fn extract_dingtalk_text(payload: &serde_json::Value) -> String {
+    if let Some(content) = payload
+        .get("text")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+    {
+        return content.to_string();
+    }
+    if let Some(s) = payload.get("text").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    String::new()
+}
+
+/// Length of the user-visible text without copying it out — used in
+/// log lines that must not contain the message body itself.
+fn extract_dingtalk_text_len(payload: &serde_json::Value) -> usize {
+    extract_dingtalk_text(payload).chars().count()
+}
+
+// ---------------------------------------------------------------------------
+// Worker-callable resolvers (used by `dingtalk_worker` at runtime, not only in tests)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn resolve_dingtalk_secret_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_secret(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_app_key_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_app_key(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_robot_code_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_robot_code(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_card_template_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_card_template(config, entry)
+}
+
+pub(crate) fn resolve_dingtalk_transport_mode_for_worker(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> crate::config::schema::DingtalkTransportMode {
+    resolve_dingtalk_transport_mode(config, entry)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only re-exports (used by `dingtalk_worker` wrappers in unit tests)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_secret_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_secret(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_app_key_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_app_key(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_dingtalk_robot_code_for_test(
+    config: &Config,
+    entry: Option<&crate::config::schema::ChannelEntry>,
+) -> Option<String> {
+    resolve_dingtalk_robot_code(config, entry)
+}
+
+#[cfg(test)]
+pub(crate) fn extract_dingtalk_text_for_test(payload: &serde_json::Value) -> String {
+    extract_dingtalk_text(payload)
+}
+
+/// List of HTTP paths the DingTalk webhook handler is registered at.
+/// Exposed for the Phase 3 integration regression tests so we can
+/// confirm both the documented callback URL and the legacy alias are
+/// bound to the same handler without spinning up a full router.
+#[cfg(test)]
+pub(crate) fn dingtalk_known_route_paths_for_test() -> &'static [&'static str] {
+    &[
+        "/webhook/dingtalk",
+        "/api/v1/gateway/dingtalk/events",
+        agent_menu::DINGTALK_MENU_CARD_CALLBACK_PATH,
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn is_dingtalk_effectively_enabled_for_test(config: &Config) -> bool {
+    is_dingtalk_effectively_enabled(config)
+}
+
 fn signed_webhook_payload(
     config: &Config,
     headers: &HeaderMap,
@@ -5955,6 +7672,46 @@ impl FeishuSecurityConfig {
             encrypt_key,
             insecure,
         }
+    }
+}
+
+/// Sanitized Feishu configuration snapshot used by desktop diagnostics.
+/// Secret-bearing values are reduced to presence booleans before the value
+/// leaves core, so the renderer never receives credentials.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FeishuDiagnosticConfigState {
+    pub enabled: bool,
+    pub app_id_present: bool,
+    pub app_secret_present: bool,
+    pub verification_token_present: bool,
+    pub encrypt_key_present: bool,
+    pub security_mode: String,
+    pub outbound_mode: String,
+}
+
+pub fn feishu_diagnostic_config_state(config: &Config) -> FeishuDiagnosticConfigState {
+    let entry = config.channels_config.feishu.as_ref();
+    let security = FeishuSecurityConfig::from_entry(entry);
+    let configured_extra = |key: &str| {
+        entry
+            .and_then(|entry| entry.extra.get(key))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(FeishuSecurityConfig::is_configured_secret)
+    };
+
+    FeishuDiagnosticConfigState {
+        enabled: entry.is_some_and(|entry| entry.enabled),
+        app_id_present: configured_extra("app_id"),
+        app_secret_present: configured_extra("app_secret"),
+        verification_token_present: security.verification_token.is_some(),
+        encrypt_key_present: security.encrypt_key.is_some(),
+        security_mode: security.mode.as_str().to_string(),
+        outbound_mode: entry
+            .and_then(|entry| entry.extra.get("outbound_mode"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|mode| !mode.trim().is_empty())
+            .unwrap_or("disabled")
+            .to_string(),
     }
 }
 
@@ -7126,18 +8883,23 @@ fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool, create_tools_for_route,
-        check_gateway_public_health, feishu_public_callback_urls,
+        acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool,
+        check_dingtalk_public_route, check_gateway_public_health, classify_dingtalk_route_response,
+        create_tools_for_route, dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
+        feishu_public_callback_urls, http_dingtalk_card_callback_post,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
         normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
         resolve_public_webhook_base_url, split_session_key, DedupCache, GatewayRuntime,
-        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard,
-        SessionLineageMeta,
+        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
-    use crate::config::{Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode};
+    use crate::config::{
+        ChannelEntry, Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode,
+    };
+    use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
+    use axum::Json;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -7859,6 +9621,55 @@ mod tests {
             .expect("Feishu card response body");
         let value = serde_json::from_slice(&bytes).expect("Feishu card response must be JSON");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn feishu_card_url_verification_returns_challenge() {
+        let challenge = "card-verification-challenge";
+        let body = json!({
+            "type": "url_verification",
+            "token": "card-verification-token",
+            "challenge": challenge
+        })
+        .to_string();
+
+        let (status, response) = call_feishu_card_http(
+            GatewayRuntime::new(feishu_security_config("dev", None, None)),
+            body,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("challenge").and_then(serde_json::Value::as_str),
+            Some(challenge)
+        );
+        assert!(response.get("toast").is_none());
+    }
+
+    #[tokio::test]
+    async fn feishu_card_challenge_does_not_require_action() {
+        let token = "configured-card-token";
+        let body = json!({
+            "type": "url_verification",
+            "token": token,
+            "challenge": "challenge-without-action"
+        })
+        .to_string();
+
+        let (status, response) = call_feishu_card_http(
+            GatewayRuntime::new(feishu_security_config("token", Some(token), None)),
+            body,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.get("challenge").and_then(serde_json::Value::as_str),
+            Some("challenge-without-action")
+        );
+        assert!(response.get("ok").is_none());
+        assert!(response.get("toast").is_none());
     }
 
     #[test]
@@ -10215,7 +12026,98 @@ mod tests {
             normalize_public_webhook_base_url("https://example.test/webhook/feishu"),
             Some("https://example.test".to_string())
         );
+        assert_eq!(
+            normalize_public_webhook_base_url(
+                "https://example.test/api/v1/gateway/dingtalk/events/"
+            ),
+            Some("https://example.test".to_string())
+        );
+        assert_eq!(
+            normalize_public_webhook_base_url("https://example.test/webhook/dingtalk"),
+            Some("https://example.test".to_string())
+        );
         assert_eq!(normalize_public_webhook_base_url("   "), None);
+    }
+
+    #[test]
+    fn dingtalk_diagnostic_config_state_contains_presence_only() {
+        let mut config = Config::default();
+        config.gateway.dingtalk.enabled = true;
+        config.gateway.dingtalk.app_key = "diagnostic-app-key".to_string();
+        config.gateway.dingtalk.app_secret = "diagnostic-app-secret".to_string();
+        config.gateway.dingtalk.robot_code = "diagnostic-robot-code".to_string();
+
+        let state = dingtalk_diagnostic_config_state(&config);
+        assert!(state.enabled);
+        assert!(state.app_key_present);
+        assert!(state.app_secret_present);
+        assert!(state.robot_code_present);
+        assert_eq!(state.webhook_path, "/api/v1/gateway/dingtalk/events");
+
+        let rendered = serde_json::to_string(&state).expect("serialize diagnostics");
+        assert!(!rendered.contains("diagnostic-app-key"));
+        assert!(!rendered.contains("diagnostic-app-secret"));
+        assert!(!rendered.contains("diagnostic-robot-code"));
+    }
+
+    #[test]
+    fn feishu_diagnostic_config_state_contains_presence_only() {
+        let mut config = Config::default();
+        config.channels_config.feishu = Some(ChannelEntry {
+            enabled: true,
+            security_mode: Some("encrypted".to_string()),
+            verification_token: Some("diagnostic-verification-token".to_string()),
+            encrypt_key: Some("diagnostic-encrypt-key".to_string()),
+            extra: HashMap::from([
+                ("app_id".to_string(), json!("diagnostic-app-id")),
+                ("app_secret".to_string(), json!("diagnostic-app-secret")),
+                ("outbound_mode".to_string(), json!("real")),
+            ]),
+            ..Default::default()
+        });
+
+        let state = feishu_diagnostic_config_state(&config);
+        assert!(state.enabled);
+        assert!(state.app_id_present);
+        assert!(state.app_secret_present);
+        assert!(state.verification_token_present);
+        assert!(state.encrypt_key_present);
+        assert_eq!(state.security_mode, "encrypted");
+        assert_eq!(state.outbound_mode, "real");
+
+        let rendered = serde_json::to_string(&state).expect("serialize diagnostics");
+        for secret in [
+            "diagnostic-app-id",
+            "diagnostic-app-secret",
+            "diagnostic-verification-token",
+            "diagnostic-encrypt-key",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn dingtalk_route_probe_classifies_expected_unsigned_responses() {
+        let missing = classify_dingtalk_route_response(401, r#"{"message":"missing_timestamp"}"#);
+        assert!(missing.reachable);
+        assert_eq!(missing.result_kind, "missing_timestamp");
+
+        let mismatch = classify_dingtalk_route_response(403, r#"{"message":"signature_mismatch"}"#);
+        assert!(mismatch.reachable);
+        assert_eq!(mismatch.result_kind, "signature_mismatch");
+
+        let tunnel = classify_dingtalk_route_response(530, "Cloudflare error 1033");
+        assert!(!tunnel.reachable);
+        assert_eq!(tunnel.result_kind, "tunnel_unreachable");
+    }
+
+    #[tokio::test]
+    async fn dingtalk_route_probe_reports_unconfigured_without_network_access() {
+        let result = check_dingtalk_public_route("   ").await;
+        assert!(!result.configured);
+        assert!(!result.reachable);
+        assert_eq!(result.status_code, None);
+        assert_eq!(result.result_kind, "not_configured");
     }
 
     #[test]
@@ -10234,6 +12136,28 @@ mod tests {
             Some("https://gateway.example.test")
         );
         let (event_url, card_url) = feishu_public_callback_urls(&config);
+        assert_eq!(
+            event_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu")
+        );
+        assert_eq!(
+            card_url.as_deref(),
+            Some("https://gateway.example.test/webhook/feishu/card")
+        );
+    }
+
+    #[test]
+    fn feishu_callback_urls_handle_trailing_slash_and_unconfigured_base() {
+        let empty = Config::default();
+        assert_eq!(feishu_public_callback_urls(&empty), (None, None));
+
+        let mut configured = Config::default();
+        configured.gateway_public = GatewayPublicConfig {
+            mode: GatewayPublicMode::ExternalPublicUrl,
+            public_webhook_base_url: Some("https://gateway.example.test/".to_string()),
+            ..GatewayPublicConfig::default()
+        };
+        let (event_url, card_url) = feishu_public_callback_urls(&configured);
         assert_eq!(
             event_url.as_deref(),
             Some("https://gateway.example.test/webhook/feishu")
@@ -10462,5 +12386,44 @@ mod tests {
         );
         assert!(!serialized.contains("verification-token-must-not-leak"));
         assert!(!serialized.contains("app-secret-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_gateway_status_action() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"action": "gateway_status"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("gateway_status"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_recent_tasks_alias() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"params": {"actionKey": "recent_tasks"}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("recent_jobs"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_card_callback_recognizes_help_action() {
+        let runtime = GatewayRuntime::new(Config::default());
+        let (status, Json(response)) = http_dingtalk_card_callback_post(
+            State(runtime),
+            json!({"value": {"action": "help"}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.ok);
+        assert_eq!(response.action.as_deref(), Some("help"));
     }
 }

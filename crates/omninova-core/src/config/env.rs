@@ -94,6 +94,33 @@ pub fn apply_env_overrides(cfg: &mut Config) {
         cfg.gateway.allow_public_bind = v == "true" || v == "1";
     });
 
+    // --- Gateway DingTalk ---
+    // AppKey / AppSecret / robotCode always come from the env var when it
+    // is set, regardless of whether `app_key` etc. are populated in the
+    // config file. This keeps real secrets out of committed config files.
+    env_opt("OMNINOVA_DINGTALK_APP_KEY", |v| {
+        cfg.gateway.dingtalk.app_key = v;
+    });
+    env_opt("OMNINOVA_DINGTALK_APP_SECRET", |v| {
+        cfg.gateway.dingtalk.app_secret = v;
+    });
+    env_opt("OMNINOVA_DINGTALK_ROBOT_CODE", |v| {
+        cfg.gateway.dingtalk.robot_code = v;
+    });
+    env_opt("OMNINOVA_DINGTALK_WEBHOOK_PATH", |v| {
+        if !v.trim().is_empty() {
+            cfg.gateway.dingtalk.webhook_path = v;
+        }
+    });
+    env_opt("OMNINOVA_DINGTALK_ENABLED", |v| {
+        cfg.gateway.dingtalk.enabled = v == "true" || v == "1";
+    });
+    env_opt("OMNINOVA_DINGTALK_OUTBOUND_MODE", |v| {
+        if !v.trim().is_empty() {
+            cfg.gateway.dingtalk.outbound_mode = v;
+        }
+    });
+
     // --- Runtime reasoning ---
     env_opt("OMNINOVA_REASONING_ENABLED", |v| {
         cfg.runtime.reasoning_enabled = v == "true" || v == "1";

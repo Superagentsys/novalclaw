@@ -19,6 +19,10 @@ interface ChannelConfigFormProps {
   onCopyWebhookUrl?: (url: string) => void;
   selectedChannelId?: string;
   onSelectedChannelChange?: (channelId: string) => void;
+  /** Runtime truth returned by gateway_status; independent from the editor selection. */
+  enabledChannelIds?: string[];
+  /** Shared Gateway Public Base URL used by status, callbacks, and health checks. */
+  publicBaseUrl?: string;
 }
 
 /** Get card callback path for feishu channel (used when channel is feishu) */
@@ -32,7 +36,7 @@ function getWebhookPath(channelId: string): string {
     case "feishu": return "/webhook/feishu";
     case "lark": return "/webhook/lark";
     case "wechat": return "/webhook/wechat";
-    case "dingtalk": return "/webhook/dingtalk";
+    case "dingtalk": return "/api/v1/gateway/dingtalk/events";
     case "webhook": return "/webhook";
     default: return "/webhook";
   }
@@ -47,6 +51,8 @@ function isLocalhost(url: string): boolean {
 function normalizePublicWebhookBaseUrl(value: string): string {
   return value
     .trim()
+    .replace(/\/api\/v1\/gateway\/dingtalk\/events\/?$/i, "")
+    .replace(/\/webhook\/dingtalk\/?$/i, "")
     .replace(/\/webhook\/feishu\/card\/?$/i, "")
     .replace(/\/webhook\/feishu\/?$/i, "")
     .replace(/\/$/, "");
@@ -72,6 +78,8 @@ export function ChannelConfigForm({
   onCopyWebhookUrl,
   selectedChannelId,
   onSelectedChannelChange,
+  enabledChannelIds,
+  publicBaseUrl,
 }: ChannelConfigFormProps) {
   const [uncontrolledSelectedId, setUncontrolledSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
   const selectedId = selectedChannelId ?? uncontrolledSelectedId;
@@ -156,7 +164,6 @@ export function ChannelConfigForm({
             || field.key === "security_mode"
             || field.key === "verification_token"
             || field.key === "encrypt_key"
-            || field.key === "public_webhook_base_url"
           : base.has(field.key)
       );
     }
@@ -184,15 +191,25 @@ export function ChannelConfigForm({
     onChange({ ...value, [id]: cleanedEntry });
   };
 
-  const enabledList = CHANNEL_PRESETS.filter(
-    (preset) => getEntry(preset.id).enabled
+  const displayedEnabledChannelIds = enabledChannelIds
+    ?? CHANNEL_PRESETS.filter((preset) => getEntry(preset.id).enabled).map(
+      (preset) => preset.id
+    );
+  const enabledList = CHANNEL_PRESETS.filter((preset) =>
+    displayedEnabledChannelIds.includes(preset.id)
   ).map((preset) => preset.name);
 
   const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
+  const dingtalkTransportMode = selectedPreset?.id === "dingtalk"
+    ? entry.extra?.["transport_mode"] || "http"
+    : "http";
   const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
     ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
     : "";
-  const webhookBaseUrl = publicWebhookBaseUrl || gatewayUrl?.trim() || "";
+  const webhookBaseUrl = normalizePublicWebhookBaseUrl(publicBaseUrl ?? "")
+    || publicWebhookBaseUrl
+    || gatewayUrl?.trim()
+    || "";
   const fullWebhookUrl = webhookBaseUrl
     ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
     : "";
@@ -466,6 +483,20 @@ export function ChannelConfigForm({
 
           <div className="setup-grid">
             {visibleFields.map((field) => {
+              if (field.key === "transport_mode" && selectedPreset.id === "dingtalk") {
+                return (
+                  <label key={field.key}>
+                    {field.label}
+                    <select
+                      value={getFieldValue(field) || "http"}
+                      onChange={(event) => handleFieldChange(field, event.target.value)}
+                    >
+                      <option value="http">HTTP（稳定文本 Bot）</option>
+                      <option value="stream">Stream（启用互动卡片）</option>
+                    </select>
+                  </label>
+                );
+              }
               // Special handling for outbound_mode - render as dropdown
               if (field.key === "outbound_mode") {
                 return (
@@ -527,6 +558,7 @@ export function ChannelConfigForm({
                     <input
                       type={field.type ?? "text"}
                       value={getFieldValue(field)}
+                      disabled={field.key === "card_template_id" && dingtalkTransportMode !== "stream"}
                       onChange={(event) =>
                         handleFieldChange(field, event.target.value)
                       }
@@ -539,6 +571,26 @@ export function ChannelConfigForm({
               );
             })}
           </div>
+
+          {selectedPreset.id === "dingtalk" && (
+            <div className="channel-guide">
+              <h3>互动卡片</h3>
+              {dingtalkTransportMode === "stream" ? (
+                <>
+                  <strong>Stream 模式已选择</strong>
+                  <p>互动卡片可用条件：Stream 已连接，且 Card Template ID 已配置。</p>
+                </>
+              ) : (
+                <>
+                  <strong>当前不可用</strong>
+                  <p>
+                    OmniNova 互动卡片需要 DingTalk Stream 模式。HTTP 模式仍支持普通文本消息和 Agent 对话。
+                    Card Template ID 会保留，切回 Stream 后无需重新填写。
+                  </p>
+                </>
+              )}
+            </div>
+          )}
 
           {selectedPreset.id === "feishu" && (
             <div className="channel-guide">
@@ -594,7 +646,11 @@ export function ChannelConfigForm({
                 </li>
                 <li>获取 App Key 和 App Secret</li>
                 <li>
-                  配置消息接收地址为 <code>/webhook/dingtalk</code>
+                  如需 sendFromApp fallback，请在本地配置中设置
+                  <code>gateway.dingtalk.robot_code</code>；诊断区只显示 present / missing。
+                </li>
+                <li>
+                  配置消息接收地址为 <code>/api/v1/gateway/dingtalk/events</code>
                 </li>
               </ol>
             </div>

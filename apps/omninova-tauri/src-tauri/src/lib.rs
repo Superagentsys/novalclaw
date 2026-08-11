@@ -5,13 +5,15 @@ mod desktop_capture;
 use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
-    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, ModelProviderConfig,
+    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
     ProviderConfig, RobotConfig,
 };
 use omninova_core::gateway::{
-    check_gateway_public_health, normalize_gateway_public_config,
+    check_dingtalk_public_route, check_gateway_public_health,
+    dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
+    feishu_public_callback_urls, normalize_gateway_public_config,
     normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse,
-    GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
+    DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
@@ -783,9 +785,10 @@ async fn open_workspace_dir(
 
 #[tauri::command]
 async fn save_setup_config(
-    config: SetupAppConfig,
+    mut config: SetupAppConfig,
     validate_all_channels: Option<bool>,
     active_channel_id: Option<String>,
+    changed_channel_ids: Option<Vec<String>>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<SaveSetupResult, String> {
     let state_ref = state.inner().clone();
@@ -804,19 +807,32 @@ async fn save_setup_config(
     } else {
         ChannelValidationScope::Current(active_channel_id.as_deref().unwrap_or("feishu"))
     };
+    if let (Some(channels), Some(changed_channel_ids)) =
+        (config.channels.as_mut(), changed_channel_ids.as_deref())
+    {
+        retain_changed_setup_channels(channels, changed_channel_ids);
+    }
     let mut next = setup_config_to_core(current, config, validation_scope)?;
     let next_gateway_url = format!("http://{}:{}", next.gateway.host, next.gateway.port);
-    let workspace_changed = current_workspace_dir != next.workspace_dir;
+    let workspace_changed = !workspace_paths_equivalent(&current_workspace_dir, &next.workspace_dir);
 
     save_config_with_fallback(&mut next)?;
     runtime.set_config(next).await.map_err(|e| e.to_string())?;
 
     let mut restarted = false;
-    if current_gateway_url != next_gateway_url || workspace_changed {
+    let gateway_url_changed = current_gateway_url != next_gateway_url;
+    if gateway_url_changed || workspace_changed {
+        println!(
+            "[gateway-lifecycle] restart_trigger=config_compare gateway_url_changed={} workspace_changed={} dingtalk_changed={} feishu_changed={}",
+            gateway_url_changed,
+            workspace_changed,
+            false,
+            false
+        );
         // Restart gateway so new workspace_dir takes effect and tools are recreated.
-        stop_gateway_inner(&state_ref).await;
+        stop_gateway_inner(&state_ref, "config_change").await;
         sleep(Duration::from_millis(200)).await;
-        if let Err(e) = start_gateway_inner(state_ref.clone()).await {
+        if let Err(e) = start_gateway_inner(state_ref.clone(), "config_change").await {
             return Err(format!("配置已保存但网关重启失败: {e}"));
         }
         restarted = true;
@@ -1309,7 +1325,11 @@ async fn preflight_gateway_bind(host: &str, port: u16) -> Result<(), (String, St
 }
 
 /// 启动本机 HTTP 网关（与 `omninova` CLI 使用同一配置与端口，便于后台常驻后命令行调用）。
-async fn start_gateway_inner(state_ref: Arc<Mutex<AppState>>) -> Result<GatewayStatusPayload, String> {
+async fn start_gateway_inner(
+    state_ref: Arc<Mutex<AppState>>,
+    reason: &'static str,
+) -> Result<GatewayStatusPayload, String> {
+    println!("[gateway-lifecycle] start reason={reason}");
     sync_gateway_task_state(&state_ref).await;
     let runtime = {
         let app_state = state_ref.lock().await;
@@ -1442,7 +1462,7 @@ async fn start_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    start_gateway_inner(state_ref).await
+    start_gateway_inner(state_ref, "user_command").await
 }
 
 #[tauri::command]
@@ -1450,7 +1470,7 @@ async fn stop_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    stop_gateway_inner(&state_ref).await;
+    stop_gateway_inner(&state_ref, "user_command").await;
     Ok(gateway_status_from_state(&state_ref).await)
 }
 
@@ -1459,9 +1479,9 @@ async fn restart_gateway(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayStatusPayload, String> {
     let state_ref = state.inner().clone();
-    stop_gateway_inner(&state_ref).await;
+    stop_gateway_inner(&state_ref, "user_command").await;
     sleep(Duration::from_millis(100)).await;
-    start_gateway_inner(state_ref).await
+    start_gateway_inner(state_ref, "user_command").await
 }
 
 #[tauri::command]
@@ -1543,6 +1563,7 @@ async fn test_gateway_health(
 
 #[tauri::command]
 async fn test_gateway_public_health(
+    base_url: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<GatewayPublicHealthStatus, String> {
     let state_ref = state.inner().clone();
@@ -1551,12 +1572,29 @@ async fn test_gateway_public_health(
         let app_state = state_ref.lock().await;
         (app_state.runtime.clone(), app_state.gateway_task.is_some())
     };
-    let config = runtime.get_config().await;
+    let mut config = runtime.get_config().await;
+    let requested_base_url = match base_url {
+        Some(value) => match normalize_public_webhook_base_url(&value) {
+            Some(value) => {
+                // This is an ephemeral probe target from the current UI draft.
+                // It must not persist or be overridden by a stale named-tunnel
+                // field while the request is in flight.
+                config.gateway_public.mode = GatewayPublicMode::ExternalPublicUrl;
+                config.gateway_public.public_webhook_base_url = Some(value.clone());
+                Some(value)
+            }
+            None => {
+                let result = GatewayPublicHealthStatus::not_configured();
+                let mut app_state = state_ref.lock().await;
+                app_state.last_public_health = Some(result.clone());
+                return Ok(result);
+            }
+        },
+        None => omninova_core::gateway::resolve_public_webhook_base_url(&config),
+    };
     let mut result = if running {
         check_gateway_public_health(&config).await
-    } else if let Some(base_url) =
-        omninova_core::gateway::resolve_public_webhook_base_url(&config)
-    {
+    } else if let Some(base_url) = requested_base_url {
         GatewayPublicHealthStatus {
             configured: true,
             ok: false,
@@ -1579,12 +1617,207 @@ async fn test_gateway_public_health(
     // Keep the configured base in the cached snapshot so stale results are
     // discarded automatically after the user changes Public Base URL.
     if result.base_url.is_none() {
-        result.base_url =
-            omninova_core::gateway::resolve_public_webhook_base_url(&config);
+        result.base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
     }
     let mut app_state = state_ref.lock().await;
     app_state.last_public_health = Some(result.clone());
     Ok(result)
+}
+
+#[tauri::command]
+async fn dingtalk_diagnostics(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DingtalkDiagnosticsPayload, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let status = gateway_status_from_state(&state_ref).await;
+    let runtime = {
+        let app_state = state_ref.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let config_status = dingtalk_diagnostic_config_state(&config);
+    let worker_started = status.running && runtime.dingtalk_worker_started().await;
+    let public_base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
+    let final_dingtalk_callback_url = dingtalk_callback_url(public_base_url.as_deref());
+    let public_health = if !status.public_health.configured {
+        "not_configured"
+    } else if status.public_health.ok {
+        "ok"
+    } else if status.public_health.error_kind.as_deref() == Some("not_checked") {
+        "not_checked"
+    } else {
+        "failed"
+    }
+    .to_string();
+    let local_health = if !status.running {
+        "not_ready"
+    } else if status.health_ok {
+        "ok"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    let mut next_steps = Vec::new();
+    if !config_status.enabled {
+        next_steps.push("启用 DingTalk 频道后重新启动 Gateway。".to_string());
+    }
+    if !config_status.app_key_present {
+        next_steps.push("配置 DingTalk App Key。".to_string());
+    }
+    if !config_status.app_secret_present {
+        next_steps.push("配置 DingTalk App Secret。".to_string());
+    }
+    if !config_status.robot_code_present {
+        next_steps.push("配置 DingTalk RobotCode。".to_string());
+    }
+    if config_status.outbound_mode.trim().is_empty()
+        || config_status.outbound_mode == "disabled"
+    {
+        next_steps.push("配置 DingTalk outbound mode。".to_string());
+    }
+    if !status.running {
+        next_steps.push("启动 Gateway。".to_string());
+    }
+    if public_base_url.is_none() {
+        next_steps.push("填写 Public Base URL 公网根地址。".to_string());
+    } else if public_health == "failed" {
+        next_steps.push("检查 cloudflared 是否运行，公网地址是否已过期。".to_string());
+    }
+    if status.running && !worker_started {
+        next_steps.push("DingTalk worker 未启动，请重启 Gateway 并检查启动日志。".to_string());
+    }
+
+    Ok(DingtalkDiagnosticsPayload {
+        dingtalk_enabled: config_status.enabled,
+        app_key_present: config_status.app_key_present,
+        app_secret_present: config_status.app_secret_present,
+        robot_code_present: config_status.robot_code_present,
+        webhook_path: config_status.webhook_path,
+        local_gateway_running: status.running,
+        local_health,
+        public_base_url_present: public_base_url.is_some(),
+        public_base_url,
+        public_health,
+        public_health_status_code: status.public_health.status_code,
+        public_health_error: status.public_health.error,
+        final_dingtalk_callback_url,
+        worker_started,
+        outbound_mode: config_status.outbound_mode,
+        public_mode: status.gateway_public_mode,
+        quick_tunnel: status.quick_tunnel_non_production,
+        next_steps,
+    })
+}
+
+#[tauri::command]
+async fn feishu_diagnostics(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<FeishuDiagnosticsPayload, String> {
+    let state_ref = state.inner().clone();
+    sync_gateway_task_state(&state_ref).await;
+    let status = gateway_status_from_state(&state_ref).await;
+    let runtime = {
+        let app_state = state_ref.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let config_status = feishu_diagnostic_config_state(&config);
+    let public_base_url = omninova_core::gateway::resolve_public_webhook_base_url(&config);
+    let (final_feishu_event_callback_url, final_feishu_card_callback_url) =
+        feishu_public_callback_urls(&config);
+    let public_health = if !status.public_health.configured {
+        "not_configured"
+    } else if status.public_health.ok {
+        "ok"
+    } else if status.public_health.error_kind.as_deref() == Some("not_checked") {
+        "not_checked"
+    } else {
+        "failed"
+    }
+    .to_string();
+    let local_health = if !status.running {
+        "not_ready"
+    } else if status.health_ok {
+        "ok"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    let mut next_steps = Vec::new();
+    if !config_status.enabled {
+        next_steps.push("启用 Feishu 频道后重新启动 Gateway。".to_string());
+    }
+    if !config_status.app_id_present {
+        next_steps.push("配置 Feishu App ID。".to_string());
+    }
+    if !config_status.app_secret_present {
+        next_steps.push("配置 Feishu App Secret。".to_string());
+    }
+    if matches!(config_status.security_mode.as_str(), "token" | "encrypted")
+        && !config_status.verification_token_present
+    {
+        next_steps.push("当前安全模式需要配置 Verification Token。".to_string());
+    }
+    if config_status.security_mode == "encrypted" && !config_status.encrypt_key_present {
+        next_steps.push("encrypted 模式需要配置 Encrypt Key。".to_string());
+    }
+    if config_status.outbound_mode == "disabled" {
+        next_steps.push("配置 Feishu outbound mode。".to_string());
+    }
+    if !status.running {
+        next_steps.push("启动 Gateway。".to_string());
+    }
+    if public_base_url.is_none() {
+        next_steps.push("填写 Public Base URL 公网根地址。".to_string());
+    } else if public_health == "failed" {
+        next_steps.push("检查 Public Health、cloudflared 和公网地址是否有效。".to_string());
+    }
+
+    Ok(FeishuDiagnosticsPayload {
+        feishu_enabled: config_status.enabled,
+        app_id_present: config_status.app_id_present,
+        app_secret_present: config_status.app_secret_present,
+        verification_token_present: config_status.verification_token_present,
+        encrypt_key_present: config_status.encrypt_key_present,
+        security_mode: config_status.security_mode,
+        outbound_mode: config_status.outbound_mode,
+        store_opened: status.store_opened,
+        retry_worker_started: status.retry_worker_enabled,
+        local_gateway_running: status.running,
+        local_health,
+        public_base_url_present: public_base_url.is_some(),
+        public_base_url,
+        public_health,
+        public_health_status_code: status.public_health.status_code,
+        public_health_error: status.public_health.error,
+        final_feishu_event_callback_url,
+        final_feishu_card_callback_url,
+        quick_tunnel: status.quick_tunnel_non_production,
+        next_steps,
+    })
+}
+
+#[tauri::command]
+async fn test_dingtalk_public_route(
+    base_url: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DingtalkPublicRouteProbe, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    let base_url = base_url
+        .as_deref()
+        .and_then(normalize_public_webhook_base_url)
+        .or_else(|| omninova_core::gateway::resolve_public_webhook_base_url(&config));
+    Ok(match base_url {
+        Some(base_url) => check_dingtalk_public_route(&base_url).await,
+        None => check_dingtalk_public_route("").await,
+    })
 }
 
 #[tauri::command]
@@ -1868,18 +2101,28 @@ fn extract_error_code(error: &str) -> Option<String> {
     }
 }
 
-async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>) {
-    let task = {
+async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>, reason: &'static str) {
+    println!("[gateway-lifecycle] stop reason={reason}");
+    let (task, runtime) = {
         let mut app_state = state.lock().await;
         let task = app_state.gateway_task.take();
+        let runtime = app_state.runtime.clone();
         app_state.last_gateway_error = None;
         app_state.last_gateway_error_code = None;
-        task
+        // A successful public probe is no longer authoritative after the
+        // local origin stops. Clear it so restart cannot resurrect stale OK.
+        app_state.last_public_health = None;
+        (task, runtime)
     };
     if let Some(task) = task {
+        // Stop the parent first so it cannot race by starting a child after an
+        // early NotRunning observation. Dropping serve_http signals the child.
         task.abort();
         let _ = task.await;
     }
+    // The Stream reconnect loop is independently spawned. Explicitly join it
+    // after the parent is gone so restart is physically 1 -> 0 -> 1.
+    runtime.shutdown_dingtalk_stream_and_join().await;
 }
 
 fn setup_config_from_core(config: &Config) -> SetupAppConfig {
@@ -1945,7 +2188,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         gateway_public,
         robot: config.robot.clone(),
         providers,
-        channels: Some(channels_from_core(&config.channels_config)),
+        channels: Some(channels_from_core(config)),
         multimodal: SetupMultimodalConfig {
             desktop_vision_enabled: config.multimodal.desktop_vision_enabled,
             desktop_vision_max_dimension_px: config.multimodal.desktop_vision_max_dimension_px,
@@ -2025,7 +2268,24 @@ fn channel_entry_from_core(entry: &Option<ChannelEntry>) -> Option<SetupChannelE
     })
 }
 
-fn channels_from_core(cfg: &ChannelsConfig) -> SetupChannelsConfig {
+fn channels_from_core(config: &Config) -> SetupChannelsConfig {
+    let cfg = &config.channels_config;
+    let mut dingtalk = channel_entry_from_core(&cfg.dingtalk);
+    if let Some(entry) = dingtalk.as_mut() {
+        entry
+            .extra
+            .entry("transport_mode".to_string())
+            .or_insert_with(|| serde_json::json!(config.gateway.dingtalk.transport_mode.as_str()));
+        if !config.gateway.dingtalk.card_template_id.trim().is_empty() {
+            entry
+                .extra
+                .entry("card_template_id".to_string())
+                .or_insert_with(|| {
+                    serde_json::json!(config.gateway.dingtalk.card_template_id.trim())
+                });
+        }
+    }
+
     SetupChannelsConfig {
         telegram: channel_entry_from_core(&cfg.telegram),
         discord: channel_entry_from_core(&cfg.discord),
@@ -2034,7 +2294,7 @@ fn channels_from_core(cfg: &ChannelsConfig) -> SetupChannelsConfig {
         wechat: channel_entry_from_core(&cfg.wechat),
         feishu: channel_entry_from_core(&cfg.feishu),
         lark: channel_entry_from_core(&cfg.lark),
-        dingtalk: channel_entry_from_core(&cfg.dingtalk),
+        dingtalk,
         matrix: channel_entry_from_core(&cfg.matrix),
         email: channel_entry_from_core(&cfg.email),
         msteams: channel_entry_from_core(&cfg.msteams),
@@ -2553,6 +2813,78 @@ fn merge_channel_entry(
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DingtalkDiagnosticsPayload {
+    dingtalk_enabled: bool,
+    app_key_present: bool,
+    app_secret_present: bool,
+    robot_code_present: bool,
+    webhook_path: String,
+    local_gateway_running: bool,
+    local_health: String,
+    public_base_url_present: bool,
+    public_base_url: Option<String>,
+    public_health: String,
+    public_health_status_code: Option<u16>,
+    public_health_error: Option<String>,
+    final_dingtalk_callback_url: Option<String>,
+    worker_started: bool,
+    outbound_mode: String,
+    public_mode: String,
+    quick_tunnel: bool,
+    next_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FeishuDiagnosticsPayload {
+    feishu_enabled: bool,
+    app_id_present: bool,
+    app_secret_present: bool,
+    verification_token_present: bool,
+    encrypt_key_present: bool,
+    security_mode: String,
+    outbound_mode: String,
+    store_opened: bool,
+    retry_worker_started: bool,
+    local_gateway_running: bool,
+    local_health: String,
+    public_base_url_present: bool,
+    public_base_url: Option<String>,
+    public_health: String,
+    public_health_status_code: Option<u16>,
+    public_health_error: Option<String>,
+    final_feishu_event_callback_url: Option<String>,
+    final_feishu_card_callback_url: Option<String>,
+    quick_tunnel: bool,
+    next_steps: Vec<String>,
+}
+
+fn dingtalk_callback_url(base_url: Option<&str>) -> Option<String> {
+    base_url
+        .and_then(normalize_public_webhook_base_url)
+        .map(|base| format!("{base}/api/v1/gateway/dingtalk/events"))
+}
+
+/// Keep only channels the current editor explicitly changed. Missing entries
+/// are merged from the persisted config by `channels_to_core`, preventing a
+/// stale/default selected channel from disabling another active integration.
+fn retain_changed_setup_channels(channels: &mut SetupChannelsConfig, changed: &[String]) {
+    let has = |channel_id: &str| changed.iter().any(|item| item == channel_id);
+    if !has("telegram") { channels.telegram = None; }
+    if !has("discord") { channels.discord = None; }
+    if !has("slack") { channels.slack = None; }
+    if !has("whatsapp") { channels.whatsapp = None; }
+    if !has("wechat") { channels.wechat = None; }
+    if !has("feishu") { channels.feishu = None; }
+    if !has("lark") { channels.lark = None; }
+    if !has("dingtalk") { channels.dingtalk = None; }
+    if !has("matrix") { channels.matrix = None; }
+    if !has("email") { channels.email = None; }
+    if !has("msteams") { channels.msteams = None; }
+    if !has("irc") { channels.irc = None; }
+    if !has("webhook") { channels.webhook = None; }
+}
+
 /// Validate that enabled Feishu/Lark channels have required extra fields
 fn validate_feishu_like_channels(channels: &SetupChannelsConfig) -> Result<(), String> {
     // Check Feishu
@@ -2700,6 +3032,31 @@ fn expand_tilde_path(value: &str) -> PathBuf {
     }
 
     PathBuf::from(value)
+}
+
+/// Semantic path comparison for gateway-restart decisions.
+///
+/// A frontend round-trip can normalize a path (trailing slash, `~` expansion,
+/// repeated separators) without the user changing anything. Treating those
+/// representations as "changed" would cause a false-positive gateway restart.
+/// Comparison is ASCII case-insensitive on Windows where the filesystem is.
+fn workspace_paths_equivalent<L, R>(left: L, right: R) -> bool
+where
+    L: AsRef<std::path::Path>,
+    R: AsRef<std::path::Path>,
+{
+    let normalize = |path: &std::path::Path| -> String {
+        let mut normalized = path.to_string_lossy().replace('\\', "/");
+        while normalized.ends_with('/') {
+            normalized.pop();
+        }
+        #[cfg(windows)]
+        {
+            normalized = normalized.to_ascii_lowercase();
+        }
+        normalized
+    };
+    normalize(left.as_ref()) == normalize(right.as_ref())
 }
 
 #[derive(Debug, Serialize)]
@@ -3068,6 +3425,9 @@ pub fn run() {
             restart_gateway,
             test_gateway_health,
             test_gateway_public_health,
+            feishu_diagnostics,
+            dingtalk_diagnostics,
+            test_dingtalk_public_route,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -3149,7 +3509,7 @@ pub fn run() {
             let state_autostart = state.clone();
             tauri::async_runtime::spawn(async move {
                 sleep(Duration::from_millis(500)).await;
-                match start_gateway_inner(state_autostart).await {
+                match start_gateway_inner(state_autostart, "startup_autostart").await {
                     Ok(s) => eprintln!("[gateway] background started: {}", s.url),
                     Err(e) => eprintln!("[gateway] auto-start failed: {e}"),
                 }
@@ -3270,9 +3630,288 @@ mod webview_startup_tests {
 }
 
 #[cfg(test)]
+mod gateway_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_paths_equivalent_ignores_trailing_slash_and_case() {
+        // A config round-trip must never decide "workspace changed" merely
+        // because the path lost its trailing slash or changed case.
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"D:\123\")
+        ));
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"d:\123")
+        ));
+        assert!(workspace_paths_equivalent(
+            PathBuf::from("/home/user/ws"),
+            PathBuf::from("/home/user/ws/")
+        ));
+        // A real change must still be detected.
+        assert!(!workspace_paths_equivalent(
+            PathBuf::from(r"D:\123"),
+            PathBuf::from(r"D:\456")
+        ));
+        assert!(!workspace_paths_equivalent(
+            PathBuf::from(""),
+            PathBuf::from(r"D:\123")
+        ));
+    }
+
+    #[test]
+    fn workspace_paths_equivalent_empty_vs_empty() {
+        assert!(workspace_paths_equivalent(PathBuf::from(""), PathBuf::from("")));
+    }
+
+    #[test]
+    fn workspace_paths_equivalent_mixed_separators() {
+        // Frontend may send forward slashes while the stored value uses
+        // backslashes on Windows; both describe the same directory.
+        #[cfg(windows)]
+        assert!(workspace_paths_equivalent(
+            PathBuf::from(r"D:\123\"),
+            PathBuf::from("D:/123")
+        ));
+    }
+}
+
+#[cfg(test)]
 mod channel_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn dingtalk_callback_url_uses_public_root_without_duplicate_slashes() {
+        assert_eq!(
+            dingtalk_callback_url(Some("https://example.test")),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(
+            dingtalk_callback_url(Some("https://example.test/")),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(
+            dingtalk_callback_url(Some(
+                "https://example.test/api/v1/gateway/dingtalk/events"
+            )),
+            Some("https://example.test/api/v1/gateway/dingtalk/events".to_string())
+        );
+        assert_eq!(dingtalk_callback_url(None), None);
+    }
+
+    #[test]
+    fn dingtalk_diagnostics_payload_contains_no_sensitive_values() {
+        let payload = DingtalkDiagnosticsPayload {
+            dingtalk_enabled: true,
+            app_key_present: true,
+            app_secret_present: true,
+            robot_code_present: true,
+            webhook_path: "/api/v1/gateway/dingtalk/events".to_string(),
+            local_gateway_running: true,
+            local_health: "ok".to_string(),
+            public_base_url_present: true,
+            public_base_url: Some("https://example.test".to_string()),
+            public_health: "ok".to_string(),
+            public_health_status_code: Some(200),
+            public_health_error: None,
+            final_dingtalk_callback_url: Some(
+                "https://example.test/api/v1/gateway/dingtalk/events".to_string(),
+            ),
+            worker_started: true,
+            outbound_mode: "session_webhook".to_string(),
+            public_mode: "quick_tunnel".to_string(),
+            quick_tunnel: true,
+            next_steps: Vec::new(),
+        };
+        let rendered = serde_json::to_string(&payload).expect("serialize diagnostics");
+        for forbidden in [
+            "secret-value",
+            "access-token-value",
+            "session-webhook-value",
+            "robot-code-value",
+            "conversation-id-value",
+            "message-id-value",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn setup_save_retains_only_explicitly_changed_channel_entries() {
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        assert!(setup.feishu.is_none());
+        assert!(setup.dingtalk.is_some());
+    }
+
+    #[test]
+    fn setup_hydrates_dingtalk_transport_without_clearing_template() {
+        use omninova_core::config::schema::DingtalkTransportMode;
+
+        let mut config = Config::default();
+        config.gateway.dingtalk.transport_mode = DingtalkTransportMode::Stream;
+        config.gateway.dingtalk.card_template_id = "saved-template".to_string();
+        config.channels_config.dingtalk = Some(ChannelEntry {
+            enabled: true,
+            ..Default::default()
+        });
+
+        let setup = channels_from_core(&config);
+        let dingtalk = setup.dingtalk.expect("DingTalk setup entry");
+        assert_eq!(
+            dingtalk.extra.get("transport_mode"),
+            Some(&serde_json::json!("stream"))
+        );
+        assert_eq!(
+            dingtalk.extra.get("card_template_id"),
+            Some(&serde_json::json!("saved-template"))
+        );
+    }
+
+    #[test]
+    fn setup_save_does_not_disable_unchanged_enabled_channels() {
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: false,
+                ..Default::default()
+            }),
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        assert!(merged.feishu.as_ref().is_some_and(|entry| entry.enabled));
+        assert!(merged.dingtalk.as_ref().is_some_and(|entry| entry.enabled));
+    }
+
+    #[test]
+    fn enabled_channel_status_reports_feishu_and_dingtalk_together() {
+        let channels = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(enabled_channel_names(&channels), vec!["feishu", "dingtalk"]);
+    }
+
+    #[test]
+    fn saving_dingtalk_preserves_complete_feishu_configuration() {
+        let feishu_extra = HashMap::from([
+            ("app_id".to_string(), serde_json::json!("saved-feishu-app")),
+            ("app_secret".to_string(), serde_json::json!("saved-feishu-secret")),
+            ("outbound_mode".to_string(), serde_json::json!("real")),
+        ]);
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                security_mode: Some("encrypted".to_string()),
+                verification_token: Some("saved-feishu-token".to_string()),
+                encrypt_key: Some("saved-feishu-key".to_string()),
+                extra: feishu_extra.clone(),
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            dingtalk: Some(SetupChannelEntry {
+                enabled: true,
+                extra: HashMap::from([(
+                    "app_key".to_string(),
+                    serde_json::json!("updated-dingtalk-app"),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["dingtalk".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        let feishu = merged.feishu.expect("Feishu must be preserved");
+        assert!(feishu.enabled);
+        assert_eq!(feishu.extra, feishu_extra);
+        assert_eq!(feishu.security_mode.as_deref(), Some("encrypted"));
+        assert_eq!(feishu.verification_token.as_deref(), Some("saved-feishu-token"));
+        assert_eq!(feishu.encrypt_key.as_deref(), Some("saved-feishu-key"));
+    }
+
+    #[test]
+    fn saving_feishu_preserves_complete_dingtalk_configuration() {
+        let dingtalk_extra = HashMap::from([
+            ("app_key".to_string(), serde_json::json!("saved-dingtalk-app")),
+            ("app_secret".to_string(), serde_json::json!("saved-dingtalk-secret")),
+            ("robot_code".to_string(), serde_json::json!("saved-dingtalk-robot")),
+            ("outbound_mode".to_string(), serde_json::json!("session_webhook")),
+        ]);
+        let current = ChannelsConfig {
+            feishu: Some(ChannelEntry {
+                enabled: true,
+                ..Default::default()
+            }),
+            dingtalk: Some(ChannelEntry {
+                enabled: true,
+                extra: dingtalk_extra.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut setup = SetupChannelsConfig {
+            feishu: Some(SetupChannelEntry {
+                enabled: true,
+                extra: HashMap::from([(
+                    "app_id".to_string(),
+                    serde_json::json!("updated-feishu-app"),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retain_changed_setup_channels(&mut setup, &["feishu".to_string()]);
+
+        let merged = channels_to_core(setup, &current);
+        let dingtalk = merged.dingtalk.expect("DingTalk must be preserved");
+        assert!(dingtalk.enabled);
+        assert_eq!(dingtalk.extra, dingtalk_extra);
+    }
 
     #[test]
     fn setup_migrates_legacy_public_webhook_url_to_gateway_public() {
