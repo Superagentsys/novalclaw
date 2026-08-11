@@ -2,6 +2,7 @@ mod cli_install;
 mod composer_attachments;
 mod desktop_capture;
 
+use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
     ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
@@ -19,11 +20,12 @@ use omninova_core::providers::{ProviderSelection, build_provider_with_selection}
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
     import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
-    skillhub_install, skillhub_list, SkillHubCategory, SkillHubItem,
+    skillhub_install, skillhub_list, skillhub_rollback, SkillHubCategory, SkillHubItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +33,7 @@ use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -1960,6 +1963,25 @@ async fn skillhub_install_skill(
     })
 }
 
+#[tauri::command]
+async fn skillhub_rollback_skill(
+    slug: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<SkillHubInstallResult, String> {
+    let target = {
+        let app_state = state.lock().await;
+        let config = app_state.runtime.get_config().await;
+        skills_target_dir(&config)
+    };
+    let (rolled_back_slug, installed) =
+        skillhub_rollback(&target, &slug).map_err(|e| e.to_string())?;
+    Ok(SkillHubInstallResult {
+        slug: rolled_back_slug,
+        installed,
+        dir: target.to_string_lossy().into_owned(),
+    })
+}
+
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
     let (runtime, running, last_started_at, last_error, error_code, last_public_health): (
         GatewayRuntime,
@@ -3037,6 +3059,159 @@ where
     normalize(left.as_ref()) == normalize(right.as_ref())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskArtifactPreview {
+    path: String,
+    name: String,
+    kind: String,
+    extension: String,
+    size: u64,
+    data_url: Option<String>,
+    text_preview: Option<String>,
+}
+
+fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
+    let requested = expand_tilde_path(path.trim());
+    let joined = if requested.is_absolute() {
+        requested
+    } else {
+        let workspace = workspace_path
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "该任务没有记录 Workspace，无法解析相对文件路径。".to_string())?;
+        expand_tilde_path(workspace).join(requested)
+    };
+    let canonical = joined
+        .canonicalize()
+        .map_err(|error| format!("文件不存在或无法访问：{}（{error}）", joined.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("该路径不是文件：{}", canonical.display()));
+    }
+
+    if let Some(workspace) = workspace_path.filter(|value| !value.trim().is_empty()) {
+        let workspace = expand_tilde_path(workspace)
+            .canonicalize()
+            .map_err(|error| format!("Workspace 无法访问：{error}"))?;
+        if !canonical.starts_with(&workspace) {
+            return Err("为保护本机文件，任务检查器只能读取当前任务 Workspace 内的文件。".to_string());
+        }
+    }
+    Ok(canonical)
+}
+
+fn artifact_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+#[tauri::command]
+fn task_artifact_preview(
+    path: String,
+    workspace_path: Option<String>,
+) -> Result<TaskArtifactPreview, String> {
+    const MAX_TEXT_BYTES: u64 = 160 * 1024;
+    const MAX_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+
+    let resolved = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
+    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
+    let extension = artifact_extension(&resolved);
+    let name = resolved
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("文件")
+        .to_string();
+    let mut data_url = None;
+    let mut text_preview = None;
+    let kind;
+
+    if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        kind = "image".to_string();
+        if metadata.len() <= MAX_IMAGE_BYTES {
+            let decoded = image::open(&resolved)
+                .map_err(|error| format!("图片预览失败：{error}"))?;
+            let thumbnail = decoded.thumbnail(640, 480);
+            let mut bytes = Cursor::new(Vec::new());
+            thumbnail
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .map_err(|error| format!("图片缩略图生成失败：{error}"))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+            data_url = Some(format!("data:image/png;base64,{encoded}"));
+        }
+    } else if matches!(
+        extension.as_str(),
+        "txt" | "md" | "markdown" | "json" | "jsonl" | "yaml" | "yml" | "toml" |
+        "csv" | "tsv" | "log" | "rs" | "tsx" | "ts" | "jsx" | "js" | "css" |
+        "html" | "xml" | "py" | "go" | "java" | "kt" | "swift" | "c" | "h" |
+        "cpp" | "hpp" | "sql" | "sh" | "ps1"
+    ) {
+        kind = "text".to_string();
+        let file = std::fs::File::open(&resolved).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(MAX_TEXT_BYTES).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+        let mut value = String::from_utf8_lossy(&bytes).to_string();
+        if metadata.len() > MAX_TEXT_BYTES {
+            value.push_str("\n\n… 预览已截断，请使用“打开文件”查看完整内容。");
+        }
+        text_preview = Some(value);
+    } else {
+        kind = "file".to_string();
+    }
+
+    Ok(TaskArtifactPreview {
+        path: resolved.to_string_lossy().to_string(),
+        name,
+        kind,
+        extension,
+        size: metadata.len(),
+        data_url,
+        text_preview,
+    })
+}
+
+#[tauri::command]
+fn open_task_artifact(
+    app: AppHandle,
+    path: String,
+    workspace_path: Option<String>,
+    reveal: Option<bool>,
+) -> Result<(), String> {
+    let resolved = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
+    let reveal = reveal.unwrap_or(false);
+
+    if !reveal {
+        #[allow(deprecated)]
+        return app
+            .shell()
+            .open(resolved.to_string_lossy().to_string(), None)
+            .map_err(|error| format!("无法打开文件：{error}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = StdCommand::new("explorer.exe");
+        command.arg(format!("/select,{}", resolved.display()));
+        hide_std_command_window(&mut command);
+        command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = StdCommand::new("open");
+        command.arg("-R").arg(&resolved);
+        command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = resolved.parent().unwrap_or(&resolved);
+        StdCommand::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map_err(|error| format!("无法定位文件：{error}"))?;
+    }
+    Ok(())
+}
+
 fn parse_gateway_url(value: &str) -> Result<(String, u16), String> {
     let normalized = value
         .trim()
@@ -3242,6 +3417,9 @@ pub fn run() {
             skillhub_browse,
             skillhub_category_list,
             skillhub_install_skill,
+            skillhub_rollback_skill,
+            task_artifact_preview,
+            open_task_artifact,
             composer_attachments::read_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
             restart_gateway,

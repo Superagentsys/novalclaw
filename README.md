@@ -175,8 +175,8 @@ echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 Key services:
 - `OmniCallScreeningService` — pre-ring allow/silence/reject via the skill rule set.
 - `OmniInCallService` — auto-answers incoming calls when the app is the default dialer.
-- `CallAgentForegroundService` — foreground service (`phoneCall|microphone`) running ASR → gateway → TTS.
-- Full session JSON is posted to `POST /api/webhook` when the call ends.
+- `CallAgentForegroundService` — foreground service (`phoneCall|microphone`) running ASR → on-device rules → TTS.
+- Full session JSON and extracted metadata remain on the phone; no desktop gateway is required.
 
 **From the Tauri project (optional convenience)**
 

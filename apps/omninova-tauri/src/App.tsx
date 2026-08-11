@@ -1,5 +1,6 @@
 import { useState } from "react";
 import "./App.css";
+import "./ui-refresh.css";
 import { AppShell, type AppNavId } from "./components/AppShell";
 import { Chat } from "./components/Chat/Chat";
 import { Setup } from "./components/Setup/Setup";
@@ -18,7 +19,10 @@ function App() {
           className="app-view"
           style={{ display: nav === "chat" ? "flex" : "none" }}
         >
-          <Chat />
+          <Chat
+            isActive={nav === "chat"}
+            onOpenSettings={(target) => setNav(target)}
+          />
         </div>
         {nav !== "chat" ? (
           <Setup

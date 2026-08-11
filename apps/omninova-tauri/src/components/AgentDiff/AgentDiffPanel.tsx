@@ -40,10 +40,6 @@ export const AgentDiffPanel: React.FC<AgentDiffPanelProps> = memo(function Agent
     () => diffState?.orderedPaths.map((path) => diffState.files[path]) ?? [],
     [diffState]
   );
-  const fileSignature = useMemo(
-    () => files.map((file) => `${file.path}:${file.status}:${file.lastEventAt}`).join("|"),
-    [files]
-  );
   const visibleFiles = useMemo(
     () => files.filter((file) => shouldShowFile(file, filter)),
     [files, filter]
@@ -51,33 +47,43 @@ export const AgentDiffPanel: React.FC<AgentDiffPanelProps> = memo(function Agent
 
   useEffect(() => {
     if (!diffState) return;
-    const isNewRun = runIdRef.current !== diffState.runId;
-    if (isNewRun) {
-      runIdRef.current = diffState.runId;
-      touchedPathsRef.current = new Set();
-      setFilter("all");
-    }
+    let cancelled = false;
 
-    const existingPaths = new Set(files.map((file) => file.path));
-    const latestFile = files.reduce<AgentChangedFile | null>(
-      (latest, file) => (!latest || file.lastEventAt > latest.lastEventAt ? file : latest),
-      null
-    );
-    const defaultPath =
-      files.length > 3
-        ? files.find((file) => file.path === diffState.activePath && file.status === "active")?.path
-        : latestFile?.path;
+    queueMicrotask(() => {
+      if (cancelled) return;
 
-    setExpandedPaths((prev) => {
-      const next = isNewRun
-        ? new Set<string>()
-        : new Set(Array.from(prev).filter((path) => existingPaths.has(path)));
-      if (defaultPath && !touchedPathsRef.current.has(defaultPath)) {
-        next.add(defaultPath);
+      const isNewRun = runIdRef.current !== diffState.runId;
+      if (isNewRun) {
+        runIdRef.current = diffState.runId;
+        touchedPathsRef.current = new Set();
+        setFilter("all");
       }
-      return next;
+
+      const existingPaths = new Set(files.map((file) => file.path));
+      const latestFile = files.reduce<AgentChangedFile | null>(
+        (latest, file) => (!latest || file.lastEventAt > latest.lastEventAt ? file : latest),
+        null
+      );
+      const defaultPath =
+        files.length > 3
+          ? files.find((file) => file.path === diffState.activePath && file.status === "active")?.path
+          : latestFile?.path;
+
+      setExpandedPaths((prev) => {
+        const next = isNewRun
+          ? new Set<string>()
+          : new Set(Array.from(prev).filter((path) => existingPaths.has(path)));
+        if (defaultPath && !touchedPathsRef.current.has(defaultPath)) {
+          next.add(defaultPath);
+        }
+        return next;
+      });
     });
-  }, [diffState?.activePath, diffState?.runId, fileSignature]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [diffState, files]);
 
   const togglePath = useCallback((path: string) => {
     touchedPathsRef.current.add(path);

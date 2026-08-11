@@ -14,8 +14,6 @@ import java.util.UUID
  */
 class OmniInCallService : InCallService() {
 
-    var autoAnswerEnabled: Boolean = true
-
     private val callCallback = object : Call.Callback() {
         override fun onStateChanged(call: Call, state: Int) {
             super.onStateChanged(call, state)
@@ -31,7 +29,8 @@ class OmniInCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         call.registerCallback(callCallback)
-        if (autoAnswerEnabled && call.state == Call.STATE_RINGING) {
+        val app = applicationContext as OmniNovaApp
+        if (app.settings.autoAnswerEnabled.value && call.state == Call.STATE_RINGING) {
             call.answer(VideoProfile.STATE_AUDIO_ONLY)
         }
     }

@@ -6,14 +6,14 @@ import android.app.NotificationManager
 import android.os.Build
 import com.omninova.phoneagent.call.AgentResponseSynthesizer
 import com.omninova.phoneagent.call.KeyInfoExtractor
+import com.omninova.phoneagent.call.LocalPhoneAgent
 import com.omninova.phoneagent.call.SpamDetector
 import com.omninova.phoneagent.call.SpeechPipeline
+import com.omninova.phoneagent.data.AppSettings
 import com.omninova.phoneagent.data.ConversationLogStore
-import com.omninova.phoneagent.net.GatewayClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 
 /**
  * 全局依赖容器。可逐步迁移到 Hilt/Koin；当前保持零依赖以便快速编译。
@@ -21,8 +21,9 @@ import kotlinx.coroutines.launch
 class OmniNovaApp : Application() {
 
     lateinit var logStore: ConversationLogStore
-    lateinit var gateway: GatewayClient
+    lateinit var settings: AppSettings
     lateinit var spamDetector: SpamDetector
+    lateinit var localAgent: LocalPhoneAgent
     lateinit var speech: SpeechPipeline
     lateinit var tts: AgentResponseSynthesizer
     lateinit var extractor: KeyInfoExtractor
@@ -32,17 +33,14 @@ class OmniNovaApp : Application() {
         super.onCreate()
         INSTANCE = this
         logStore = ConversationLogStore(this)
-        gateway = GatewayClient()
+        settings = AppSettings(this)
         extractor = KeyInfoExtractor()
         spamDetector = SpamDetector(initialJson = assetJson("spam_detection_rules.json"))
+        localAgent = LocalPhoneAgent()
         speech = SpeechPipeline(this)
         tts = AgentResponseSynthesizer(this)
 
         createNotificationChannel()
-
-        appScope.launch {
-            gateway.fetchSpamRules()?.let { spamDetector.updateRules(it) }
-        }
     }
 
     private fun createNotificationChannel() {

@@ -3,7 +3,33 @@ export const TASK_HISTORY_STORAGE_KEY = "omninova-task-history-v1";
 /** Max number of task records kept locally (older ones are dropped). */
 const MAX_TASKS = 100;
 
-export type TaskStatus = "running" | "completed" | "failed" | "cancelled";
+export type TaskStatus =
+  | "needs_approval"
+  | "waiting_input"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface TaskChangedFile {
+  path: string;
+  additions: number;
+  deletions: number;
+  changeType?: "created" | "modified" | "deleted" | "added" | "removed";
+}
+
+export interface TaskActivityEntry {
+  at: number;
+  label: string;
+  tone?: "info" | "success" | "warning" | "error";
+  /** Compact process category. Raw model deltas and command output are never stored. */
+  kind?: "lifecycle" | "model" | "tool" | "file" | "approval";
+  status?: "running" | "completed" | "failed" | "waiting";
+  detail?: string;
+  toolName?: string;
+  path?: string;
+}
 
 /** One agent run initiated by the user, tracked for the 历史任务 panel. */
 export interface TaskHistoryEntry {
@@ -14,6 +40,8 @@ export interface TaskHistoryEntry {
   avatarId: string;
   agentName: string;
   sessionId: string;
+  /** Effective workspace used by this run, for resolving relative artifact paths. */
+  workspacePath?: string;
   status: TaskStatus;
   /** epoch ms */
   startedAt: number;
@@ -21,6 +49,11 @@ export interface TaskHistoryEntry {
   endedAt?: number;
   durationMs?: number;
   resultPreview?: string;
+  changedFiles?: TaskChangedFile[];
+  activity?: TaskActivityEntry[];
+  attentionReason?: string;
+  approvalTool?: string;
+  nextAction?: string;
 }
 
 export function loadTaskHistory(): TaskHistoryEntry[] {
@@ -29,7 +62,37 @@ export function loadTaskHistory(): TaskHistoryEntry[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed as TaskHistoryEntry[];
+    const now = Date.now();
+    return (parsed as TaskHistoryEntry[]).map((entry) => {
+      // A persisted active state cannot still be backed by a live Tauri run
+      // after the application has restarted. Mark it explicitly instead of
+      // leaving a permanent "进行中" record.
+      if (
+        entry.status === "running" ||
+        entry.status === "needs_approval" ||
+        entry.status === "waiting_input"
+      ) {
+        return {
+          ...entry,
+          status: "interrupted" as const,
+          endedAt: entry.endedAt ?? now,
+          durationMs: entry.durationMs ?? Math.max(0, now - entry.startedAt),
+          attentionReason: "应用已关闭或任务连接已中断，请检查后重新执行。",
+          nextAction: "重新执行任务",
+          activity: [
+            ...(entry.activity ?? []),
+            {
+              at: now,
+              label: "应用重新启动，未完成任务已标记为中断",
+              tone: "warning" as const,
+              kind: "lifecycle" as const,
+              status: "failed" as const,
+            },
+          ].slice(-120),
+        };
+      }
+      return entry;
+    });
   } catch {
     return [];
   }
@@ -67,14 +130,26 @@ export function patchTask(
 }
 
 const STATUS_LABELS: Record<TaskStatus, string> = {
+  needs_approval: "需要授权",
+  waiting_input: "等待输入",
   running: "进行中",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
+  interrupted: "已中断",
 };
 
 export function taskStatusLabel(status: TaskStatus): string {
   return STATUS_LABELS[status] ?? status;
+}
+
+export function taskNeedsAttention(status: TaskStatus): boolean {
+  return (
+    status === "needs_approval" ||
+    status === "waiting_input" ||
+    status === "failed" ||
+    status === "interrupted"
+  );
 }
 
 export function formatTaskTime(ms: number): string {

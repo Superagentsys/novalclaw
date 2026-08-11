@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { UiIcon } from "../UiIcon";
 
 type SpeechRecCtor = new () => SpeechRecognitionLike;
 
@@ -243,7 +244,7 @@ export function ChatMediaInteraction({
             onClick={() => setSttHint(null)}
             aria-label="关闭提示"
           >
-            ✕
+            <UiIcon name="close" size={13} />
           </button>
         </div>
       )}
@@ -256,6 +257,7 @@ export function ChatMediaInteraction({
               autoPlay
               playsInline
               muted
+              aria-label="摄像头实时预览"
             />
           ) : (
             <div className="chat-media-audio-only">
@@ -283,31 +285,37 @@ export function ChatMediaInteraction({
           type="button"
           className={`chat-icon-btn chat-media-toggle ${videoOn ? "is-active" : ""}`}
           title={videoOn ? "关闭摄像头" : "开启摄像头"}
+          aria-label={videoOn ? "关闭摄像头" : "开启摄像头"}
+          aria-pressed={videoOn}
           disabled={disabled}
           onClick={toggleVideo}
         >
-          <span aria-hidden>▣</span>
+          <UiIcon name="video" />
         </button>
         <button
           type="button"
           className={`chat-icon-btn chat-media-toggle ${audioOn ? "is-active" : ""}`}
           title={audioOn ? "关闭麦克风" : "开启麦克风"}
+          aria-label={audioOn ? "关闭麦克风" : "开启麦克风"}
+          aria-pressed={audioOn}
           disabled={disabled}
           onClick={toggleAudio}
         >
-          <span aria-hidden>🎤</span>
+          <UiIcon name="audio" />
         </button>
         <button
           type="button"
           className={`chat-icon-btn chat-media-toggle ${listening ? "is-active is-listening" : ""}`}
           title={listening ? "停止语音输入" : "语音转文字（中文）"}
+          aria-label={listening ? "停止语音输入" : "语音转文字（中文）"}
+          aria-pressed={listening}
           disabled={disabled}
           onClick={() => {
             if (listening) stopSpeechRecognition();
             else void startSpeechRecognition();
           }}
         >
-          <span aria-hidden>🗣</span>
+          <UiIcon name="sound" />
         </button>
         {trailingActions}
       </div>

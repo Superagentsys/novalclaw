@@ -257,6 +257,7 @@ export interface SkillHubItem {
   iconUrl?: string | null;
   downloads: number;
   category?: string | null;
+  version?: string | null;
 }
 
 export interface SkillHubCategory {

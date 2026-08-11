@@ -20,6 +20,10 @@ class OmniCallScreeningService : CallScreeningService() {
 
     override fun onScreenCall(callDetails: Call.Details) {
         val app = applicationContext as OmniNovaApp
+        if (!app.settings.spamScreeningEnabled.value) {
+            respondToCall(callDetails, CallResponse.Builder().build())
+            return
+        }
         val phone = callDetails.handle?.schemeSpecificPart
         val decision = app.spamDetector.evaluate(
             phoneNumber = phone,

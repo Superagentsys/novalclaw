@@ -7,6 +7,7 @@ import {
   type ChannelPreset,
   type ChannelField,
 } from "../../types/config";
+import { UiIcon } from "../UiIcon";
 
 interface ChannelConfigFormProps {
   value: ChannelsConfig;
@@ -25,7 +26,7 @@ interface ChannelConfigFormProps {
 }
 
 /** Get card callback path for feishu channel (used when channel is feishu) */
-function getCardCallbackPath(_channelId: string): string {
+function getCardCallbackPath(): string {
   return "/webhook/feishu/card";
 }
 
@@ -82,8 +83,14 @@ export function ChannelConfigForm({
 }: ChannelConfigFormProps) {
   const [uncontrolledSelectedId, setUncontrolledSelectedId] = useState<string>(DEFAULT_CHANNEL_ID);
   const selectedId = selectedChannelId ?? uncontrolledSelectedId;
-  const [healthStatus, setHealthStatus] = useState<"idle" | "checking" | "ok" | "error">("idle");
-  const [healthMessage, setHealthMessage] = useState<string>("");
+  const currentGatewayUrl = gatewayUrl ?? "";
+  const [healthResult, setHealthResult] = useState<{
+    url: string;
+    status: "idle" | "checking" | "ok" | "error";
+    message: string;
+  }>({ url: currentGatewayUrl, status: "idle", message: "" });
+  const healthStatus = healthResult.url === currentGatewayUrl ? healthResult.status : "idle";
+  const healthMessage = healthResult.url === currentGatewayUrl ? healthResult.message : "";
   const [copyStatus, setCopyStatus] = useState<string>("");
   const [copyCardStatus, setCopyCardStatus] = useState<string>("");
   const [publicUrlNormalizationNotice, setPublicUrlNormalizationNotice] = useState("");
@@ -95,27 +102,28 @@ export function ChannelConfigForm({
 
   const webhookPath = useMemo(() => getWebhookPath(selectedId), [selectedId]);
   const cardCallbackPath = useMemo(
-    () => selectedId === "feishu" ? getCardCallbackPath(selectedId) : "",
+    () => selectedId === "feishu" ? getCardCallbackPath() : "",
     [selectedId]
   );
 
   /** Handle health check button click */
   const handleHealthCheck = async () => {
     if (!onHealthCheck) return;
-    setHealthStatus("checking");
-    setHealthMessage("");
+    const checkedUrl = currentGatewayUrl;
+    setHealthResult({ url: checkedUrl, status: "checking", message: "" });
     try {
       const result = await onHealthCheck();
       if (result.ok) {
-        setHealthStatus("ok");
-        setHealthMessage("Gateway 健康检查通过");
+        setHealthResult({ url: checkedUrl, status: "ok", message: "Gateway 健康检查通过" });
       } else {
-        setHealthStatus("error");
-        setHealthMessage(result.message || "健康检查失败");
+        setHealthResult({ url: checkedUrl, status: "error", message: result.message || "健康检查失败" });
       }
     } catch (err) {
-      setHealthStatus("error");
-      setHealthMessage(err instanceof Error ? err.message : "连接失败");
+      setHealthResult({
+        url: checkedUrl,
+        status: "error",
+        message: err instanceof Error ? err.message : "连接失败",
+      });
     }
   };
 
@@ -138,12 +146,6 @@ export function ChannelConfigForm({
     setCopyCardStatus("已复制");
     setTimeout(() => setCopyCardStatus(""), 2000);
   };
-
-  /** Reset health status when gateway URL changes. */
-  useEffect(() => {
-    setHealthStatus("idle");
-    setHealthMessage("");
-  }, [gatewayUrl]);
 
   const selectChannel = (channelId: string) => {
     setUncontrolledSelectedId(channelId);
@@ -292,7 +294,7 @@ export function ChannelConfigForm({
   };
 
   /** Validate only the channel currently being edited. */
-  const validateFeishuLike = (): string | undefined => {
+  const currentValidationError = (() => {
     if (!FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset?.id ?? "")) {
       return undefined;
     }
@@ -326,15 +328,12 @@ export function ChannelConfigForm({
     }
 
     return undefined;
-  };
+  })();
 
   // Trigger validation when the currently edited channel changes.
   useEffect(() => {
-    const error = validateFeishuLike();
-    if (onValidationChange) {
-      onValidationChange(error);
-    }
-  }, [entry, selectedPreset, onValidationChange]);
+    onValidationChange?.(currentValidationError);
+  }, [currentValidationError, onValidationChange]);
 
   return (
     <section className="setup-section">
@@ -365,7 +364,7 @@ export function ChannelConfigForm({
               return (
                 <option key={preset.id} value={preset.id}>
                   {preset.name}
-                  {isEnabled ? " ✓" : ""}
+                  {isEnabled ? "（已启用）" : ""}
                   {preset.isDefault ? " (推荐)" : ""}
                 </option>
               );
@@ -470,7 +469,8 @@ export function ChannelConfigForm({
             )}
             {isLocal && fullWebhookUrl && (
               <div className="localhost-warning">
-                ⚠️ 127.0.0.1 / localhost 只能被本机访问，飞书、Slack 等公网平台无法直接回调。真实接入需要公网服务器、反向代理或内网穿透。
+                <UiIcon name="warning" size={16} />
+                <span>127.0.0.1 / localhost 只能被本机访问，飞书、Slack 等公网平台无法直接回调。真实接入需要公网服务器、反向代理或内网穿透。</span>
               </div>
             )}
           </div>

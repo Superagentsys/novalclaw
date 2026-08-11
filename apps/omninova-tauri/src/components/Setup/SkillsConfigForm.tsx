@@ -6,6 +6,7 @@ import type {
   SkillsConfig,
 } from "../../types/config";
 import { invokeTauri } from "../../utils/tauri";
+import { UiIcon } from "../UiIcon";
 
 interface Props {
   config: SkillsConfig;
@@ -24,6 +25,32 @@ interface SkillsPackageSummary {
   names: string[];
   items?: SkillItem[];
   slugs?: string[];
+}
+
+interface StatusNote {
+  tone: "ok" | "error";
+  message: string;
+}
+
+interface SkillInstallLogEntry {
+  id: string;
+  at: number;
+  skill: string;
+  slug: string;
+  action: "install" | "update" | "rollback";
+  status: "running" | "success" | "error";
+  detail: string;
+}
+
+const SKILL_INSTALL_LOG_KEY = "omninova.skillhub.installLog.v1";
+
+function loadInstallLog(): SkillInstallLogEntry[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SKILL_INSTALL_LOG_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 60) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Max cards rendered at once (the library can hold 10k+ skills). */
@@ -105,7 +132,7 @@ function prettyName(name: string): string {
   return name.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-/** Pick an emoji for a skill based on its subdomain / keywords. */
+/** Restore the original local skill markers used before the visual refresh. */
 function iconFor(item: SkillItem): string {
   const hay = `${item.subdomain ?? ""} ${item.name}`.toLowerCase();
   const table: [RegExp, string][] = [
@@ -123,15 +150,15 @@ function iconFor(item: SkillItem): string {
     [/mobile|android|ios/, "📱"],
     [/report|compliance|govern|stig|audit/, "📋"],
     [/image|vision|photo/, "🖼️"],
-    [/paper|research|citation|academic|nature/, "📄"],
+    [/paper|research|citation|academic|nature/, "📚"],
   ];
-  for (const [re, emoji] of table) {
-    if (re.test(hay)) return emoji;
+  for (const [re, icon] of table) {
+    if (re.test(hay)) return icon;
   }
   return "🧩";
 }
 
-/** Emoji fallback for a marketplace category. */
+/** Original category marker, used only when SkillHub does not provide a logo. */
 function marketIcon(item: SkillHubItem): string {
   const table: Record<string, string> = {
     "office-efficiency": "🗂️",
@@ -151,6 +178,33 @@ function marketIcon(item: SkillHubItem): string {
   return table[item.category ?? ""] ?? "🧩";
 }
 
+function safeSkillIconUrl(value?: string | null): string | null {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function MarketBrandIcon({ item }: { item: SkillHubItem }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const iconUrl = safeSkillIconUrl(item.iconUrl);
+  if (iconUrl && !imageFailed) {
+    return (
+      <img
+        src={iconUrl}
+        alt=""
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
+  return <span className="skill-original-marker">{marketIcon(item)}</span>;
+}
+
 function formatDownloads(n: number): string {
   if (n >= 10000) return `${(n / 10000).toFixed(1)}w`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
@@ -159,7 +213,7 @@ function formatDownloads(n: number): string {
 
 export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const [importPath, setImportPath] = useState("");
-  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importStatus, setImportStatus] = useState<StatusNote | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [summary, setSummary] = useState<SkillsPackageSummary | null>(null);
   const [isLoadingSummary, setIsLoadingSummary] = useState(false);
@@ -177,7 +231,11 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketError, setMarketError] = useState<string | null>(null);
   const [installingSlug, setInstallingSlug] = useState<string | null>(null);
-  const [installNote, setInstallNote] = useState<string | null>(null);
+  const [rollingBackSlug, setRollingBackSlug] = useState<string | null>(null);
+  const [installNote, setInstallNote] = useState<StatusNote | null>(null);
+  const [expandedSlugs, setExpandedSlugs] = useState<Set<string>>(() => new Set());
+  const [installLog, setInstallLog] = useState<SkillInstallLogEntry[]>(loadInstallLog);
+  const [installLogOpen, setInstallLogOpen] = useState(false);
 
   const MARKET_PAGE_SIZE = 24;
 
@@ -206,6 +264,44 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const installedSlugs = useMemo(
     () => new Set(summary?.slugs ?? []),
     [summary]
+  );
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SKILL_INSTALL_LOG_KEY, JSON.stringify(installLog.slice(0, 60)));
+    } catch {
+      // Keep the in-memory audit trail when WebView storage is unavailable.
+    }
+  }, [installLog]);
+
+  const startInstallLog = useCallback(
+    (item: SkillHubItem, action: SkillInstallLogEntry["action"]) => {
+      const id = `${Date.now()}-${item.slug}-${action}`;
+      setInstallLogOpen(true);
+      setInstallLog((prev) => [
+        {
+          id,
+          at: Date.now(),
+          skill: item.name,
+          slug: item.slug,
+          action,
+          status: "running" as const,
+          detail: action === "rollback" ? "正在恢复上一版本" : "正在下载并验证技能包",
+        },
+        ...prev,
+      ].slice(0, 60));
+      return id;
+    },
+    []
+  );
+
+  const finishInstallLog = useCallback(
+    (id: string, status: "success" | "error", detail: string) => {
+      setInstallLog((prev) => prev.map((entry) =>
+        entry.id === id ? { ...entry, status, detail: detail.slice(0, 500) } : entry
+      ));
+    },
+    []
   );
 
   // Load categories + featured once the module is enabled.
@@ -273,23 +369,65 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   };
 
   const handleInstall = useCallback(
-    async (item: SkillHubItem) => {
+    async (item: SkillHubItem, isUpdate = false) => {
+      const action = isUpdate ? "update" : "install";
+      const logId = startInstallLog(item, action);
       setInstallingSlug(item.slug);
       setInstallNote(null);
       try {
         const result = await invokeTauri<SkillHubInstallResult>("skillhub_install_skill", {
           slug: item.slug,
           namespace: item.namespace ?? undefined,
+          version: item.version ?? undefined,
         });
-        setInstallNote(`✓ 已安装「${item.name}」（${result.installed} 个技能）`);
+        setInstallNote({
+          tone: "ok",
+          message: `${isUpdate ? "已更新" : "已安装"}「${item.name}」（${result.installed} 个技能）`,
+        });
+        finishInstallLog(
+          logId,
+          "success",
+          `${isUpdate ? "更新" : "安装"}完成，已验证 ${result.installed} 个 SKILL.md；上一版本会在更新时保留用于回滚。`
+        );
         await refreshSummary();
       } catch (e) {
-        setInstallNote(`✗ 安装「${item.name}」失败：${String(e)}`);
+        const detail = String(e);
+        setInstallNote({
+          tone: "error",
+          message: `${isUpdate ? "更新" : "安装"}「${item.name}」失败：${detail}`,
+        });
+        finishInstallLog(logId, "error", detail);
       } finally {
         setInstallingSlug(null);
       }
     },
-    [refreshSummary]
+    [finishInstallLog, refreshSummary, startInstallLog]
+  );
+
+  const handleRollback = useCallback(
+    async (item: SkillHubItem) => {
+      const logId = startInstallLog(item, "rollback");
+      setRollingBackSlug(item.slug);
+      setInstallNote(null);
+      try {
+        const result = await invokeTauri<SkillHubInstallResult>("skillhub_rollback_skill", {
+          slug: item.slug,
+        });
+        setInstallNote({
+          tone: "ok",
+          message: `已回滚「${item.name}」（${result.installed} 个技能）`,
+        });
+        finishInstallLog(logId, "success", `已恢复上一版本，并保留被替换版本以便再次切换。`);
+        await refreshSummary();
+      } catch (e) {
+        const detail = String(e);
+        setInstallNote({ tone: "error", message: `回滚「${item.name}」失败：${detail}` });
+        finishInstallLog(logId, "error", detail);
+      } finally {
+        setRollingBackSlug(null);
+      }
+    },
+    [finishInstallLog, refreshSummary, startInstallLog]
   );
 
   const allItems: SkillItem[] = useMemo(() => {
@@ -316,10 +454,10 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     setImportStatus(null);
     try {
       const result = await invokeTauri<string>("import_skills", { sourceDir: importPath });
-      setImportStatus(`✓ ${result}`);
+      setImportStatus({ tone: "ok", message: result });
       await refreshSummary();
     } catch (e) {
-      setImportStatus(`✗ 导入失败: ${String(e)}`);
+      setImportStatus({ tone: "error", message: `导入失败: ${String(e)}` });
     } finally {
       setIsImporting(false);
     }
@@ -327,15 +465,12 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
   const renderMarketCard = (item: SkillHubItem) => {
     const installed = installedSlugs.has(item.slug);
-    const busy = installingSlug === item.slug;
+    const busy = installingSlug === item.slug || rollingBackSlug === item.slug;
+    const expanded = expandedSlugs.has(item.slug);
     return (
-      <div className="market-card" key={`${item.namespace ?? ""}/${item.slug}`} title={item.name}>
+      <div className={`market-card${expanded ? " is-expanded" : ""}`} key={`${item.namespace ?? ""}/${item.slug}`}>
         <div className="market-card-icon" aria-hidden>
-          {item.iconUrl ? (
-            <img src={item.iconUrl} alt="" loading="lazy" />
-          ) : (
-            <span>{marketIcon(item)}</span>
-          )}
+          <MarketBrandIcon item={item} />
         </div>
         <div className="market-card-body">
           <div className="market-card-name">{item.name}</div>
@@ -343,23 +478,67 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             {item.description || "（该技能未提供描述）"}
           </div>
           <div className="market-card-meta">
-            <span className="market-card-downloads">↓ {formatDownloads(item.downloads)}</span>
+            <span className="market-card-downloads">
+              下载 {formatDownloads(item.downloads)}
+            </span>
+            <span className="market-card-tag">版本 {item.version || "最新"}</span>
             {item.category ? (
               <span className="market-card-tag">
                 {categories.find((c) => c.key === item.category)?.name ?? item.category}
               </span>
             ) : null}
           </div>
+          {expanded ? (
+            <dl className="market-card-details">
+              <div><dt>来源</dt><dd>SkillHub{item.namespace ? ` / @${item.namespace}` : ""}</dd></div>
+              <div><dt>版本</dt><dd>{item.version || "远端接口未提供版本号，安装当前最新版"}</dd></div>
+              <div><dt>权限</dt><dd>安装器只写入技能目录并验证 SKILL.md；执行权限由 Agent 自主性策略控制</dd></div>
+              <div><dt>更新</dt><dd>更新前保留一个上一版本，可通过回滚恢复</dd></div>
+            </dl>
+          ) : null}
         </div>
-        <button
-          type="button"
-          className={`market-card-btn${installed ? " is-installed" : ""}`}
-          disabled={busy || installed}
-          onClick={() => void handleInstall(item)}
-          title={installed ? "已安装" : "安装到本地技能库"}
-        >
-          {installed ? "✓ 已安装" : busy ? "安装中…" : "+ 安装"}
-        </button>
+        <div className="market-card-actions">
+          <button
+            type="button"
+            className="market-card-detail-btn"
+            aria-expanded={expanded}
+            onClick={() => setExpandedSlugs((prev) => {
+              const next = new Set(prev);
+              if (next.has(item.slug)) next.delete(item.slug);
+              else next.add(item.slug);
+              return next;
+            })}
+          >
+            {expanded ? "收起" : "详情"}
+          </button>
+          <button
+            type="button"
+            className={`market-card-btn${installed ? " is-installed" : ""}`}
+            disabled={busy}
+            onClick={() => void handleInstall(item, installed)}
+            title={installed ? "下载最新版并保留当前版本用于回滚" : "安装到本地技能库"}
+          >
+            {installingSlug === item.slug ? (
+              "处理中…"
+            ) : installed ? (
+              <><UiIcon name="sync" size={13} /> 更新</>
+            ) : (
+              <><UiIcon name="plus" size={13} /> 安装</>
+            )}
+          </button>
+          {installed ? (
+            <button
+              type="button"
+              className="market-card-rollback-btn"
+              disabled={busy}
+              onClick={() => void handleRollback(item)}
+              title="恢复更新前保留的上一版本"
+            >
+              <UiIcon name="history" size={12} />
+              {rollingBackSlug === item.slug ? "回滚中…" : "回滚"}
+            </button>
+          ) : null}
+        </div>
       </div>
     );
   };
@@ -370,7 +549,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
       <section className="setup-section">
         <div className="section-heading">
           <div>
-            <h2>技能扩展</h2>
+            <h2>技能运行状态</h2>
             <div className="section-subtitle">
               允许 Agent 加载并使用外部技能（SKILL.md 格式）
             </div>
@@ -440,11 +619,13 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
             {installNote ? (
               <div
-                className={`skill-import-status ${
-                  installNote.includes("✗") ? "is-error" : "is-ok"
-                }`}
+                className={`skill-import-status ${installNote.tone === "error" ? "is-error" : "is-ok"}`}
               >
-                {installNote}
+                <UiIcon
+                  name={installNote.tone === "error" ? "warning" : "check"}
+                  size={14}
+                />{" "}
+                {installNote.message}
               </div>
             ) : null}
 
@@ -510,6 +691,46 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                 ) : null}
               </>
             )}
+
+            <details
+              className="market-install-log"
+              open={installLogOpen}
+              onToggle={(event) => setInstallLogOpen(event.currentTarget.open)}
+            >
+              <summary>
+                <span><UiIcon name="history" size={14} /> 安装日志</span>
+                <small>{installLog.length ? `${installLog.length} 条本机记录` : "暂无记录"}</small>
+              </summary>
+              <div className="market-install-log-body">
+                {installLog.length ? (
+                  <>
+                    <ol>
+                      {installLog.map((entry) => (
+                        <li key={entry.id} data-status={entry.status}>
+                          <span className="market-install-log-icon">
+                            <UiIcon
+                              name={entry.status === "success" ? "check" : entry.status === "error" ? "warning" : "sync"}
+                              size={12}
+                            />
+                          </span>
+                          <span>
+                            <strong>
+                              {entry.action === "install" ? "安装" : entry.action === "update" ? "更新" : "回滚"}
+                              「{entry.skill}」
+                            </strong>
+                            <small>{entry.detail}</small>
+                          </span>
+                          <time>{new Date(entry.at).toLocaleString("zh-CN", { hour12: false })}</time>
+                        </li>
+                      ))}
+                    </ol>
+                    <button type="button" onClick={() => setInstallLog([])}>清空安装日志</button>
+                  </>
+                ) : (
+                  <div className="skill-empty">安装、更新和回滚结果会记录在本机，不上传到市场。</div>
+                )}
+              </div>
+            </details>
           </section>
 
           {/* Installed gallery */}
@@ -555,7 +776,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                   {visible.map((s) => (
                     <div className="skill-card" key={s.name} title={s.name}>
                       <div className="skill-card-icon" aria-hidden>
-                        {iconFor(s)}
+                        <span className="skill-original-marker">{iconFor(s)}</span>
                       </div>
                       <div className="skill-card-body">
                         <div className="skill-card-name">{prettyName(s.name)}</div>
@@ -567,7 +788,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                         ) : null}
                       </div>
                       <span className="skill-card-check" title="已启用">
-                        ✓
+                        <UiIcon name="check" size={11} />
                       </span>
                     </div>
                   ))}
@@ -607,11 +828,13 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             </div>
             {importStatus && (
               <div
-                className={`skill-import-status ${
-                  importStatus.includes("✗") ? "is-error" : "is-ok"
-                }`}
+                className={`skill-import-status ${importStatus.tone === "error" ? "is-error" : "is-ok"}`}
               >
-                {importStatus}
+                <UiIcon
+                  name={importStatus.tone === "error" ? "warning" : "check"}
+                  size={14}
+                />{" "}
+                {importStatus.message}
               </div>
             )}
           </section>
