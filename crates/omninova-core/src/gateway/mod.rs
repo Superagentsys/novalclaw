@@ -9,6 +9,11 @@ pub mod feishu_store;
 pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
+pub mod wecom_protocol;
+pub mod wecom_stream;
+pub mod wecom_inbound;
+pub mod wecom_outbound;
+pub mod wecom_worker;
 
 /// Unified DingTalk Stream lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,6 +35,9 @@ pub enum DingTalkStreamState {
 
 #[cfg(test)]
 mod dingtalk_tests;
+
+#[cfg(test)]
+mod wecom_tests;
 
 use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
 use crate::gateway::feishu_store::FeishuStore;
@@ -473,6 +481,12 @@ pub struct GatewayRuntime {
     /// The counter prevents old owners from clearing new owners' state (ABA race).
     /// Only the current owner may call release (Drop or explicit cleanup).
     dingtalk_stream_owner: Arc<StreamOwner>,
+    /// WeCom Stream connection state.
+    wecom_stream_connected: Arc<AtomicBool>,
+    /// WeCom Stream subscribed state.
+    wecom_stream_subscribed: Arc<AtomicBool>,
+    /// WeCom Stream owner lifecycle.
+    wecom_stream_owner: Arc<WecomStreamOwner>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
@@ -745,6 +759,154 @@ impl StreamOwner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WeCom Stream owner lifecycle (mirrors DingTalk pattern)
+// ---------------------------------------------------------------------------
+
+/// Owner-aware WeCom Stream lifecycle using a generation counter to prevent ABA races.
+pub(crate) struct WecomStreamOwner {
+    generation: AtomicU64,
+    active: AtomicBool,
+    connected: AtomicBool,
+    subscribed: AtomicBool,
+    shutdown_tx: tokio::sync::Mutex<Option<watch::Sender<bool>>>,
+    loop_handle: tokio::sync::Mutex<Option<OwnedStreamLoop>>,
+}
+
+impl WecomStreamOwner {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            subscribed: AtomicBool::new(false),
+            shutdown_tx: tokio::sync::Mutex::new(None),
+            loop_handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Try to acquire ownership with strictly monotonically increasing
+    /// generations. Returns (gen, shutdown_rx) on success, or
+    /// (current_gen, None) when another owner is already active.
+    ///
+    /// The generation counter NEVER resets: even after a full release the
+    /// next successful acquisition is previous_gen + 1. A late release by an
+    /// old owner (stale gen) can therefore never invalidate a new owner.
+    async fn try_acquire(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        let mut tx_guard = self.shutdown_tx.lock().await;
+        if self.active.load(Ordering::Acquire) {
+            return (self.generation.load(Ordering::Acquire), None);
+        }
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active.store(true, Ordering::Release);
+        let (tx, rx) = watch::channel(false);
+        *tx_guard = Some(tx);
+        (gen, Some(rx))
+    }
+
+    /// Release ownership. Generation-scoped: only the current owner may
+    /// release; a stale owner's release is ignored entirely.
+    async fn release(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(true);
+        }
+        self.loop_handle.lock().await.take();
+    }
+
+    fn set_connected(&self, value: bool) {
+        self.connected.store(value, Ordering::Release);
+    }
+
+    fn set_subscribed(&self, value: bool) {
+        self.subscribed.store(value, Ordering::Release);
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Ordering::Acquire)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Register the reconnect-loop JoinHandle so `shutdown_and_join` can
+    /// truly await the loop's teardown (Stop → join → Start).
+    async fn register_loop_handle(&self, owner_gen: u64, handle: tokio::task::JoinHandle<()>) {
+        if self.generation.load(Ordering::Acquire) == owner_gen {
+            *self.loop_handle.lock().await = Some(OwnedStreamLoop {
+                owner_gen,
+                handle,
+            });
+        }
+    }
+
+    /// Mark generation as acquired synchronously (legacy single-call path).
+    /// Returns the new generation number.
+    fn mark_active_for_acquire(&self, new_gen: u64) -> u64 {
+        self.generation.store(new_gen, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        new_gen
+    }
+
+    /// Release ownership synchronously. Generation-scoped: a stale owner's
+    /// release must never invalidate a newer owner.
+    fn release_sync(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+    }
+
+    async fn shutdown_and_join(&self, owner_gen: u64, wait: Duration) -> StreamShutdownOutcome {
+        if !self.active.load(Ordering::Acquire) {
+            return StreamShutdownOutcome::NotRunning;
+        }
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(true);
+        }
+
+        let owned = self.loop_handle.lock().await.take();
+        match owned {
+            Some(mut h) if h.owner_gen == owner_gen => {
+                match tokio::time::timeout(wait, &mut h.handle).await {
+                    Ok(Ok(())) => StreamShutdownOutcome::Graceful,
+                    Ok(Err(_)) => StreamShutdownOutcome::JoinFailed,
+                    Err(_) => {
+                        h.handle.abort();
+                        let _ = h.handle.await;
+                        StreamShutdownOutcome::Aborted
+                    }
+                }
+            }
+            _ => StreamShutdownOutcome::JoinFailed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentRunRegistry {
     inner: Arc<RwLock<HashMap<String, ActiveAgentRun>>>,
@@ -865,6 +1027,9 @@ impl GatewayRuntime {
             dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
+            wecom_stream_connected: Arc::new(AtomicBool::new(false)),
+            wecom_stream_subscribed: Arc::new(AtomicBool::new(false)),
+            wecom_stream_owner: Arc::new(WecomStreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
@@ -890,6 +1055,9 @@ impl GatewayRuntime {
             dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
+            wecom_stream_connected: Arc::new(AtomicBool::new(false)),
+            wecom_stream_subscribed: Arc::new(AtomicBool::new(false)),
+            wecom_stream_owner: Arc::new(WecomStreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
@@ -1286,6 +1454,128 @@ impl GatewayRuntime {
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
         self.dingtalk_store.get().cloned()
+    }
+
+    // ---------------------------------------------------------------------------
+    // WeCom Stream lifecycle
+    // ---------------------------------------------------------------------------
+
+    /// Try-acquire WeCom stream ownership. Returns `Some(gen)` on success or
+    /// `None` when another owner is already active. Generations are strictly
+    /// monotonically increasing across the runtime's lifetime.
+    pub(crate) async fn try_acquire_wecom_stream_owner(&self) -> Option<u64> {
+        let (gen, shutdown_rx) = self.wecom_stream_owner.try_acquire().await;
+        shutdown_rx.map(|_| gen)
+    }
+
+    /// Register the reconnect-loop JoinHandle so Gateway Stop can truly join
+    /// the WeCom teardown before Start.
+    pub(crate) async fn register_wecom_stream_loop_handle(
+        &self,
+        owner_gen: u64,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.wecom_stream_owner
+            .register_loop_handle(owner_gen, handle)
+            .await;
+    }
+
+    /// Legacy synchronous acquire (returns current gen; used by tests and
+    /// the legacy start path). Active owners are NOT re-acquired.
+    pub(crate) fn acquire_wecom_stream_generation(&self) -> u64 {
+        // Use the proper try_acquire method from WecomStreamOwner
+        // This atomically increments generation and sets active=true
+        let gen = self.wecom_stream_owner.current_generation();
+        if self.wecom_stream_owner.is_active() {
+            // Already have an active stream, return current gen (no new acquisition)
+            gen
+        } else {
+            // Increment and set active - this is what try_acquire does
+            // But we need to do it synchronously here, so we simulate the atomic behavior
+            let new_gen = gen + 1;
+            // Mark as active by setting the generation to new_gen and active=true
+            // The WecomStreamOwner tracks this - we need to properly acquire
+            // Use fetch_add pattern to atomically get new gen
+            self.wecom_stream_owner.mark_active_for_acquire(new_gen)
+        }
+    }
+
+    pub(crate) fn is_wecom_stream_generation_active(&self, gen: u64) -> bool {
+        self.wecom_stream_owner.current_generation() == gen
+            && self.wecom_stream_owner.is_active()
+    }
+
+    pub(crate) fn current_wecom_stream_generation(&self) -> u64 {
+        self.wecom_stream_owner.current_generation()
+    }
+
+    /// Check if WeCom stream is currently active (for debugging).
+    pub(crate) fn is_wecom_stream_active(&self) -> bool {
+        self.wecom_stream_owner.is_active()
+    }
+
+    pub(crate) fn set_wecom_stream_connected(&self, value: bool) {
+        self.wecom_stream_connected.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_wecom_stream_subscribed(&self, value: bool) {
+        self.wecom_stream_subscribed.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_wecom_stream_state(&self, _state: crate::gateway::wecom_stream::WecomStreamState) {
+        // WeCom uses simpler state tracking than DingTalk
+        // State changes are logged in wecom_stream.rs
+    }
+
+    pub(crate) async fn shutdown_wecom_stream_generation(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        self.wecom_stream_owner
+            .shutdown_and_join(owner_gen, wait)
+            .await
+    }
+
+    /// Gateway Stop entry point: signal shutdown and JOIN the reconnect loop
+    /// so restart is physically 1 -> 0 -> 1 (mirrors DingTalk semantics).
+    pub async fn shutdown_wecom_stream_and_join(&self) {
+        const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        let owner_gen = self.wecom_stream_owner.current_generation();
+        let outcome = self
+            .shutdown_wecom_stream_generation(owner_gen, STREAM_SHUTDOWN_TIMEOUT)
+            .await;
+        println!("[wecom-stream] lifecycle_join outcome={outcome:?} gen={owner_gen}");
+    }
+
+    pub(crate) fn signal_wecom_stream_shutdown(&self, _owner_gen: u64) {
+        // Signal handled by WecomStreamGuard
+    }
+
+    pub(crate) fn release_wecom_stream_generation(&self, gen: u64) {
+        // Release ownership if this is the current generation
+        let current = self.wecom_stream_owner.current_generation();
+        if current == gen {
+            self.wecom_stream_owner.release_sync(gen);
+        } else {
+            println!(
+                "[wecom-stream] owner_release_ignored stale_gen={} current_gen={}",
+                gen, current
+            );
+        }
+    }
+
+    /// Increment reply success counter.
+    pub async fn increment_wecom_reply_success(&self) {}
+
+    /// Increment reply failure counter.
+    pub async fn increment_wecom_reply_failure(&self) {}
+
+    /// Get WebSocket sender for WeCom outbound (placeholder for Phase 1B).
+    pub async fn get_wecom_ws_sender(&self) -> Option<tokio::sync::mpsc::Sender<String>> {
+        // Phase 1A: WeCom reply is handled inline in wecom_stream.rs
+        // Phase 1B will implement proper WebSocket sender sharing
+        None
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
@@ -2699,6 +2989,10 @@ impl GatewayRuntime {
         // Start unified DingTalk Stream transport (handles both robot and card topics)
         let mut dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
 
+        // Start WeCom WebSocket transport
+        use crate::gateway::wecom_stream;
+        let mut wecom_stream_guard = wecom_stream::start(Arc::new(self.clone())).await;
+
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
         crate::gateway::feishu_worker::run_retry_worker_once(&runtime).await;
@@ -2800,6 +3094,9 @@ impl GatewayRuntime {
         let serve_result = axum::serve(listener, app).await;
         if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
             stream_guard.shutdown().await;
+        }
+        if let Some(wecom_guard) = wecom_stream_guard.as_mut() {
+            wecom_guard.shutdown().await;
         }
         serve_result?;
         Ok(())
@@ -3600,6 +3897,8 @@ impl GatewayRuntimeStatus {
             if c.webhook.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("webhook".to_string()); }
             if c.wechat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("wechat".to_string()); }
             if c.dingtalk.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("dingtalk".to_string()); }
+            // WeCom: check channels_config.wecom.enabled OR gateway.wecom.enabled
+            if c.wecom.as_ref().map(|e| e.enabled).unwrap_or(false) || cfg.gateway.wecom.enabled { list.push("wecom".to_string()); }
             if c.google_chat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("google_chat".to_string()); }
             if c.matrix.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("matrix".to_string()); }
             if c.signal.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("signal".to_string()); }

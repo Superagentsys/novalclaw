@@ -86,6 +86,7 @@ export interface ChannelsConfig {
   feishu?: ChannelEntryConfig;
   lark?: ChannelEntryConfig;
   dingtalk?: ChannelEntryConfig;
+  wecom?: ChannelEntryConfig;
   matrix?: ChannelEntryConfig;
   email?: ChannelEntryConfig;
   msteams?: ChannelEntryConfig;
@@ -199,6 +200,16 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
       { key: "app_secret", label: "App Secret", placeholder: "钉钉应用 AppSecret", type: "password", isExtra: true },
       { key: "token", label: "签名密钥", placeholder: "自定义机器人签名密钥", type: "password" },
       { key: "token_env", label: "Secret 环境变量", placeholder: "DINGTALK_TOKEN", type: "text" },
+    ],
+  },
+  {
+    id: "wecom",
+    name: "企业微信 WeCom",
+    category: "im",
+    tokenEnvHint: "WECOM_BOT_SECRET",
+    fields: [
+      { key: "bot_id", label: "Bot ID", placeholder: "企业微信智能机器人 BotID", type: "text", isExtra: true },
+      { key: "secret", label: "Secret (长连接密钥)", placeholder: "企业微信长连接专用密钥", type: "password", isExtra: true },
     ],
   },
   {

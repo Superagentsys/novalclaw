@@ -37,6 +37,7 @@ function getWebhookPath(channelId: string): string {
     case "lark": return "/webhook/lark";
     case "wechat": return "/webhook/wechat";
     case "dingtalk": return "/api/v1/gateway/dingtalk/events";
+    case "wecom": return ""; // WeCom uses WebSocket, not webhook
     case "webhook": return "/webhook";
     default: return "/webhook";
   }
@@ -658,7 +659,7 @@ export function ChannelConfigForm({
 
           {selectedPreset.id === "wechat" && (
             <div className="channel-guide">
-              <h3>企业微信接入指引</h3>
+              <h3>微信/企业微信（Webhook）接入指引</h3>
               <ol>
                 <li>
                   登录{" "}
@@ -675,6 +676,27 @@ export function ChannelConfigForm({
                   设置接收消息的 URL 为 <code>/webhook/wechat</code>
                   ，获取 Token 和 EncodingAESKey
                 </li>
+              </ol>
+            </div>
+          )}
+
+          {selectedPreset.id === "wecom" && (
+            <div className="channel-guide">
+              <h3>企业微信 WeCom 智能机器人接入指引</h3>
+              <ol>
+                <li>
+                  登录{" "}
+                  <a
+                    href="https://work.weixin.qq.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    企业微信管理后台
+                  </a>
+                </li>
+                <li>在「智能机器人」中创建机器人，获取 BotID 和长连接专用 Secret</li>
+                <li>长连接模式无需配置公网回调地址，无需消息加解密</li>
+                <li>OmniNova Phase 1A 支持：WebSocket 长连接、消息接收、文本回复</li>
               </ol>
             </div>
           )}

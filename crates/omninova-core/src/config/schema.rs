@@ -1021,6 +1021,10 @@ pub struct GatewayConfig {
     /// but rejects all requests; no outbound DingTalk calls are made.
     #[serde(default)]
     pub dingtalk: GatewayDingtalkConfig,
+    /// WeCom (企业微信智能机器人) gateway config. Defaults to disabled.
+    /// When disabled, no WebSocket connection is established.
+    #[serde(default)]
+    pub wecom: GatewayWecomConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1109,6 +1113,38 @@ fn default_gateway_dingtalk_outbound_mode() -> String {
     "session_webhook".into()
 }
 
+/// WeCom (企业微信) Smart Bot config. Uses WebSocket long-connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayWecomConfig {
+    /// Master switch. When `false` (the default), no WeCom WebSocket connection is established.
+    #[serde(default)]
+    pub enabled: bool,
+    /// WeCom Bot ID (智能机器人 BotID).
+    #[serde(default)]
+    pub bot_id: String,
+    /// Optional environment variable name holding the Bot ID.
+    #[serde(default)]
+    pub bot_id_env: Option<String>,
+    /// WeCom Long-connection Secret (长连接专用密钥).
+    #[serde(default)]
+    pub secret: String,
+    /// Optional environment variable name holding the Secret.
+    #[serde(default)]
+    pub secret_env: Option<String>,
+}
+
+impl Default for GatewayWecomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_id: String::new(),
+            bot_id_env: None,
+            secret: String::new(),
+            secret_env: None,
+        }
+    }
+}
+
 fn default_gateway_host() -> String {
     "127.0.0.1".into()
 }
@@ -1155,6 +1191,7 @@ impl Default for GatewayConfig {
             webhook_signing_include_timestamp: false,
             webhook_signing_require_timestamp: false,
             dingtalk: GatewayDingtalkConfig::default(),
+            wecom: GatewayWecomConfig::default(),
         }
     }
 }
@@ -1460,6 +1497,8 @@ pub struct ChannelsConfig {
     pub twitch: Option<ChannelEntry>,
     #[serde(default)]
     pub wechat: Option<ChannelEntry>,
+    #[serde(default)]
+    pub wecom: Option<ChannelEntry>,
     #[serde(default)]
     pub zalo: Option<ChannelEntry>,
     #[serde(default)]

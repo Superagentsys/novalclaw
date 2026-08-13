@@ -28,6 +28,8 @@ pub enum ChannelKind {
     Tlon,
     Twitch,
     Wechat,
+    /// WeCom (企业微信) Smart Bot WebSocket long-connection.
+    Wecom,
     Zalo,
     ZaloPersonal,
     Lark,

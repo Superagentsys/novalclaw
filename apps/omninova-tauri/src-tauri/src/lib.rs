@@ -562,6 +562,8 @@ struct SetupChannelsConfig {
     #[serde(default)]
     dingtalk: Option<SetupChannelEntry>,
     #[serde(default)]
+    wecom: Option<SetupChannelEntry>,
+    #[serde(default)]
     matrix: Option<SetupChannelEntry>,
     #[serde(default)]
     email: Option<SetupChannelEntry>,
@@ -1282,8 +1284,9 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
     }
 }
 
-fn enabled_channel_names(channels: &ChannelsConfig) -> Vec<&'static str> {
-    [
+fn enabled_channel_names(config: &Config) -> Vec<&'static str> {
+    let channels = &config.channels_config;
+    let mut names: Vec<&'static str> = [
         ("telegram", channels.telegram.as_ref()),
         ("discord", channels.discord.as_ref()),
         ("slack", channels.slack.as_ref()),
@@ -1300,7 +1303,25 @@ fn enabled_channel_names(channels: &ChannelsConfig) -> Vec<&'static str> {
     ]
     .into_iter()
     .filter_map(|(name, entry)| entry.filter(|entry| entry.enabled).map(|_| name))
-    .collect()
+    .collect();
+    // WeCom effective enablement matches `wecom_stream::start` exactly:
+    // gateway.wecom.enabled OR channels_config.wecom.enabled.
+    if wecom_effective_enabled(config) {
+        names.push("wecom");
+    }
+    names
+}
+
+/// Effective WeCom enablement, matching `wecom_stream::start` exactly:
+/// `gateway.wecom.enabled || channels_config.wecom.enabled`.
+fn wecom_effective_enabled(config: &Config) -> bool {
+    config.gateway.wecom.enabled
+        || config
+            .channels_config
+            .wecom
+            .as_ref()
+            .map(|entry| entry.enabled)
+            .unwrap_or(false)
 }
 
 async fn preflight_gateway_bind(host: &str, port: u16) -> Result<(), (String, String)> {
@@ -1355,7 +1376,22 @@ async fn start_gateway_inner(
         .map_err(|error| format!("Gateway 启动失败：{error}"))?;
     eprintln!(
         "[gateway] enabled_channels={:?}",
-        enabled_channel_names(&cfg.channels_config)
+        enabled_channel_names(&cfg)
+    );
+
+    // WeCom enablement diagnostic: the stream transport enables via
+    // gateway.wecom.enabled OR channels_config.wecom.enabled. Surface the
+    // effective decision without any Bot ID / Secret.
+    eprintln!(
+        "[gateway] wecom_enablement gateway_enabled={} channels_config_present={} channels_config_enabled={} effective_enabled={}",
+        cfg.gateway.wecom.enabled,
+        cfg.channels_config.wecom.is_some(),
+        cfg.channels_config
+            .wecom
+            .as_ref()
+            .map(|entry| entry.enabled)
+            .unwrap_or(false),
+        wecom_effective_enabled(&cfg)
     );
 
     // Check if already running without holding the state lock across another
@@ -2123,6 +2159,10 @@ async fn stop_gateway_inner(state: &Arc<Mutex<AppState>>, reason: &'static str) 
     // The Stream reconnect loop is independently spawned. Explicitly join it
     // after the parent is gone so restart is physically 1 -> 0 -> 1.
     runtime.shutdown_dingtalk_stream_and_join().await;
+    // WeCom uses the same owner+join contract: Gateway Stop must await the
+    // WeCom reconnect-loop teardown before returning, otherwise an immediate
+    // Start would race a still-live first connection (double WebSocket).
+    runtime.shutdown_wecom_stream_and_join().await;
 }
 
 fn setup_config_from_core(config: &Config) -> SetupAppConfig {
@@ -2286,6 +2326,18 @@ fn channels_from_core(config: &Config) -> SetupChannelsConfig {
         }
     }
 
+    // Build WeCom entry: secret is masked, bot_id is shown
+    let mut wecom = channel_entry_from_core(&cfg.wecom);
+    if let Some(entry) = wecom.as_mut() {
+        // Mask the secret - WeCom secret is stored in extra["secret"]
+        if entry.extra.contains_key("secret") {
+            entry.extra.insert(
+                "secret".to_string(),
+                serde_json::Value::String(SETUP_SENSITIVE_VALUE_MARKER.to_string()),
+            );
+        }
+    }
+
     SetupChannelsConfig {
         telegram: channel_entry_from_core(&cfg.telegram),
         discord: channel_entry_from_core(&cfg.discord),
@@ -2295,6 +2347,7 @@ fn channels_from_core(config: &Config) -> SetupChannelsConfig {
         feishu: channel_entry_from_core(&cfg.feishu),
         lark: channel_entry_from_core(&cfg.lark),
         dingtalk,
+        wecom,
         matrix: channel_entry_from_core(&cfg.matrix),
         email: channel_entry_from_core(&cfg.email),
         msteams: channel_entry_from_core(&cfg.msteams),
@@ -2878,6 +2931,7 @@ fn retain_changed_setup_channels(channels: &mut SetupChannelsConfig, changed: &[
     if !has("feishu") { channels.feishu = None; }
     if !has("lark") { channels.lark = None; }
     if !has("dingtalk") { channels.dingtalk = None; }
+    if !has("wecom") { channels.wecom = None; }
     if !has("matrix") { channels.matrix = None; }
     if !has("email") { channels.email = None; }
     if !has("msteams") { channels.msteams = None; }
@@ -2979,6 +3033,7 @@ fn channels_to_core(setup: SetupChannelsConfig, current: &ChannelsConfig) -> Cha
         feishu: merge_channel_entry(setup.feishu, current.feishu.as_ref()),
         lark: merge_channel_entry(setup.lark, current.lark.as_ref()),
         dingtalk: merge_channel_entry(setup.dingtalk, current.dingtalk.as_ref()),
+        wecom: merge_channel_entry(setup.wecom, current.wecom.as_ref()),
         matrix: merge_channel_entry(setup.matrix, current.matrix.as_ref()),
         email: merge_channel_entry(setup.email, current.email.as_ref()),
         msteams: merge_channel_entry(setup.msteams, current.msteams.as_ref()),
@@ -3826,8 +3881,46 @@ mod channel_tests {
             }),
             ..Default::default()
         };
+        let config = Config {
+            channels_config: channels,
+            ..Default::default()
+        };
 
-        assert_eq!(enabled_channel_names(&channels), vec!["feishu", "dingtalk"]);
+        assert_eq!(enabled_channel_names(&config), vec!["feishu", "dingtalk"]);
+    }
+
+    #[test]
+    fn wecom_effective_enabled_true_via_gateway_config() {
+        // gateway.wecom.enabled=true, channels_config.wecom absent/disabled
+        // -> effective=true -> enabled_channels must include "wecom".
+        let mut config = Config::default();
+        config.gateway.wecom.enabled = true;
+
+        assert!(wecom_effective_enabled(&config));
+        assert!(enabled_channel_names(&config).contains(&"wecom"));
+    }
+
+    #[test]
+    fn wecom_effective_enabled_true_via_channels_config() {
+        // gateway.wecom.enabled=false, channels_config.wecom.enabled=true
+        // -> effective=true -> enabled_channels must include "wecom".
+        let mut config = Config::default();
+        config.channels_config.wecom = Some(ChannelEntry {
+            enabled: true,
+            ..Default::default()
+        });
+
+        assert!(wecom_effective_enabled(&config));
+        assert!(enabled_channel_names(&config).contains(&"wecom"));
+    }
+
+    #[test]
+    fn wecom_effective_enabled_false_excludes_wecom() {
+        // Both disabled -> effective=false -> enabled_channels must NOT
+        // include "wecom".
+        let config = Config::default();
+        assert!(!wecom_effective_enabled(&config));
+        assert!(!enabled_channel_names(&config).contains(&"wecom"));
     }
 
     #[test]
@@ -4234,9 +4327,9 @@ mod channel_tests {
 
     #[test]
     fn test_lark_is_disabled_by_default() {
-        let channels = ChannelsConfig::default();
-        assert!(!channels.lark.as_ref().is_some_and(|entry| entry.enabled));
-        assert!(!enabled_channel_names(&channels).contains(&"lark"));
+        let config = Config::default();
+        assert!(!config.channels_config.lark.as_ref().is_some_and(|entry| entry.enabled));
+        assert!(!enabled_channel_names(&config).contains(&"lark"));
     }
 
     #[test]
@@ -4249,7 +4342,11 @@ mod channel_tests {
             }),
             ..Default::default()
         };
-        assert_eq!(enabled_channel_names(&channels), vec!["feishu"]);
+        let config = Config {
+            channels_config: channels,
+            ..Default::default()
+        };
+        assert_eq!(enabled_channel_names(&config), vec!["feishu"]);
     }
 
     /// Test 5: Enabled channel with only extra should be saved
