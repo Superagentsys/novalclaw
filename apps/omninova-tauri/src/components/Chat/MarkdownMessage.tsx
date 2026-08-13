@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  Children,
+  createContext,
+  isValidElement,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,6 +15,7 @@ import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
 import mermaid from "mermaid";
 import { useTheme } from "../../theme/themeState";
+import { invokeTauri } from "../../utils/tauri";
 
 import "katex/dist/katex.min.css";
 import "./MarkdownMessage.css";
@@ -83,31 +92,73 @@ function MermaidDiagram({ code }: { code: string }) {
   );
 }
 
-/** Code block with language label and copy button; delegates fenced `mermaid`. */
+const COLLAPSE_LINE_THRESHOLD = 14;
+const WorkspacePathContext = createContext<string | null>(null);
+
+function collectNodeText(node: React.ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(collectNodeText).join("");
+  if (isValidElement(node)) {
+    return collectNodeText(
+      (node.props as { children?: React.ReactNode }).children,
+    );
+  }
+  return "";
+}
+
+function looksLikeFilePath(text: string): boolean {
+  const line = text.replace(/\s+$/, "").trim();
+  if (!line || line.includes("\n") || line.length > 260) return false;
+  if (/[;{}()<>|"'`=*?]/.test(line)) return false;
+  for (let i = 0; i < line.length; i += 1) {
+    if (line.charCodeAt(i) < 0x20) return false;
+  }
+  const name = line.split(/[\\/]/).pop() ?? line;
+  // Require a stem plus a letter-initial extension so numbers like 3.14 are excluded.
+  return /^.+\.[A-Za-z][A-Za-z0-9]{0,11}$/.test(name);
+}
+
+function countLines(text: string): number {
+  if (!text) return 0;
+  return text.replace(/\n$/, "").split("\n").length;
+}
+
+function fileBasename(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+/** Fenced code: copy, collapse long blocks, and preview workspace file paths. */
 function CodeBlock({
-  inline,
   className,
   children,
 }: {
-  inline?: boolean;
   className?: string;
   children?: React.ReactNode;
 }) {
+  const workspacePath = useContext(WorkspacePathContext);
   const [copied, setCopied] = useState(false);
-  const raw = String(children ?? "");
+  const [expanded, setExpanded] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewText, setPreviewText] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const source = collectNodeText(children).replace(/\n$/, "");
   const match = /language-([\w-]+)/.exec(className ?? "");
   const lang = match?.[1];
-
-  if (inline) {
-    return <code className="md-inline-code">{children}</code>;
-  }
+  const filePath = looksLikeFilePath(source) ? source.trim() : null;
+  const lineCount = countLines(source);
+  const collapsible = !filePath && lineCount > COLLAPSE_LINE_THRESHOLD;
+  const collapsed = collapsible && !expanded;
 
   if (lang === "mermaid") {
-    return <MermaidDiagram code={raw.replace(/\n$/, "")} />;
+    return <MermaidDiagram code={source} />;
   }
 
   const onCopy = () => {
-    navigator.clipboard?.writeText(raw.replace(/\n$/, "")).then(
+    const text = previewing && previewText ? previewText : source;
+    navigator.clipboard?.writeText(text).then(
       () => {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
@@ -116,23 +167,152 @@ function CodeBlock({
     );
   };
 
+  const loadPreview = async () => {
+    if (!filePath) return;
+    if (previewText || previewImage) {
+      setPreviewing(true);
+      return;
+    }
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const preview = await invokeTauri<{
+        textPreview?: string | null;
+        dataUrl?: string | null;
+      }>("task_artifact_preview", {
+        path: filePath,
+        workspacePath: workspacePath || undefined,
+      });
+      setPreviewText(preview.textPreview ?? null);
+      setPreviewImage(preview.dataUrl ?? null);
+      if (!preview.textPreview && !preview.dataUrl) {
+        setPreviewError("该文件类型不提供内嵌预览，可改用「打开文件」。");
+      }
+      setPreviewing(true);
+    } catch (reason) {
+      setPreviewError(String(reason));
+      setPreviewing(true);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const toggleFilePreview = () => {
+    if (previewing) {
+      setPreviewing(false);
+      return;
+    }
+    void loadPreview();
+  };
+
+  const openFile = (reveal: boolean) => {
+    if (!filePath) return;
+    void invokeTauri("open_task_artifact", {
+      path: filePath,
+      workspacePath: workspacePath || undefined,
+      reveal,
+    }).catch((reason) => {
+      setPreviewError(String(reason));
+      setPreviewing(true);
+    });
+  };
+
+  const hasPreviewContent = Boolean(previewText || previewImage);
+  const showPreview = Boolean(filePath && previewing && (hasPreviewContent || previewError));
+  const hidePre = Boolean(filePath && previewing && hasPreviewContent);
+
   return (
-    <div className="md-code-wrap">
+    <div className={`md-code-wrap${filePath ? " md-code-wrap--file" : ""}`}>
       <div className="md-code-header">
-        <span className="md-code-lang">{lang ?? "text"}</span>
-        <button type="button" className="md-code-copy" onClick={onCopy}>
-          {copied ? "已复制" : "复制"}
-        </button>
+        <span
+          className={`md-code-lang${filePath ? " is-file" : ""}`}
+          title={filePath ?? lang ?? "text"}
+        >
+          {filePath ? fileBasename(filePath) : lang ?? "text"}
+        </span>
+        <div className="md-code-header-actions">
+          {filePath ? (
+            <>
+              <button
+                type="button"
+                className="md-code-copy md-code-copy--primary"
+                onClick={toggleFilePreview}
+                disabled={previewLoading}
+              >
+                {previewLoading ? "读取中…" : previewing ? "收起预览" : "展开预览"}
+              </button>
+              <button
+                type="button"
+                className="md-code-copy"
+                onClick={() => openFile(false)}
+              >
+                打开文件
+              </button>
+            </>
+          ) : null}
+          {collapsible ? (
+            <button
+              type="button"
+              className="md-code-copy md-code-copy--primary"
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? "收起" : `展开全部（${lineCount} 行）`}
+            </button>
+          ) : null}
+          <button type="button" className="md-code-copy" onClick={onCopy}>
+            {copied ? "已复制" : "复制"}
+          </button>
+        </div>
       </div>
-      <pre className="md-code-block">
-        <code className={className}>{children}</code>
-      </pre>
+      {hidePre ? null : (
+        <pre
+          className={`md-code-block${collapsed ? " md-code-block--collapsed" : ""}${
+            filePath || collapsed ? " md-code-block--clickable" : ""
+          }`}
+          onClick={
+            filePath
+              ? toggleFilePreview
+              : collapsed
+                ? () => setExpanded(true)
+                : undefined
+          }
+        >
+          <code className={className}>{children}</code>
+        </pre>
+      )}
+      {showPreview ? (
+        <div className="md-code-preview">
+          {previewError ? (
+            <div className="md-code-preview-error">{previewError}</div>
+          ) : null}
+          {previewImage ? (
+            <img
+              className="md-code-preview-image"
+              src={previewImage}
+              alt={filePath ?? ""}
+            />
+          ) : null}
+          {previewText ? <pre className="md-code-preview-text">{previewText}</pre> : null}
+        </div>
+      ) : null}
     </div>
   );
 }
 
+function PreBlock({ children }: { children?: React.ReactNode }) {
+  const codeEl = Children.toArray(children).find((child) => isValidElement(child));
+  if (!isValidElement(codeEl)) {
+    return <CodeBlock>{children}</CodeBlock>;
+  }
+  const props = codeEl.props as { className?: string; children?: React.ReactNode };
+  return <CodeBlock className={props.className}>{props.children}</CodeBlock>;
+}
+
 const components: Components = {
-  code: CodeBlock as Components["code"],
+  pre: PreBlock as Components["pre"],
+  code: ({ className, children }) => (
+    <code className={className || "md-inline-code"}>{children}</code>
+  ),
   a: ({ href, children }) => (
     <a href={href} target="_blank" rel="noreferrer noopener">
       {children}
@@ -146,7 +326,13 @@ const components: Components = {
 };
 
 /** Renders assistant/agent message content as rich Markdown. */
-export function MarkdownMessage({ content }: { content: string }) {
+export function MarkdownMessage({
+  content,
+  workspacePath,
+}: {
+  content: string;
+  workspacePath?: string | null;
+}) {
   const remarkPlugins = useMemo(() => [remarkGfm, remarkMath], []);
   const rehypePlugins = useMemo(
     () => [rehypeKatex, [rehypeHighlight, { detect: true, ignoreMissing: true }]],
@@ -154,16 +340,18 @@ export function MarkdownMessage({ content }: { content: string }) {
   );
 
   return (
-    <div className="md-content">
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        rehypePlugins={rehypePlugins as any}
-        components={components}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
+    <WorkspacePathContext.Provider value={workspacePath ?? null}>
+      <div className="md-content">
+        <ReactMarkdown
+          remarkPlugins={remarkPlugins}
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          rehypePlugins={rehypePlugins as any}
+          components={components}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+    </WorkspacePathContext.Provider>
   );
 }
 

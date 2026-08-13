@@ -195,7 +195,7 @@ export function TaskDeliverable({
             <span>{isComplete ? "任务摘要" : "当前进展"}</span>
           </div>
           {task.resultPreview ? (
-            <MarkdownMessage content={task.resultPreview} />
+            <MarkdownMessage content={task.resultPreview} workspacePath={task.workspacePath} />
           ) : (
             <p>{task.attentionReason || "任务尚未产生可展示的结果，完成后会在此集中呈现。"}</p>
           )}
@@ -385,7 +385,7 @@ export function TaskInspector({
           task?.resultPreview || files.length ? (
             <div className="task-inspector-results-stack">
               {task?.resultPreview ? (
-                <div className="task-inspector-result"><MarkdownMessage content={task.resultPreview} /></div>
+                <div className="task-inspector-result"><MarkdownMessage content={task.resultPreview} workspacePath={task.workspacePath} /></div>
               ) : null}
               {files.length ? (
                 <section className="task-inspector-result-files" aria-label="成果文件">

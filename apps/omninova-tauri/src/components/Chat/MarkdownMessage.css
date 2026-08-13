@@ -107,15 +107,24 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 5px 10px;
   background: color-mix(in srgb, var(--ui-code-bg) 86%, white);
   border-bottom: 1px solid color-mix(in srgb, var(--ui-code-text) 20%, transparent);
 }
 .md-code-lang {
+  min-width: 0;
   font-size: 11px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
   color: color-mix(in srgb, var(--ui-code-text) 68%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.md-code-lang.is-file {
+  text-transform: none;
+  letter-spacing: 0;
 }
 .md-code-copy {
   font-size: 11px;
@@ -127,8 +136,17 @@
   cursor: pointer;
   transition: background 0.15s ease;
 }
-.md-code-copy:hover {
-  background: color-mix(in srgb, var(--ui-code-text) 10%, transparent);
+.md-code-copy--primary {
+  font-weight: 600;
+  background: color-mix(in srgb, var(--ui-accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--ui-accent) 42%, transparent);
+  color: var(--ui-accent-strong, var(--ui-accent));
+}
+.md-code-header-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 6px;
 }
 .md-code-block {
   margin: 0;
@@ -139,6 +157,52 @@
   line-height: 1.55;
   background: var(--ui-code-bg);
   color: var(--ui-code-text);
+}
+.md-code-block--clickable {
+  cursor: pointer;
+}
+.md-code-block.md-code-block--collapsed {
+  max-height: 17.6em;
+  overflow: hidden;
+  position: relative;
+}
+.md-code-block.md-code-block--collapsed::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2.4em;
+  background: linear-gradient(transparent, var(--ui-code-bg));
+  pointer-events: none;
+}
+.md-code-preview {
+  border-top: 1px solid color-mix(in srgb, var(--ui-code-text) 18%, transparent);
+  background: color-mix(in srgb, var(--ui-code-bg) 92%, white);
+}
+.md-code-preview-text {
+  margin: 0;
+  max-height: min(60vh, 42em);
+  overflow: auto;
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ui-code-text);
+}
+.md-code-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  margin: 10px auto;
+  object-fit: contain;
+}
+.md-code-preview-error {
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--ui-danger, #c0392b);
 }
 .md-code-block code {
   background: transparent;

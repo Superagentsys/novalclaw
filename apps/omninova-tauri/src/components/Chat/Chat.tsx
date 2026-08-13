@@ -2232,7 +2232,7 @@ export function Chat({
                 >
                   <div className="chat-bubble-content">
                     {msg.role === "assistant" ? (
-                      <MarkdownMessage content={msg.content} />
+                      <MarkdownMessage content={msg.content} workspacePath={activeWorkspaceDir} />
                     ) : (
                       msg.content
                     )}
