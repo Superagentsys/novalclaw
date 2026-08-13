@@ -300,7 +300,27 @@
   outline: 0;
   background: transparent;
   color: var(--ui-text);
+  color-scheme: light;
   font-size: 10px;
+}
+
+.chat-toolbar-model select option,
+.task-onboarding-action select option {
+  background-color: var(--ui-surface-2);
+  color: var(--ui-text);
+}
+
+.chat-toolbar-model select option:checked,
+.task-onboarding-action select option:checked {
+  background-color: var(--ui-accent);
+  color: var(--ui-text-on-accent);
+}
+
+:root[data-theme="midnight"] .chat-toolbar-model select,
+:root[data-theme="midnight"] .task-onboarding-action select,
+:root[data-theme="graphite"] .chat-toolbar-model select,
+:root[data-theme="graphite"] .task-onboarding-action select {
+  color-scheme: dark;
 }
 
 .chat-toolbar-gateway button,
