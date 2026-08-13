@@ -830,6 +830,88 @@
   opacity: 1;
 }
 
+/* Settings used to inherit fixed light-theme colors from App.css.  Keep every
+   configuration surface on semantic tokens so system-dark, midnight and
+   graphite remain readable without per-screen color patches. */
+.setup-page .setup-section :is(label, .provider-picker > span, .provider-selector > span),
+.provider-card :is(label, .toggle span),
+.gateway-public-config label,
+.gateway-runtime-grid span,
+.gateway-runtime-url-list span,
+.gateway-runtime-meta,
+.gateway-runtime-panel small {
+  color: var(--ui-text-secondary);
+}
+
+.provider-card {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-2);
+  color: var(--ui-text);
+}
+
+.provider-card:hover {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
+}
+
+.provider-meta,
+.gateway-runtime-panel :is(.setup-action-hint, .section-subtitle) {
+  color: var(--ui-text-muted);
+}
+
+.provider-card :is(input, select),
+.provider-picker select {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-3);
+  color: var(--ui-text);
+}
+
+.provider-actions .ghost-button,
+.gateway-runtime-panel button:not(.setup-btn--primary):not(.setup-btn--danger) {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-2);
+  color: var(--ui-text-secondary);
+}
+
+.provider-actions .ghost-button:hover,
+.gateway-runtime-panel button:not(.setup-btn--primary):not(.setup-btn--danger):hover {
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.gateway-public-config,
+.gateway-runtime-grid > div,
+.gateway-runtime-url-list > div {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-2);
+}
+
+.gateway-runtime-grid :is(strong, code),
+.gateway-runtime-url-list code {
+  color: var(--ui-text);
+}
+
+.gateway-runtime-url-list code {
+  background: var(--ui-surface-3);
+}
+
+.gateway-runtime-warning {
+  border-color: color-mix(in srgb, var(--ui-warning) 36%, var(--ui-border));
+  background: var(--ui-warning-soft);
+  color: var(--ui-warning);
+}
+
+.gateway-runtime-info {
+  border-color: color-mix(in srgb, var(--ui-accent) 32%, var(--ui-border));
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+}
+
+.gateway-public-error,
+.gateway-status-error {
+  color: var(--ui-danger);
+}
+
 .setup-toggle-row,
 .setup-card,
 .gateway-runtime-card,
@@ -962,6 +1044,10 @@
   color: var(--ui-text-secondary);
   font-size: 12.5px;
   font-weight: 700;
+}
+
+.persona-form :is(label, h3, .persona-panel-title, .persona-label) {
+  color: var(--ui-text);
 }
 
 .persona-input,

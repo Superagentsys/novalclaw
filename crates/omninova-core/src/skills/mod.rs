@@ -221,9 +221,11 @@ fn parse_skillhub_item(v: &serde_json::Value) -> Option<SkillHubItem> {
         .unwrap_or(&slug)
         .to_string();
     let description = v
-        .get("summary")
-        .or_else(|| v.get("description"))
+        .get("description_zh")
         .and_then(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| v.get("summary").and_then(|s| s.as_str()))
+        .or_else(|| v.get("description").and_then(|s| s.as_str()))
         .unwrap_or("")
         .trim()
         .to_string();
@@ -255,6 +257,16 @@ fn parse_skillhub_item(v: &serde_json::Value) -> Option<SkillHubItem> {
         category,
         version,
     })
+}
+
+fn parse_skillhub_items(body: &serde_json::Value) -> Vec<SkillHubItem> {
+    let data = body.get("data").unwrap_or(body);
+    data.get("skills")
+        .or_else(|| data.get("top10"))
+        .or_else(|| data.get("items"))
+        .and_then(|items| items.as_array())
+        .map(|items| items.iter().filter_map(parse_skillhub_item).collect())
+        .unwrap_or_default()
 }
 
 /// Fetch the level-1 category taxonomy from SkillHub.
@@ -293,11 +305,9 @@ pub async fn skillhub_categories() -> Result<Vec<SkillHubCategory>> {
 
 /// List skills from SkillHub.
 ///
-/// * `source == "featured"` uses the official curated top list.
-/// * otherwise the general marketplace catalog is used.
-///
-/// When `category` or `keyword` is supplied the results are filtered
-/// client-side over a wider fetch, so pagination is best-effort.
+/// `source == "featured"` requests the highest-scoring entries from the
+/// regular marketplace. Contest endpoints legitimately return an empty list
+/// between events and therefore cannot serve as the product catalog.
 pub async fn skillhub_list(
     source: &str,
     category: Option<&str>,
@@ -308,19 +318,17 @@ pub async fn skillhub_list(
     let client = skillhub_client()?;
     let page = page.max(1);
     let page_size = page_size.clamp(1, 60);
-    let has_filter = category.map(|c| !c.is_empty()).unwrap_or(false)
-        || keyword.map(|k| !k.trim().is_empty()).unwrap_or(false);
-
-    let url = if source == "featured" {
-        format!("{SKILLHUB_API_BASE}/api/v1/contest/top")
-    } else if has_filter {
-        // Fetch a wide page and filter locally.
-        format!("{SKILLHUB_API_BASE}/api/v1/contest/skills?page=1&pageSize=60")
-    } else {
-        format!(
-            "{SKILLHUB_API_BASE}/api/v1/contest/skills?page={page}&pageSize={page_size}"
-        )
-    };
+    let mut query = vec![format!("page={page}"), format!("pageSize={page_size}")];
+    if source == "featured" {
+        query.push("sortBy=score".to_string());
+    }
+    if let Some(category) = category.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(format!("category={}", urlencoding::encode(category)));
+    }
+    if let Some(keyword) = keyword.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(format!("keyword={}", urlencoding::encode(keyword)));
+    }
+    let url = format!("{SKILLHUB_API_BASE}/api/skills?{}", query.join("&"));
 
     let body: serde_json::Value = client
         .get(&url)
@@ -333,41 +341,7 @@ pub async fn skillhub_list(
         .await
         .context("Failed to decode SkillHub list")?;
 
-    // Locate the array regardless of the specific envelope shape.
-    let data = body.get("data").unwrap_or(&body);
-    let arr = data
-        .get("top10")
-        .or_else(|| data.get("items"))
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut items: Vec<SkillHubItem> = arr.iter().filter_map(parse_skillhub_item).collect();
-
-    if let Some(cat) = category.filter(|c| !c.is_empty()) {
-        items.retain(|it| it.category.as_deref() == Some(cat));
-    }
-    if let Some(kw) = keyword.map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty()) {
-        items.retain(|it| {
-            it.name.to_lowercase().contains(&kw)
-                || it.slug.to_lowercase().contains(&kw)
-                || it.description.to_lowercase().contains(&kw)
-        });
-    }
-
-    if source == "featured" {
-        return Ok(items);
-    }
-    if has_filter {
-        // Apply local pagination over the filtered set.
-        let start = ((page - 1) * page_size) as usize;
-        let end = (start + page_size as usize).min(items.len());
-        if start >= items.len() {
-            return Ok(Vec::new());
-        }
-        return Ok(items[start..end].to_vec());
-    }
-    Ok(items)
+    Ok(parse_skillhub_items(&body))
 }
 
 /// Download a SkillHub skill package and extract it into `target_dir/<slug>`.
@@ -574,4 +548,56 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod skillhub_tests {
+    use super::parse_skillhub_items;
+    use serde_json::json;
+
+    #[test]
+    fn parses_regular_marketplace_envelope() {
+        let body = json!({
+            "code": 0,
+            "data": {
+                "skills": [{
+                    "name": "会议助手",
+                    "slug": "meeting-assistant",
+                    "description": "English fallback",
+                    "description_zh": "中文描述",
+                    "downloads": 42,
+                    "category": "office-efficiency",
+                    "version": "1.2.3",
+                    "namespace": {
+                        "handle": "nova-lab",
+                        "publicSlug": "meeting-assistant"
+                    }
+                }],
+                "total": 1
+            }
+        });
+
+        let items = parse_skillhub_items(&body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].slug, "meeting-assistant");
+        assert_eq!(items[0].namespace.as_deref(), Some("nova-lab"));
+        assert_eq!(items[0].description, "中文描述");
+    }
+
+    #[test]
+    fn falls_back_when_localized_description_is_empty() {
+        let body = json!({
+            "data": {
+                "skills": [{
+                    "name": "Fallback Skill",
+                    "slug": "fallback-skill",
+                    "description_zh": "   ",
+                    "description": "Readable fallback"
+                }]
+            }
+        });
+
+        let items = parse_skillhub_items(&body);
+        assert_eq!(items[0].description, "Readable fallback");
+    }
 }

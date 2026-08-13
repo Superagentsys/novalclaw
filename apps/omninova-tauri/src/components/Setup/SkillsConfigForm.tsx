@@ -673,7 +673,20 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             ) : marketItems.length === 0 && marketLoading ? (
               <div className="skill-empty">正在加载 SkillHub 技能…</div>
             ) : marketItems.length === 0 ? (
-              <div className="skill-empty">没有匹配的技能，换个关键词或分类试试。</div>
+              <div className="skill-empty">
+                {marketKeyword.trim() || activeCategory
+                  ? "没有匹配的技能，换个关键词或分类试试。"
+                  : "SkillHub 暂未返回技能，请稍后重新加载。"}
+                {!marketKeyword.trim() && !activeCategory ? (
+                  <button
+                    type="button"
+                    className="setup-btn setup-btn--secondary"
+                    onClick={() => void loadMarket(1, "", "", false)}
+                  >
+                    重新加载
+                  </button>
+                ) : null}
+              </div>
             ) : (
               <>
                 <div className="market-grid">{marketItems.map(renderMarketCard)}</div>
