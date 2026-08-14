@@ -1114,11 +1114,31 @@ fn default_gateway_dingtalk_outbound_mode() -> String {
 }
 
 /// WeCom (企业微信) Smart Bot config. Uses WebSocket long-connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WecomTransportMode {
+    #[default]
+    LongConnection,
+    HttpCallback,
+}
+
+impl WecomTransportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LongConnection => "long_connection",
+            Self::HttpCallback => "http_callback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayWecomConfig {
     /// Master switch. When `false` (the default), no WeCom WebSocket connection is established.
     #[serde(default)]
     pub enabled: bool,
+    /// Explicit inbound transport. Legacy configs remain on long connection.
+    #[serde(default)]
+    pub transport_mode: WecomTransportMode,
     /// WeCom Bot ID (智能机器人 BotID).
     #[serde(default)]
     pub bot_id: String,
@@ -1131,16 +1151,40 @@ pub struct GatewayWecomConfig {
     /// Optional environment variable name holding the Secret.
     #[serde(default)]
     pub secret_env: Option<String>,
+    /// Token configured in the Smart Bot URL callback settings.
+    #[serde(default)]
+    pub callback_token: String,
+    #[serde(default)]
+    pub callback_token_env: Option<String>,
+    /// 43-character EncodingAESKey for encrypted HTTP callbacks.
+    #[serde(default)]
+    pub encoding_aes_key: String,
+    #[serde(default)]
+    pub encoding_aes_key_env: Option<String>,
+    /// ReceiveId for Bot Webhook callback verification.
+    /// Per WeCom official docs: this field is OPTIONAL for Bot Webhook.
+    /// If configured in WeCom后台, must match the value in the decrypted frame.
+    #[serde(default)]
+    pub receive_id: String,
+    #[serde(default)]
+    pub receive_id_env: Option<String>,
 }
 
 impl Default for GatewayWecomConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            transport_mode: WecomTransportMode::LongConnection,
             bot_id: String::new(),
             bot_id_env: None,
             secret: String::new(),
             secret_env: None,
+            callback_token: String::new(),
+            callback_token_env: None,
+            encoding_aes_key: String::new(),
+            encoding_aes_key_env: None,
+            receive_id: String::new(),
+            receive_id_env: None,
         }
     }
 }

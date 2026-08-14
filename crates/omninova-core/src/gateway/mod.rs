@@ -10,6 +10,8 @@ pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
 pub mod wecom_protocol;
+pub mod wecom_crypto;
+pub mod wecom_http;
 pub mod wecom_stream;
 pub mod wecom_inbound;
 pub mod wecom_outbound;
@@ -2989,9 +2991,61 @@ impl GatewayRuntime {
         // Start unified DingTalk Stream transport (handles both robot and card topics)
         let mut dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
 
-        // Start WeCom WebSocket transport
+        // Start the existing WeCom WebSocket transport only when explicitly
+        // selected. HTTP callback mode terminates at the Gateway routes below
+        // and must not create a competing long connection.
         use crate::gateway::wecom_stream;
-        let mut wecom_stream_guard = wecom_stream::start(Arc::new(self.clone())).await;
+        use crate::gateway::wecom_http;
+        use crate::gateway::wecom_stream::WecomStreamGuard;
+
+        // Resolve transport mode and log
+        let wecom_transport_mode = wecom_http::resolve_transport_mode(&cfg);
+        let wecom_transport_is_http = wecom_transport_mode == crate::config::WecomTransportMode::HttpCallback;
+        let wecom_transport_source = if cfg.channels_config.wecom
+            .as_ref()
+            .and_then(|e| e.extra.get("transport_mode"))
+            .is_some()
+        {
+            "channel_extra"
+        } else {
+            "gateway_config"
+        };
+        println!(
+            "[wecom] transport_resolved mode={} source={}",
+            wecom_transport_mode.as_str(),
+            wecom_transport_source
+        );
+
+        // HTTP callback mode: validate credentials at startup (fail-fast)
+        if wecom_transport_is_http {
+            let (token_ok, aes_ok) = wecom_http::check_http_credentials_present(&cfg);
+            println!(
+                "[wecom-http] credentials_resolved token_present={} aes_key_present={}",
+                token_ok, aes_ok
+            );
+            if !token_ok || !aes_ok {
+                println!("[wecom-http] configuration_invalid reason={}",
+                    if !token_ok && !aes_ok {
+                        "callback_token_and_aes_key_missing"
+                    } else if !token_ok {
+                        "callback_token_missing"
+                    } else {
+                        "encoding_aes_key_missing"
+                    }
+                );
+            }
+        }
+
+        let mut wecom_stream_guard: Option<WecomStreamGuard> = if !wecom_transport_is_http {
+            // Long connection mode
+            println!("[wecom-stream] start_initiated");
+            // Note: wecom_stream::start() already returns Option<WecomStreamGuard>
+            wecom_stream::start(Arc::new(self.clone())).await
+        } else {
+            // HTTP callback mode
+            println!("[wecom-http] transport_selected=true websocket_started=false");
+            None
+        };
 
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
@@ -3019,6 +3073,10 @@ impl GatewayRuntime {
             .route("/webhook/feishu", post(http_feishu_webhook))
             .route("/webhook/lark", post(http_lark_webhook))
             .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            .route(
+                wecom_http::WECOM_HTTP_CALLBACK_PATH,
+                get(http_wecom_callback_verify).post(http_wecom_callback_post),
+            )
             // Alias documented in `config.template.toml` and used by the
             // real DingTalk enterprise app bot callback wizard:
             //   `https://<public-host>/api/v1/gateway/dingtalk/events`.
@@ -3095,7 +3153,7 @@ impl GatewayRuntime {
         if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
             stream_guard.shutdown().await;
         }
-        if let Some(wecom_guard) = wecom_stream_guard.as_mut() {
+        if let Some(ref mut wecom_guard) = wecom_stream_guard {
             wecom_guard.shutdown().await;
         }
         serve_result?;
@@ -4607,6 +4665,114 @@ async fn http_webhook(
             message: e.to_string(),
         })),
     }
+}
+
+fn wecom_http_error_response(
+    error: wecom_http::WecomHttpError,
+) -> (StatusCode, String) {
+    match error {
+        wecom_http::WecomHttpError::BadSignature
+        | wecom_http::WecomHttpError::ReceiveIdMismatch => {
+            (StatusCode::FORBIDDEN, "forbidden".to_string())
+        }
+        wecom_http::WecomHttpError::Disabled
+        | wecom_http::WecomHttpError::WrongTransport => {
+            (StatusCode::NOT_FOUND, "not_found".to_string())
+        }
+        wecom_http::WecomHttpError::MissingConfiguration => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wecom_http_not_configured".to_string(),
+        ),
+        wecom_http::WecomHttpError::InvalidEnvelope
+        | wecom_http::WecomHttpError::EncodingKeyDecodeFailed
+        | wecom_http::WecomHttpError::CiphertextBase64Failed
+        | wecom_http::WecomHttpError::AesCbcFailed
+        | wecom_http::WecomHttpError::Pkcs7Failed
+        | wecom_http::WecomHttpError::FrameTooShort
+        | wecom_http::WecomHttpError::MessageLengthInvalid
+        | wecom_http::WecomHttpError::Utf8Failed
+        | wecom_http::WecomHttpError::InvalidPayload => {
+            (StatusCode::BAD_REQUEST, "invalid_callback".to_string())
+        }
+    }
+}
+
+async fn http_wecom_callback_verify(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<wecom_http::WecomCallbackQuery>,
+) -> (StatusCode, String) {
+    println!("[wecom-http] callback_verify_received=true");
+    println!("[wecom-http] query_fields_present msg_signature={} timestamp={} nonce={} echostr={}",
+        !query.msg_signature.is_empty(),
+        !query.timestamp.is_empty(),
+        !query.nonce.is_empty(),
+        query.echostr.is_some()
+    );
+
+    let config = runtime.get_config().await;
+
+    // Log credential status without exposing values
+    let (token_ok, aes_ok) = wecom_http::check_http_credentials_present(&config);
+    println!("[wecom-http] credentials_status token_present={} aes_key_present={}", token_ok, aes_ok);
+
+    match wecom_http::verify_url(&config, &query) {
+        Ok(plaintext) => {
+            println!("[wecom-http] signature_valid=true");
+            println!("[wecom-http] decrypt_ok=true");
+            println!("[wecom-http] verify_success=true");
+            (StatusCode::OK, plaintext)
+        }
+        Err(error) => {
+            let (signature_valid, decrypt_ok) = wecom_http::error_flags(&error);
+            println!(
+                "[wecom-http] signature_valid={} decrypt_ok={} verify_success=false",
+                signature_valid, decrypt_ok
+            );
+            println!("[wecom-http] failure_reason={:?}", error);
+            wecom_http_error_response(error)
+        }
+    }
+}
+
+async fn http_wecom_callback_post(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<wecom_http::WecomCallbackQuery>,
+    raw_body: String,
+) -> (StatusCode, String) {
+    println!("[wecom-http] callback_received=true body_len={}", raw_body.len());
+    let config = runtime.get_config().await;
+    let parsed = match wecom_http::parse_post(&config, &query, &raw_body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let (signature_valid, decrypt_ok) = wecom_http::error_flags(&error);
+            println!(
+                "[wecom-http] signature_valid={} decrypt_ok={} inbound_parse_ok=false",
+                signature_valid, decrypt_ok
+            );
+            return wecom_http_error_response(error);
+        }
+    };
+    println!("[wecom-http] signature_valid=true");
+    println!("[wecom-http] decrypt_ok=true");
+    println!(
+        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_len={}",
+        crate::gateway::wecom_stream::short_hash(&parsed.body.msgid),
+        wecom_http::chat_type(&parsed.body),
+        parsed.body.msgtype.as_deref().unwrap_or("unknown"),
+        parsed.inbound.text.chars().count()
+    );
+
+    if !runtime.dedup_cache().check_and_insert(&parsed.body.msgid).await {
+        println!(
+            "[wecom-http] duplicate_msgid={} ignored=true",
+            crate::gateway::wecom_stream::short_hash(&parsed.body.msgid)
+        );
+    } else {
+        // Phase 2A.1 deliberately ends at the normalized inbound contract.
+        // Agent dispatch and HTTP replies are introduced in a later phase.
+        println!("[wecom-http] callback_accepted=true agent_dispatch=false");
+    }
+    (StatusCode::OK, String::new())
 }
 
 async fn http_wechat_webhook(
