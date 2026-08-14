@@ -882,7 +882,9 @@ async fn handle_message_callback(
             println!("[wecom-card] panel_requested msg_id={}", short_hash(msg_id));
             let task_id = crate::gateway::wecom_card::new_task_id();
             crate::gateway::wecom_card::register_panel(&task_id, inbound.session_id.clone()).await;
-            let card = crate::gateway::wecom_card::build_panel_card(&task_id);
+            // Phase 2A.3.2: menu subtitle = mode + connection + time summary.
+            let subtitle = crate::gateway::wecom_card::current_menu_subtitle(runtime).await;
+            let card = crate::gateway::wecom_card::build_panel_card_with_subtitle(&task_id, &subtitle);
             println!("[wecom-card] card_dispatch_requested task_id={}", short_hash(&task_id));
             crate::gateway::wecom_card::card_store()
                 .note_card_req_id(
