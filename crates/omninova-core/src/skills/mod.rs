@@ -355,36 +355,8 @@ pub async fn skillhub_install(
     version: Option<&str>,
 ) -> Result<(String, usize)> {
     validate_skillhub_slug(slug)?;
-    let mut url = format!(
-        "{SKILLHUB_API_BASE}/api/v1/download?slug={}",
-        urlencoding::encode(slug)
-    );
-    if let Some(ns) = namespace.filter(|s| !s.is_empty()) {
-        url.push_str(&format!("&namespace={}", urlencoding::encode(ns)));
-    }
-    if let Some(v) = version.filter(|s| !s.is_empty()) {
-        url.push_str(&format!("&tag={}", urlencoding::encode(v)));
-    }
-
     let client = skillhub_client()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("SkillHub download request failed")?
-        .error_for_status()
-        .context("SkillHub download returned an error status")?;
-    const MAX_PACKAGE_BYTES: u64 = 25 * 1024 * 1024;
-    if resp.content_length().is_some_and(|size| size > MAX_PACKAGE_BYTES) {
-        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .context("Failed to read SkillHub package bytes")?;
-    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
-    }
+    let bytes = download_skillhub_package(&client, slug, namespace, version).await?;
 
     fs::create_dir_all(target_dir)?;
     let dest_root = target_dir.join(slug);
@@ -467,6 +439,76 @@ pub async fn skillhub_install(
         return Err(error).context("Failed to activate the validated SkillHub package");
     }
     Ok((slug.to_string(), count))
+}
+
+fn skillhub_download_url(slug: &str, namespace: Option<&str>, version: Option<&str>) -> String {
+    let mut url = format!(
+        "{SKILLHUB_API_BASE}/api/v1/download?slug={}",
+        urlencoding::encode(slug)
+    );
+    if let Some(ns) = namespace.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&namespace={}", urlencoding::encode(ns)));
+    }
+    // SkillHub treats `tag` as a named tag. Marketplace `version` is semver
+    // (e.g. 1.0.2) and must be sent as `version`, otherwise the API returns 404.
+    if let Some(v) = version.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&version={}", urlencoding::encode(v)));
+    }
+    url
+}
+
+async fn download_skillhub_package(
+    client: &reqwest::Client,
+    slug: &str,
+    namespace: Option<&str>,
+    version: Option<&str>,
+) -> Result<Vec<u8>> {
+    let version = version.filter(|s| !s.is_empty());
+    let mut urls = vec![skillhub_download_url(slug, namespace, version)];
+    if version.is_some() {
+        urls.push(skillhub_download_url(slug, namespace, None));
+    }
+
+    let mut last_error = None;
+    for url in urls {
+        match fetch_skillhub_package(client, &url).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("SkillHub download failed")))
+}
+
+async fn fetch_skillhub_package(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    const MAX_PACKAGE_BYTES: u64 = 25 * 1024 * 1024;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .context("SkillHub download request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.trim();
+        if detail.is_empty() {
+            anyhow::bail!("SkillHub download returned HTTP {status}");
+        }
+        anyhow::bail!(
+            "SkillHub download returned HTTP {status}: {}",
+            detail.chars().take(180).collect::<String>()
+        );
+    }
+    if resp.content_length().is_some_and(|size| size > MAX_PACKAGE_BYTES) {
+        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .context("Failed to read SkillHub package bytes")?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        anyhow::bail!("SkillHub package exceeds the 25 MiB download limit");
+    }
+    Ok(bytes.to_vec())
 }
 
 fn validate_skillhub_slug(slug: &str) -> Result<()> {
@@ -552,7 +594,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod skillhub_tests {
-    use super::parse_skillhub_items;
+    use super::{parse_skillhub_items, skillhub_download_url};
     use serde_json::json;
 
     #[test]
@@ -599,5 +641,18 @@ mod skillhub_tests {
 
         let items = parse_skillhub_items(&body);
         assert_eq!(items[0].description, "Readable fallback");
+    }
+
+    #[test]
+    fn download_url_sends_marketplace_version_as_version_not_tag() {
+        let url = skillhub_download_url(
+            "web-tools-guide",
+            Some("user_ec205dbb"),
+            Some("1.0.2"),
+        );
+        assert!(url.contains("slug=web-tools-guide"));
+        assert!(url.contains("namespace=user_ec205dbb"));
+        assert!(url.contains("version=1.0.2"));
+        assert!(!url.contains("tag="));
     }
 }
