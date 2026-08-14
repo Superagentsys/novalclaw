@@ -8,6 +8,30 @@ export async function readComposerAttachmentsFromPaths(
   return invokeTauri<string>("read_composer_attachments", { paths });
 }
 
+export interface PreparedComposerAttachment {
+  name: string;
+  originalPath: string;
+  workspaceRelativePath: string;
+  size: number;
+  kind: "image" | "text" | "office" | "file";
+  content: string;
+  note: string;
+}
+
+/** 将桌面绝对路径附件复制/挂载进当前 Workspace，并生成 Agent 可读取的上下文。 */
+export async function prepareComposerAttachments(
+  paths: string[],
+  workspacePath: string,
+  sessionId: string,
+): Promise<PreparedComposerAttachment[]> {
+  if (!paths.length) return [];
+  return invokeTauri<PreparedComposerAttachment[]>("prepare_composer_attachments", {
+    paths,
+    workspacePath,
+    sessionId,
+  });
+}
+
 /** 系统文件选择对话框（桌面 Tauri） */
 export async function pickComposerAttachmentPaths(): Promise<string[]> {
   const { open } = await import("@tauri-apps/plugin-dialog");

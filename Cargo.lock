@@ -3177,6 +3177,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-shell",
  "tokio",
+ "zip",
 ]
 
 [[package]]

@@ -588,6 +588,32 @@
 .task-inspector-process-list code { overflow-wrap: anywhere; color: var(--ui-text-muted); font-size: 8px; }
 .task-inspector-process-list time { color: var(--ui-text-muted); font-size: 8px; }
 
+.task-inspector-process-path {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid var(--ui-border);
+  border-radius: 5px;
+  background: var(--ui-surface-1);
+  color: var(--ui-accent-strong);
+  font-size: 8px;
+  text-align: left;
+}
+
+.task-inspector-process-path span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-inspector-process-path:hover {
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-soft);
+}
+
 .task-inspector-result {
   padding: 12px;
   border: 1px solid var(--ui-border);
