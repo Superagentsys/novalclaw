@@ -1531,6 +1531,12 @@ impl GatewayRuntime {
         self.wecom_stream_connected.store(value, Ordering::Release);
     }
 
+    /// Whether the WeCom websocket is currently connected (real state
+    /// for the card gateway_status action; no hardcoded "normal").
+    pub(crate) fn is_wecom_stream_connected(&self) -> bool {
+        self.wecom_stream_connected.load(Ordering::Acquire)
+    }
+
     pub(crate) fn set_wecom_stream_subscribed(&self, value: bool) {
         self.wecom_stream_subscribed.store(value, Ordering::Release);
     }
@@ -3048,8 +3054,10 @@ impl GatewayRuntime {
         }
 
         let mut wecom_stream_guard: Option<WecomStreamGuard> = if !wecom_transport_is_http {
-            // Long connection mode
-            println!("[wecom-stream] start_initiated");
+            // Long connection mode. `start_initiated` is printed inside
+            // wecom_stream::start() (owner_acquired follows); this outer
+            // log is the startup REQUEST so the two are distinguishable.
+            println!("[wecom-stream] start_requested");
             // Note: wecom_stream::start() already returns Option<WecomStreamGuard>
             wecom_stream::start(Arc::new(self.clone())).await
         } else {
@@ -4851,10 +4859,11 @@ async fn http_wecom_callback_post(
     println!("[wecom-http] signature_valid=true");
     println!("[wecom-http] decrypt_ok=true");
     println!(
-        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_len={} response_url_present={}",
+        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_bytes={} text_chars={} response_url_present={}",
         wecom_stream::short_hash(&parsed.body.msgid),
         wecom_http::chat_type(&parsed.body),
         parsed.body.msgtype.as_deref().unwrap_or("unknown"),
+        parsed.inbound.text.len(),
         parsed.inbound.text.chars().count(),
         parsed.body.response_url.is_some()
     );

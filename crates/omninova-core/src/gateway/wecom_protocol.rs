@@ -398,6 +398,30 @@ pub fn build_template_card_update_envelope(
     }
 }
 
+/// Build a PROACTIVE `aibot_send_msg` envelope (Phase 2A.3.1e).
+///
+/// Unlike respond_msg / respond_update_msg this needs NO callback
+/// req_id: the req_id is self-generated for ACK correlation, `chat_id`
+/// targets the conversation (single chat: the user's userid; group:
+/// the chatid), and `message_body` carries `{"msgtype": ..., ...}`.
+pub fn build_send_message_envelope(
+    req_id: &str,
+    chat_id: &str,
+    message_body: serde_json::Value,
+) -> WecomRequestEnvelope {
+    let mut body = message_body;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("chatid".to_string(), serde_json::json!(chat_id));
+    }
+    WecomRequestEnvelope {
+        cmd: WECOM_CMD_SEND_MSG.to_string(),
+        headers: WecomHeaders {
+            req_id: req_id.to_string(),
+        },
+        body: Some(body),
+    }
+}
+
 /// Build an aibot_respond_msg request envelope with extended options.
 pub fn build_respond_envelope_with_options(req_id: &str, text: &str, ctx: &WecomReplyContext) -> WecomRequestEnvelope {
     let mut env = build_stream_respond_envelope(req_id, text);

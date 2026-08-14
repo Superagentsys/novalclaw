@@ -32,13 +32,16 @@ use crate::gateway::wecom_protocol::WecomCallbackBody;
 use crate::gateway::wecom_stream::{short_hash, WecomOutboundMsg};
 use crate::gateway::GatewayRuntime;
 
-/// Panel card constants.
-pub const PANEL_TITLE: &str = "OmniNova 控制面板";
-pub const PANEL_DESC: &str = "请选择操作";
+/// Panel card constants (Phase 2A.3.1e unified menu UX).
+pub const PANEL_TITLE: &str = "OmniNova · 控制中心";
+pub const PANEL_DESC: &str = "企业微信长连接 · Online";
+pub const PANEL_READY_SUBTITLE: &str = "请选择操作";
 pub const PANEL_EXPIRED_TEXT: &str = "该操作面板已过期，请重新打开。";
 pub const UNKNOWN_ACTION_TEXT: &str = "未知操作，已忽略。";
 pub const CARD_TTL_SECS: i64 = 30 * 60;
 pub const RECENT_JOBS_LIMIT: usize = 5;
+/// Hard timeout grace added on top of the monitor's soft duration.
+pub const MONITOR_GRACE_SECS: u64 = 15;
 
 /// Canonical panel buttons: (action key, label) — order is the card layout.
 pub const PANEL_BUTTONS: &[(&str, &str)] = &[
@@ -131,7 +134,8 @@ impl WecomPanelAction {
 // Card JSON builders (official template_card / button_interaction shape)
 // ---------------------------------------------------------------------------
 
-/// Build the `template_card` object for the OmniNova control panel.
+/// Build the `template_card` object for the OmniNova control panel
+/// (Ready state: subtitle = "请选择操作").
 pub fn build_panel_card(task_id: &str) -> serde_json::Value {
     serde_json::json!({
         "card_type": "button_interaction",
@@ -143,6 +147,7 @@ pub fn build_panel_card(task_id: &str) -> serde_json::Value {
             "title": PANEL_TITLE,
             "desc": PANEL_DESC,
         },
+        "sub_title_text": PANEL_READY_SUBTITLE,
         "task_id": task_id,
         "button_list": PANEL_BUTTONS
             .iter()
@@ -155,6 +160,19 @@ pub fn build_panel_card(task_id: &str) -> serde_json::Value {
     })
 }
 
+/// Menu subtitle driven by the panel's monitor state (Phase 2A.3.1e).
+pub fn panel_subtitle_for_state(state: &MonitorState) -> String {
+    match state {
+        MonitorState::Idle => PANEL_READY_SUBTITLE.to_string(),
+        MonitorState::Running { deadline, .. } => {
+            let remaining = remaining_secs_until(*deadline);
+            format!("桌面监控中 · 剩余 {remaining} 秒")
+        }
+        MonitorState::Completed { .. } => "桌面监控完成".to_string(),
+        MonitorState::Failed { .. } => "桌面监控失败".to_string(),
+    }
+}
+
 /// Panel card with an action result shown in `sub_title_text`
 /// (card updates keep the buttons; the result replaces the subtitle).
 pub fn build_panel_card_with_text(task_id: &str, text: &str) -> serde_json::Value {
@@ -164,13 +182,77 @@ pub fn build_panel_card_with_text(task_id: &str, text: &str) -> serde_json::Valu
 }
 
 // ---------------------------------------------------------------------------
-// Card state store (in-memory, 30-min TTL, event dedup, monitor single-flight)
+// Card state store (in-memory, 30-min TTL, event dedup, monitor
+// single-flight + countdown state)
 // ---------------------------------------------------------------------------
 
+/// Per-panel monitor state (Phase 2A.3.1e). `Running.deadline` is a
+/// monotonic `Instant`; remaining seconds are always recomputed as
+/// `deadline - now` — never a decrement counter, so scheduler drift
+/// cannot accumulate.
+/// Delivery outcome of a completed monitor's proactive result
+/// (Phase 2A.3.1f): task completion ≠ result delivery. Only an ACK with
+/// errcode==0 marks it Sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorDelivery {
+    Pending,
+    Sent,
+    Failed { errcode: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorState {
+    Idle,
+    Running {
+        duration_secs: u64,
+        started_at: i64,
+        deadline: std::time::Instant,
+        generation: u64,
+    },
+    Completed {
+        duration_secs: u64,
+        elapsed_ms: u64,
+        summary: String,
+        completed_at: i64,
+        delivery: MonitorDelivery,
+    },
+    Failed {
+        error_summary: String,
+        elapsed_ms: u64,
+    },
+}
+
+impl Default for MonitorState {
+    fn default() -> Self {
+        MonitorState::Idle
+    }
+}
+
+impl MonitorState {
+    pub fn phase(&self) -> &'static str {
+        match self {
+            MonitorState::Idle => "idle",
+            MonitorState::Running { .. } => "running",
+            MonitorState::Completed { .. } => "completed",
+            MonitorState::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// Monotonic remaining seconds: deadline - now (min 0).
+pub fn remaining_secs_until(deadline: std::time::Instant) -> u64 {
+    deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs()
+}
+
+/// Kinds of outbound card/proactive req_ids awaiting ACK, so the ACK
+/// log can distinguish initial card / card update / proactive send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WecomCardStatus {
-    Active,
-    MonitorRunning,
+pub enum WecomCardReqKind {
+    InitialCard,
+    UpdateCard,
+    Proactive,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +262,7 @@ pub struct WecomCardState {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_action: Option<String>,
-    pub status: WecomCardStatus,
+    pub monitor: MonitorState,
 }
 
 /// One entry of the WeCom recent-jobs log (redacted summary only).
@@ -191,16 +273,22 @@ pub struct WecomRecentJob {
     pub created_at: i64,
 }
 
+/// A pending outbound req awaiting its ACK: kind + optional task_id so
+/// a proactive ACK can update the monitor delivery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WecomCardPendingReq {
+    pub kind: WecomCardReqKind,
+    pub task_id: Option<String>,
+}
+
 struct WecomCardStoreInner {
     cards: HashMap<String, WecomCardState>,
     /// Event msgids already handled per task (retry dedup).
     seen_events: HashMap<String, HashSet<String>>,
-    /// Single-flight monitor guard per task_id.
-    monitor_running: HashSet<String>,
-    /// Last completed monitor result per task (shown on the next interaction).
-    monitor_results: HashMap<String, String>,
-    /// req_ids of card replies awaiting their ACK (for card_ack_ok logging).
-    pending_card_req_ids: HashSet<String>,
+    /// Monitor state per task_id (single-flight + countdown).
+    monitors: HashMap<String, MonitorState>,
+    /// req_ids of card/proactive messages awaiting their ACK, by kind.
+    pending_card_req_ids: HashMap<String, WecomCardPendingReq>,
     /// Bounded recent-jobs log (most recent first).
     recent_jobs: VecDeque<WecomRecentJob>,
 }
@@ -216,9 +304,8 @@ impl WecomCardStore {
             inner: Arc::new(Mutex::new(WecomCardStoreInner {
                 cards: HashMap::new(),
                 seen_events: HashMap::new(),
-                monitor_running: HashSet::new(),
-                monitor_results: HashMap::new(),
-                pending_card_req_ids: HashSet::new(),
+                monitors: HashMap::new(),
+                pending_card_req_ids: HashMap::new(),
                 recent_jobs: VecDeque::new(),
             })),
         }
@@ -248,7 +335,7 @@ impl WecomCardStore {
                 created_at,
                 updated_at: created_at,
                 last_action: None,
-                status: WecomCardStatus::Active,
+                monitor: MonitorState::Idle,
             },
         );
     }
@@ -265,8 +352,7 @@ impl WecomCardStore {
         if expired {
             inner.cards.remove(task_id);
             inner.seen_events.remove(task_id);
-            inner.monitor_running.remove(task_id);
-            inner.monitor_results.remove(task_id);
+            inner.monitors.remove(task_id);
             return None;
         }
         inner.cards.get(task_id).cloned()
@@ -292,37 +378,122 @@ impl WecomCardStore {
         }
     }
 
-    /// Single-flight admission for monitor actions on a card.
-    pub async fn try_start_monitor(&self, task_id: &str) -> bool {
+    /// Current monitor state for a task.
+    pub async fn monitor_state(&self, task_id: &str) -> MonitorState {
+        let inner = self.inner.lock();
+        inner.monitors.get(task_id).cloned().unwrap_or_default()
+    }
+
+    /// Single-flight monitor admission. Returns false when a monitor is
+    /// already running on this task (the click then shows live remaining
+    /// time instead of starting a second task).
+    pub async fn try_start_monitor(&self, task_id: &str, duration_secs: u64, generation: u64) -> bool {
         let mut inner = self.inner.lock();
-        if inner.monitor_running.contains(task_id) {
+        if let Some(MonitorState::Running { .. }) = inner.monitors.get(task_id) {
             return false;
         }
-        inner.monitor_running.insert(task_id.to_string());
+        let now = Self::now();
+        inner.monitors.insert(
+            task_id.to_string(),
+            MonitorState::Running {
+                duration_secs,
+                started_at: now,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(duration_secs),
+                generation,
+            },
+        );
         if let Some(state) = inner.cards.get_mut(task_id) {
-            state.status = WecomCardStatus::MonitorRunning;
-            state.updated_at = Self::now();
+            state.updated_at = now;
         }
         true
     }
 
-    /// Finish a monitor: store the result text for the next interaction.
-    pub async fn finish_monitor(&self, task_id: &str, result: String) {
+    /// Live remaining seconds for a running monitor (None when idle).
+    pub async fn monitor_remaining_secs(&self, task_id: &str) -> Option<u64> {
+        let inner = self.inner.lock();
+        match inner.monitors.get(task_id) {
+            Some(MonitorState::Running { deadline, .. }) => Some(remaining_secs_until(*deadline)),
+            _ => None,
+        }
+    }
+
+    /// Mark a monitor completed (summary rendered to the user later).
+    pub async fn complete_monitor(
+        &self,
+        task_id: &str,
+        duration_secs: u64,
+        elapsed_ms: u64,
+        summary: String,
+    ) {
         let mut inner = self.inner.lock();
-        inner.monitor_running.remove(task_id);
-        inner
-            .monitor_results
-            .insert(task_id.to_string(), result);
+        inner.monitors.insert(
+            task_id.to_string(),
+            MonitorState::Completed {
+                duration_secs,
+                elapsed_ms,
+                summary,
+                completed_at: Self::now(),
+                delivery: MonitorDelivery::Pending,
+            },
+        );
         if let Some(state) = inner.cards.get_mut(task_id) {
-            state.status = WecomCardStatus::Active;
             state.updated_at = Self::now();
         }
     }
 
-    /// Take (and clear) the last completed monitor result.
-    pub async fn take_monitor_result(&self, task_id: &str) -> Option<String> {
+    /// ACK errcode==0 for the proactive result → delivery Sent.
+    pub async fn mark_delivery_sent(&self, task_id: &str) {
         let mut inner = self.inner.lock();
-        inner.monitor_results.remove(task_id)
+        if let Some(MonitorState::Completed { delivery, .. }) = inner.monitors.get_mut(task_id) {
+            *delivery = MonitorDelivery::Sent;
+        }
+    }
+
+    /// ACK errcode!=0 for the proactive result → delivery Failed. The
+    /// monitor task itself is NOT re-executed.
+    pub async fn mark_delivery_failed(&self, task_id: &str, errcode: i64) {
+        let mut inner = self.inner.lock();
+        if let Some(MonitorState::Completed { delivery, .. }) = inner.monitors.get_mut(task_id) {
+            *delivery = MonitorDelivery::Failed { errcode };
+        }
+    }
+
+    /// Mark a monitor failed/timed out.
+    pub async fn fail_monitor(&self, task_id: &str, error_summary: String, elapsed_ms: u64) {
+        let mut inner = self.inner.lock();
+        inner.monitors.insert(
+            task_id.to_string(),
+            MonitorState::Failed {
+                error_summary,
+                elapsed_ms,
+            },
+        );
+        if let Some(state) = inner.cards.get_mut(task_id) {
+            state.updated_at = Self::now();
+        }
+    }
+
+    /// Test-only deadline override for deterministic countdown tests.
+    #[cfg(test)]
+    pub async fn set_monitor_deadline_for_test(&self, task_id: &str, deadline: std::time::Instant) {
+        let mut inner = self.inner.lock();
+        if let Some(MonitorState::Running {
+            duration_secs,
+            started_at,
+            generation,
+            ..
+        }) = inner.monitors.get(task_id).cloned()
+        {
+            inner.monitors.insert(
+                task_id.to_string(),
+                MonitorState::Running {
+                    duration_secs,
+                    started_at,
+                    deadline,
+                    generation,
+                },
+            );
+        }
     }
 
     /// Record one inbound WeCom message handling entry (bounded log).
@@ -363,15 +534,26 @@ impl WecomCardStore {
         lines.join("\n")
     }
 
-    /// Track a card reply req_id until its ACK arrives.
-    pub async fn note_card_reply_req_id(&self, req_id: &str) {
+    /// Track an outbound card/proactive req_id until its ACK arrives.
+    pub async fn note_card_req_id(
+        &self,
+        req_id: &str,
+        kind: WecomCardReqKind,
+        task_id: Option<&str>,
+    ) {
         let mut inner = self.inner.lock();
-        inner.pending_card_req_ids.insert(req_id.to_string());
+        inner.pending_card_req_ids.insert(
+            req_id.to_string(),
+            WecomCardPendingReq {
+                kind,
+                task_id: task_id.map(String::from),
+            },
+        );
     }
 
-    /// Returns true (and clears the entry) when the ACK belongs to a
-    /// card reply; used to emit `[wecom-card] card_ack_ok`.
-    pub async fn consume_card_reply_ack(&self, req_id: &str) -> bool {
+    /// Returns (and clears) the pending req when the ACK arrives; used
+    /// for kind-specific ACK logging and delivery-state updates.
+    pub async fn consume_card_req_ack(&self, req_id: &str) -> Option<WecomCardPendingReq> {
         let mut inner = self.inner.lock();
         inner.pending_card_req_ids.remove(req_id)
     }
@@ -382,8 +564,7 @@ impl WecomCardStore {
         let mut inner = self.inner.lock();
         inner.cards.clear();
         inner.seen_events.clear();
-        inner.monitor_running.clear();
-        inner.monitor_results.clear();
+        inner.monitors.clear();
         inner.pending_card_req_ids.clear();
         inner.recent_jobs.clear();
     }
@@ -431,33 +612,56 @@ pub fn enabled_channels(config: &Config) -> Vec<&'static str> {
     out
 }
 
-/// Pure, deterministic gateway status text (no secrets, no LLM).
-pub fn gateway_status_text(
-    enabled_channels: &[&str],
-    agent_name: &str,
-    now: &OffsetDateTime,
-) -> String {
-    let channel_list = if enabled_channels.is_empty() {
+/// REAL state snapshot consumed by the gateway_status action — no
+/// hardcoded "normal" values.
+#[derive(Debug, Clone)]
+pub struct WecomGatewayStatusSnapshot {
+    pub transport: &'static str,
+    pub connection_connected: bool,
+    pub stream_active: bool,
+    pub generation: u64,
+    /// Honest flag: last-heartbeat time is NOT tracked anywhere yet.
+    pub last_heartbeat_available: bool,
+    pub enabled_channels: Vec<&'static str>,
+    pub agent_name: String,
+}
+
+/// Pure, deterministic gateway status text from the REAL state snapshot
+/// (no secrets, no LLM, no hardcoded health claims).
+pub fn gateway_status_text(snapshot: &WecomGatewayStatusSnapshot, now: &OffsetDateTime) -> String {
+    let channel_list = if snapshot.enabled_channels.is_empty() {
         "无".to_string()
     } else {
-        enabled_channels.join("、")
+        snapshot.enabled_channels.join("、")
+    };
+    let heartbeat = if snapshot.last_heartbeat_available {
+        "已追踪"
+    } else {
+        "未追踪（当前版本不记录心跳时间）"
     };
     let time_text = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
     format!(
-        "Gateway 状态\n\n运行中\n启用渠道：{}\nAgent：{}\n时间：{}",
-        channel_list, agent_name, time_text
+        "Gateway 状态\n\nGateway running: true\nWeCom transport: {}\nconnection: {}\nstream active: {}\ngeneration: {}\nlast heartbeat: {}\nenabled channels: {}\nAgent: {}\n时间: {}",
+        snapshot.transport,
+        if snapshot.connection_connected { "connected" } else { "disconnected" },
+        snapshot.stream_active,
+        snapshot.generation,
+        heartbeat,
+        channel_list,
+        snapshot.agent_name,
+        time_text,
     )
 }
 
-/// Fixed help text (no LLM).
+/// Fixed help text (no LLM): lists the panel commands and the 5 actions.
 pub fn help_text() -> &'static str {
-    "OmniNova 使用帮助\n\n普通聊天：直接发消息，如“你好”。\n工具任务：使用 /monitor 桌面 30秒 / /monitor 桌面 60秒。\n控制面板：发送 菜单 / 面板 / /panel。\n安全说明：高风险工具默认不在聊天中直接执行。"
+    "OmniNova 使用帮助\n\n菜单命令：菜单 / 面板 / menu / /menu / panel / /panel\n\n操作说明：\n· 网关状态：查看 Gateway 与 WeCom 连接状态\n· 最近任务：最近 5 条处理记录\n· 监控 30 秒：桌面监控 30 秒，完成后自动推送结果\n· 监控 60 秒：桌面监控 60 秒，完成后自动推送结果\n· 帮助：显示本说明\n\n普通聊天直接发消息即可。"
 }
 
 // ---------------------------------------------------------------------------
-// Shared card action boundary (Phase 2A.3.1d)
+// Shared card action boundary (Phase 2A.3.1d / 2A.3.1e)
 // ---------------------------------------------------------------------------
 //
 // Same architecture as the DingTalk/Feishu panels: transport adapters
@@ -472,6 +676,8 @@ pub struct CardActionContext {
     pub task_id: String,
     pub session_key: Option<String>,
     pub action: WecomPanelAction,
+    /// Proactive-send target: single chat → userid, group → chatid.
+    pub target_chat_id: Option<String>,
 }
 
 /// Platform-independent action result. `content` is rendered into the
@@ -490,6 +696,7 @@ impl WecomCardActionService {
     pub async fn execute(
         runtime: &Arc<GatewayRuntime>,
         store: &WecomCardStore,
+        outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
         context: CardActionContext,
     ) -> CardActionResult {
         store
@@ -498,15 +705,19 @@ impl WecomCardActionService {
         match context.action {
             WecomPanelAction::GatewayStatus => {
                 let config = runtime.get_config().await;
-                let channels = enabled_channels(&config);
-                let channels_ref: Vec<&str> = channels.iter().copied().collect();
+                let snapshot = WecomGatewayStatusSnapshot {
+                    transport: wecom_transport_mode_str(&config),
+                    connection_connected: runtime.is_wecom_stream_connected(),
+                    stream_active: runtime.is_wecom_stream_active(),
+                    generation: runtime.current_wecom_stream_generation(),
+                    // Honest: heartbeat timestamps are not tracked.
+                    last_heartbeat_available: false,
+                    enabled_channels: enabled_channels(&config),
+                    agent_name: config.agent.name.clone(),
+                };
                 CardActionResult {
                     title: "网关状态",
-                    content: gateway_status_text(
-                        &channels_ref,
-                        &config.agent.name,
-                        &OffsetDateTime::now_utc(),
-                    ),
+                    content: gateway_status_text(&snapshot, &OffsetDateTime::now_utc()),
                 }
             }
             WecomPanelAction::RecentJobs => CardActionResult {
@@ -515,11 +726,27 @@ impl WecomCardActionService {
             },
             WecomPanelAction::Monitor30 => CardActionResult {
                 title: "桌面监控 · 30 秒",
-                content: start_monitor(store, &context.task_id, 30).await,
+                content: start_monitor(
+                    runtime,
+                    store,
+                    outbound_tx,
+                    &context.task_id,
+                    context.target_chat_id.clone(),
+                    30,
+                )
+                .await,
             },
             WecomPanelAction::Monitor60 => CardActionResult {
                 title: "桌面监控 · 60 秒",
-                content: start_monitor(store, &context.task_id, 60).await,
+                content: start_monitor(
+                    runtime,
+                    store,
+                    outbound_tx,
+                    &context.task_id,
+                    context.target_chat_id.clone(),
+                    60,
+                )
+                .await,
             },
             WecomPanelAction::Help => CardActionResult {
                 title: "帮助",
@@ -529,55 +756,302 @@ impl WecomCardActionService {
     }
 }
 
-/// Monitor action: single-flight admission, immediate "监控中..." card
-/// update, background desktop monitor (shared business service), result
-/// stored for the next interaction. Phase 2A.3.1 does not proactively
-/// push the final result (no unsolicited frame in the long-connection
-/// MVP); it is shown on the next card interaction.
-async fn start_monitor(store: &WecomCardStore, task_id: &str, duration_secs: u64) -> String {
-    if !store.try_start_monitor(task_id).await {
+fn wecom_transport_mode_str(config: &Config) -> &'static str {
+    crate::gateway::wecom_http::resolve_transport_mode(config).as_str()
+}
+
+/// Proactive target resolution (Phase 2A.3.1e P6):
+/// single chat → event.from.userid; group chat → event.chatid.
+pub fn resolve_card_target(body: &WecomCallbackBody) -> Option<String> {
+    let chat_type = body.chattype.as_deref().unwrap_or("");
+    if crate::gateway::wecom_protocol::WecomChatType::from_str(Some(chat_type)).is_group() {
+        body.chatid
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    } else {
+        body.from
+            .as_ref()
+            .and_then(|f| f.userid.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    }
+}
+
+/// Proactive outbound body abstraction (Phase 2A.3.1f): the monitor
+/// result currently ships as Markdown (reliable); the template_card
+/// path stays available as a future re-enable boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProactiveBody {
+    Markdown { content: String },
+    TemplateCard { body: serde_json::Value },
+}
+
+impl ProactiveBody {
+    pub fn to_wire(&self) -> serde_json::Value {
+        match self {
+            ProactiveBody::Markdown { content } => serde_json::json!({
+                "msgtype": "markdown",
+                "markdown": { "content": content },
+            }),
+            ProactiveBody::TemplateCard { body } => body.clone(),
+        }
+    }
+
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            ProactiveBody::Markdown { .. } => "markdown",
+            ProactiveBody::TemplateCard { .. } => "template_card",
+        }
+    }
+}
+
+/// FUTURE card path (kept per P5, NOT used for monitor delivery in
+/// 2A.3.1f): text_notice template_card body. Real E2E showed errcode
+/// 42045 for this payload, so delivery defaults to Markdown.
+pub fn build_monitor_result_message(title: &str, summary: &str) -> serde_json::Value {
+    serde_json::json!({
+        "msgtype": "template_card",
+        "template_card": {
+            "card_type": "text_notice",
+            "source": {
+                "desc": "OmniNova",
+                "desc_color": 0,
+            },
+            "main_title": {
+                "title": title,
+                "desc": summary,
+            }
+        }
+    })
+}
+
+/// Reliable Markdown content for the monitor final result (P3).
+/// Never contains absolute paths, secrets, userids or stacktraces —
+/// `summary` comes exclusively from our own fixed safe texts.
+pub fn build_monitor_result_markdown(
+    kind: &str,
+    duration_secs: u64,
+    elapsed_ms: u64,
+    summary: &str,
+) -> String {
+    match kind {
+        "completed" => format!(
+            "### OmniNova · 桌面监控完成\n\n**状态：** 完成\n**监控时长：** {duration_secs} 秒\n**实际耗时：** {:.1} 秒\n\n**检测结果**\n{summary}",
+            elapsed_ms as f64 / 1000.0
+        ),
+        "timeout" => format!(
+            "### OmniNova · 桌面监控超时\n\n**状态：** 超时\n**监控时长：** {duration_secs} 秒"
+        ),
+        _ => format!("### OmniNova · 桌面监控失败\n\n**状态：** 失败\n**原因：** {summary}"),
+    }
+}
+
+/// Monitor click decision (P2/P3): Running → live remaining seconds
+/// (no second task); otherwise starts the monitor and returns the
+/// immediate countdown text.
+async fn start_monitor(
+    runtime: &Arc<GatewayRuntime>,
+    store: &WecomCardStore,
+    outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
+    task_id: &str,
+    target_chat_id: Option<String>,
+    duration_secs: u64,
+) -> String {
+    // MONITOR_SINGLE_FLIGHT: a second click while running shows the
+    // live remaining time and never starts another task.
+    if let Some(remaining) = store.monitor_remaining_secs(task_id).await {
         println!(
-            "[wecom-card] monitor_admission=busy task_id={}",
-            short_hash(task_id)
+            "[wecom-card] monitor_admission=busy task_id={} remaining={}",
+            short_hash(task_id),
+            remaining
         );
-        return "桌面监控进行中，请稍候…".to_string();
+        return format!("桌面监控正在运行\n剩余：{remaining} 秒");
+    }
+
+    let generation = runtime.current_wecom_stream_generation();
+    if !store.try_start_monitor(task_id, duration_secs, generation).await {
+        return "桌面监控正在运行，请稍候…".to_string();
     }
     println!(
-        "[wecom-card] monitor_admission=acquired task_id={} duration={}",
+        "[wecom-card] monitor_started task_id={} duration={} generation={}",
         short_hash(task_id),
-        duration_secs
+        duration_secs,
+        generation
     );
 
     let store_for_job = store.clone();
+    let runtime_for_job = runtime.clone();
+    let tx_for_job = outbound_tx.clone();
     let task_for_job = task_id.to_string();
+    let started = std::time::Instant::now();
     tokio::spawn(async move {
         let captures_dir = directories::ProjectDirs::from("com", "omninova", "OmniNova")
             .map(|dirs| dirs.config_dir().join("captures"))
             .unwrap_or_else(|| std::env::temp_dir().join("omninova-captures"));
-        let result = crate::desktop_capture::monitor_desktop(&captures_dir, duration_secs).await;
-        let text = if result.ok {
-            let detail = if result.changed.unwrap_or(false) {
-                "检测到桌面变化"
-            } else {
-                "未检测到明显变化"
-            };
-            format!(
-                "桌面监控完成\n\n监控时长：{duration_secs} 秒\n结果：{detail}"
-            )
-        } else {
-            "桌面监控失败，请稍后重试。".to_string()
+        // Hard timeout = soft duration + grace: a monitor can never hang forever.
+        let hard_timeout = std::time::Duration::from_secs(duration_secs + MONITOR_GRACE_SECS);
+        let outcome = tokio::time::timeout(
+            hard_timeout,
+            crate::desktop_capture::monitor_desktop(&captures_dir, duration_secs),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let (kind, summary) = match outcome {
+            Err(_) => (
+                "timeout",
+                format!("桌面监控超时\n\n监控时长：{duration_secs} 秒\n实际耗时：{:.1} 秒\n请稍后重试。", elapsed_ms as f64 / 1000.0),
+            ),
+            Ok(result) if result.ok => {
+                let detail = if result.changed.unwrap_or(false) {
+                    "检测到桌面变化"
+                } else {
+                    "未检测到明显变化"
+                };
+                (
+                    "completed",
+                    format!(
+                        "桌面监控完成\n\n监控时长：{duration_secs} 秒\n实际耗时：{:.1} 秒\n结果：{detail}",
+                        elapsed_ms as f64 / 1000.0
+                    ),
+                )
+            }
+            Ok(_) => (
+                "failed",
+                "桌面监控失败\n\n请稍后重试。".to_string(),
+            ),
         };
-        store_for_job.finish_monitor(&task_for_job, text).await;
         println!(
-            "[wecom-card] monitor_completed task_id={}",
-            short_hash(&task_for_job)
+            "[wecom-card] monitor_completed task_id={} kind={} duration_ms={} result_len={}",
+            short_hash(&task_for_job),
+            kind,
+            elapsed_ms,
+            summary.chars().count()
         );
+        if kind != "completed" {
+            println!("[wecom-card] monitor_{kind} task_id={}", short_hash(&task_for_job));
+        }
+        let result = match kind {
+            "completed" => {
+                store_for_job
+                    .complete_monitor(&task_for_job, duration_secs, elapsed_ms, summary.clone())
+                    .await;
+                summary
+            }
+            _ => {
+                store_for_job
+                    .fail_monitor(&task_for_job, summary.clone(), elapsed_ms)
+                    .await;
+                summary
+            }
+        };
+        // Automatic result delivery (P7) — with generation fence (P9).
+        deliver_monitor_result(
+            &runtime_for_job,
+            &store_for_job,
+            &tx_for_job,
+            &task_for_job,
+            target_chat_id,
+            generation,
+            kind,
+            duration_secs,
+            elapsed_ms,
+            &result,
+        )
+        .await;
     });
 
-    let previous = store.take_monitor_result(task_id).await;
-    match previous {
-        Some(previous) => format!("上次结果：{previous}\n\n监控中...（{duration_secs} 秒桌面监控已启动）"),
-        None => format!("监控中...（{duration_secs} 秒桌面监控已启动）"),
+    // Immediate card update within the 5-second window (P3 countdown).
+    format!(
+        "桌面监控\n状态：监控中\n总时长：{duration_secs} 秒\n剩余：{duration_secs} 秒"
+    )
+}
+
+/// Deliver a finished monitor result via a PROACTIVE `aibot_send_msg`.
+///
+/// Phase 2A.3.1f: the body is RELIABLE MARKDOWN (msgtype=markdown);
+/// `proactive_send_write_ok` means TRANSPORT WRITE only — delivery is
+/// confirmed by the ACK (errcode==0), which the stream ACK branch maps
+/// into the monitor delivery state (Pending/Sent/Failed).
+///
+/// Guards: generation fence (stale lifecycle results discarded), panel
+/// TTL validity, target presence. Never touches the event req_id (the
+/// official updateTemplateCard 5-second rule is preserved).
+#[allow(clippy::too_many_arguments)]
+async fn deliver_monitor_result(
+    runtime: &Arc<GatewayRuntime>,
+    store: &WecomCardStore,
+    outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
+    task_id: &str,
+    target_chat_id: Option<String>,
+    generation: u64,
+    kind: &str,
+    duration_secs: u64,
+    elapsed_ms: u64,
+    summary: &str,
+) {
+    // P9: stale generation → discard; a new lifecycle must never receive
+    // an old lifecycle's monitor result.
+    if generation != 0 && !runtime.is_wecom_stream_generation_active(generation) {
+        println!(
+            "[wecom-card] monitor_result_discarded reason=stale_generation task_id={}",
+            short_hash(task_id)
+        );
+        return;
+    }
+    // Panel must still be valid (30-min TTL).
+    if store.lookup_valid(task_id).await.is_none() {
+        println!(
+            "[wecom-card] monitor_result_discarded reason=panel_expired task_id={}",
+            short_hash(task_id)
+        );
+        return;
+    }
+    let Some(target) = target_chat_id else {
+        println!(
+            "[wecom-card] monitor_result_discarded reason=no_target task_id={}",
+            short_hash(task_id)
+        );
+        return;
+    };
+
+    let body = ProactiveBody::Markdown {
+        content: build_monitor_result_markdown(kind, duration_secs, elapsed_ms, summary),
+    };
+    let req_id = format!("wecom_monitor_{}", uuid::Uuid::new_v4());
+    println!(
+        "[wecom-card] monitor_result_push_requested task_id={} target={} kind={} format={}",
+        short_hash(task_id),
+        short_hash(&target),
+        kind,
+        body.format_name()
+    );
+    store
+        .note_card_req_id(&req_id, WecomCardReqKind::Proactive, Some(task_id))
+        .await;
+
+    // Transport send: at most ONE retry for a transient transport
+    // failure. Payload validation errors (4xxxx ACK) are NEVER retried —
+    // that path lives in the ACK handler and only marks delivery failed.
+    let message = WecomOutboundMsg::ProactiveMessage {
+        req_id: req_id.clone(),
+        chat_id: target,
+        body: body.to_wire(),
+    };
+    if outbound_tx.send(message.clone()).await.is_err() {
+        println!(
+            "[wecom-card] monitor_result_push_retry task_id={} attempt=2 reason=transport_send_failed",
+            short_hash(task_id)
+        );
+        if outbound_tx.send(message).await.is_err() {
+            println!(
+                "[wecom-card] monitor_result_push_failed task_id={} reason=channel_closed",
+                short_hash(task_id)
+            );
+        }
     }
 }
 
@@ -680,14 +1154,17 @@ pub async fn handle_card_event(
 
     // Low-sensitive structural diagnostic so the next real E2E shows
     // exactly which fields WeCom actually sent. Never prints values.
+    // Flat vs nested fields are reported SEPARATELY (Phase 2A.3.1e).
     println!(
-        "[wecom-card] event_shape msgtype_event={} eventtype_present={} eventtype_template_card={} event_key_present={} task_id_present={} card_type_present={} userid_present={} chatid_present={}",
+        "[wecom-card] event_shape msgtype_event={} eventtype_present={} eventtype_template_card={} flat_event_key_present={} flat_task_id_present={} nested_payload_present={} nested_event_key_present={} nested_task_id_present={} userid_present={} chatid_present={}",
         body.msgtype.as_deref() == Some("event"),
         event.and_then(|e| e.eventtype.as_ref()).is_some(),
         event.and_then(|e| e.eventtype.as_deref()) == Some("template_card_event"),
         event.and_then(|e| e.event_key.as_deref()).map(|v| !v.trim().is_empty()).unwrap_or(false),
         event.and_then(|e| e.task_id.as_deref()).map(|v| !v.trim().is_empty()).unwrap_or(false),
-        event.and_then(|e| e.card_type.as_deref()).is_some(),
+        event.and_then(|e| e.template_card_event.as_ref()).is_some(),
+        event.and_then(|e| e.template_card_event.as_ref()).and_then(|n| n.event_key.as_deref()).map(|v| !v.trim().is_empty()).unwrap_or(false),
+        event.and_then(|e| e.template_card_event.as_ref()).and_then(|n| n.task_id.as_deref()).map(|v| !v.trim().is_empty()).unwrap_or(false),
         body.from.as_ref().and_then(|f| f.userid.as_deref()).map(|v| !v.trim().is_empty()).unwrap_or(false),
         body.chatid.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
     );
@@ -779,14 +1256,17 @@ pub async fn handle_card_event(
         task_id: task_id.to_string(),
         session_key: state.session_key.clone(),
         action,
+        target_chat_id: resolve_card_target(body),
     };
-    let result = WecomCardActionService::execute(runtime, store, context).await;
+    let result = WecomCardActionService::execute(runtime, store, outbound_tx, context).await;
     let card = build_panel_card_with_text(task_id, &result.content);
     println!(
         "[wecom-card] card_dispatch_requested task_id={} update=true",
         short_hash(task_id)
     );
-    store.note_card_reply_req_id(req_id).await;
+    store
+        .note_card_req_id(req_id, WecomCardReqKind::UpdateCard, Some(task_id))
+        .await;
     if let Err(error) = outbound_tx
         .send(WecomOutboundMsg::TemplateCardUpdate {
             req_id: req_id.to_string(),
@@ -1267,10 +1747,25 @@ mod tests {
     #[test]
     fn wecom_gateway_status_card() {
         let now = OffsetDateTime::now_utc();
-        let text = gateway_status_text(&["wecom", "dingtalk"], "omninova", &now);
+        let snapshot = WecomGatewayStatusSnapshot {
+            transport: "long_connection",
+            connection_connected: true,
+            stream_active: true,
+            generation: 7,
+            last_heartbeat_available: false,
+            enabled_channels: vec!["wecom", "dingtalk"],
+            agent_name: "omninova".to_string(),
+        };
+        let text = gateway_status_text(&snapshot, &now);
         assert!(text.contains("Gateway 状态"));
-        assert!(text.contains("启用渠道：wecom、dingtalk"));
-        assert!(text.contains("Agent：omninova"));
+        assert!(text.contains("Gateway running: true"));
+        assert!(text.contains("WeCom transport: long_connection"));
+        assert!(text.contains("connection: connected"));
+        assert!(text.contains("generation: 7"));
+        assert!(text.contains("enabled channels: wecom、dingtalk"));
+        assert!(text.contains("Agent: omninova"));
+        // Honest about what is NOT tracked.
+        assert!(text.contains("未追踪"));
         // No secret-like content ever enters this text.
         assert!(!text.contains("secret"));
         assert!(!text.contains("token"));
@@ -1296,21 +1791,27 @@ mod tests {
     async fn wecom_monitor_30_singleflight() {
         let store = WecomCardStore::new();
         store.register("task-m30".to_string(), None).await;
-        assert!(store.try_start_monitor("task-m30").await);
-        assert!(!store.try_start_monitor("task-m30").await);
-        store.finish_monitor("task-m30", "done".to_string()).await;
-        assert!(store.try_start_monitor("task-m30").await);
+        assert!(store.try_start_monitor("task-m30", 30, 0).await);
+        assert!(!store.try_start_monitor("task-m30", 30, 0).await);
+        store
+            .complete_monitor("task-m30", 30, 1000, "done".to_string())
+            .await;
+        assert!(matches!(
+            store.monitor_state("task-m30").await,
+            MonitorState::Completed { .. }
+        ));
+        assert!(store.try_start_monitor("task-m30", 30, 0).await);
     }
 
     #[tokio::test]
     async fn wecom_monitor_60_singleflight() {
         let store = WecomCardStore::new();
         store.register("task-m60".to_string(), None).await;
-        assert!(store.try_start_monitor("task-m60").await);
-        assert!(!store.try_start_monitor("task-m60").await);
+        assert!(store.try_start_monitor("task-m60", 60, 0).await);
+        assert!(!store.try_start_monitor("task-m60", 60, 0).await);
         // A different card can still start its own monitor.
         store.register("task-other".to_string(), None).await;
-        assert!(store.try_start_monitor("task-other").await);
+        assert!(store.try_start_monitor("task-other", 60, 0).await);
     }
 
     #[test]
@@ -1524,5 +2025,522 @@ mod tests {
             }
             other => panic!("expected TemplateCardUpdate, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2A.3.1e: monitor countdown state + proactive auto delivery
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn monitor_30_state_starts_at_30() {
+        let store = WecomCardStore::new();
+        store.register("task-cd-1".to_string(), None).await;
+        assert!(store.try_start_monitor("task-cd-1", 30, 0).await);
+        let remaining = store.monitor_remaining_secs("task-cd-1").await.unwrap();
+        assert!(remaining <= 30, "remaining={remaining}");
+        assert!(remaining >= 29, "remaining={remaining}");
+        assert!(matches!(
+            store.monitor_state("task-cd-1").await,
+            MonitorState::Running { duration_secs: 30, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn monitor_countdown_uses_deadline() {
+        // Remaining seconds must be recomputed from the monotonic
+        // deadline (deadline - now), not a decrement counter.
+        let store = WecomCardStore::new();
+        store.register("task-cd-2".to_string(), None).await;
+        assert!(store.try_start_monitor("task-cd-2", 30, 0).await);
+        // Shift the deadline 12s into the past.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(12);
+        store.set_monitor_deadline_for_test("task-cd-2", past).await;
+        let remaining = store.monitor_remaining_secs("task-cd-2").await.unwrap();
+        assert_eq!(remaining, 0, "deadline passed → remaining 0");
+    }
+
+    #[tokio::test]
+    async fn monitor_running_second_click_does_not_duplicate() {
+        let store = WecomCardStore::new();
+        store.register("task-sf-1".to_string(), None).await;
+        assert!(store.try_start_monitor("task-sf-1", 30, 0).await);
+        assert!(!store.try_start_monitor("task-sf-1", 30, 0).await);
+        assert!(matches!(
+            store.monitor_state("task-sf-1").await,
+            MonitorState::Running { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn monitor_running_second_click_returns_remaining() {
+        let store = WecomCardStore::new();
+        store.register("task-sf-2".to_string(), None).await;
+        assert!(store.try_start_monitor("task-sf-2", 30, 0).await);
+        let remaining = store.monitor_remaining_secs("task-sf-2").await.unwrap();
+        let subtitle = panel_subtitle_for_state(&store.monitor_state("task-sf-2").await);
+        assert_eq!(subtitle, format!("桌面监控中 · 剩余 {remaining} 秒"));
+    }
+
+    #[tokio::test]
+    async fn monitor_completion_changes_state_completed() {
+        let store = WecomCardStore::new();
+        store.register("task-fin-1".to_string(), None).await;
+        assert!(store.try_start_monitor("task-fin-1", 30, 0).await);
+        store
+            .complete_monitor("task-fin-1", 30, 30123, "桌面监控完成\n\n结果：检测到桌面变化".to_string())
+            .await;
+        match store.monitor_state("task-fin-1").await {
+            MonitorState::Completed {
+                duration_secs,
+                elapsed_ms,
+                summary,
+                ..
+            } => {
+                assert_eq!(duration_secs, 30);
+                assert_eq!(elapsed_ms, 30123);
+                assert!(summary.contains("桌面监控完成"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_completion_queues_proactive_message() {
+        let (runtime, tx, mut rx) = handler_with_channel().await;
+        let store = WecomCardStore::new();
+        store.register("task-push-1".to_string(), None).await;
+        deliver_monitor_result(
+            &runtime,
+            &store,
+            &tx,
+            "task-push-1",
+            Some("user-target".to_string()),
+            0,
+            "completed",
+            30,
+            30815,
+            "检测到桌面变化",
+        )
+        .await;
+        match rx.try_recv().expect("completion must queue a proactive message") {
+            WecomOutboundMsg::ProactiveMessage { req_id, chat_id, body } => {
+                assert!(req_id.starts_with("wecom_monitor_"));
+                assert_eq!(chat_id, "user-target");
+                // Phase 2A.3.1f: reliable MARKDOWN, no template_card.
+                assert_eq!(body["msgtype"], "markdown");
+                assert!(body.get("template_card").is_none());
+                let content = body["markdown"]["content"].as_str().unwrap();
+                assert!(content.contains("### OmniNova · 桌面监控完成"));
+                assert!(content.contains("30 秒"));
+                assert!(content.contains("30.8 秒"));
+                assert!(content.contains("检测到桌面变化"));
+            }
+            other => panic!("expected ProactiveMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proactive_single_uses_userid() {
+        let body: WecomCallbackBody = serde_json::from_value(serde_json::json!({
+            "msgid": "t-s",
+            "msgtype": "event",
+            "chattype": "single",
+            "from": {"userid": "user-single-1"},
+            "event": {"eventtype": "template_card_event"}
+        }))
+        .unwrap();
+        assert_eq!(resolve_card_target(&body).as_deref(), Some("user-single-1"));
+    }
+
+    #[test]
+    fn proactive_group_uses_chatid() {
+        let body: WecomCallbackBody = serde_json::from_value(serde_json::json!({
+            "msgid": "t-g",
+            "msgtype": "event",
+            "chattype": "group",
+            "chatid": "chat-group-1",
+            "from": {"userid": "user-group-1"},
+            "event": {"eventtype": "template_card_event"}
+        }))
+        .unwrap();
+        assert_eq!(resolve_card_target(&body).as_deref(), Some("chat-group-1"));
+    }
+
+    #[test]
+    fn proactive_wire_cmd_is_aibot_send_msg() {
+        let body = ProactiveBody::Markdown {
+            content: build_monitor_result_markdown("completed", 30, 30815, "检测到桌面变化"),
+        }
+        .to_wire();
+        let envelope =
+            crate::gateway::wecom_protocol::build_send_message_envelope("req-pro", "chat-1", body);
+        assert_eq!(envelope.cmd, "aibot_send_msg");
+        assert_eq!(envelope.headers.req_id, "req-pro");
+        let body = envelope.body.unwrap();
+        assert_eq!(body["chatid"], "chat-1");
+        assert_eq!(body["msgtype"], "markdown");
+    }
+
+    #[tokio::test]
+    async fn proactive_ack_correlates_req_id() {
+        let store = WecomCardStore::new();
+        store
+            .note_card_req_id("req-pro-1", WecomCardReqKind::Proactive, Some("task-ack-1"))
+            .await;
+        let pending = store.consume_card_req_ack("req-pro-1").await.unwrap();
+        assert_eq!(pending.kind, WecomCardReqKind::Proactive);
+        assert_eq!(pending.task_id.as_deref(), Some("task-ack-1"));
+        assert_eq!(store.consume_card_req_ack("req-pro-1").await, None);
+    }
+
+    #[tokio::test]
+    async fn monitor_failure_notifies_user() {
+        let (runtime, tx, mut rx) = handler_with_channel().await;
+        let store = WecomCardStore::new();
+        store.register("task-fail-1".to_string(), None).await;
+        deliver_monitor_result(
+            &runtime,
+            &store,
+            &tx,
+            "task-fail-1",
+            Some("user-target".to_string()),
+            0,
+            "failed",
+            30,
+            3000,
+            "桌面监控失败，请稍后重试。",
+        )
+        .await;
+        match rx.try_recv().expect("failure must notify the user") {
+            WecomOutboundMsg::ProactiveMessage { body, .. } => {
+                assert_eq!(body["msgtype"], "markdown");
+                let content = body["markdown"]["content"].as_str().unwrap();
+                assert!(content.contains("### OmniNova · 桌面监控失败"));
+                assert!(content.contains("桌面监控失败"));
+            }
+            other => panic!("expected ProactiveMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_timeout_notifies_user() {
+        let (runtime, tx, mut rx) = handler_with_channel().await;
+        let store = WecomCardStore::new();
+        store.register("task-time-1".to_string(), None).await;
+        deliver_monitor_result(
+            &runtime,
+            &store,
+            &tx,
+            "task-time-1",
+            Some("user-target".to_string()),
+            0,
+            "timeout",
+            30,
+            45000,
+            "桌面监控超时，请稍后重试。",
+        )
+        .await;
+        match rx.try_recv().expect("timeout must notify the user") {
+            WecomOutboundMsg::ProactiveMessage { body, .. } => {
+                assert_eq!(body["msgtype"], "markdown");
+                let content = body["markdown"]["content"].as_str().unwrap();
+                assert!(content.contains("### OmniNova · 桌面监控超时"));
+            }
+            other => panic!("expected ProactiveMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_generation_monitor_result_discarded() {
+        let (runtime, tx, mut rx) = handler_with_channel().await;
+        let store = WecomCardStore::new();
+        store.register("task-stale-1".to_string(), None).await;
+        // generation=99 is not active on this runtime → result discarded.
+        deliver_monitor_result(
+            &runtime,
+            &store,
+            &tx,
+            "task-stale-1",
+            Some("user-target".to_string()),
+            99,
+            "completed",
+            30,
+            30000,
+            "检测到桌面变化",
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "stale generation must never send a monitor result"
+        );
+    }
+
+    #[test]
+    fn menu_ready_render() {
+        let card = build_panel_card("task-menu-1");
+        assert_eq!(card["main_title"]["title"], PANEL_TITLE);
+        assert_eq!(card["main_title"]["desc"], PANEL_DESC);
+        assert_eq!(card["sub_title_text"], PANEL_READY_SUBTITLE);
+        assert_eq!(card["button_list"].as_array().unwrap().len(), 5);
+        assert_eq!(panel_subtitle_for_state(&MonitorState::Idle), PANEL_READY_SUBTITLE);
+    }
+
+    #[tokio::test]
+    async fn menu_running_render() {
+        let store = WecomCardStore::new();
+        store.register("task-menu-2".to_string(), None).await;
+        store.try_start_monitor("task-menu-2", 30, 0).await;
+        let state = store.monitor_state("task-menu-2").await;
+        assert!(panel_subtitle_for_state(&state).contains("桌面监控中 · 剩余"));
+    }
+
+    #[tokio::test]
+    async fn menu_completed_render() {
+        let store = WecomCardStore::new();
+        store.register("task-menu-3".to_string(), None).await;
+        store
+            .complete_monitor("task-menu-3", 30, 1000, "done".to_string())
+            .await;
+        let state = store.monitor_state("task-menu-3").await;
+        assert_eq!(panel_subtitle_for_state(&state), "桌面监控完成");
+    }
+
+    #[tokio::test]
+    async fn menu_failed_render() {
+        let store = WecomCardStore::new();
+        store.register("task-menu-4".to_string(), None).await;
+        store
+            .fail_monitor("task-menu-4", "error".to_string(), 500)
+            .await;
+        let state = store.monitor_state("task-menu-4").await;
+        assert_eq!(panel_subtitle_for_state(&state), "桌面监控失败");
+    }
+
+    #[test]
+    fn gateway_status_uses_real_state() {
+        let now = OffsetDateTime::now_utc();
+        // A DISCONNECTED http_callback snapshot must render disconnected
+        // values — never a hardcoded "正常".
+        let snapshot = WecomGatewayStatusSnapshot {
+            transport: "http_callback",
+            connection_connected: false,
+            stream_active: false,
+            generation: 0,
+            last_heartbeat_available: false,
+            enabled_channels: vec![],
+            agent_name: "omninova".to_string(),
+        };
+        let text = gateway_status_text(&snapshot, &now);
+        assert!(text.contains("WeCom transport: http_callback"));
+        assert!(text.contains("connection: disconnected"));
+        assert!(text.contains("stream active: false"));
+        assert!(text.contains("generation: 0"));
+        assert!(text.contains("未追踪"));
+        assert!(!text.contains("正常"));
+    }
+
+    #[test]
+    fn help_remains_deterministic() {
+        let first = help_text();
+        let second = help_text();
+        assert_eq!(first, second);
+        for command in ["菜单", "面板", "menu", "/menu", "panel", "/panel"] {
+            assert!(first.contains(command), "help must list {command}");
+        }
+        for action in ["网关状态", "最近任务", "监控 30 秒", "监控 60 秒", "帮助"] {
+            assert!(first.contains(action), "help must describe {action}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2A.3.1f: reliable Markdown delivery + ACK semantics
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn monitor_completed_builds_markdown_proactive_message() {
+        let content = build_monitor_result_markdown("completed", 30, 30815, "检测到桌面变化");
+        assert!(content.contains("### OmniNova · 桌面监控完成"));
+        assert!(content.contains("**状态：** 完成"));
+        assert!(content.contains("**监控时长：** 30 秒"));
+        assert!(content.contains("**实际耗时：** 30.8 秒"));
+        assert!(content.contains("检测到桌面变化"));
+    }
+
+    #[test]
+    fn monitor_failed_builds_markdown_proactive_message() {
+        let content = build_monitor_result_markdown("failed", 30, 3000, "桌面监控失败，请稍后重试。");
+        assert!(content.contains("### OmniNova · 桌面监控失败"));
+        assert!(content.contains("**状态：** 失败"));
+        assert!(content.contains("**原因：** 桌面监控失败"));
+    }
+
+    #[test]
+    fn monitor_timeout_builds_markdown_proactive_message() {
+        let content = build_monitor_result_markdown("timeout", 60, 75000, "");
+        assert!(content.contains("### OmniNova · 桌面监控超时"));
+        assert!(content.contains("**状态：** 超时"));
+        assert!(content.contains("**监控时长：** 60 秒"));
+    }
+
+    #[test]
+    fn monitor_result_markdown_has_no_template_card() {
+        for (kind, duration, elapsed, summary) in [
+            ("completed", 30, 30815, "检测到桌面变化"),
+            ("failed", 30, 3000, "桌面监控失败，请稍后重试。"),
+            ("timeout", 60, 75000, ""),
+        ] {
+            let body = ProactiveBody::Markdown {
+                content: build_monitor_result_markdown(kind, duration, elapsed, summary),
+            }
+            .to_wire();
+            assert_eq!(body["msgtype"], "markdown", "kind={kind}");
+            assert!(body.get("template_card").is_none(), "kind={kind}");
+        }
+        // Markdown must never leak paths/secrets/userids.
+        let content = build_monitor_result_markdown("completed", 30, 30815, "检测到桌面变化");
+        assert!(!content.contains("C:\\"));
+        assert!(!content.contains("/Users/"));
+    }
+
+    #[test]
+    fn proactive_markdown_wire_cmd_is_aibot_send_msg() {
+        let body = ProactiveBody::Markdown {
+            content: build_monitor_result_markdown("completed", 30, 30815, "检测到桌面变化"),
+        }
+        .to_wire();
+        let envelope =
+            crate::gateway::wecom_protocol::build_send_message_envelope("req-md", "chat-md", body);
+        assert_eq!(envelope.cmd, "aibot_send_msg");
+        assert_eq!(envelope.headers.req_id, "req-md");
+    }
+
+    #[test]
+    fn proactive_markdown_body_has_msgtype_markdown() {
+        let body = ProactiveBody::Markdown {
+            content: build_monitor_result_markdown("completed", 30, 30815, "检测到桌面变化"),
+        }
+        .to_wire();
+        assert_eq!(body["msgtype"], "markdown");
+        assert!(body["markdown"]["content"].as_str().is_some());
+        // The template_card path stays available as a future boundary.
+        let card = build_monitor_result_message("t", "s");
+        assert_eq!(card["template_card"]["card_type"], "text_notice");
+    }
+
+    #[tokio::test]
+    async fn proactive_write_ok_is_not_delivery_success() {
+        // Completion alone leaves delivery Pending: only an ACK errcode==0
+        // (handled in the stream ACK branch) marks it Sent.
+        let store = WecomCardStore::new();
+        store.register("task-wok".to_string(), None).await;
+        store
+            .complete_monitor("task-wok", 30, 30000, "检测到桌面变化".to_string())
+            .await;
+        match store.monitor_state("task-wok").await {
+            MonitorState::Completed { delivery, .. } => {
+                assert_eq!(delivery, MonitorDelivery::Pending);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_ack_zero_marks_delivery_sent() {
+        let store = WecomCardStore::new();
+        store.register("task-sent".to_string(), None).await;
+        store
+            .complete_monitor("task-sent", 30, 30000, "检测到桌面变化".to_string())
+            .await;
+        store.mark_delivery_sent("task-sent").await;
+        match store.monitor_state("task-sent").await {
+            MonitorState::Completed { delivery, .. } => {
+                assert_eq!(delivery, MonitorDelivery::Sent);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_ack_error_marks_delivery_failed() {
+        let store = WecomCardStore::new();
+        store.register("task-aerr".to_string(), None).await;
+        store
+            .complete_monitor("task-aerr", 30, 30000, "检测到桌面变化".to_string())
+            .await;
+        store.mark_delivery_failed("task-aerr", 42045).await;
+        match store.monitor_state("task-aerr").await {
+            MonitorState::Completed { delivery, .. } => {
+                assert_eq!(delivery, MonitorDelivery::Failed { errcode: 42045 });
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_validation_error_not_retried() {
+        // A 4xxxx ACK error only marks delivery failed — the same payload
+        // is never re-sent and no new outbound message is produced.
+        let (_runtime, tx, mut rx) = handler_with_channel().await;
+        let store = WecomCardStore::new();
+        store.register("task-vretry".to_string(), None).await;
+        store
+            .complete_monitor("task-vretry", 30, 30000, "检测到桌面变化".to_string())
+            .await;
+        store.mark_delivery_failed("task-vretry", 42045).await;
+        // The ACK-error path (stream branch) only calls mark_delivery_failed:
+        // nothing is enqueued on the outbound channel.
+        assert!(
+            rx.try_recv().is_err(),
+            "payload validation errors must never re-queue a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_completion_not_reexecuted_on_delivery_failure() {
+        // Delivery failure must NOT re-run the monitor: state stays
+        // Completed (Failed delivery), never flips back to Running.
+        let store = WecomCardStore::new();
+        store.register("task-nore".to_string(), None).await;
+        store
+            .complete_monitor("task-nore", 30, 30000, "检测到桌面变化".to_string())
+            .await;
+        store.mark_delivery_failed("task-nore", 42045).await;
+        assert!(matches!(
+            store.monitor_state("task-nore").await,
+            MonitorState::Completed { .. }
+        ));
+        // And the single-flight gate stays free of any automatic restart:
+        // only an explicit user click may start a NEW monitor.
+        assert!(!matches!(
+            store.monitor_state("task-nore").await,
+            MonitorState::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn single_target_still_uses_userid() {
+        let body: WecomCallbackBody = serde_json::from_value(serde_json::json!({
+            "msgid": "t-s2",
+            "msgtype": "event",
+            "chattype": "single",
+            "from": {"userid": "user-single-2"},
+            "event": {"eventtype": "template_card_event"}
+        }))
+        .unwrap();
+        assert_eq!(resolve_card_target(&body).as_deref(), Some("user-single-2"));
+    }
+
+    #[test]
+    fn group_target_still_uses_chatid() {
+        let body: WecomCallbackBody = serde_json::from_value(serde_json::json!({
+            "msgid": "t-g2",
+            "msgtype": "event",
+            "chattype": "group",
+            "chatid": "chat-group-2",
+            "from": {"userid": "user-group-2"},
+            "event": {"eventtype": "template_card_event"}
+        }))
+        .unwrap();
+        assert_eq!(resolve_card_target(&body).as_deref(), Some("chat-group-2"));
     }
 }

@@ -11,10 +11,10 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::wecom_protocol::{
-    build_ping_envelope, build_stream_respond_envelope, build_subscribe_envelope,
-    build_template_card_respond_envelope, build_template_card_update_envelope,
-    parse_response_envelope, WecomCallbackEnvelope, WecomCommandType, WecomEventType,
-    WecomResponseEnvelope,
+    build_ping_envelope, build_send_message_envelope, build_stream_respond_envelope,
+    build_subscribe_envelope, build_template_card_respond_envelope,
+    build_template_card_update_envelope, parse_response_envelope, WecomCallbackEnvelope,
+    WecomCommandType, WecomEventType, WecomResponseEnvelope,
 };
 
 pub const WECOM_WS_URL: &str = "wss://openws.work.weixin.qq.com";
@@ -82,6 +82,10 @@ pub enum WecomOutboundMsg {
     /// `body.response_type = "update_template_card"`, replying to the
     /// template_card_event frame's req_id within 5 seconds.
     TemplateCardUpdate { req_id: String, body: serde_json::Value },
+    /// PROACTIVE message (Phase 2A.3.1e): `aibot_send_msg` — needs NO
+    /// callback req_id. `chat_id` targets the conversation (single:
+    /// userid; group: chatid); `body` carries {"msgtype": ..., ...}.
+    ProactiveMessage { req_id: String, chat_id: String, body: serde_json::Value },
     Ping { req_id: String },
 }
 
@@ -536,6 +540,25 @@ async fn run_physical_writer_inline<W>(
                             }
                         }
                     }
+                    Some(WecomOutboundMsg::ProactiveMessage { req_id, chat_id, body }) => {
+                        if !runtime.is_wecom_stream_generation_active(gen) {
+                            println!("[wecom-stream] physical_writer_exit stale physical_id={}", physical_id);
+                            return;
+                        }
+                        let env = build_send_message_envelope(&req_id, &chat_id, body);
+                        let json = serde_json::to_string(&env).unwrap_or_default();
+                        println!("[wecom-card] proactive_send_write_started req_id={} target={} physical_id={}", short_hash(&req_id), short_hash(&chat_id), physical_id);
+                        match write.send(Message::Text(json.into())).await {
+                            Ok(()) => {
+                                println!("[wecom-card] proactive_send_write_ok req_id={} physical_id={}", short_hash(&req_id), physical_id);
+                                runtime.increment_wecom_reply_success().await;
+                            }
+                            Err(e) => {
+                                println!("[wecom-card] proactive_send_write_failed req_id={} physical_id={} error={}", short_hash(&req_id), physical_id, e);
+                                return;
+                            }
+                        }
+                    }
                     None => {
                         println!("[wecom-stream] physical_writer_exit channel_closed physical_id={}", physical_id);
                         return;
@@ -678,19 +701,71 @@ async fn handle_incoming_message(
             } else {
                 println!("[wecom-stream] reply_ack_ok req_id={} errmsg={} physical_id={}", req_id_short, errmsg_short, physical_id);
             }
-            // Card replies (template_card) are tracked separately so the
-            // panel lifecycle can log its own ACK (Phase 2A.3.1).
-            if crate::gateway::wecom_card::card_store()
-                .consume_card_reply_ack(&ack.headers.req_id)
+            // Card replies and proactive sends are tracked by KIND so the
+            // ACK log distinguishes them; a proactive errcode==0 ACK is the
+            // ONLY thing that marks the monitor result DELIVERED.
+            match crate::gateway::wecom_card::card_store()
+                .consume_card_req_ack(&ack.headers.req_id)
                 .await
             {
-                println!("[wecom-card] card_ack_ok req_id={} physical_id={}", req_id_short, physical_id);
+                Some(pending) => match pending.kind {
+                    crate::gateway::wecom_card::WecomCardReqKind::InitialCard => {
+                        println!("[wecom-card] card_initial_ack_ok req_id={} physical_id={}", req_id_short, physical_id);
+                    }
+                    crate::gateway::wecom_card::WecomCardReqKind::UpdateCard => {
+                        println!("[wecom-card] card_update_ack_ok req_id={} physical_id={}", req_id_short, physical_id);
+                    }
+                    crate::gateway::wecom_card::WecomCardReqKind::Proactive => {
+                        println!("[wecom-card] proactive_send_ack_ok req_id={} errcode=0 physical_id={}", req_id_short, physical_id);
+                        if let Some(task_id) = pending.task_id {
+                            crate::gateway::wecom_card::card_store()
+                                .mark_delivery_sent(&task_id)
+                                .await;
+                            println!(
+                                "[wecom-card] monitor_result_delivered=true task_id={}",
+                                short_hash(&task_id)
+                            );
+                        }
+                    }
+                },
+                None => {}
             }
         } else {
             if is_heartbeat {
                 println!("[wecom-stream] heartbeat_ack_error req_id={} errcode={} physical_id={}", req_id_short, ack.errcode, physical_id);
             } else {
                 println!("[wecom-stream] reply_ack_error req_id={} errcode={} errmsg={} physical_id={}", req_id_short, ack.errcode, errmsg_short, physical_id);
+            }
+            // Kind-specific ACK errors with the full (sanitized, bounded)
+            // server errmsg — write_ok alone never counts as delivery.
+            match crate::gateway::wecom_card::card_store()
+                .consume_card_req_ack(&ack.headers.req_id)
+                .await
+            {
+                Some(pending) => {
+                    let errmsg_sane = sanitize_errmsg(&ack.errmsg);
+                    match pending.kind {
+                        crate::gateway::wecom_card::WecomCardReqKind::InitialCard => {
+                            println!("[wecom-card] card_initial_ack_error req_id={} errcode={} errmsg={} physical_id={}", req_id_short, ack.errcode, errmsg_sane, physical_id);
+                        }
+                        crate::gateway::wecom_card::WecomCardReqKind::UpdateCard => {
+                            println!("[wecom-card] card_update_ack_error req_id={} errcode={} errmsg={} physical_id={}", req_id_short, ack.errcode, errmsg_sane, physical_id);
+                        }
+                        crate::gateway::wecom_card::WecomCardReqKind::Proactive => {
+                            println!("[wecom-card] proactive_send_ack_error req_id={} errcode={} errmsg={} physical_id={}", req_id_short, ack.errcode, errmsg_sane, physical_id);
+                            if let Some(task_id) = pending.task_id {
+                                crate::gateway::wecom_card::card_store()
+                                    .mark_delivery_failed(&task_id, ack.errcode)
+                                    .await;
+                            }
+                            println!(
+                                "[wecom-card] monitor_result_delivery_failed errcode={} physical_id={}",
+                                ack.errcode, physical_id
+                            );
+                        }
+                    }
+                }
+                None => {}
             }
             if !is_heartbeat && (ack.errcode == 40001 || ack.errcode == 40013 || ack.errcode == 40014) {
                 return Err(format!("ack_error errcode={}", ack.errcode));
@@ -703,7 +778,22 @@ async fn handle_incoming_message(
     let envelope: WecomCallbackEnvelope = match serde_json::from_str(&text) {
         Ok(e) => e,
         Err(_) => {
-            println!("[wecom-stream] non_callback_frame len={}", text.len());
+            // Low-sensitivity classification (Phase 2A.3.1e): classify
+            // non-callback frames without printing the raw payload.
+            let (json_parseable, cmd_present, frame_kind) = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(value) => {
+                    let cmd = value.get("cmd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    (true, !cmd.is_empty(), cmd)
+                }
+                Err(_) => (false, false, String::new()),
+            };
+            println!(
+                "[wecom-stream] non_callback_frame len={} json_parseable={} cmd_present={} frame_kind={}",
+                text.len(),
+                json_parseable,
+                cmd_present,
+                frame_kind
+            );
             return Ok(());
         }
     };
@@ -769,10 +859,11 @@ async fn handle_message_callback(
 
     let chat_type = body.chattype.as_deref().unwrap_or("unknown");
     println!(
-        "[wecom-stream] inbound_parse_ok=true msg_id={} chat_type={} text_len={}",
+        "[wecom-stream] inbound_parse_ok=true msg_id={} chat_type={} text_bytes={} text_chars={}",
         short_hash(msg_id),
         chat_type,
-        inbound.text.len()
+        inbound.text.len(),
+        inbound.text.chars().count()
     );
 
     if inbound.text.is_empty() {
@@ -794,7 +885,11 @@ async fn handle_message_callback(
             let card = crate::gateway::wecom_card::build_panel_card(&task_id);
             println!("[wecom-card] card_dispatch_requested task_id={}", short_hash(&task_id));
             crate::gateway::wecom_card::card_store()
-                .note_card_reply_req_id(req_id)
+                .note_card_req_id(
+                    req_id,
+                    crate::gateway::wecom_card::WecomCardReqKind::InitialCard,
+                    None,
+                )
                 .await;
             shared_tx
                 .send(WecomOutboundMsg::TemplateCard {
@@ -807,8 +902,8 @@ async fn handle_message_callback(
         }
         None => {
             println!(
-                "[wecom-card] panel_trigger_checked matched=false text_len={}",
-                inbound.text.chars().count()
+                "[wecom-card] panel_trigger_checked matched=false text_bytes={}",
+                inbound.text.len()
             );
         }
     }
@@ -874,6 +969,21 @@ pub fn short_hash(s: &str) -> String {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     format!("{:08x}", h.finish())
+}
+
+/// Sanitize a server errmsg for logs: strip control characters and
+/// bound to 256 chars. Never logs outbound payloads or user data.
+fn sanitize_errmsg(errmsg: &str) -> String {
+    let cleaned: String = errmsg
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect();
+    if errmsg.chars().count() > 256 {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
 }
 
 #[cfg(test)]
