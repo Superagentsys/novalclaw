@@ -295,6 +295,15 @@ pub enum WecomCardReqKind {
     Proactive,
 }
 
+/// Transport origin of a panel (Phase 2A.3.3): the shared business core
+/// is transport-agnostic, but a panel created by one transport must
+/// never be handled by the other's outbound path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WecomCardTransport {
+    LongConnection,
+    HttpCallback,
+}
+
 #[derive(Debug, Clone)]
 pub struct WecomCardState {
     pub task_id: String,
@@ -303,6 +312,11 @@ pub struct WecomCardState {
     pub updated_at: i64,
     pub last_action: Option<String>,
     pub monitor: MonitorState,
+    pub transport: WecomCardTransport,
+    /// HTTP callback temporary reply channel (Phase 2A.3.3a). Never
+    /// logged in plaintext — only presence + short hash.
+    pub response_url: Option<String>,
+    pub response_url_received_at: Option<i64>,
 }
 
 /// One entry of the WeCom recent-jobs log (redacted summary only).
@@ -325,6 +339,10 @@ struct WecomCardStoreInner {
     cards: HashMap<String, WecomCardState>,
     /// Event msgids already handled per task (retry dedup).
     seen_events: HashMap<String, HashSet<String>>,
+    /// Panel-trigger dedup: callback msgid → panel task_id. A retried
+    /// "menu" callback must reuse the SAME panel (same task_id), never
+    /// create a second one.
+    panel_triggers: HashMap<String, String>,
     /// Monitor state per task_id (single-flight + countdown).
     monitors: HashMap<String, MonitorState>,
     /// req_ids of card/proactive messages awaiting their ACK, by kind.
@@ -344,6 +362,7 @@ impl WecomCardStore {
             inner: Arc::new(Mutex::new(WecomCardStoreInner {
                 cards: HashMap::new(),
                 seen_events: HashMap::new(),
+                panel_triggers: HashMap::new(),
                 monitors: HashMap::new(),
                 pending_card_req_ids: HashMap::new(),
                 recent_jobs: VecDeque::new(),
@@ -355,9 +374,26 @@ impl WecomCardStore {
         OffsetDateTime::now_utc().unix_timestamp()
     }
 
-    /// Register a fresh panel (used by the panel trigger).
+    pub(crate) fn now_unix() -> i64 {
+        Self::now()
+    }
+
+    /// Register a fresh panel (used by the panel trigger). Long
+    /// Connection origin (legacy default).
     pub async fn register(&self, task_id: String, session_key: Option<String>) {
-        self.register_at(task_id, session_key, Self::now()).await;
+        self.register_with_transport(task_id, session_key, WecomCardTransport::LongConnection)
+            .await;
+    }
+
+    /// Register a panel with an explicit transport origin.
+    pub async fn register_with_transport(
+        &self,
+        task_id: String,
+        session_key: Option<String>,
+        transport: WecomCardTransport,
+    ) {
+        self.register_at_with_transport(task_id, session_key, Self::now(), transport)
+            .await;
     }
 
     pub(crate) async fn register_at(
@@ -365,6 +401,22 @@ impl WecomCardStore {
         task_id: String,
         session_key: Option<String>,
         created_at: i64,
+    ) {
+        self.register_at_with_transport(
+            task_id,
+            session_key,
+            created_at,
+            WecomCardTransport::LongConnection,
+        )
+        .await;
+    }
+
+    pub(crate) async fn register_at_with_transport(
+        &self,
+        task_id: String,
+        session_key: Option<String>,
+        created_at: i64,
+        transport: WecomCardTransport,
     ) {
         let mut inner = self.inner.lock();
         inner.cards.insert(
@@ -376,8 +428,37 @@ impl WecomCardStore {
                 updated_at: created_at,
                 last_action: None,
                 monitor: MonitorState::Idle,
+                transport,
+                response_url: None,
+                response_url_received_at: None,
             },
         );
+    }
+
+    /// Attach the HTTP callback response_url to a panel (with an
+    /// explicit received_at for expiry tests).
+    pub(crate) async fn attach_response_url_at(
+        &self,
+        task_id: &str,
+        response_url: String,
+        received_at: i64,
+    ) {
+        let mut inner = self.inner.lock();
+        if let Some(state) = inner.cards.get_mut(task_id) {
+            state.response_url = Some(response_url);
+            state.response_url_received_at = Some(received_at);
+        }
+    }
+
+    /// The panel's HTTP delivery context: response_url + received_at.
+    /// Returns None when the panel has no response_url.
+    pub async fn http_delivery_context(&self, task_id: &str) -> Option<(String, i64)> {
+        let inner = self.inner.lock();
+        let state = inner.cards.get(task_id)?;
+        match (&state.response_url, state.response_url_received_at) {
+            (Some(url), Some(received_at)) => Some((url.clone(), received_at)),
+            _ => None,
+        }
     }
 
     /// Lookup a live panel by task_id. Expired panels (30-min TTL) are
@@ -612,12 +693,30 @@ impl WecomCardStore {
         inner.pending_card_req_ids.remove(req_id)
     }
 
+    /// Panel-trigger dedup: returns None the first time a callback
+    /// msgid opens a panel (registering msgid → task_id), or Some(
+    /// existing task_id) for a retry — the retry must REUSE the same
+    /// panel, never create a second one.
+    pub async fn dedup_panel_trigger(&self, msg_id: &str, task_id: &str) -> Option<String> {
+        let mut inner = self.inner.lock();
+        match inner.panel_triggers.get(msg_id) {
+            Some(existing) => Some(existing.clone()),
+            None => {
+                inner
+                    .panel_triggers
+                    .insert(msg_id.to_string(), task_id.to_string());
+                None
+            }
+        }
+    }
+
     /// Test-only reset of the global store.
     #[cfg(test)]
     pub async fn reset(&self) {
         let mut inner = self.inner.lock();
         inner.cards.clear();
         inner.seen_events.clear();
+        inner.panel_triggers.clear();
         inner.monitors.clear();
         inner.pending_card_req_ids.clear();
         inner.recent_jobs.clear();
@@ -641,6 +740,62 @@ pub async fn register_panel(task_id: &str, session_key: Option<String>) {
     card_store()
         .register(task_id.to_string(), session_key)
         .await;
+}
+
+/// Register a panel created through the HTTP callback transport
+/// (Phase 2A.3.3): its events are only handled by the HTTP card adapter.
+pub async fn register_http_panel(task_id: &str, session_key: Option<String>) {
+    register_http_panel_with_url(task_id, session_key, None).await;
+}
+
+/// Register an HTTP panel AND attach the callback's temporary
+/// response_url for later monitor-result delivery (Phase 2A.3.3a).
+pub async fn register_http_panel_with_url(
+    task_id: &str,
+    session_key: Option<String>,
+    response_url: Option<String>,
+) {
+    card_store()
+        .register_with_transport(
+            task_id.to_string(),
+            session_key,
+            WecomCardTransport::HttpCallback,
+        )
+        .await;
+    if let Some(url) = response_url {
+        card_store()
+            .attach_response_url_at(task_id, url, WecomCardStore::now_unix())
+            .await;
+    }
+}
+
+/// Assumed response_url validity window (10 minutes). Official TTL is
+/// unverified (network-restricted audit); this is a documented safe
+/// default — stale URLs are rejected, never retried.
+pub const RESPONSE_URL_TTL_SECS: i64 = 10 * 60;
+
+/// Test-only monitor execution guard: when set, start_monitor performs
+/// admission + returns the immediate running render WITHOUT spawning
+/// the real desktop capture task.
+#[cfg(test)]
+static MONITOR_EXECUTION_DISABLED_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn disable_monitor_execution_for_tests(disabled: bool) {
+    MONITOR_EXECUTION_DISABLED_FOR_TESTS.store(disabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Short hash for response_url logging — the URL itself is never
+/// printed anywhere.
+pub fn response_url_hash(url: &str) -> String {
+    short_hash(url)
+}
+
+/// Menu subtitle for the HTTP callback transport: the callback itself
+/// proves the channel is functional; no WebSocket state is involved.
+pub fn http_menu_subtitle() -> String {
+    format!("运行正常 · {}", transport_label("http_callback"))
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +927,7 @@ impl WecomCardActionService {
     pub async fn execute(
         runtime: &Arc<GatewayRuntime>,
         store: &WecomCardStore,
-        outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
+        delivery: &MonitorDeliveryTarget,
         context: CardActionContext,
     ) -> CardActionResult {
         store
@@ -781,9 +936,19 @@ impl WecomCardActionService {
         match context.action {
             WecomPanelAction::GatewayStatus => {
                 let config = runtime.get_config().await;
+                // Transport-aware connection state (parity gap fix):
+                // an HTTP callback itself proves the channel is
+                // functional; the WS adapter reports the live socket
+                // state instead.
+                let connection_connected = match delivery {
+                    MonitorDeliveryTarget::HttpCallback => true,
+                    MonitorDeliveryTarget::LongConnection { .. } => {
+                        runtime.is_wecom_stream_connected()
+                    }
+                };
                 let snapshot = WecomGatewayStatusSnapshot {
                     transport: wecom_transport_mode_str(&config),
-                    connection_connected: runtime.is_wecom_stream_connected(),
+                    connection_connected,
                     stream_active: runtime.is_wecom_stream_active(),
                     generation: runtime.current_wecom_stream_generation(),
                     // Honest: heartbeat timestamps are not tracked.
@@ -792,20 +957,20 @@ impl WecomCardActionService {
                     agent_name: config.agent.name.clone(),
                 };
                 CardActionResult {
-                    title: "网关状态",
+                    title: "状态",
                     content: gateway_status_text(&snapshot, &OffsetDateTime::now_utc()),
                 }
             }
             WecomPanelAction::RecentJobs => CardActionResult {
-                title: "最近任务",
+                title: "任务",
                 content: store.recent_jobs_text().await,
             },
             WecomPanelAction::Monitor30 => CardActionResult {
-                title: "桌面监控 · 30 秒",
+                title: "监控30秒",
                 content: start_monitor(
                     runtime,
                     store,
-                    outbound_tx,
+                    delivery,
                     &context.task_id,
                     context.target_chat_id.clone(),
                     30,
@@ -813,11 +978,11 @@ impl WecomCardActionService {
                 .await,
             },
             WecomPanelAction::Monitor60 => CardActionResult {
-                title: "桌面监控 · 60 秒",
+                title: "监控60秒",
                 content: start_monitor(
                     runtime,
                     store,
-                    outbound_tx,
+                    delivery,
                     &context.task_id,
                     context.target_chat_id.clone(),
                     60,
@@ -931,7 +1096,7 @@ pub fn build_monitor_result_markdown(
 async fn start_monitor(
     runtime: &Arc<GatewayRuntime>,
     store: &WecomCardStore,
-    outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
+    delivery: &MonitorDeliveryTarget,
     task_id: &str,
     target_chat_id: Option<String>,
     duration_secs: u64,
@@ -974,20 +1139,47 @@ async fn start_monitor(
         _ => None,
     };
 
-    let generation = runtime.current_wecom_stream_generation();
+    // Generation fence applies to the long-connection transport only;
+    // HTTP has no generation lifecycle (generation 0 → fence skipped).
+    let generation = match delivery {
+        MonitorDeliveryTarget::LongConnection { .. } => runtime.current_wecom_stream_generation(),
+        MonitorDeliveryTarget::HttpCallback => 0,
+    };
     if !store.try_start_monitor(task_id, duration_secs, generation).await {
         return render_monitor_running_card_text(duration_secs, duration_secs);
     }
     println!(
-        "[wecom-card] monitor_started task_id={} duration={} generation={}",
+        "[wecom-card] monitor_started task_id={} duration={} generation={} transport={}",
         short_hash(task_id),
         duration_secs,
-        generation
+        generation,
+        match delivery {
+            MonitorDeliveryTarget::LongConnection { .. } => "long_connection",
+            MonitorDeliveryTarget::HttpCallback => "http_callback",
+        }
     );
+
+    // Test-only guard: skip the real desktop capture task (tests verify
+    // the immediate update response without touching the desktop).
+    #[cfg(test)]
+    if MONITOR_EXECUTION_DISABLED_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst) {
+        let running = render_monitor_running_card_text(duration_secs, duration_secs);
+        return match prior_summary {
+            Some(prior) => format!("{prior}{running}"),
+            None => running,
+        };
+    }
 
     let store_for_job = store.clone();
     let runtime_for_job = runtime.clone();
-    let tx_for_job = outbound_tx.clone();
+    let delivery_for_job = match delivery {
+        MonitorDeliveryTarget::LongConnection { outbound_tx } => {
+            MonitorDeliveryTarget::LongConnection {
+                outbound_tx: outbound_tx.clone(),
+            }
+        }
+        MonitorDeliveryTarget::HttpCallback => MonitorDeliveryTarget::HttpCallback,
+    };
     let task_for_job = task_id.to_string();
     let started = std::time::Instant::now();
     tokio::spawn(async move {
@@ -1068,19 +1260,36 @@ async fn start_monitor(
             }
         };
         // Automatic result delivery (P7) — with generation fence (P9).
-        deliver_monitor_result(
-            &runtime_for_job,
-            &store_for_job,
-            &tx_for_job,
-            &task_for_job,
-            target_chat_id,
-            generation,
-            kind,
-            duration_secs,
-            elapsed_ms,
-            &result,
-        )
-        .await;
+        // Transport-specific delivery (Phase 2A.3.3): WS pushes
+        // proactively; HTTP stores and defers to the next interaction.
+        match &delivery_for_job {
+            MonitorDeliveryTarget::LongConnection { outbound_tx } => {
+                deliver_monitor_result(
+                    &runtime_for_job,
+                    &store_for_job,
+                    outbound_tx,
+                    &task_for_job,
+                    target_chat_id,
+                    generation,
+                    kind,
+                    duration_secs,
+                    elapsed_ms,
+                    &result,
+                )
+                .await;
+            }
+            MonitorDeliveryTarget::HttpCallback => {
+                deliver_monitor_result_http(
+                    &store_for_job,
+                    &task_for_job,
+                    kind,
+                    duration_secs,
+                    elapsed_ms,
+                    &result,
+                )
+                .await;
+            }
+        }
     });
 
     // Immediate card update within the 5-second window (P3 countdown).
@@ -1102,7 +1311,7 @@ async fn start_monitor(
 /// TTL validity, target presence. Never touches the event req_id (the
 /// official updateTemplateCard 5-second rule is preserved).
 #[allow(clippy::too_many_arguments)]
-async fn deliver_monitor_result(
+pub(crate) async fn deliver_monitor_result(
     runtime: &Arc<GatewayRuntime>,
     store: &WecomCardStore,
     outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
@@ -1176,9 +1385,101 @@ async fn deliver_monitor_result(
     }
 }
 
+/// HTTP-callback monitor result delivery (Phase 2A.3.3a): the result is
+/// sent to the panel's stored response_url as MARKDOWN via the
+/// `wecom_http_delivery` adapter. Delivery is only marked Sent when the
+/// server RESPONSE confirms success — a transport write alone never
+/// counts. The WebSocket is never involved in HTTP mode.
+pub async fn deliver_monitor_result_http(
+    store: &WecomCardStore,
+    task_id: &str,
+    kind: &str,
+    duration_secs: u64,
+    elapsed_ms: u64,
+    summary: &str,
+) {
+    // Expiry / presence checks against the panel's stored context.
+    let Some((response_url, received_at)) = store.http_delivery_context(task_id).await else {
+        println!(
+            "[wecom-http-card] monitor_result_delivery_failed task_id={} reason=no_response_url",
+            short_hash(task_id)
+        );
+        store.mark_delivery_failed(task_id, -1).await;
+        return;
+    };
+    let now = WecomCardStore::now_unix();
+    if now - received_at > RESPONSE_URL_TTL_SECS {
+        println!(
+            "[wecom-http-card] monitor_result_delivery_failed task_id={} reason=response_url_expired",
+            short_hash(task_id)
+        );
+        store.mark_delivery_failed(task_id, -2).await;
+        return;
+    }
+
+    let content = build_monitor_result_markdown(kind, duration_secs, elapsed_ms, summary);
+    println!(
+        "[wecom-http-card] monitor_result_delivery_requested task_id={} channel=response_url response_url_present=true response_url_hash={}",
+        short_hash(task_id),
+        response_url_hash(&response_url)
+    );
+
+    match crate::gateway::wecom_http_delivery::post_response_url_markdown(&response_url, &content)
+        .await
+    {
+        Ok(()) => {
+            store.mark_delivery_sent(task_id).await;
+            println!(
+                "[wecom-http-card] monitor_result_delivered=true task_id={}",
+                short_hash(task_id)
+            );
+        }
+        Err(error) => {
+            let code = match error.status {
+                Some(status) => status as i64,
+                None => -1,
+            };
+            store.mark_delivery_failed(task_id, code).await;
+            println!(
+                "[wecom-http-card] monitor_result_delivery_failed task_id={} reason={}",
+                short_hash(task_id),
+                error.kind
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event handling (template_card_event)
 // ---------------------------------------------------------------------------
+
+/// Monitor final-result delivery target (Phase 2A.3.3). The shared
+/// monitor core is transport-agnostic; only the DELIVERY step differs.
+pub enum MonitorDeliveryTarget {
+    /// Long connection: proactive `aibot_send_msg` via the outbound queue.
+    LongConnection { outbound_tx: mpsc::Sender<WecomOutboundMsg> },
+    /// HTTP callback: no verified proactive channel — the result is
+    /// stored (MonitorState + recent_jobs) and shown on the next card
+    /// interaction; delivery is explicitly deferred, never faked.
+    HttpCallback,
+}
+
+/// Transport-agnostic outcome of a card event (Phase 2A.3.3). The
+/// adapters render/send per their own transport; the shared core never
+/// touches transport wire types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CardEventOutcome {
+    /// Action executed; the adapter sends this updated card.
+    Updated {
+        task_id: String,
+        action: &'static str,
+        card: serde_json::Value,
+    },
+    /// Safe textual rejection (expired panel / unknown action).
+    Rejected { reply_text: String },
+    /// Consumed without a reply (malformed / duplicate / wrong transport).
+    Consumed,
+}
 
 /// Official routing discriminator: a callback is a template-card click
 /// ONLY when the frame is an event callback with
@@ -1252,25 +1553,20 @@ pub fn card_event_source(body: &WecomCallbackBody) -> &'static str {
     }
 }
 
-/// Handle a `template_card_event` callback (long connection).
+/// SHARED card-event core (Phase 2A.3.3): validate task_id → transport
+/// origin → TTL → dedup → allowlist → deterministic action → render.
+/// Returns a transport-agnostic [`CardEventOutcome`]; the WS and HTTP
+/// adapters render/send it over their own wire.
 ///
-/// validate task_id → TTL → dedup → allowlist → deterministic action →
-/// update the SAME card via the official `aibot_respond_update_msg`
-/// envelope (headers.req_id = the event frame's req_id; task_id
-/// preserved; dispatched immediately, well under the 5-second window —
-/// no LLM, no monitor wait). Card events NEVER dispatch the Agent.
-///
-/// APPLICATION-LEVEL ERROR ISOLATION (Phase 2A.3.1c): a malformed or
-/// stale card event is NOT a transport protocol error. Missing
-/// task_id/event_key, unknown/expired tasks, duplicates and unknown
-/// actions are logged and consumed (Ok) — they can never bubble up to
-/// the read loop as a connection-level `protocol` failure.
-pub async fn handle_card_event(
+/// APPLICATION-LEVEL ERROR ISOLATION: a malformed or stale card event
+/// is consumed (`Consumed`) or answered with a safe text
+/// (`Rejected`) — never an error, never the Agent.
+pub async fn handle_card_event_core(
     runtime: &Arc<GatewayRuntime>,
     body: &WecomCallbackBody,
-    req_id: &str,
-    outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
-) -> Result<(), String> {
+    transport: WecomCardTransport,
+    delivery: &MonitorDeliveryTarget,
+) -> CardEventOutcome {
     let event = body.event.as_ref();
 
     // Low-sensitive structural diagnostic so the next real E2E shows
@@ -1292,9 +1588,9 @@ pub async fn handle_card_event(
 
     // SINGLE normalization source: the whole card pipeline reads only
     // the normalized event (ONE_CARD_EVENT_SOURCE=true).
-    let Some(normalized) = normalize_template_card_event(body, req_id) else {
+    let Some(normalized) = normalize_template_card_event(body, "") else {
         println!("[wecom-card] event_rejected reason=not_template_card_event");
-        return Ok(());
+        return CardEventOutcome::Consumed;
     };
     println!(
         "[wecom-card] event_normalized source={} task_id_present={} event_key_present={} card_type_present={}",
@@ -1309,7 +1605,7 @@ pub async fn handle_card_event(
         Some(task_id) => task_id,
         None => {
             println!("[wecom-card] event_rejected reason=missing_task_id");
-            return Ok(());
+            return CardEventOutcome::Consumed;
         }
     };
     // Missing event_key: application-level rejection, never a protocol error.
@@ -1317,7 +1613,7 @@ pub async fn handle_card_event(
         Some(event_key) => event_key,
         None => {
             println!("[wecom-card] event_rejected reason=missing_event_key");
-            return Ok(());
+            return CardEventOutcome::Consumed;
         }
     };
 
@@ -1332,14 +1628,22 @@ pub async fn handle_card_event(
     // task_id validation + 30-min TTL.
     let Some(state) = store.lookup_valid(task_id).await else {
         println!("[wecom-card] card_expired task_id={}", short_hash(task_id));
-        let _ = outbound_tx
-            .send(WecomOutboundMsg::Reply {
-                req_id: req_id.to_string(),
-                text: PANEL_EXPIRED_TEXT.to_string(),
-            })
-            .await;
-        return Ok(());
+        return CardEventOutcome::Rejected {
+            reply_text: PANEL_EXPIRED_TEXT.to_string(),
+        };
     };
+
+    // Transport origin guard (P11): a panel created by one transport is
+    // never handled by the other's adapter.
+    if state.transport != transport {
+        println!(
+            "[wecom-card] card_transport_mismatch task_id={} panel_transport={:?} event_transport={:?}",
+            short_hash(task_id),
+            state.transport,
+            transport
+        );
+        return CardEventOutcome::Consumed;
+    }
 
     // Event retry dedup (per task_id + event msgid).
     if !store.dedup_event(task_id, &normalized.msg_id).await {
@@ -1347,7 +1651,7 @@ pub async fn handle_card_event(
             "[wecom-card] event_duplicate ignored=true task_id={}",
             short_hash(task_id)
         );
-        return Ok(());
+        return CardEventOutcome::Consumed;
     }
 
     // Allowlist: unknown action → safe prompt; never Agent/tools.
@@ -1356,13 +1660,9 @@ pub async fn handle_card_event(
             "[wecom-card] unknown_action rejected=true task_id={}",
             short_hash(task_id)
         );
-        let _ = outbound_tx
-            .send(WecomOutboundMsg::Reply {
-                req_id: req_id.to_string(),
-                text: UNKNOWN_ACTION_TEXT.to_string(),
-            })
-            .await;
-        return Ok(());
+        return CardEventOutcome::Rejected {
+            reply_text: UNKNOWN_ACTION_TEXT.to_string(),
+        };
     };
 
     println!(
@@ -1371,35 +1671,71 @@ pub async fn handle_card_event(
         short_hash(task_id)
     );
 
-    // Deterministic immediate update (no LLM / no long task): the card
-    // update is dispatched right here, within the 5-second window.
+    // Deterministic immediate update (no LLM / no long task).
     let context = CardActionContext {
         task_id: task_id.to_string(),
         session_key: state.session_key.clone(),
         action,
         target_chat_id: resolve_card_target(body),
     };
-    let result = WecomCardActionService::execute(runtime, store, outbound_tx, context).await;
+    let result = WecomCardActionService::execute(runtime, store, delivery, context).await;
     let card = build_panel_card_with_text(task_id, &result.content);
-    println!(
-        "[wecom-card] card_dispatch_requested task_id={} update=true",
-        short_hash(task_id)
-    );
-    store
-        .note_card_req_id(req_id, WecomCardReqKind::UpdateCard, Some(task_id))
-        .await;
-    if let Err(error) = outbound_tx
-        .send(WecomOutboundMsg::TemplateCardUpdate {
-            req_id: req_id.to_string(),
-            body: card,
-        })
+    CardEventOutcome::Updated {
+        task_id: task_id.to_string(),
+        action: action.key(),
+        card,
+    }
+}
+
+/// Long-connection card-event adapter: wraps the shared core and sends
+/// the outcome over the existing WS outbound queue
+/// (`aibot_respond_update_msg` for updates; safe text Reply for
+/// rejections). Behavior is unchanged from Phase 2A.3.1f.
+pub async fn handle_card_event(
+    runtime: &Arc<GatewayRuntime>,
+    body: &WecomCallbackBody,
+    req_id: &str,
+    outbound_tx: &mpsc::Sender<WecomOutboundMsg>,
+) -> Result<(), String> {
+    let delivery = MonitorDeliveryTarget::LongConnection {
+        outbound_tx: outbound_tx.clone(),
+    };
+    match handle_card_event_core(runtime, body, WecomCardTransport::LongConnection, &delivery)
         .await
     {
-        // Outbound queue loss is a transport concern of the writer loop;
-        // never a stream protocol error.
-        println!("[wecom-card] card_update_send_failed reason={error} isolated=true");
+        CardEventOutcome::Updated { task_id, card, .. } => {
+            println!(
+                "[wecom-card] card_dispatch_requested task_id={} update=true",
+                short_hash(&task_id)
+            );
+            let store = card_store();
+            store
+                .note_card_req_id(req_id, WecomCardReqKind::UpdateCard, Some(&task_id))
+                .await;
+            if let Err(error) = outbound_tx
+                .send(WecomOutboundMsg::TemplateCardUpdate {
+                    req_id: req_id.to_string(),
+                    body: card,
+                })
+                .await
+            {
+                // Outbound queue loss is a transport concern of the writer
+                // loop; never a stream protocol error.
+                println!("[wecom-card] card_update_send_failed reason={error} isolated=true");
+            }
+            Ok(())
+        }
+        CardEventOutcome::Rejected { reply_text } => {
+            let _ = outbound_tx
+                .send(WecomOutboundMsg::Reply {
+                    req_id: req_id.to_string(),
+                    text: reply_text,
+                })
+                .await;
+            Ok(())
+        }
+        CardEventOutcome::Consumed => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]

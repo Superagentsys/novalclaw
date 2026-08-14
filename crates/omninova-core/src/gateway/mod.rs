@@ -10,6 +10,8 @@ pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
 pub mod wecom_card;
+pub mod wecom_http_card;
+pub mod wecom_http_delivery;
 pub mod wecom_protocol;
 pub mod wecom_crypto;
 pub mod wecom_http;
@@ -4868,6 +4870,23 @@ async fn http_wecom_callback_post(
         parsed.body.response_url.is_some()
     );
 
+    // ---------------------------------------------------------------------
+    // Phase 2A.3.3: HTTP interactive card events. Shared card core,
+    // HTTP transport adapter. Never the Agent, never the WebSocket.
+    // ---------------------------------------------------------------------
+    if crate::gateway::wecom_card::is_template_card_event(&parsed.body) {
+        let runtime_arc = Arc::new(runtime.clone());
+        return crate::gateway::wecom_http_card::handle_http_card_event(
+            &runtime_arc,
+            &config,
+            &query,
+            &parsed.body,
+        )
+        .await
+        .map(Json)
+        .map_err(wecom_http_error_response);
+    }
+
     match wecom_http::classify_callback(&parsed.body) {
         // -----------------------------------------------------------------
         // Stream refresh: NOT user input — never dispatch Agent.
@@ -4950,6 +4969,17 @@ async fn http_wecom_callback_post(
         // Real user text message: stream state + async Agent + placeholder.
         // -----------------------------------------------------------------
         wecom_http::WecomHttpCallbackKind::UserText => {
+            // Phase 2A.3.3: HTTP panel trigger (menu/菜单/面板/...)
+            // short-circuits to an encrypted template_card — no Agent.
+            if let Some(card_response) = crate::gateway::wecom_http_card::panel_trigger_response(
+                &config,
+                &query,
+                &parsed,
+            )
+            .await
+            {
+                return Ok(Json(card_response));
+            }
             let chat_type = wecom_http::chat_type(&parsed.body);
             let store = runtime.wecom_http_stream_store();
             let (stream, created) = store
