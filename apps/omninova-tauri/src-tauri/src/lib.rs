@@ -3454,7 +3454,114 @@ struct TaskArtifactPreview {
     text_preview: Option<String>,
 }
 
-fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectedTaskArtifact {
+    path: String,
+    size: u64,
+    modified_at: u64,
+    extension: String,
+}
+
+fn should_skip_artifact_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git" | ".omninova" | "node_modules" | "target" | ".cache" | ".idea" | ".vscode"
+    )
+}
+
+fn collect_recent_workspace_files(
+    root: &Path,
+    current: &Path,
+    cutoff_ms: u64,
+    depth: usize,
+    visited: &mut usize,
+    output: &mut Vec<CollectedTaskArtifact>,
+) -> Result<(), String> {
+    const MAX_DEPTH: usize = 12;
+    const MAX_VISITED: usize = 20_000;
+    const MAX_RESULTS: usize = 1_000;
+    if depth > MAX_DEPTH || *visited >= MAX_VISITED || output.len() >= MAX_RESULTS {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(current)
+        .map_err(|error| format!("无法扫描 {}：{error}", current.display()))?;
+    for entry in entries {
+        if *visited >= MAX_VISITED || output.len() >= MAX_RESULTS {
+            break;
+        }
+        *visited += 1;
+        let entry = match entry {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !should_skip_artifact_dir(&name) {
+                let _ = collect_recent_workspace_files(root, &path, cutoff_ms, depth + 1, visited, output);
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or(0);
+        if modified_at < cutoff_ms {
+            continue;
+        }
+        let relative = match path.strip_prefix(root) {
+            Ok(value) => value.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        output.push(CollectedTaskArtifact {
+            extension: artifact_extension(&path),
+            path: relative,
+            size: metadata.len(),
+            modified_at,
+        });
+    }
+    Ok(())
+}
+
+/// 扫描任务开始后在 Workspace 内实际生成/更新的文件，补足后端未发送 file_changed 的场景。
+#[tauri::command]
+fn collect_task_artifacts(
+    workspace_path: String,
+    started_at: u64,
+) -> Result<Vec<CollectedTaskArtifact>, String> {
+    let root = expand_tilde_path(workspace_path.trim())
+        .canonicalize()
+        .map_err(|error| format!("Workspace 无法访问：{error}"))?;
+    if !root.is_dir() {
+        return Err("Workspace 不是目录。".to_string());
+    }
+    let cutoff_ms = started_at.saturating_sub(2_000);
+    let mut output = Vec::new();
+    let mut visited = 0;
+    collect_recent_workspace_files(&root, &root, cutoff_ms, 0, &mut visited, &mut output)?;
+    output.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    output.truncate(200);
+    Ok(output)
+}
+
+fn resolve_task_workspace_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
     let requested = expand_tilde_path(path.trim());
     let joined = if requested.is_absolute() {
         requested
@@ -3467,10 +3574,6 @@ fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Resul
     let canonical = joined
         .canonicalize()
         .map_err(|error| format!("文件不存在或无法访问：{}（{error}）", joined.display()))?;
-    if !canonical.is_file() {
-        return Err(format!("该路径不是文件：{}", canonical.display()));
-    }
-
     if let Some(workspace) = workspace_path.filter(|value| !value.trim().is_empty()) {
         let workspace = expand_tilde_path(workspace)
             .canonicalize()
@@ -3478,6 +3581,14 @@ fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Resul
         if !canonical.starts_with(&workspace) {
             return Err("为保护本机文件，任务检查器只能读取当前任务 Workspace 内的文件。".to_string());
         }
+    }
+    Ok(canonical)
+}
+
+fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
+    let canonical = resolve_task_workspace_path(path, workspace_path)?;
+    if !canonical.is_file() {
+        return Err(format!("该路径不是文件：{}", canonical.display()));
     }
     Ok(canonical)
 }
@@ -3560,7 +3671,7 @@ fn open_task_artifact(
     workspace_path: Option<String>,
     reveal: Option<bool>,
 ) -> Result<(), String> {
-    let resolved = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
+    let resolved = resolve_task_workspace_path(&path, workspace_path.as_deref())?;
     let reveal = reveal.unwrap_or(false);
 
     if !reveal {
@@ -3574,7 +3685,11 @@ fn open_task_artifact(
     #[cfg(target_os = "windows")]
     {
         let mut command = StdCommand::new("explorer.exe");
-        command.arg(format!("/select,{}", resolved.display()));
+        if resolved.is_dir() {
+            command.arg(&resolved);
+        } else {
+            command.arg(format!("/select,{}", resolved.display()));
+        }
         hide_std_command_window(&mut command);
         command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
     }
@@ -3586,7 +3701,11 @@ fn open_task_artifact(
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = resolved.parent().unwrap_or(&resolved);
+        let target = if resolved.is_dir() {
+            resolved.as_path()
+        } else {
+            resolved.parent().unwrap_or(&resolved)
+        };
         StdCommand::new("xdg-open")
             .arg(target)
             .spawn()
@@ -3818,7 +3937,9 @@ pub fn run() {
             skillhub_rollback_skill,
             task_artifact_preview,
             open_task_artifact,
+            collect_task_artifacts,
             composer_attachments::read_composer_attachments,
+            composer_attachments::prepare_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
             restart_gateway,
             test_gateway_health,

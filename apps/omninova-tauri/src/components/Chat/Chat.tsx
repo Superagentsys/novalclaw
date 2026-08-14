@@ -1,5 +1,4 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
-import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
 import { listenAgentRunEvents } from "../../utils/events";
@@ -7,7 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   isTauriEnvironment,
   pickComposerAttachmentPaths,
-  readComposerAttachmentsFromPaths,
+  prepareComposerAttachments,
 } from "../../utils/composerAttachments";
 import {
   areStoredMessagesEqual,
@@ -35,6 +34,7 @@ import {
   type TaskActivityEntry,
   type TaskHistoryEntry,
   type TaskStatus,
+  type TaskChangedFile,
 } from "../../utils/taskHistory";
 import type {
   AgentPersonaConfig,
@@ -86,6 +86,9 @@ const CHAT_ATTACHMENT_INPUT_ID = "chat-composer-file-input";
 const DROP_FILES_MAX_COUNT = 16;
 /** 会话级临时 Workspace 的持久化 key（bug#3：工作空间记忆） */
 const SESSION_WORKSPACE_STORAGE_KEY = "omninova.chat.sessionWorkspaces.v1";
+const COMPOSER_HEIGHT_STORAGE_KEY = "omninova.chat.composerHeight.v1";
+const COMPOSER_MIN_HEIGHT = 54;
+const COMPOSER_MAX_HEIGHT = 240;
 
 const TEXT_FILE_EXTENSIONS = new Set([
   "txt",
@@ -204,6 +207,10 @@ interface ComposerAttachment {
   content: string;
   /** 芯片上的补充说明，如大小或读取失败原因 */
   note?: string;
+  /** Tauri 原生拖放/选择得到的绝对路径；发送前才挂载进当前 Workspace。 */
+  sourcePath?: string;
+  /** 发送前挂载完成后使用的 Workspace 相对路径。 */
+  mountedPath?: string;
 }
 
 let composerAttachmentSeq = 0;
@@ -325,6 +332,13 @@ interface ChatProps {
   onOpenSettings?: (target: "providers" | "general" | "channels" | "skills" | "persona") => void;
 }
 
+interface CollectedTaskArtifact {
+  path: string;
+  size: number;
+  modifiedAt: number;
+  extension: string;
+}
+
 export function Chat({
   initialSidebarTab = "avatars",
   isActive = true,
@@ -337,6 +351,7 @@ export function Chat({
   const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>(() =>
     loadTaskHistory()
   );
+  const taskHistoryRef = useRef<TaskHistoryEntry[]>(taskHistory);
   const [selectedTaskRunId, setSelectedTaskRunId] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("process");
@@ -383,6 +398,12 @@ export function Chat({
   const insertedReplyRunIdsRef = useRef<Set<string>>(new Set());
   const runsRef = useRef(runs);
   const [composerDragActive, setComposerDragActive] = useState(false);
+  const [composerInputHeight, setComposerInputHeight] = useState(() => {
+    const stored = Number(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
+    return Number.isFinite(stored)
+      ? Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, stored))
+      : COMPOSER_MIN_HEIGHT;
+  });
   const [desktopVisionMaster, setDesktopVisionMaster] = useState(false);
   const [desktopVisionOn, setDesktopVisionOn] = useState(false);
   const [desktopVisionMaxPx, setDesktopVisionMaxPx] = useState(1280);
@@ -571,14 +592,6 @@ export function Chat({
       setInputs((prev) => ({ ...prev, [activeAvatarId]: value })),
     [activeAvatarId]
   );
-  const appendActiveInput = useCallback(
-    (updater: (prev: string) => string) =>
-      setInputs((prev) => ({
-        ...prev,
-        [activeAvatarId]: updater(prev[activeAvatarId] ?? ""),
-      })),
-    [activeAvatarId]
-  );
 
   useEffect(() => {
     setSidebarTab(initialSidebarTab);
@@ -659,11 +672,57 @@ export function Chat({
 
   useEffect(() => {
     saveTaskHistory(taskHistory);
+    taskHistoryRef.current = taskHistory;
   }, [taskHistory]);
+
+  const refreshTaskArtifacts = useCallback(async (runId: string) => {
+    const target = taskHistoryRef.current.find((task) => task.runId === runId);
+    if (!target?.workspacePath) return;
+    try {
+      const detected = await invokeTauri<CollectedTaskArtifact[]>("collect_task_artifacts", {
+        workspacePath: target.workspacePath,
+        startedAt: target.startedAt,
+      });
+      if (!detected.length) return;
+      setTaskHistory((prev) => {
+        const latest = prev.find((task) => task.runId === runId);
+        if (!latest) return prev;
+        const byPath = new Map<string, TaskChangedFile>();
+        for (const file of latest.changedFiles ?? []) {
+          byPath.set(file.path.replace(/\\/g, "/"), file);
+        }
+        for (const artifact of detected) {
+          const key = artifact.path.replace(/\\/g, "/");
+          const existing = byPath.get(key);
+          byPath.set(key, {
+            path: key,
+            additions: existing?.additions ?? 0,
+            deletions: existing?.deletions ?? 0,
+            changeType: existing?.changeType ?? "modified",
+            size: artifact.size,
+            modifiedAt: artifact.modifiedAt,
+            source: existing?.source ?? "scan",
+          });
+        }
+        const changedFiles = [...byPath.values()]
+          .sort((left, right) => (right.modifiedAt ?? 0) - (left.modifiedAt ?? 0))
+          .slice(0, 200);
+        return patchTask(prev, runId, { changedFiles });
+      });
+    } catch (reason) {
+      if (import.meta.env.DEV) {
+        console.debug("[collect_task_artifacts]", reason);
+      }
+    }
+  }, []);
 
   // 记录一次新任务（发送消息即视为一次任务）。
   const recordTaskStart = useCallback((entry: TaskHistoryEntry) => {
-    setTaskHistory((prev) => addTask(prev, entry));
+    setTaskHistory((prev) => {
+      const next = addTask(prev, entry);
+      taskHistoryRef.current = next;
+      return next;
+    });
     setSelectedTaskRunId(entry.runId);
   }, []);
 
@@ -1021,6 +1080,7 @@ export function Chat({
                 typeof rawPayload.change_type === "string"
                   ? rawPayload.change_type as NonNullable<TaskHistoryEntry["changedFiles"]>[number]["changeType"]
                   : undefined,
+              source: "event" as const,
             };
             const changedFiles = [
               ...existing.filter((file) => file.path !== path),
@@ -1137,6 +1197,7 @@ export function Chat({
           }
           appendTaskActivity(runId, "任务已完成", "success");
           finalizeTask(runId, "completed", finalReply);
+          void refreshTaskArtifacts(runId);
         }
         if (import.meta.env.DEV) {
           console.log("[finishRun] run_id=" + runId);
@@ -1151,6 +1212,7 @@ export function Chat({
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
           appendTaskActivity(runId, "任务已取消", "warning");
           finalizeTask(runId, "cancelled");
+          void refreshTaskArtifacts(runId);
         }
         finishRun(runId);
         return;
@@ -1165,6 +1227,7 @@ export function Chat({
         }
         appendTaskActivity(runId, `任务失败：${rawError}`, "error");
         finalizeTask(runId, "failed", rawError);
+        void refreshTaskArtifacts(runId);
       }
       finishRun(runId);
     }).then((fn) => {
@@ -1186,6 +1249,7 @@ export function Chat({
     finishRun,
     finalizeTask,
     patchTaskProgress,
+    refreshTaskArtifacts,
   ]);
 
   const refreshGatewayStatus = async () => {
@@ -1368,15 +1432,7 @@ export function Chat({
     const targetSessionId = sessionId;
     const text = input.trim();
     // bug#1/#2：附件在发送时才拼接进正文；聊天气泡只显示简洁的附件名。
-    const pendingAttachments = attachmentsBySession[avatarId] ?? [];
-    const attachmentBlock = pendingAttachments
-      .map((a) => a.content.trim())
-      .filter(Boolean)
-      .join("\n\n");
-    const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
-    const displayText = pendingAttachments.length
-      ? `${text ? `${text}\n\n` : ""}附件：${pendingAttachments.map((a) => a.name).join("、")}`
-      : text;
+    let pendingAttachments = attachmentsBySession[avatarId] ?? [];
     const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
     if (active && terminalRunIdsRef.current.has(active)) {
       finishRun(active);
@@ -1384,7 +1440,7 @@ export function Chat({
       setError("当前 Agent 仍在执行，请等待完成或取消。");
       return;
     }
-    if (!outgoingText) return;
+    if (!text && pendingAttachments.length === 0) return;
     // Generate a run_id for real-time event correlation.
     const runId = crypto.randomUUID();
     runAvatarIdsRef.current[runId] = avatarId;
@@ -1396,6 +1452,51 @@ export function Chat({
       setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
       return;
     }
+
+    const pathAttachments = pendingAttachments.filter(
+      (attachment): attachment is ComposerAttachment & { sourcePath: string } =>
+        Boolean(attachment.sourcePath)
+    );
+    if (pathAttachments.length) {
+      if (!activeWorkspaceDir) {
+        setError("拖入的本地文件需要先选择 Workspace。文件不会被移除，选择后可直接重新发送。");
+        return;
+      }
+      try {
+        const prepared = await prepareComposerAttachments(
+          pathAttachments.map((attachment) => attachment.sourcePath),
+          activeWorkspaceDir,
+          targetSessionId,
+        );
+        let preparedIndex = 0;
+        pendingAttachments = pendingAttachments.map((attachment) => {
+          if (!attachment.sourcePath) return attachment;
+          const mounted = prepared[preparedIndex];
+          preparedIndex += 1;
+          if (!mounted) return attachment;
+          return {
+            ...attachment,
+            kind: mounted.kind === "image" ? "image" : mounted.kind === "text" ? "text" : "other",
+            content: mounted.content,
+            note: mounted.note,
+            mountedPath: mounted.workspaceRelativePath,
+          };
+        });
+        setAttachmentsBySession((prev) => ({ ...prev, [avatarId]: pendingAttachments }));
+      } catch (reason) {
+        setError(`附件挂载失败：${reason instanceof Error ? reason.message : String(reason)}`);
+        return;
+      }
+    }
+
+    const attachmentBlock = pendingAttachments
+      .map((attachment) => attachment.content.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
+    const displayText = pendingAttachments.length
+      ? `${text ? `${text}\n\n` : ""}附件：${pendingAttachments.map((attachment) => attachment.name).join("、")}`
+      : text;
 
     // 本地维护该会话的步骤列表，避免依赖共享状态。
     let localSteps: ExecutionStep[] = [
@@ -1467,7 +1568,17 @@ export function Chat({
         tone: "info",
         kind: "lifecycle",
         status: "waiting",
-      }],
+      }, ...pendingAttachments
+        .filter((attachment) => attachment.mountedPath)
+        .map((attachment) => ({
+          at: Date.now(),
+          label: `输入附件已挂载：${attachment.name}`,
+          tone: "success" as const,
+          kind: "file" as const,
+          status: "completed" as const,
+          path: attachment.mountedPath,
+          detail: attachment.note,
+        }))],
     });
 
     elapsedTimersRef.current[avatarId] = setInterval(() => {
@@ -1616,11 +1727,54 @@ export function Chat({
     }
   };
 
-  const appendVoiceTranscript = useCallback(
-    (text: string) => {
-      appendActiveInput((prev) => (prev.trim() ? `${prev} ${text}` : text));
+  const updateComposerHeight = useCallback((height: number) => {
+    const next = Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, height));
+    setComposerInputHeight(next);
+    localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, String(next));
+  }, []);
+
+  const handleComposerResizePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const startY = event.clientY;
+      const startHeight = composerInputHeight;
+      const pointerId = event.pointerId;
+      event.currentTarget.setPointerCapture(pointerId);
+
+      const handlePointerMove = (moveEvent: PointerEvent) => {
+        // 输入区固定在窗口底部，向上拖动表示增加高度。
+        updateComposerHeight(startHeight + startY - moveEvent.clientY);
+      };
+      const handlePointerEnd = () => {
+        window.removeEventListener("pointermove", handlePointerMove);
+        window.removeEventListener("pointerup", handlePointerEnd);
+        window.removeEventListener("pointercancel", handlePointerEnd);
+      };
+
+      window.addEventListener("pointermove", handlePointerMove);
+      window.addEventListener("pointerup", handlePointerEnd, { once: true });
+      window.addEventListener("pointercancel", handlePointerEnd, { once: true });
     },
-    [appendActiveInput]
+    [composerInputHeight, updateComposerHeight]
+  );
+
+  const handleComposerResizeKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        updateComposerHeight(composerInputHeight + 16);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        updateComposerHeight(composerInputHeight - 16);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        updateComposerHeight(COMPOSER_MIN_HEIGHT);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        updateComposerHeight(COMPOSER_MAX_HEIGHT);
+      }
+    },
+    [composerInputHeight, updateComposerHeight]
   );
 
   const addAttachments = useCallback(
@@ -1644,37 +1798,26 @@ export function Chat({
     [activeAvatarId]
   );
 
-  /** Tauri 桌面：按路径逐个读取，生成附件芯片（bug#1） */
+  /** Tauri 桌面：先保留原始路径；发送时再挂载到当时生效的 Workspace。 */
   const mergePathsIntoInput = useCallback(
     async (paths: string[]) => {
       const limited = paths.slice(0, DROP_FILES_MAX_COUNT);
-      const items: ComposerAttachment[] = [];
-      for (const path of limited) {
+      const items: ComposerAttachment[] = limited.map((path) => {
         const name = workspaceBasename(path);
-        try {
-          const content = await readComposerAttachmentsFromPaths([path]);
-          if (!content.trim()) continue;
-          const ext = fileExtensionLower(name);
-          const isImage = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(ext);
-          items.push({
-            id: nextAttachmentId(),
-            name,
-            kind: isImage ? "image" : TEXT_FILE_EXTENSIONS.has(ext) ? "text" : "other",
-            content: content.trim(),
-          });
-        } catch (err) {
-          items.push({
-            id: nextAttachmentId(),
-            name,
-            kind: "other",
-            content: `[附件读取失败: ${name}]`,
-            note: err instanceof Error ? err.message : "读取失败",
-          });
-        }
-      }
+        const ext = fileExtensionLower(name);
+        const isImage = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(ext);
+        return {
+          id: nextAttachmentId(),
+          name,
+          kind: isImage ? "image" : TEXT_FILE_EXTENSIONS.has(ext) ? "text" : "other",
+          content: "",
+          note: activeWorkspaceDir ? "发送时挂载到当前 Workspace" : "请先选择 Workspace",
+          sourcePath: path,
+        };
+      });
       addAttachments(items);
     },
-    [addAttachments]
+    [activeWorkspaceDir, addAttachments]
   );
 
   /** 浏览器预览等非 Tauri 环境：用 File API 读取 */
@@ -1907,13 +2050,6 @@ export function Chat({
     [mergeDroppedIntoInput]
   );
 
-  const statusText =
-    gatewayStatus === "connected"
-      ? "gateway 已连接"
-      : gatewayStatus === "connecting"
-      ? "gateway 正在恢复"
-      : "gateway 未连接";
-
   const gatewayPort = (() => {
     try {
       const u = new URL(gatewayUrl || "http://127.0.0.1:10809");
@@ -2098,54 +2234,6 @@ export function Chat({
 
         <main className="chat-main">
           <div className="chat-main-toolbar">
-            {/* bug#9：工作区路径常驻显示，避免多项目混淆 */}
-            <button
-              type="button"
-              className={`chat-toolbar-workspace${activeWorkspaceDir ? "" : " chat-toolbar-workspace--empty"}`}
-              title={
-                activeWorkspaceDir
-                  ? `${workspaceLabel} Workspace：${activeWorkspaceDir}（点击可更换）`
-                  : "尚未选择 Workspace，点击选择"
-              }
-              onClick={(e) => void handleChooseWorkspace(e)}
-              disabled={sending}
-            >
-              <UiIcon name="folder" size={15} />
-              <span className="chat-toolbar-workspace-path">
-                {activeWorkspaceDir ? `${workspaceLabel} · ${workspaceSummary}` : "未选择 Workspace"}
-              </span>
-            </button>
-            <div className="chat-toolbar-model">
-              <ModelPicker
-                value={selectedModel}
-                onChange={setSelectedModel}
-                providers={availableProviders}
-                defaultProvider={defaultProviderId}
-                defaultModel={defaultModelId}
-                maxMode={maxMode}
-                onMaxModeChange={setMaxMode}
-                onConfigureCustom={() => onOpenSettings?.("providers")}
-                disabled={sending}
-              />
-            </div>
-            {!modelReady ? (
-              <button
-                type="button"
-                className="chat-toolbar-config-action"
-                onClick={() => onOpenSettings?.("providers")}
-              >
-                检查模型配置
-              </button>
-            ) : null}
-            <div className={`chat-toolbar-gateway chat-toolbar-gateway--${gatewayStatus}`}>
-              <span className={`chat-gateway-dot chat-gateway-dot--${gatewayStatus}`} aria-hidden />
-              <span>{gatewayStatus === "connected" ? "网关在线" : gatewayStatus === "connecting" ? "网关检查中" : "网关离线"}</span>
-              {gatewayStatus === "disconnected" ? (
-                <button type="button" onClick={() => void handleStartGateway()} disabled={gatewayStarting}>
-                  {gatewayStarting ? "启动中…" : "启动网关"}
-                </button>
-              ) : null}
-            </div>
             <div className="chat-main-toolbar-spacer" />
             <div className="chat-target-pill">
               <span className="chat-target-pill-icon" aria-hidden>
@@ -2335,74 +2423,6 @@ export function Chat({
           )}
 
           <div className="chat-composer-wrap">
-            <ChatMediaInteraction
-              appendTranscript={appendVoiceTranscript}
-              disabled={sending || gatewayStatus !== "connected"}
-              trailingActions={
-                <div
-                  ref={workspaceMenuRef}
-                  className={`chat-workspace-actions${
-                    sessionWorkspaceDir ? " chat-workspace-actions--temporary" : ""
-                  }`}
-                >
-                  <button
-                    type="button"
-                    className="chat-workspace-pill"
-                    title={
-                      activeWorkspaceDir
-                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}\n普通点击 = 重新选择临时 Workspace；Shift+点击 = 保存到该 Agent；右键 = 更多操作`
-                        : "选择 Workspace（普通点击 = 当前会话临时 Workspace；Shift+点击 = 保存到该 Agent）"
-                    }
-                    aria-label={
-                      activeWorkspaceDir
-                        ? `${workspaceLabel} Workspace：${activeWorkspaceDir}`
-                        : "选择 Workspace"
-                    }
-                    onClick={(e) => void handleChooseWorkspace(e)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      if (!sending) setWorkspaceMenuOpen((open) => !open);
-                    }}
-                    disabled={sending}
-                  >
-                    <UiIcon name="folder" size={15} />
-                    {activeWorkspaceDir ? (
-                      <span className="chat-workspace-pill-scope">{workspaceLabel}</span>
-                    ) : null}
-                    <span className="chat-workspace-pill-path">{workspaceSummary}</span>
-                  </button>
-                  {workspaceMenuOpen ? (
-                    <div className="chat-workspace-menu" role="menu">
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={(e) => void handleChooseWorkspace(e)}
-                      >
-                        重新选择 Workspace
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => void handleOpenWorkspace()}
-                        disabled={!activeWorkspaceDir}
-                      >
-                        打开当前 Workspace 文件夹
-                      </button>
-                      {sessionWorkspaceDir ? (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={handleClearSessionWorkspace}
-                        >
-                          清除当前会话临时 Workspace
-                        </button>
-                      ) : null}
-                    </div>
-                  ) : null}
-                </div>
-              }
-            />
-
             <input
               id={CHAT_ATTACHMENT_INPUT_ID}
               type="file"
@@ -2412,141 +2432,240 @@ export function Chat({
               aria-label="选择附件文件"
               onChange={handleAttachFilesChange}
             />
-
-            {attachments.length ? (
-              <div className="chat-attachment-chips" aria-label="待发送附件">
-                {attachments.map((a) => (
-                  <span
-                    key={a.id}
-                    className={`chat-attachment-chip chat-attachment-chip--${a.kind}`}
-                    title={a.note ? `${a.name}（${a.note}）` : a.name}
-                  >
-                    <UiIcon
-                      name={a.kind === "image" ? "fileImage" : a.kind === "text" ? "fileText" : "file"}
-                      size={14}
-                    />
-                    <span className="chat-attachment-chip-name">{a.name}</span>
-                    {a.note ? (
-                      <span className="chat-attachment-chip-note">{a.note}</span>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="chat-attachment-chip-remove"
-                      aria-label={`移除附件 ${a.name}`}
-                      onClick={() => removeAttachment(a.id)}
-                      disabled={sending}
-                    >
-                      <UiIcon name="close" size={11} />
-                    </button>
-                  </span>
-                ))}
+            <div className="chat-composer-card">
+              <div
+                className="chat-composer-resize-handle"
+                role="separator"
+                aria-label="调整消息输入框高度"
+                aria-orientation="horizontal"
+                aria-valuemin={COMPOSER_MIN_HEIGHT}
+                aria-valuemax={COMPOSER_MAX_HEIGHT}
+                aria-valuenow={composerInputHeight}
+                tabIndex={0}
+                title="向上或向下拖动调整输入框高度；也可使用方向键"
+                onPointerDown={handleComposerResizePointerDown}
+                onKeyDown={handleComposerResizeKeyDown}
+              >
+                <span aria-hidden />
               </div>
-            ) : null}
-            <div
-              className={`chat-input-row${composerDragActive ? " chat-input-row--drag-over" : ""}`}
-              onDragEnter={handleComposerDragEnter}
-              onDragLeave={handleComposerDragLeave}
-              onDragOver={handleComposerDragOverFiles}
-              onDrop={handleComposerDropFiles}
-              aria-label="消息输入区域：可将文件拖入白色输入栏或点击下方曲别针添加附件"
-            >
-              {sending ? (
-                <span className="chat-attach-btn chat-attach-btn--disabled" title="发送中暂不可添加附件">
-                  <UiIcon name="paperclip" size={17} />
-                </span>
-              ) : isTauriEnvironment() ? (
-                <button
-                  type="button"
-                  className="chat-attach-btn"
-                  title="添加附件（系统文件对话框；亦可拖入输入框）"
-                  aria-label="添加附件"
-                  onClick={() => void handleAttachTauri()}
-                >
-                  <UiIcon name="paperclip" size={17} />
-                </button>
-              ) : (
-                <label
-                  htmlFor={CHAT_ATTACHMENT_INPUT_ID}
-                  className="chat-attach-btn"
-                  title="添加附件（点击选择文件；亦可拖入输入框）"
-                >
-                  <UiIcon name="paperclip" size={17} />
-                </label>
-              )}
-              <textarea
-                ref={composerInputRef}
-                className="chat-input"
-                value={input}
-                onChange={(e) => setActiveInput(e.target.value)}
-                onKeyDown={handleKeyDown}
+              {attachments.length ? (
+                <div className="chat-attachment-chips" aria-label="待发送附件">
+                  {attachments.map((a) => (
+                    <span
+                      key={a.id}
+                      className={`chat-attachment-chip chat-attachment-chip--${a.kind}`}
+                      title={a.note ? `${a.name}（${a.note}）${a.mountedPath ? `\n${a.mountedPath}` : ""}` : a.name}
+                    >
+                      <UiIcon
+                        name={a.kind === "image" ? "fileImage" : a.kind === "text" ? "fileText" : "file"}
+                        size={14}
+                      />
+                      <span className="chat-attachment-chip-name">{a.name}</span>
+                      {a.note ? <span className="chat-attachment-chip-note">{a.note}</span> : null}
+                      {a.mountedPath ? <span className="chat-attachment-chip-path">{a.mountedPath}</span> : null}
+                      <button
+                        type="button"
+                        className="chat-attachment-chip-remove"
+                        aria-label={`移除附件 ${a.name}`}
+                        onClick={() => removeAttachment(a.id)}
+                        disabled={sending}
+                      >
+                        <UiIcon name="close" size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+
+              <div
+                className={`chat-input-row${composerDragActive ? " chat-input-row--drag-over" : ""}`}
+                onDragEnter={handleComposerDragEnter}
+                onDragLeave={handleComposerDragLeave}
                 onDragOver={handleComposerDragOverFiles}
                 onDrop={handleComposerDropFiles}
-                onPaste={handleComposerPaste}
-                placeholder={
-                  gatewayStatus === "connected"
-                    ? "输入消息，Enter 发送…（支持拖入/粘贴文件）"
-                    : "网关未连接…（仍可拖入文件编辑草稿）"
-                }
-                rows={3}
-                disabled={gatewayStatus !== "connected"}
-              />
-              {sending ? (
-                <button
-                  type="button"
-                  className="chat-cancel-button"
-                  onClick={handleCancel}
-                >
-                  取消
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="chat-send-fab"
-                  onClick={() => void handleSend()}
-                  disabled={
-                    (!input.trim() && attachments.length === 0) ||
-                    gatewayStatus !== "connected"
-                  }
-                  aria-label="发送"
-                >
-                  <UiIcon name="send" size={17} />
-                </button>
-              )}
-            </div>
-            <div className="chat-composer-meta">
-              <label
-                className={`chat-vision-toggle${desktopVisionMaster ? "" : " chat-vision-toggle--disabled"}`}
-                title={
-                  desktopVisionMaster
-                    ? "发送时截取主屏幕并传给支持视觉的多模态模型"
-                    : "请先在 设置 → 通用 中开启「桌面视觉监控」"
-                }
+                aria-label="消息输入区域：可拖动输入框右下角调整高度，也可拖入或粘贴文件"
               >
-                <input
-                  type="checkbox"
-                  checked={desktopVisionOn && desktopVisionMaster}
-                  disabled={!desktopVisionMaster || sending || gatewayStatus !== "connected"}
-                  onChange={() => {
-                    if (!desktopVisionMaster) return;
-                    setDesktopVisionOn((prev) => {
-                      const next = !prev;
-                      localStorage.setItem(DESKTOP_VISION_SESSION_KEY, next ? "1" : "0");
-                      return next;
-                    });
-                  }}
+                <textarea
+                  ref={composerInputRef}
+                  className="chat-input"
+                  value={input}
+                  onChange={(e) => setActiveInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  onDragOver={handleComposerDragOverFiles}
+                  onDrop={handleComposerDropFiles}
+                  onPaste={handleComposerPaste}
+                  placeholder={
+                    gatewayStatus === "connected"
+                      ? "输入消息，Enter 发送…（支持拖入/粘贴文件）"
+                      : "网关未连接…（仍可拖入文件编辑草稿）"
+                  }
+                  rows={2}
+                  style={{ height: `${composerInputHeight}px` }}
+                  disabled={gatewayStatus !== "connected"}
                 />
-                <span>桌面视觉</span>
-              </label>
-            </div>
-            <div className="chat-gateway-footer">
-              <span
-                className={`chat-gateway-dot chat-gateway-dot--${gatewayStatus}`}
-                aria-hidden
-              />
-              <span className="chat-gateway-footer-text">
-                {statusText} · port: {gatewayPort}
-                {gatewayUrl ? ` · ${gatewayUrl}` : ""}
-              </span>
+                {sending ? (
+                  <button type="button" className="chat-cancel-button" onClick={handleCancel}>
+                    取消
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="chat-send-fab"
+                    onClick={() => void handleSend()}
+                    disabled={(!input.trim() && attachments.length === 0) || gatewayStatus !== "connected"}
+                    aria-label="发送"
+                  >
+                    <UiIcon name="send" size={17} />
+                  </button>
+                )}
+              </div>
+
+              <div className="chat-composer-toolbar" aria-label="任务输入设置">
+                <div className="chat-composer-tools-left">
+                  {sending ? (
+                    <span className="chat-attach-btn chat-attach-btn--disabled" title="发送中暂不可添加附件">
+                      <UiIcon name="paperclip" size={16} />
+                    </span>
+                  ) : isTauriEnvironment() ? (
+                    <button
+                      type="button"
+                      className="chat-attach-btn"
+                      title="添加附件（也可直接拖入输入框）"
+                      aria-label="添加附件"
+                      onClick={() => void handleAttachTauri()}
+                    >
+                      <UiIcon name="paperclip" size={16} />
+                    </button>
+                  ) : (
+                    <label htmlFor={CHAT_ATTACHMENT_INPUT_ID} className="chat-attach-btn" title="添加附件">
+                      <UiIcon name="paperclip" size={16} />
+                    </label>
+                  )}
+                  <label
+                    className={`chat-vision-toggle${desktopVisionMaster ? "" : " chat-vision-toggle--disabled"}`}
+                    title={
+                      desktopVisionMaster
+                        ? "发送时截取主屏幕并传给支持视觉的多模态模型"
+                        : "请先在 设置 → 通用 中开启桌面视觉监控"
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={desktopVisionOn && desktopVisionMaster}
+                      disabled={!desktopVisionMaster || sending || gatewayStatus !== "connected"}
+                      onChange={() => {
+                        if (!desktopVisionMaster) return;
+                        setDesktopVisionOn((prev) => {
+                          const next = !prev;
+                          localStorage.setItem(DESKTOP_VISION_SESSION_KEY, next ? "1" : "0");
+                          return next;
+                        });
+                      }}
+                    />
+                    <span>桌面视觉</span>
+                  </label>
+                </div>
+
+                <div className="chat-composer-tools-center">
+                  <div className="chat-composer-model-shell">
+                    <ModelPicker
+                      value={selectedModel}
+                      onChange={setSelectedModel}
+                      providers={availableProviders}
+                      defaultProvider={defaultProviderId}
+                      defaultModel={defaultModelId}
+                      maxMode={maxMode}
+                      onMaxModeChange={setMaxMode}
+                      onConfigureCustom={() => onOpenSettings?.("providers")}
+                      disabled={sending}
+                      variant="inline"
+                    />
+                  </div>
+                  {!modelReady ? (
+                    <button
+                      type="button"
+                      className="chat-composer-permission chat-composer-config-action"
+                      onClick={() => onOpenSettings?.("providers")}
+                    >
+                      配置模型
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="chat-composer-permission"
+                    title="工具授权规则由本地安全设置统一管理"
+                    onClick={() => onOpenSettings?.("general")}
+                  >
+                    <UiIcon name="safety" size={14} />
+                    <span>默认权限</span>
+                  </button>
+                  <div
+                    ref={workspaceMenuRef}
+                    className={`chat-workspace-actions${sessionWorkspaceDir ? " chat-workspace-actions--temporary" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      className="chat-workspace-pill"
+                      title={
+                        activeWorkspaceDir
+                          ? `${workspaceLabel} Workspace：${activeWorkspaceDir}\n点击重新选择；右键查看更多操作`
+                          : "选择当前任务使用的 Workspace"
+                      }
+                      aria-label={activeWorkspaceDir ? `${workspaceLabel} Workspace：${activeWorkspaceDir}` : "选择 Workspace"}
+                      onClick={(e) => void handleChooseWorkspace(e)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        if (!sending) setWorkspaceMenuOpen((open) => !open);
+                      }}
+                      disabled={sending}
+                    >
+                      <UiIcon name="folder" size={15} />
+                      {activeWorkspaceDir ? <span className="chat-workspace-pill-scope">{workspaceLabel}</span> : null}
+                      <span className="chat-workspace-pill-path">{workspaceSummary}</span>
+                    </button>
+                    {workspaceMenuOpen ? (
+                      <div className="chat-workspace-menu" role="menu">
+                        <button type="button" role="menuitem" onClick={(e) => void handleChooseWorkspace(e)}>
+                          重新选择 Workspace
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void handleOpenWorkspace()}
+                          disabled={!activeWorkspaceDir}
+                        >
+                          打开当前 Workspace 文件夹
+                        </button>
+                        {sessionWorkspaceDir ? (
+                          <button type="button" role="menuitem" onClick={handleClearSessionWorkspace}>
+                            清除当前会话临时 Workspace
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  className={`chat-composer-gateway chat-composer-gateway--${gatewayStatus}`}
+                  title={gatewayStatus === "connected" ? gatewayUrl || "网关在线" : "点击启动或刷新网关"}
+                  onClick={() => {
+                    if (gatewayStatus === "disconnected") void handleStartGateway();
+                    else void refreshGatewayStatus();
+                  }}
+                  disabled={gatewayStarting || gatewayStatus === "connecting"}
+                >
+                  <span className={`chat-gateway-dot chat-gateway-dot--${gatewayStatus}`} aria-hidden />
+                  {gatewayStatus === "connected"
+                    ? `网关 ${gatewayPort}`
+                    : gatewayStatus === "connecting"
+                      ? "检查中"
+                      : gatewayStarting
+                        ? "启动中…"
+                        : "启动网关"}
+                </button>
+              </div>
             </div>
           </div>
 

@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- shared model-selection helpers are intentionally colocated with the picker */
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { UiIcon } from "../UiIcon";
 import "./ModelPicker.css";
@@ -176,14 +177,23 @@ export function ModelPicker({
       const width = Math.min(320, window.innerWidth - 24);
       let left = variant === "inline" ? rect.right - width : rect.left;
       left = Math.min(Math.max(12, left), window.innerWidth - width - 12);
-      const maxHeight = Math.min(440, window.innerHeight - rect.bottom - 24);
-      setPanelStyle({
-        position: "fixed",
-        top: rect.bottom + 8,
-        left,
-        width,
-        maxHeight,
-      });
+      if (variant === "inline") {
+        setPanelStyle({
+          position: "fixed",
+          bottom: window.innerHeight - rect.top + 8,
+          left,
+          width,
+          maxHeight: Math.min(440, Math.max(180, rect.top - 24)),
+        });
+      } else {
+        setPanelStyle({
+          position: "fixed",
+          top: rect.bottom + 8,
+          left,
+          width,
+          maxHeight: Math.min(440, window.innerHeight - rect.bottom - 24),
+        });
+      }
     };
 
     const handlePointerDown = (event: MouseEvent) => {
@@ -236,6 +246,7 @@ export function ModelPicker({
         <UiIcon name="apps" size={14} />
         <span className="model-picker-trigger-label">{selectedLabel}</span>
         {maxMode ? <span className="model-picker-max-chip">Max</span> : null}
+        <span className="model-picker-chevron" aria-hidden />
       </button>
 
       {open ? (

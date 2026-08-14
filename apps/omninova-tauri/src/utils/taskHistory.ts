@@ -17,6 +17,10 @@ export interface TaskChangedFile {
   additions: number;
   deletions: number;
   changeType?: "created" | "modified" | "deleted" | "added" | "removed";
+  /** 文件元信息来自任务结束后的 Workspace 扫描或实时事件。 */
+  size?: number;
+  modifiedAt?: number;
+  source?: "event" | "scan";
 }
 
 export interface TaskActivityEntry {

@@ -48,6 +48,22 @@
   font-weight: 700;
 }
 
+.model-picker-chevron {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  margin: -3px 1px 0 2px;
+  transform: rotate(45deg);
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transition: transform 160ms ease, margin 160ms ease;
+}
+
+.model-picker.is-open .model-picker-chevron {
+  margin-top: 3px;
+  transform: rotate(225deg);
+}
+
 .model-picker-panel {
   z-index: 36;
   display: flex;

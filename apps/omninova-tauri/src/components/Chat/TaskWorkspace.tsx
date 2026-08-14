@@ -60,6 +60,25 @@ function formatFileSize(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatArtifactTime(value?: number): string {
+  if (!value) return "时间未知";
+  return new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function artifactMetadata(file: TaskChangedFile): string {
+  return [
+    artifactKindLabel(file.path),
+    file.size != null ? formatFileSize(file.size) : null,
+    file.modifiedAt ? formatArtifactTime(file.modifiedAt) : null,
+  ].filter(Boolean).join(" · ");
+}
+
 function ArtifactThumbnail({
   file,
   workspacePath,
@@ -220,7 +239,7 @@ export function TaskDeliverable({
                   >
                     <ArtifactThumbnail file={file} workspacePath={task.workspacePath} eager={index < 4} />
                     <span>{file.path.split(/[\\/]/).pop()}</span>
-                    <small>{artifactKindLabel(file.path)}</small>
+                    <small>{artifactMetadata(file)}</small>
                   </button>
                   <code>+{file.additions} / -{file.deletions}</code>
                 </li>
@@ -284,6 +303,23 @@ export function TaskInspector({
 
   const selectedArtifact = files.find((file) => file.path === selectedArtifactPath) ?? null;
 
+  const openProcessArtifact = (path: string) => {
+    const normalized = path.replace(/\\/g, "/");
+    const file = files.find((candidate) => candidate.path.replace(/\\/g, "/") === normalized);
+    if (file) {
+      setSelectedArtifactPath(file.path);
+      onTabChange("results");
+      return;
+    }
+    void invokeTauri<void>("open_task_artifact", {
+      path,
+      workspacePath: task?.workspacePath,
+      reveal: true,
+    }).catch(() => {
+      // 过程中的临时路径可能已不存在；保留文字记录即可。
+    });
+  };
+
   return (
     <aside className={`task-inspector${open ? " is-open" : ""}`} aria-hidden={!open} aria-label="任务检查器">
       <header className="task-inspector-head">
@@ -328,7 +364,17 @@ export function TaskInspector({
                   <span>
                     <strong>{item.label}</strong>
                     {item.detail && item.detail !== item.label ? <small>{item.detail}</small> : null}
-                    {item.path ? <code>{item.path}</code> : null}
+                    {item.path ? (
+                      <button
+                        type="button"
+                        className="task-inspector-process-path"
+                        onClick={() => openProcessArtifact(item.path!)}
+                        title="查看成果；若尚未收录则在文件资源管理器中定位"
+                      >
+                        <UiIcon name="folder" size={11} />
+                        <span>{item.path}</span>
+                      </button>
+                    ) : null}
                   </span>
                   <time>{new Date(item.at).toLocaleTimeString("zh-CN", { hour12: false })}</time>
                 </li>
@@ -357,7 +403,7 @@ export function TaskInspector({
                       <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
                       <span>
                         <strong title={file.path}>{file.path}</strong>
-                        <small>{artifactKindLabel(file.path)} · {file.changeType || "modified"}</small>
+                        <small>{artifactMetadata(file)} · {file.changeType || "modified"}</small>
                       </span>
                       <code>+{file.additions} -{file.deletions}</code>
                     </button>
@@ -402,7 +448,7 @@ export function TaskInspector({
                       >
                         <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
                         <span>{file.path.split(/[\\/]/).pop()}</span>
-                        <small>{artifactKindLabel(file.path)}</small>
+                        <small>{artifactMetadata(file)}</small>
                       </button>
                     ))}
                   </div>
@@ -474,7 +520,7 @@ function ArtifactPreviewPane({
         <span className="task-artifact-preview-icon"><UiIcon name={artifactIcon(file.path)} size={15} /></span>
         <span>
           <strong title={file.path}>{file.path.split(/[\\/]/).pop()}</strong>
-          <small>{preview ? `${artifactKindLabel(file.path)} · ${formatFileSize(preview.size)}` : artifactKindLabel(file.path)}</small>
+          <small>{preview ? `${artifactKindLabel(file.path)} · ${formatFileSize(preview.size)} · ${formatArtifactTime(file.modifiedAt)}` : artifactMetadata(file)}</small>
         </span>
         <span className="task-artifact-preview-actions">
           <button type="button" onClick={() => void openArtifact(false)} disabled={file.changeType === "deleted"}>打开</button>
