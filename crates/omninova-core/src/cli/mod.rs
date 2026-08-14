@@ -1,6 +1,9 @@
+mod repl;
 mod tui;
 
 use crate::config::{Config, GatewayPublicMode};
+use crate::channels::ChannelKind;
+use crate::cron::{now_timestamp, CronJob, CronStore, Schedule};
 use crate::daemon::service::{
     GatewayServiceCheckLevel, GatewayServiceCheckReport, GatewayServiceOperation,
     resolve_gateway_service,
@@ -39,19 +42,29 @@ fn cprintln(enabled: bool, msg: &str) {
     about = "OmniNova CLI — AI assistant powered by novalclaw architecture",
     next_line_help = true,
     after_help = "Examples:
+  omninova                         # interactive REPL (Claude Code style)
+  omninova -p \"summarize this repo\"
+  omninova --session work -p \"status\"
+  omninova tui
+  omninova web                     # open the browser UI
   omninova skills list
-  omninova config get default_provider
-  omninova gateway run
-  omninova gateway status
-  omninova --dev gateway run
+  omninova cron list
+  omninova gateway run             # start gateway + web at /app
   omninova doctor
-  omninova --profile work gateway run
 
 Headless server (no desktop):
   omninova gateway run
   omninova daemon install    # Linux: systemd user unit; macOS: launchd; Windows: Task Scheduler",
 )]
 pub struct Cli {
+    #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
+    /// One-shot prompt (Claude Code `-p`). Prints the reply and exits.
+    pub prompt: Option<String>,
+
+    #[arg(long, value_name = "id")]
+    /// Session id for REPL / `-p` / default chat.
+    pub session: Option<String>,
+
     #[arg(long, global = true)]
     /// Dev profile: isolate state under ~/.omninova-dev, default gateway port 19001,
     /// and shift derived ports (browser/canvas).
@@ -75,7 +88,7 @@ pub struct Cli {
     pub container: Option<String>,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -137,6 +150,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Manage the local document knowledge base.
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommands,
+    },
     /// Manage gateway-owned node pairing and node commands.
     Nodes {
         #[command(subcommand)]
@@ -176,6 +194,8 @@ pub enum Commands {
     Status,
     /// Open a terminal UI connected to the Gateway.
     Tui,
+    /// Open the Web UI in a browser (`/app` on the local gateway).
+    Web,
     /// Open the Control UI with your current token.
     Dashboard,
     /// Emergency stop controls.
@@ -314,8 +334,12 @@ pub enum CronCommands {
         name: String,
         #[arg(long)]
         schedule: String,
+        /// Legacy shell payload; omitted for agent jobs.
         #[arg(long)]
-        command: String,
+        command: Option<String>,
+        /// Instruction handed to the agent when the job fires.
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Remove a cron job by name or ID.
     Remove { id: String },
@@ -390,6 +414,40 @@ pub enum MemoryCommands {
     },
     /// Reindex memory.
     Reindex,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KnowledgeCommands {
+    /// List indexed documents.
+    List {
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Add a note or import a file.
+    Add {
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        collection: Option<String>,
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Search document passages.
+    Search {
+        query: Vec<String>,
+        #[arg(long)]
+        collection: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
+    /// Show a document's full text.
+    Show { id: String },
+    /// Remove a document.
+    Remove { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -651,8 +709,9 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
 
     let mut config = Config::load_or_init()?;
 
-    match &cli.command {
-        Commands::Agent { message, session_id } => {
+    match cli.command.as_ref() {
+        None => repl::run_default(config, cli.prompt.clone(), cli.session.clone()).await,
+        Some(Commands::Agent { message, session_id }) => {
             let runtime = GatewayRuntime::new(config);
             let inbound = crate::channels::adapters::cli::inbound_from_cli(
                 message.clone(),
@@ -662,7 +721,7 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             let resp = runtime.process_inbound(&inbound).await?;
             Ok(resp.reply)
         }
-        Commands::Gateway { command } => match command {
+        Some(Commands::Gateway { command }) => match command {
             Some(GatewayCommands::Run { host, port, force }) => {
                 if *force {
                     if let Some(p) = port.or(Some(config.gateway.port)) {
@@ -694,55 +753,61 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 Ok("gateway stopped".to_string())
             }
         },
-        Commands::Config { command } => run_config(command, &config).await,
-        Commands::Configure => {
+        Some(Commands::Config { command }) => run_config(command, &config).await,
+        Some(Commands::Configure) => {
             tokio::task::spawn_blocking(|| {
                 InteractiveConfigurator::new().run()
             }).await??;
             Ok("configuration complete".to_string())
         }
-        Commands::Setup => {
+        Some(Commands::Setup) => {
             std::fs::create_dir_all(config.config_path.parent().unwrap_or(&config.workspace_dir))?;
             std::fs::create_dir_all(&config.workspace_dir)?;
             config.save()?;
             Ok(format!("config initialized at {}", config.config_path.display()))
         }
-        Commands::Health => {
+        Some(Commands::Health) => {
             let runtime = GatewayRuntime::new(config);
             let health = runtime.health().await;
             Ok(serde_json::to_string_pretty(&health)?)
         }
-        Commands::Doctor => run_doctor(&config).await,
-        Commands::Diagnostics { command } => match command {
+        Some(Commands::Doctor) => run_doctor(&config).await,
+        Some(Commands::Diagnostics { command }) => match command {
             DiagnosticsCommands::Export { output } => {
                 run_diagnostics(&config, output.as_deref()).await
             }
         },
-        Commands::Cron { command } => run_cron(command, &config).await,
-        Commands::Channels { command } => run_channels(command, &config).await,
-        Commands::Message { command } => run_message(command, &config).await,
-        Commands::Models { command } => run_models(command, &config).await,
-        Commands::Mcp => {
+        Some(Commands::Cron { command }) => run_cron(command, &config).await,
+        Some(Commands::Channels { command }) => run_channels(command, &config).await,
+        Some(Commands::Message { command }) => run_message(command, &config).await,
+        Some(Commands::Models { command }) => run_models(command, &config).await,
+        Some(Commands::Mcp) => {
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "status": "mcp_server_not_implemented_via_runtime"
             }))?)
         }
-        Commands::Memory { command } => run_memory(command, &config).await,
-        Commands::Nodes { command } => run_nodes(command, &config).await,
-        Commands::Pairing { command } => run_pairing(command, &config).await,
-        Commands::Plugins { command } => run_plugins(command, &config).await,
-        Commands::Sandbox { command } => run_sandbox(command, &config).await,
-        Commands::Secrets { command } => run_secrets(command, &config).await,
-        Commands::Security { command } => run_security(command, &config).await,
-        Commands::Sessions { command } => run_sessions(command, &config).await,
-        Commands::Status => run_status(&config).await,
-        Commands::Tui => tui::run_tui(config).await,
-        Commands::Dashboard => {
-            let url = format!("http://{}:{}/dashboard", config.gateway.host, config.gateway.port);
+        Some(Commands::Memory { command }) => run_memory(command, &config).await,
+        Some(Commands::Knowledge { command }) => run_knowledge(command, &config).await,
+        Some(Commands::Nodes { command }) => run_nodes(command, &config).await,
+        Some(Commands::Pairing { command }) => run_pairing(command, &config).await,
+        Some(Commands::Plugins { command }) => run_plugins(command, &config).await,
+        Some(Commands::Sandbox { command }) => run_sandbox(command, &config).await,
+        Some(Commands::Secrets { command }) => run_secrets(command, &config).await,
+        Some(Commands::Security { command }) => run_security(command, &config).await,
+        Some(Commands::Sessions { command }) => run_sessions(command, &config).await,
+        Some(Commands::Status) => run_status(&config).await,
+        Some(Commands::Tui) => tui::run_tui(config).await,
+        Some(Commands::Web) | Some(Commands::Dashboard) => {
+            let host = if config.gateway.host == "0.0.0.0" || config.gateway.host == "::" {
+                "127.0.0.1"
+            } else {
+                config.gateway.host.as_str()
+            };
+            let url = format!("http://{}:{}/app", host, config.gateway.port);
             open_url(&url)?;
             Ok(format!("opened {}", url))
         }
-        Commands::Estop { command } => {
+        Some(Commands::Estop { command }) => {
             let runtime = GatewayRuntime::new(config);
             match command {
                 EstopCommands::Status => Ok(serde_json::to_string_pretty(&runtime.estop_status().await?)?),
@@ -752,10 +817,10 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 EstopCommands::Resume => Ok(serde_json::to_string_pretty(&runtime.estop_resume().await?)?),
             }
         }
-        Commands::Approvals { command } => run_approvals(command, &config).await,
-        Commands::Daemon { command } => run_daemon(command, &config).await,
-        Commands::Skills { command } => run_skills(command.as_ref(), &config).await,
-        Commands::Browser { command } => match command {
+        Some(Commands::Approvals { command }) => run_approvals(command, &config).await,
+        Some(Commands::Daemon { command }) => run_daemon(command, &config).await,
+        Some(Commands::Skills { command }) => run_skills(command.as_ref(), &config).await,
+        Some(Commands::Browser { command }) => match command {
             Some(BrowserCommands::Install) => install_agent_browser().await,
             Some(BrowserCommands::Status) => {
                 let status = check_dep_installed("agent-browser", "--version").await;
@@ -768,10 +833,10 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 install_agent_browser().await
             }
         },
-        Commands::System { command } => run_system(command.as_ref(), &config).await,
-        Commands::Feishu { command } => run_feishu(command, &config).await,
-        Commands::SetupDeps { command } => run_setup(command).await,
-        Commands::Route { channel, text, agent } => {
+        Some(Commands::System { command }) => run_system(command.as_ref(), &config).await,
+        Some(Commands::Feishu { command }) => run_feishu(command, &config).await,
+        Some(Commands::SetupDeps { command }) => run_setup(command).await,
+        Some(Commands::Route { channel, text, agent }) => {
             let runtime = GatewayRuntime::new(config);
             let mut metadata = std::collections::HashMap::new();
             if let Some(a) = agent {
@@ -787,15 +852,15 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             let route = runtime.route(&inbound).await;
             Ok(serde_json::to_string_pretty(&route)?)
         }
-        Commands::ConfigPrint => {
+        Some(Commands::ConfigPrint) => {
             let runtime = GatewayRuntime::new(config);
             let cfg = runtime.get_config().await;
             Ok(serde_json::to_string_pretty(&cfg)?)
         }
-        Commands::Completion { shell } => {
+        Some(Commands::Completion { shell }) => {
             run_completion(shell.as_deref())
         }
-        Commands::Docs { query } => {
+        Some(Commands::Docs { query }) => {
             if query.is_empty() {
                 return Ok(builtin_docs_index(&config));
             }
@@ -807,8 +872,8 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
             open_url(&format!("https://docs.omninova.ai/search?q={}", urlencoding::encode(&q)))?;
             Ok(format!("opened docs for: {}", q))
         }
-        Commands::Qr => Ok(generate_pairing_qr(&config)?),
-        Commands::Reset { force } => {
+        Some(Commands::Qr) => Ok(generate_pairing_qr(&config)?),
+        Some(Commands::Reset { force }) => {
             if !*force {
                 anyhow::bail!("use --force to confirm reset");
             }
@@ -819,14 +884,14 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
                 base, cfg_path
             ))
         }
-        Commands::Uninstall { force } => {
+        Some(Commands::Uninstall { force }) => {
             if !*force {
                 anyhow::bail!("use --force to confirm uninstall");
             }
             let svc = resolve_gateway_service();
             Ok(serde_json::to_string_pretty(&svc.operate_report(GatewayServiceOperation::Uninstall))?)
         }
-        Commands::Logs { follow, lines } => {
+        Some(Commands::Logs { follow, lines }) => {
             let log_dir = config.workspace_dir.join("logs");
             let log_file = log_dir.join("gateway.log");
             if !log_file.exists() {
@@ -1021,23 +1086,88 @@ fn non_empty_config_value(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-async fn run_cron(cmd: &CronCommands, _config: &Config) -> Result<String> {
+async fn run_cron(cmd: &CronCommands, config: &Config) -> Result<String> {
+    let store = CronStore::open(config.workspace_dir.join("cron.json")).await?;
     match cmd {
-        CronCommands::List => Ok("[]".to_string()),
-        CronCommands::Add { name, schedule, command } => {
+        CronCommands::List => Ok(serde_json::to_string_pretty(&store.list().await)?),
+        CronCommands::Add {
+            name,
+            schedule,
+            command,
+            prompt,
+        } => {
+            let prompt = prompt
+                .clone()
+                .or_else(|| command.clone())
+                .unwrap_or_default();
+            if prompt.trim().is_empty() {
+                anyhow::bail!("provide --prompt (agent job) or --command");
+            }
+            let parsed = Schedule::parse(schedule)?;
+            let job = CronJob {
+                id: format!("job-{}", now_timestamp().replace([':', '.'], "-")),
+                name: name.clone(),
+                schedule: schedule.clone(),
+                prompt,
+                command: command.clone().unwrap_or_default(),
+                description: String::new(),
+                template_id: None,
+                tz_offset_minutes: 0,
+                enabled: true,
+                last_run: None,
+                last_status: None,
+                next_run: parsed.next_run_iso(0),
+                last_error: None,
+                created_at: now_timestamp(),
+            };
+            store.upsert(job.clone()).await?;
+            Ok(serde_json::to_string_pretty(&job)?)
+        }
+        CronCommands::Remove { id } => {
+            let removed = store.remove(id).await?;
             Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "added": { "name": name, "schedule": schedule, "command": command }
+                "id": id,
+                "removed": removed
             }))?)
         }
-        CronCommands::Remove { id } => Ok(format!("cron job '{}' remove not yet implemented", id)),
-        CronCommands::Pause { id } => Ok(format!("cron job '{}' pause not yet implemented", id)),
-        CronCommands::Resume { id } => Ok(format!("cron job '{}' resume not yet implemented", id)),
+        CronCommands::Pause { id } => {
+            store.set_enabled(id, false).await?;
+            Ok(serde_json::to_string_pretty(&store.get(id).await)?)
+        }
+        CronCommands::Resume { id } => {
+            store.set_enabled(id, true).await?;
+            if let Some(job) = store.get(id).await {
+                if let Ok(schedule) = Schedule::parse(&job.schedule) {
+                    let _ = store
+                        .set_next_run(id, schedule.next_run_iso(job.tz_offset_minutes))
+                        .await;
+                }
+            }
+            Ok(serde_json::to_string_pretty(&store.get(id).await)?)
+        }
     }
 }
 
-async fn run_channels(cmd: &ChannelCommands, _config: &Config) -> Result<String> {
+async fn run_channels(cmd: &ChannelCommands, config: &Config) -> Result<String> {
     match cmd {
-        ChannelCommands::List => Ok("[]".to_string()),
+        ChannelCommands::List => {
+            let raw = serde_json::to_value(&config.channels_config)?;
+            let mut items = Vec::new();
+            if let Some(map) = raw.as_object() {
+                for (name, value) in map {
+                    let enabled = value
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    items.push(serde_json::json!({
+                        "channel": name,
+                        "enabled": enabled,
+                        "configured": !value.is_null(),
+                    }));
+                }
+            }
+            Ok(serde_json::to_string_pretty(&items)?)
+        }
         ChannelCommands::Login { channel, verbose: _ } => {
             Ok(format!("channel login '{}' not yet implemented", channel))
         }
@@ -1067,9 +1197,9 @@ async fn run_message(cmd: &MessageCommands, _config: &Config) -> Result<String> 
     }
 }
 
-async fn run_models(cmd: &ModelCommands, _config: &Config) -> Result<String> {
+async fn run_models(cmd: &ModelCommands, config: &Config) -> Result<String> {
     match cmd {
-        ModelCommands::List => Ok("[]".to_string()),
+        ModelCommands::List => Ok(serde_json::to_string_pretty(&repl::models_view(config))?),
         ModelCommands::Scan { provider } => {
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "provider": provider, "models": []
@@ -1089,6 +1219,78 @@ async fn run_memory(cmd: &MemoryCommands, _config: &Config) -> Result<String> {
             }))?)
         }
         MemoryCommands::Reindex => Ok("memory reindex not yet implemented".to_string()),
+    }
+}
+
+async fn run_knowledge(cmd: &KnowledgeCommands, config: &Config) -> Result<String> {
+    let store = crate::knowledge::KnowledgeStore::open_in(&config.workspace_dir).await?;
+    match cmd {
+        KnowledgeCommands::List { collection } => {
+            Ok(serde_json::to_string_pretty(&store.list(collection.as_deref()).await)?)
+        }
+        KnowledgeCommands::Add {
+            title,
+            file,
+            text,
+            collection,
+            tags,
+        } => {
+            let tags = tags
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect::<Vec<_>>();
+            let doc = if let Some(path) = file {
+                store
+                    .import_path(path, collection.as_deref(), tags)
+                    .await?
+            } else {
+                let content = text.clone().unwrap_or_default();
+                if content.trim().is_empty() {
+                    anyhow::bail!("provide --file or --text");
+                }
+                store
+                    .upsert(crate::knowledge::KnowledgeUpsert {
+                        id: None,
+                        title: title.clone().unwrap_or_else(|| "Untitled".into()),
+                        collection: collection.clone().unwrap_or_else(|| "default".into()),
+                        source: "note".into(),
+                        source_path: None,
+                        kind: "md".into(),
+                        tags,
+                        content,
+                        enabled: true,
+                    })
+                    .await?
+            };
+            Ok(serde_json::to_string_pretty(&doc)?)
+        }
+        KnowledgeCommands::Search {
+            query,
+            collection,
+            limit,
+        } => {
+            let q = query.join(" ");
+            Ok(serde_json::to_string_pretty(
+                &store.search(&q, collection.as_deref(), *limit).await,
+            )?)
+        }
+        KnowledgeCommands::Show { id } => match store.get(id).await? {
+            Some((doc, content)) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "document": doc,
+                "content": content
+            }))?),
+            None => anyhow::bail!("document not found: {id}"),
+        },
+        KnowledgeCommands::Remove { id } => {
+            let removed = store.remove(id).await?;
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "id": id,
+                "removed": removed
+            }))?)
+        }
     }
 }
 
@@ -1170,22 +1372,30 @@ async fn run_sessions(cmd: &SessionCommands, config: &Config) -> Result<String> 
         }
         SessionCommands::Show { session_id } => {
             let runtime = GatewayRuntime::new(config.clone());
-            let snapshot = runtime.session_tree_snapshot().await?;
-            let entry = snapshot
-                .sessions
-                .into_iter()
-                .find(|s| s.session_id.as_deref() == Some(session_id.as_str()));
-            match entry {
-                Some(node) => Ok(serde_json::to_string_pretty(&node)?),
-                None => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "session_id": session_id,
-                    "found": false,
-                    "messages": []
-                }))?),
+            let mut history = runtime
+                .get_session_history(&ChannelKind::Web, session_id)
+                .await;
+            if history.messages.is_empty() {
+                history = runtime
+                    .get_session_history(&ChannelKind::Cli, session_id)
+                    .await;
             }
+            Ok(serde_json::to_string_pretty(&history)?)
         }
         SessionCommands::Delete { session_id } => {
-            Ok(format!("session {} delete not yet implemented", session_id))
+            let runtime = GatewayRuntime::new(config.clone());
+            let web = runtime
+                .delete_session(&ChannelKind::Web, session_id)
+                .await
+                .unwrap_or(false);
+            let cli = runtime
+                .delete_session(&ChannelKind::Cli, session_id)
+                .await
+                .unwrap_or(false);
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "session_id": session_id,
+                "removed": web || cli
+            }))?)
         }
     }
 }
@@ -2609,10 +2819,26 @@ mod productized_gateway_tests {
             .expect("diagnostics export should parse");
         assert!(matches!(
             cli.command,
-            Commands::Diagnostics {
+            Some(Commands::Diagnostics {
                 command: DiagnosticsCommands::Export { output: None }
-            }
+            })
         ));
+    }
+
+    #[test]
+    fn default_invocation_is_repl_and_prompt_flag_parses() {
+        let bare = Cli::try_parse_from(["omninova"]).expect("bare omninova should parse");
+        assert!(bare.command.is_none());
+        assert!(bare.prompt.is_none());
+
+        let oneshot = Cli::try_parse_from(["omninova", "-p", "hello", "--session", "s1"])
+            .expect("-p should parse without a subcommand");
+        assert!(oneshot.command.is_none());
+        assert_eq!(oneshot.prompt.as_deref(), Some("hello"));
+        assert_eq!(oneshot.session.as_deref(), Some("s1"));
+
+        let web = Cli::try_parse_from(["omninova", "web"]).expect("web subcommand");
+        assert!(matches!(web.command, Some(Commands::Web)));
     }
 
     #[test]

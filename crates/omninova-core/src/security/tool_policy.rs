@@ -29,6 +29,7 @@ const READ_ONLY_WORKSPACE_TOOLS: &[&str] = &[
     "grep_search",
     "grep",
     "search",
+    "knowledge_search",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

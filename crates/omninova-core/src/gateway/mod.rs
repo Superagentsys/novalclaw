@@ -7,6 +7,7 @@ pub mod dingtalk_stream;
 pub mod dingtalk_worker;
 pub mod feishu_store;
 pub mod feishu_worker;
+pub mod control;
 pub mod pairing;
 pub mod ws;
 
@@ -61,10 +62,11 @@ use crate::security::{
     EstopState, PendingApproval, SecurityContext,
 };
 use crate::skills::{format_skills_prompt, load_skills_from_dir};
+use crate::knowledge::append_knowledge_prompt;
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
     FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
-    HttpRequestTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool,
+    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool,
     WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
@@ -479,6 +481,8 @@ pub struct GatewayRuntime {
     monitor_flights: Arc<MonitorFlightGuard>,
     /// Per-card DingTalk monitor single-flight guard.
     dingtalk_monitor_guard: Arc<DingtalkMonitorGuard>,
+    /// Broadcast bus for Web/CLI subscribers of live agent-run events.
+    event_bus: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -868,6 +872,7 @@ impl GatewayRuntime {
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            event_bus: tokio::sync::broadcast::channel(256).0,
         }
     }
 
@@ -893,7 +898,16 @@ impl GatewayRuntime {
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            event_bus: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+        self.event_bus.subscribe()
+    }
+
+    pub fn publish_event(&self, event: serde_json::Value) {
+        let _ = self.event_bus.send(event);
     }
 
     pub(crate) fn dedup_cache(&self) -> Arc<DedupCache> {
@@ -1293,6 +1307,31 @@ impl GatewayRuntime {
         self
     }
 
+    /// Starts the automation scheduler against the stores in `workspace_dir`,
+    /// executing each job's instruction through the agent pipeline. No-ops when
+    /// another scheduler is already running in this process.
+    pub async fn spawn_automation_scheduler(&self, workspace_dir: &std::path::Path) {
+        let store = match crate::cron::CronStore::open(workspace_dir.join("cron.json")).await {
+            Ok(store) => store,
+            Err(error) => {
+                warn!("failed to open automation store: {error}");
+                return;
+            }
+        };
+        let runs =
+            match crate::cron::CronRunStore::open(workspace_dir.join("cron_runs.json")).await {
+                Ok(runs) => runs,
+                Err(error) => {
+                    warn!("failed to open automation run history: {error}");
+                    return;
+                }
+            };
+        let executor = Arc::new(AgentJobExecutor::new(self.clone()));
+        if crate::cron::CronScheduler::new(store, runs, executor).spawn_once() {
+            info!("automation scheduler attached to gateway runtime");
+        }
+    }
+
     pub async fn health(&self) -> GatewayHealth {
         let cfg = self.config.read().await.clone();
         let provider = build_provider_from_config(&cfg);
@@ -1371,6 +1410,7 @@ impl GatewayRuntime {
                 }
             }
         }
+        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
         let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg, security);
@@ -1426,6 +1466,8 @@ impl GatewayRuntime {
                 }
             }
         }
+
+        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
         Ok(Agent::new(
@@ -1601,6 +1643,8 @@ impl GatewayRuntime {
                 }
             }
         }
+
+        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         // ==== FEISHU CHAT-ONLY MODE ====
         // Inject chat-only system prompt when inbound is chat_only mode
@@ -1905,6 +1949,8 @@ impl GatewayRuntime {
                 }
             }
         }
+
+        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let agent_security = security.clone();
         let mut agent = Agent::new(
@@ -2714,7 +2760,10 @@ impl GatewayRuntime {
             }
         }
 
-        let app = Router::new()
+        self.spawn_automation_scheduler(&cfg.workspace_dir).await;
+
+        let app = crate::gateway::control::with_web_ui(
+            Router::new()
             .route("/", get(http_root))
             .route("/health", get(http_health))
             .route("/chat", post(http_chat))
@@ -2772,7 +2821,9 @@ impl GatewayRuntime {
             )
             .route("/metrics", get(http_metrics))
             .route("/ws/chat", get(ws::ws_chat_handler))
-            .with_state(self);
+            .merge(crate::gateway::control::router())
+        )
+        .with_state(self);
 
         if cfg.observability.prometheus_enabled {
             let metrics_port = cfg.observability.prometheus_port.unwrap_or(9090);
@@ -2797,12 +2848,64 @@ impl GatewayRuntime {
         }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        let display_host = if cfg.gateway.host == "0.0.0.0" || cfg.gateway.host == "::" {
+            "127.0.0.1".to_string()
+        } else {
+            cfg.gateway.host.clone()
+        };
+        println!(
+            "[gateway] listening on http://{}  web ui: http://{}:{}/app  api: http://{}:{}/api",
+            addr, display_host, cfg.gateway.port, display_host, cfg.gateway.port
+        );
         let serve_result = axum::serve(listener, app).await;
         if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
             stream_guard.shutdown().await;
         }
         serve_result?;
         Ok(())
+    }
+}
+
+/// Executes automation jobs by handing their instruction to the agent pipeline,
+/// the same path a chat message takes.
+pub struct AgentJobExecutor {
+    runtime: GatewayRuntime,
+}
+
+impl AgentJobExecutor {
+    pub fn new(runtime: GatewayRuntime) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::cron::CronJobExecutor for AgentJobExecutor {
+    async fn execute(&self, job: &crate::cron::CronJob) -> anyhow::Result<String> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "source".to_string(),
+            serde_json::Value::String("automation".to_string()),
+        );
+        metadata.insert(
+            "automation_id".to_string(),
+            serde_json::Value::String(job.id.clone()),
+        );
+        metadata.insert(
+            "automation_name".to_string(),
+            serde_json::Value::String(job.name.clone()),
+        );
+
+        let inbound = InboundMessage {
+            channel: ChannelKind::Cli,
+            user_id: Some("automation".to_string()),
+            // A stable session per job lets the agent keep context across runs.
+            session_id: Some(format!("automation-{}", job.id)),
+            text: job.prompt.clone(),
+            metadata,
+        };
+
+        let response = self.runtime.process_inbound(&inbound).await?;
+        Ok(response.reply)
     }
 }
 
@@ -4062,6 +4165,9 @@ pub struct GatewayApprovalsQuery {
 async fn http_root() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "OmniNova Gateway",
+        "web": "/app",
+        "invoke": "POST /api/v1/invoke",
+        "events": "GET /api/v1/events",
         "health": "/health",
         "chat": "/chat",
         "config": "/config",
@@ -8586,7 +8692,7 @@ async fn http_api_cron_list(
             serde_json::json!({ "jobs": [], "note": "cron store not initialized" }),
         ));
     };
-    let jobs = store.list();
+    let jobs = store.list().await;
     let items: Vec<serde_json::Value> = jobs
         .iter()
         .map(|j| {
@@ -8594,10 +8700,12 @@ async fn http_api_cron_list(
                 "id": j.id,
                 "name": j.name,
                 "schedule": j.schedule,
+                "prompt": j.prompt,
                 "command": j.command,
                 "enabled": j.enabled,
                 "last_run": j.last_run,
                 "last_status": j.last_status,
+                "last_error": j.last_error,
                 "next_run": j.next_run,
             })
         })
@@ -8609,6 +8717,10 @@ async fn http_api_cron_list(
 struct ApiCronAddRequest {
     name: String,
     schedule: String,
+    /// Instruction handed to the agent; preferred over `command`.
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
     command: String,
 }
 
@@ -8625,14 +8737,17 @@ async fn http_api_cron_add(
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
         schedule: req.schedule,
+        prompt: req.prompt,
         command: req.command,
+        description: String::new(),
+        template_id: None,
+        tz_offset_minutes: 0,
         enabled: true,
         last_run: None,
         last_status: None,
         next_run: None,
-        created_at: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
+        last_error: None,
+        created_at: crate::cron::now_timestamp(),
     };
     let id = job.id.clone();
     store.add(job).await.map_err(|e| {
@@ -8688,7 +8803,8 @@ pub fn create_workspace_tools(
             Some(30),
             config.clone(),
         )),
-        Box::new(PdfReadTool::new(workspace)),
+        Box::new(PdfReadTool::new(workspace.clone())),
+        Box::new(KnowledgeSearchTool::new(workspace)),
     ]
 }
 
@@ -8724,6 +8840,7 @@ pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn
 
     tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
     tools.push(Box::new(MemoryRecallTool::new(memory)));
+    tools.push(Box::new(KnowledgeSearchTool::new(config.workspace_dir.clone())));
 
     tools
         .into_iter()

@@ -47,7 +47,7 @@
 
 .task-status-strip > button,
 .task-artifact-inspect,
-.task-onboarding-action button {
+.task-onboarding-action > button {
   display: inline-flex;
   min-height: 30px;
   align-items: center;
@@ -64,7 +64,7 @@
 
 .task-status-strip > button:hover,
 .task-artifact-inspect:hover,
-.task-onboarding-action button:hover {
+.task-onboarding-action > button:hover {
   border-color: var(--ui-accent);
   background: var(--ui-accent-soft);
   color: var(--ui-accent-strong);
@@ -278,7 +278,12 @@
   padding-right: 10px;
 }
 
-.chat-toolbar-model,
+.chat-toolbar-model {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+}
+
 .chat-toolbar-gateway {
   display: inline-flex;
   min-width: 0;
@@ -292,16 +297,6 @@
   color: var(--ui-text-secondary);
   font-size: 10px;
   white-space: nowrap;
-}
-
-.chat-toolbar-model select {
-  max-width: 118px;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  color: var(--ui-text);
-  color-scheme: light;
-  font-size: 10px;
 }
 
 .chat-toolbar-model select option,
@@ -801,6 +796,20 @@
   display: flex;
   min-height: 38px;
   align-items: center;
+}
+
+.task-onboarding-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+}
+
+.task-onboarding-model .model-picker-trigger {
+  min-height: 34px;
+  max-width: 280px;
+  font-size: 12px;
 }
 
 .task-onboarding-action label {

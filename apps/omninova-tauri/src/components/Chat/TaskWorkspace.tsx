@@ -12,6 +12,7 @@ import {
   type TaskStatus,
 } from "../../utils/taskHistory";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { ModelPicker, type PickerProvider } from "./ModelPicker";
 import "./TaskWorkspace.css";
 
 type InspectorTab = "process" | "changes" | "logs" | "results";
@@ -518,6 +519,10 @@ export function TaskOnboarding({
   selectedModel,
   providers,
   onModelChange,
+  maxMode,
+  onMaxModeChange,
+  defaultProvider,
+  defaultModel,
   onConfigureModel,
   onChooseWorkspace,
   onStartGateway,
@@ -527,8 +532,12 @@ export function TaskOnboarding({
   workspaceReady: boolean;
   gatewayReady: boolean;
   selectedModel: string;
-  providers: Array<{ id: string; label: string }>;
+  providers: PickerProvider[];
   onModelChange: (value: string) => void;
+  maxMode: boolean;
+  onMaxModeChange: (value: boolean) => void;
+  defaultProvider?: string;
+  defaultModel?: string;
   onConfigureModel: () => void;
   onChooseWorkspace: () => void;
   onStartGateway: () => void;
@@ -557,13 +566,20 @@ export function TaskOnboarding({
       <div className="task-onboarding-action">
         {currentStep === 0 ? (
           providers.length ? (
-            <label>
+            <div className="task-onboarding-model">
               <span>本次任务优先模型</span>
-              <select value={selectedModel} onChange={(event) => onModelChange(event.target.value)}>
-                <option value="auto">自动选择服务</option>
-                {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
-              </select>
-            </label>
+              <ModelPicker
+                variant="inline"
+                value={selectedModel}
+                onChange={onModelChange}
+                providers={providers}
+                defaultProvider={defaultProvider}
+                defaultModel={defaultModel}
+                maxMode={maxMode}
+                onMaxModeChange={onMaxModeChange}
+                onConfigureCustom={onConfigureModel}
+              />
+            </div>
           ) : (
             <button type="button" onClick={onConfigureModel}><UiIcon name="settings" size={15} /> 配置模型</button>
           )

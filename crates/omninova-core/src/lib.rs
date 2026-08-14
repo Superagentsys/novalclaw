@@ -7,6 +7,7 @@ pub mod cron;
 pub mod daemon;
 pub mod desktop_capture;
 pub mod gateway;
+pub mod knowledge;
 pub mod memory;
 pub mod observability;
 pub mod providers;
@@ -19,6 +20,7 @@ pub mod util;
 pub use agent::Agent;
 pub use config::{AgentConfig, Config};
 pub use cron::{CronScheduler, CronStore};
+pub use knowledge::{KnowledgeStore, KnowledgeUpsert};
 pub use memory::backend::{InMemoryMemory, MockMemory};
 pub use providers::{MockProvider, OpenAiProvider};
 

@@ -40,6 +40,7 @@ import SkinOutlined from "@ant-design/icons/SkinOutlined";
 import SoundOutlined from "@ant-design/icons/SoundOutlined";
 import SunOutlined from "@ant-design/icons/SunOutlined";
 import SyncOutlined from "@ant-design/icons/SyncOutlined";
+import ClockCircleOutlined from "@ant-design/icons/ClockCircleOutlined";
 import TeamOutlined from "@ant-design/icons/TeamOutlined";
 import ToolOutlined from "@ant-design/icons/ToolOutlined";
 import VideoCameraOutlined from "@ant-design/icons/VideoCameraOutlined";
@@ -90,6 +91,7 @@ const ICONS = {
   sound: SoundOutlined,
   sun: SunOutlined,
   sync: SyncOutlined,
+  clock: ClockCircleOutlined,
   team: TeamOutlined,
   tool: ToolOutlined,
   video: VideoCameraOutlined,

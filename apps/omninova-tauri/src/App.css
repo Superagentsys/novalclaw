@@ -1088,6 +1088,29 @@
   gap: 12px;
 }
 
+.provider-picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.provider-custom-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.provider-custom-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .provider-card {
   padding: 18px;
   border-radius: var(--radius-lg);
@@ -3436,9 +3459,9 @@
 .chat-input-row {
   display: flex;
   gap: 10px;
-  align-items: center;
+  align-items: flex-end;
   flex-shrink: 0;
-  padding: 8px 12px;
+  padding: 12px 14px;
   border-radius: var(--radius-xl);
   border: 1px solid var(--border-soft);
   background: #fff;
@@ -3453,15 +3476,17 @@
 
 .chat-input {
   flex: 1;
-  min-height: 40px;
-  max-height: 140px;
-  padding: 8px 4px;
+  min-height: 78px;
+  max-height: 280px;
+  padding: 6px 4px;
   border: none;
   border-radius: 0;
   background: transparent;
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: 15px;
+  line-height: 1.65;
   resize: none;
+  overflow-y: auto;
   transition: border-color 0.15s;
 }
 

@@ -22,7 +22,23 @@ const parseStringList = (value: string) =>
 function isLocalProvider(provider: ProviderConfig): boolean {
   const preset = PROVIDER_PRESETS.find((item) => item.id === provider.id);
   if (preset) return preset.category === "local";
-  return ["ollama", "lmstudio", "vllm", "local"].includes(provider.type);
+  return ["ollama", "lmstudio", "vllm", "sglang", "llamacpp", "local"].includes(
+    provider.type
+  );
+}
+
+function slugifyProviderId(name: string, existing: string[]): string {
+  const base =
+    name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "custom";
+  const id = base.startsWith("custom-") ? base : `custom-${base}`;
+  if (!existing.includes(id)) return id;
+  let index = 2;
+  while (existing.includes(`${id}-${index}`)) index += 1;
+  return `${id}-${index}`;
 }
 
 export function ProviderConfigForm({
@@ -33,6 +49,13 @@ export function ProviderConfigForm({
   onDefaultChange,
 }: Props) {
   const [advancedIds, setAdvancedIds] = useState<Set<string>>(new Set());
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customDraft, setCustomDraft] = useState({
+    name: "",
+    baseUrl: "",
+    apiKey: "",
+    models: "",
+  });
 
   const updateProvider = (
     index: number,
@@ -51,6 +74,30 @@ export function ProviderConfigForm({
       return;
     }
     onChange([...value, { ...nextProvider, enabled: true }]);
+  };
+
+  const addCustomProvider = () => {
+    const name = customDraft.name.trim() || "自定义模型";
+    const models = parseStringList(customDraft.models);
+    if (!customDraft.baseUrl.trim() || models.length === 0) {
+      return;
+    }
+    const id = slugifyProviderId(name, value.map((provider) => provider.id));
+    onChange([
+      ...value,
+      {
+        id,
+        name,
+        type: "openai",
+        api_key_env: customDraft.apiKey.trim() || undefined,
+        base_url: customDraft.baseUrl.trim(),
+        models,
+        enabled: true,
+      },
+    ]);
+    setAdvancedIds((prev) => new Set(prev).add(id));
+    setCustomDraft({ name: "", baseUrl: "", apiKey: "", models: "" });
+    setCustomOpen(false);
   };
 
   const removeProvider = (providerId: string) => {
@@ -137,45 +184,115 @@ export function ProviderConfigForm({
           <div>
             <h2>已接入服务</h2>
             <div className="section-subtitle">
-              添加云端或本地服务，填写密钥即可使用。高级项（显示名、地址）按需展开。
+              添加云端、本地或自定义 OpenAI 兼容服务。填写密钥即可使用。
             </div>
           </div>
-          <label className="provider-picker">
-            <span>添加服务</span>
-            <select
-              value=""
-              onChange={(event) => addProvider(event.target.value)}
-              disabled={availableProviders.length === 0}
+          <div className="provider-picker-row">
+            <label className="provider-picker">
+              <span>添加服务</span>
+              <select
+                value=""
+                onChange={(event) => addProvider(event.target.value)}
+                disabled={availableProviders.length === 0}
+              >
+                <option value="" disabled>
+                  {availableProviders.length === 0 ? "已添加全部预设" : "选择模型服务"}
+                </option>
+                <optgroup label="云端">
+                  {availableProviders
+                    .filter((preset) => preset.category === "cloud")
+                    .map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </option>
+                    ))}
+                </optgroup>
+                <optgroup label="本地">
+                  {availableProviders
+                    .filter((preset) => preset.category === "local")
+                    .map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </option>
+                    ))}
+                </optgroup>
+              </select>
+            </label>
+            <button
+              type="button"
+              className="setup-btn setup-btn--secondary"
+              onClick={() => setCustomOpen((open) => !open)}
             >
-              <option value="" disabled>
-                {availableProviders.length === 0 ? "已添加全部预设" : "选择模型服务"}
-              </option>
-              <optgroup label="云端">
-                {availableProviders
-                  .filter((preset) => preset.category === "cloud")
-                  .map((preset) => (
-                    <option key={preset.id} value={preset.id}>
-                      {preset.name}
-                    </option>
-                  ))}
-              </optgroup>
-              <optgroup label="本地">
-                {availableProviders
-                  .filter((preset) => preset.category === "local")
-                  .map((preset) => (
-                    <option key={preset.id} value={preset.id}>
-                      {preset.name}
-                    </option>
-                  ))}
-              </optgroup>
-            </select>
-          </label>
+              {customOpen ? "收起自定义" : "添加自定义服务"}
+            </button>
+          </div>
         </div>
+
+        {customOpen ? (
+          <div className="provider-custom-form">
+            <p className="section-subtitle">
+              适用于任何 OpenAI 兼容网关：填写 Base URL、密钥和模型 ID。
+            </p>
+            <div className="setup-grid">
+              <label>
+                显示名称
+                <input
+                  value={customDraft.name}
+                  onChange={(event) =>
+                    setCustomDraft((prev) => ({ ...prev, name: event.target.value }))
+                  }
+                  placeholder="例如公司网关 / 聚合 API"
+                />
+              </label>
+              <label>
+                Base URL
+                <input
+                  value={customDraft.baseUrl}
+                  onChange={(event) =>
+                    setCustomDraft((prev) => ({ ...prev, baseUrl: event.target.value }))
+                  }
+                  placeholder="https://api.example.com/v1"
+                />
+              </label>
+              <label>
+                API Key / 环境变量
+                <input
+                  value={customDraft.apiKey}
+                  onChange={(event) =>
+                    setCustomDraft((prev) => ({ ...prev, apiKey: event.target.value }))
+                  }
+                  placeholder="OPENAI_API_KEY 或直接填 sk-..."
+                />
+              </label>
+              <label>
+                模型 ID
+                <input
+                  value={customDraft.models}
+                  onChange={(event) =>
+                    setCustomDraft((prev) => ({ ...prev, models: event.target.value }))
+                  }
+                  placeholder="glm-5.1, minimax-m3"
+                />
+              </label>
+            </div>
+            <div className="provider-custom-actions">
+              <button
+                type="button"
+                className="setup-btn setup-btn--primary"
+                onClick={addCustomProvider}
+                disabled={!customDraft.baseUrl.trim() || !customDraft.models.trim()}
+              >
+                加入列表
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="setup-stack">
           {value.map((provider, index) => {
             const local = isLocalProvider(provider);
-            const advanced = advancedIds.has(provider.id);
+            const custom = provider.id.startsWith("custom-") || provider.type === "custom";
+            const advanced = advancedIds.has(provider.id) || custom;
             return (
               <div
                 key={provider.id}
@@ -187,7 +304,7 @@ export function ProviderConfigForm({
                   <div className="provider-title">
                     <strong>{provider.name}</strong>
                     <span className="provider-pill">
-                      {local ? "本地" : "云端"}
+                      {local ? "本地" : custom ? "自定义" : "云端"}
                     </span>
                     <span className="provider-meta">{provider.id}</span>
                   </div>
@@ -265,7 +382,7 @@ export function ProviderConfigForm({
                         onChange={(event) =>
                           updateProvider(index, "base_url", event.target.value)
                         }
-                        placeholder={local ? "http://localhost:11434" : "https://api.example.com"}
+                        placeholder={local ? "http://localhost:11434" : "https://api.example.com/v1"}
                       />
                     </label>
                   </div>
@@ -275,7 +392,7 @@ export function ProviderConfigForm({
           })}
           {value.length === 0 ? (
             <div className="empty-state">
-              暂未添加模型服务，请先从右上角选择需要接入的平台。
+              暂未添加模型服务，请先从右上角选择平台，或添加自定义 OpenAI 兼容服务。
             </div>
           ) : null}
         </div>

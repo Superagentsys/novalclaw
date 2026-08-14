@@ -626,7 +626,7 @@ fn default_max_cost_per_day_cents() -> u32 {
     500
 }
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec!["file_read".into(), "memory_recall".into(), "knowledge_search".into()]
 }
 
 impl Default for AutonomyConfig {

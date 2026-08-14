@@ -2,7 +2,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMediaInteraction } from "./ChatMediaInteraction";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
-import { listen } from "@tauri-apps/api/event";
+import { listenAgentRunEvents } from "../../utils/events";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   isTauriEnvironment,
@@ -55,6 +55,14 @@ import {
   TaskStatusBar,
   type InspectorTab,
 } from "./TaskWorkspace";
+import {
+  ModelPicker,
+  parseModelSelection,
+  persistModelSelection,
+  readStoredMaxMode,
+  readStoredModelSelection,
+  type PickerProvider,
+} from "./ModelPicker";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -314,7 +322,7 @@ interface ChatProps {
   /** Chat stays mounted across navigation; refresh configuration when visible. */
   isActive?: boolean;
   /** Open a related configuration surface from prerequisite/action prompts. */
-  onOpenSettings?: (target: "providers" | "general") => void;
+  onOpenSettings?: (target: "providers" | "general" | "channels" | "skills" | "persona") => void;
 }
 
 export function Chat({
@@ -354,12 +362,14 @@ export function Chat({
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
   const [gatewayStarting, setGatewayStarting] = useState(false);
-  // bug#10：下拉选项来自实际已启用的 Provider（而非写死列表），选中值随消息发送生效。
-  const [availableProviders, setAvailableProviders] = useState<
-    { id: string; label: string }[]
-  >([]);
-  const [selectedModel, setSelectedModel] = useState("auto");
+  // bug#10：选项来自实际已启用的 Provider 模型列表，选中值随消息发送生效。
+  const [availableProviders, setAvailableProviders] = useState<PickerProvider[]>([]);
+  const [selectedModel, setSelectedModel] = useState(readStoredModelSelection);
+  const [maxMode, setMaxMode] = useState(readStoredMaxMode);
+  const [defaultProviderId, setDefaultProviderId] = useState("");
+  const [defaultModelId, setDefaultModelId] = useState("");
   const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const stickToBottomRef = useRef(true);
   const historyLoadGenRef = useRef(0);
   // 每个会话独立的取消标志与计时器。
@@ -440,6 +450,14 @@ export function Chat({
       : null;
     return selected ?? taskHistory.find((task) => task.avatarId === activeAvatarId) ?? null;
   }, [activeAvatarId, selectedTaskRunId, taskHistory]);
+
+  // Grow the composer with its content up to the CSS max-height, then scroll.
+  useEffect(() => {
+    const node = composerInputRef.current;
+    if (!node) return;
+    node.style.height = "auto";
+    node.style.height = `${node.scrollHeight}px`;
+  }, [input, activeAvatarId]);
 
   const openInspector = useCallback((tab: InspectorTab = "process") => {
     setInspectorTab(tab);
@@ -771,12 +789,34 @@ export function Chat({
         setWorkspaceStatus(cfg.workspace_status ?? null);
         const enabled = (cfg.providers ?? [])
           .filter((p) => p.enabled)
-          .map((p) => ({ id: p.id, label: p.name || p.id }));
+          .map((p) => ({
+            id: p.id,
+            label: p.name || p.id,
+            type: p.type,
+            models: p.models ?? [],
+          }));
         setAvailableProviders(enabled);
-        // 之前选中的 Provider 已被禁用/删除时回退到自动。
-        setSelectedModel((prev) =>
-          prev === "auto" || enabled.some((p) => p.id === prev) ? prev : "auto"
-        );
+        setDefaultProviderId(cfg.default_provider ?? "");
+        setDefaultModelId(cfg.default_model ?? "");
+        // 之前选中的 Provider/模型 已被禁用/删除时回退到自动。
+        setSelectedModel((prev) => {
+          let next = prev;
+          if (prev !== "auto") {
+            const parsed = parseModelSelection(prev);
+            const provider = enabled.find((item) => item.id === parsed.providerId);
+            if (!provider) next = "auto";
+            else if (parsed.model && provider.models.includes(parsed.model)) next = prev;
+            else if (!parsed.model) {
+              next = provider.models[0]
+                ? `${provider.id}::${provider.models[0]}`
+                : provider.id;
+            } else {
+              next = "auto";
+            }
+          }
+          if (next !== prev) persistModelSelection(next);
+          return next;
+        });
         const stored = localStorage.getItem(DESKTOP_VISION_SESSION_KEY);
         if (stored === "1") setDesktopVisionOn(true);
         else if (stored === "0") setDesktopVisionOn(false);
@@ -902,12 +942,10 @@ export function Chat({
   }, []);
 
   useEffect(() => {
-    if (!isTauriEnvironment()) return;
-
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    listen<AgentRunEvent | Record<string, unknown>>("agent-run-event", (event) => {
+    listenAgentRunEvents<AgentRunEvent | Record<string, unknown>>("agent-run-event", (event) => {
       const payload = event.payload as AgentRunEvent & {
         type?: string;
         run_id?: string;
@@ -1451,8 +1489,14 @@ export function Chat({
     let route: RouteDecision | null = null;
 
     try {
+      const parsedSelection = parseModelSelection(selectedModel);
       const metadata: Record<string, unknown> = {
-        preferred_provider: selectedModel === "auto" ? undefined : selectedModel,
+        preferred_provider:
+          selectedModel === "auto" ? undefined : parsedSelection.providerId,
+        preferred_model:
+          selectedModel === "auto" ? undefined : parsedSelection.model,
+        max_mode: maxMode || undefined,
+        reasoning_enabled: maxMode || undefined,
         // Session-scoped temporary workspace (takes highest priority in the backend).
         // Clears when the user closes the app or starts a new session.
         ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
@@ -1720,13 +1764,22 @@ export function Chat({
     const saveToAgent = event?.shiftKey ?? false;
     setWorkspaceMenuOpen(false);
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: saveToAgent ? "选择该 Agent 的 Workspace 目录" : "选择临时 Workspace 目录",
-      });
-      if (selected == null) return;
-      const dir = selected as string;
+      let dir: string | null = null;
+      if (isTauriEnvironment()) {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: saveToAgent ? "选择该 Agent 的 Workspace 目录" : "选择临时 Workspace 目录",
+        });
+        if (selected == null) return;
+        dir = selected as string;
+      } else {
+        const typed = window.prompt(
+          saveToAgent ? "输入该 Agent 的 Workspace 绝对路径" : "输入临时 Workspace 绝对路径"
+        );
+        dir = typed?.trim() || null;
+        if (!dir) return;
+      }
 
       if (saveToAgent) {
         // Save to the agent config (persistent).
@@ -2062,19 +2115,19 @@ export function Chat({
                 {activeWorkspaceDir ? `${workspaceLabel} · ${workspaceSummary}` : "未选择 Workspace"}
               </span>
             </button>
-            <label className="chat-toolbar-model" title="选择本次任务优先使用的模型服务">
-              <UiIcon name="apps" size={14} />
-              <select
+            <div className="chat-toolbar-model">
+              <ModelPicker
                 value={selectedModel}
-                onChange={(event) => setSelectedModel(event.target.value)}
-                aria-label="任务模型"
-              >
-                <option value="auto">自动模型</option>
-                {availableProviders.map((provider) => (
-                  <option key={provider.id} value={provider.id}>{provider.label}</option>
-                ))}
-              </select>
-            </label>
+                onChange={setSelectedModel}
+                providers={availableProviders}
+                defaultProvider={defaultProviderId}
+                defaultModel={defaultModelId}
+                maxMode={maxMode}
+                onMaxModeChange={setMaxMode}
+                onConfigureCustom={() => onOpenSettings?.("providers")}
+                disabled={sending}
+              />
+            </div>
             {!modelReady ? (
               <button
                 type="button"
@@ -2192,6 +2245,10 @@ export function Chat({
                 selectedModel={selectedModel}
                 providers={availableProviders}
                 onModelChange={setSelectedModel}
+                maxMode={maxMode}
+                onMaxModeChange={setMaxMode}
+                defaultProvider={defaultProviderId}
+                defaultModel={defaultModelId}
                 onConfigureModel={() => onOpenSettings?.("providers")}
                 onChooseWorkspace={() => void handleChooseWorkspace()}
                 onStartGateway={() => void handleStartGateway()}
@@ -2417,6 +2474,7 @@ export function Chat({
                 </label>
               )}
               <textarea
+                ref={composerInputRef}
                 className="chat-input"
                 value={input}
                 onChange={(e) => setActiveInput(e.target.value)}
@@ -2429,7 +2487,7 @@ export function Chat({
                     ? "输入消息，Enter 发送…（支持拖入/粘贴文件）"
                     : "网关未连接…（仍可拖入文件编辑草稿）"
                 }
-                rows={1}
+                rows={3}
                 disabled={gatewayStatus !== "connected"}
               />
               {sending ? (

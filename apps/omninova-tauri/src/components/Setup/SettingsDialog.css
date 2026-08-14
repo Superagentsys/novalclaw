@@ -1,0 +1,101 @@
+.settings-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--ui-canvas, #0f172a) 55%, transparent);
+  backdrop-filter: blur(8px);
+}
+
+.settings-dialog {
+  display: flex;
+  width: min(920px, calc(100vw - 32px));
+  max-height: min(860px, calc(100vh - 48px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--ui-border);
+  border-radius: 20px;
+  background: var(--ui-surface-1);
+  box-shadow: var(--shadow-lg, 0 24px 64px rgba(15, 23, 42, 0.22));
+}
+
+.settings-dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 12px;
+}
+
+.settings-dialog-head h2 {
+  margin: 0;
+  color: var(--ui-text);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.settings-dialog-head p {
+  margin: 4px 0 0;
+  color: var(--ui-text-muted);
+  font-size: 13px;
+}
+
+.settings-dialog-close {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  place-items: center;
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  background: var(--ui-surface-2, var(--ui-canvas));
+  color: var(--ui-text);
+  cursor: pointer;
+}
+
+.settings-dialog-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 20px 12px;
+}
+
+.settings-dialog-tabs button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ui-text-secondary, var(--ui-text-muted));
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.settings-dialog-tabs button:hover {
+  background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+}
+
+.settings-dialog-tabs button.is-active {
+  border-color: color-mix(in srgb, var(--ui-accent) 35%, var(--ui-border));
+  background: var(--ui-accent-soft);
+  color: var(--ui-text);
+  font-weight: 650;
+}
+
+.settings-dialog-body {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.settings-dialog-body .setup-page--embedded,
+.settings-dialog-body .setup-page--dialog {
+  width: 100%;
+  max-width: none;
+  height: auto;
+  margin: 0;
+  padding: 4px 20px 24px;
+}

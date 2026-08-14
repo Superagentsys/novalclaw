@@ -5,6 +5,8 @@ import { UiIcon, type UiIconName } from "./UiIcon";
 
 export type AppNavId =
   | "chat"
+  | "automation"
+  | "knowledge"
   | "general"
   | "providers"
   | "channels"
@@ -20,6 +22,8 @@ interface NavItem {
 
 const WORKSPACE_NAV: NavItem[] = [
   { id: "chat", label: "任务中心", description: "对话、执行与任务历史", icon: "message" },
+  { id: "automation", label: "自动化", description: "定时任务、模板与运行记录", icon: "clock" },
+  { id: "knowledge", label: "知识库", description: "文档入库、检索与给 Agent 引用", icon: "knowledge" },
 ];
 
 const RESOURCE_NAV: NavItem[] = [
@@ -33,6 +37,7 @@ const SIDEBAR_STORAGE_KEY = "omninova.ui.sidebarCollapsed.v1";
 
 interface AppShellProps {
   activeNav: AppNavId;
+  settingsTab?: AppNavId | null;
   onNavigate: (id: AppNavId) => void;
   children: ReactNode;
 }
@@ -45,7 +50,12 @@ function readSidebarPreference(): boolean {
   }
 }
 
-export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
+export function AppShell({
+  activeNav,
+  settingsTab = null,
+  onNavigate,
+  children,
+}: AppShellProps) {
   const [collapsed, setCollapsed] = useState(readSidebarPreference);
 
   useEffect(() => {
@@ -64,7 +74,9 @@ export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
           <button
             key={item.id}
             type="button"
-            className={`app-shell-nav-item ${activeNav === item.id ? "is-active" : ""}`}
+            className={`app-shell-nav-item ${
+              activeNav === item.id || settingsTab === item.id ? "is-active" : ""
+            }`}
             onClick={() => onNavigate(item.id)}
             aria-current={activeNav === item.id ? "page" : undefined}
             aria-label={collapsed ? item.label : undefined}
@@ -130,11 +142,11 @@ export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
           <ThemeSwitcher collapsed={collapsed} />
           <button
             type="button"
-            className={`app-shell-nav-item ${activeNav === "general" ? "is-active" : ""}`}
+            className={`app-shell-nav-item ${settingsTab === "general" ? "is-active" : ""}`}
             onClick={() => onNavigate("general")}
-            aria-current={activeNav === "general" ? "page" : undefined}
+            aria-current={settingsTab === "general" ? "page" : undefined}
             aria-label={collapsed ? "设置" : undefined}
-            title={collapsed ? "设置" : "应用、网关与隐私设置"}
+            title={collapsed ? "设置" : "网关、编排与安全域"}
           >
             <span className="app-shell-nav-icon">
               <UiIcon name="settings" />
@@ -142,7 +154,7 @@ export function AppShell({ activeNav, onNavigate, children }: AppShellProps) {
             {!collapsed ? (
               <span className="app-shell-nav-copy">
                 <span className="app-shell-nav-label">设置</span>
-                <span className="app-shell-nav-description">应用、网关与隐私</span>
+                <span className="app-shell-nav-description">网关、编排与安全域</span>
               </span>
             ) : null}
           </button>

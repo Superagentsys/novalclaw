@@ -564,7 +564,7 @@
 }
 
 .chat-input-row {
-  min-height: 58px;
+  min-height: 104px;
   border: 1px solid var(--ui-border-strong);
   border-radius: calc(var(--theme-panel-radius) + 2px);
   box-shadow: var(--theme-card-shadow);
@@ -847,6 +847,11 @@
   border-color: var(--ui-border);
   background: var(--ui-surface-2);
   color: var(--ui-text);
+}
+
+.provider-custom-form {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-2);
 }
 
 .provider-card:hover {

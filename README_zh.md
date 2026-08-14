@@ -91,6 +91,41 @@ launchctl list com.omninova.gateway   # 可选：查看是否已加载
 
 配置默认在 **`~/.omninova/config.toml`**，也可用环境变量 **`OMNINOVA_CONFIG_DIR`** 指定配置目录。其余子命令（`agent`、`skills`、`channels`、`cron` 等）与带桌面版相同。
 
+### CLI（Claude Code 风格）
+
+```bash
+omninova                         # 流式 REPL
+omninova -p "总结这个仓库"        # 单次问答
+omninova tui                     # 全屏终端 UI
+omninova cron list
+omninova knowledge list
+omninova knowledge add --title "入职手册" --file ./handbook.md
+omninova knowledge search "wifi 密码"
+omninova models list
+omninova sessions list
+```
+
+### Web 版（与桌面同一套 React UI）
+
+Gateway 在 `/app` 提供与桌面相同的控制界面。先构建前端，再启动网关：
+
+```bash
+cd apps/omninova-tauri && npm install && npm run build:web
+# 回到仓库根目录
+omninova gateway run
+# 打开 http://127.0.0.1:10809/app
+omninova web
+```
+
+开发时可用 Vite 热更新（API 会代理到网关）：
+
+```bash
+omninova gateway run
+cd apps/omninova-tauri && npm run dev:web   # http://127.0.0.1:5173
+```
+
+若 UI 产物不在二进制旁，可设 `OMNINOVA_WEB_DIR=/path/to/dist`。浏览器中会跳过托盘、系统截图、原生目录对话框等桌面专属能力；对话、会话、技能、模型、渠道与自动化走同一套 Gateway API。
+
 ### 前置要求
 - **Rust**: 最新稳定版 (`rustup update`)
 - **仅命令行 / 无桌面**：仅安装 Rust 即可；**不需要** Node.js。
@@ -189,7 +224,7 @@ omninovalclaw/
 ├── skills/                  # 内置 SKILL.md 技能包（可导入工作区）
 │   └── phone-call-assistant/ # 移动端电话助手技能（骚扰规则 + 关键信息 Schema）
 ├── apps/
-│   ├── omninova-tauri/      # 桌面前端 (React 19 + TypeScript) & Tauri 配置
+│   ├── omninova-tauri/      # 桌面 + Web 前端 (React 19 + TypeScript) & Tauri 配置
 │   │   ├── src/             # UI 组件 (Setup, Chat, Console)
 │   │   ├── src-tauri/       # Tauri 后端入口
 │   │   └── public/          # 静态资源

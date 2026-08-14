@@ -1,4 +1,4 @@
-use crate::config::{Config, ModelProviderConfig};
+use crate::config::{Config, ModelProviderConfig, ProviderConfig};
 use crate::providers::{AnthropicProvider, GeminiProvider, MockProvider, OpenAiProvider, Provider};
 
 #[derive(Debug, Clone, Default)]
@@ -6,6 +6,34 @@ pub struct ProviderSelection {
     pub provider: Option<String>,
     pub model: Option<String>,
 }
+
+const OPENAI_COMPATIBLE: &[&str] = &[
+    "openai",
+    "openrouter",
+    "ollama",
+    "deepseek",
+    "qwen",
+    "moonshot",
+    "groq",
+    "xai",
+    "mistral",
+    "lmstudio",
+    "together",
+    "fireworks",
+    "novita",
+    "perplexity",
+    "cohere",
+    "doubao",
+    "qianfan",
+    "glm",
+    "minimax",
+    "nvidia",
+    "cloudflare",
+    "sglang",
+    "vllm",
+    "llamacpp",
+    "custom",
+];
 
 pub fn build_provider_from_config(config: &Config) -> Box<dyn Provider> {
     build_provider_with_selection(config, &ProviderSelection::default())
@@ -22,16 +50,46 @@ pub fn build_provider_with_selection(
         .unwrap_or("openai")
         .to_lowercase();
 
-    let profile = config.model_providers.get(&provider_name);
-    let api_key = resolve_api_key(&provider_name, config, profile);
-    let model = selection
-        .model
-        .clone()
-        .unwrap_or_else(|| resolve_model(&provider_name, config, profile));
-    let base_url = resolve_base_url(&provider_name, config, profile);
+    let listed = find_listed_provider(config, &provider_name);
+    let profile = config
+        .model_providers
+        .get(&provider_name)
+        .or_else(|| listed.and_then(|item| config.model_providers.get(&item.id)));
+    let kind = listed
+        .map(|item| item.provider_type.to_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider_name.clone());
+
+    let api_key = resolve_api_key(&provider_name, config, profile)
+        .or_else(|| listed.and_then(|item| resolve_listed_api_key(item)));
+    let model = selection.model.clone().unwrap_or_else(|| {
+        resolve_model(
+            &kind,
+            config,
+            profile,
+            listed.and_then(|item| item.models.first().cloned()),
+        )
+    });
+    let base_url = profile
+        .and_then(|item| item.base_url.clone())
+        .or_else(|| listed.and_then(|item| item.base_url.clone()))
+        .map(|url| normalize_openai_base_url(&kind, url))
+        .or_else(|| resolve_known_base_url(&provider_name))
+        .or_else(|| resolve_known_base_url(&kind))
+        .or_else(|| {
+            if listed.is_none() {
+                config
+                    .api_url
+                    .clone()
+                    .map(|url| normalize_openai_base_url(&kind, url))
+            } else {
+                None
+            }
+        });
     let temp = config.default_temperature;
 
-    match provider_name.as_str() {
+    let dispatch = resolve_dispatch_kind(&provider_name, &kind, base_url.is_some());
+    match dispatch.as_str() {
         "anthropic" => Box::new(AnthropicProvider::new(
             base_url.as_deref(),
             api_key.as_deref(),
@@ -47,56 +105,72 @@ pub fn build_provider_with_selection(
             None,
         )),
         "mock" => Box::new(MockProvider::new("mock-provider")),
-        "openai"
-        | "openrouter"
-        | "ollama"
-        | "deepseek"
-        | "qwen"
-        | "moonshot"
-        | "groq"
-        | "xai"
-        | "mistral"
-        | "lmstudio"
-        | "together"
-        | "fireworks"
-        | "novita"
-        | "perplexity"
-        | "cohere"
-        | "doubao"
-        | "qianfan"
-        | "glm"
-        | "minimax"
-        | "nvidia"
-        | "cloudflare"
-        | "sglang"
-        | "vllm"
-        | "llamacpp" => Box::new(OpenAiProvider::new(
-            base_url.as_deref(),
-            api_key.as_deref(),
-            model,
-            temp,
-            None,
-        )),
-        _ if provider_name.starts_with("custom:") => {
-            let custom_url = provider_name.strip_prefix("custom:").unwrap_or_default();
+        "openai-compat" => {
+            let custom_url = provider_name
+                .strip_prefix("custom:")
+                .map(str::to_string)
+                .or(base_url);
             Box::new(OpenAiProvider::new(
-                Some(custom_url),
+                custom_url.as_deref(),
                 api_key.as_deref(),
                 model,
                 temp,
                 None,
             ))
         }
+        _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(OpenAiProvider::new(
+            base_url.as_deref(),
+            api_key.as_deref(),
+            model,
+            temp,
+            None,
+        )),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
     }
+}
+
+fn find_listed_provider<'a>(config: &'a Config, provider_name: &str) -> Option<&'a ProviderConfig> {
+    config
+        .providers
+        .iter()
+        .find(|item| item.id.eq_ignore_ascii_case(provider_name))
+}
+
+fn resolve_dispatch_kind(provider_name: &str, kind: &str, has_base_url: bool) -> String {
+    if provider_name.starts_with("custom:") || kind == "custom" {
+        return "openai-compat".into();
+    }
+    if kind == "anthropic" || provider_name == "anthropic" {
+        return "anthropic".into();
+    }
+    if kind == "gemini" || provider_name == "gemini" {
+        return "gemini".into();
+    }
+    if kind == "mock" || provider_name == "mock" {
+        return "mock".into();
+    }
+    if OPENAI_COMPATIBLE.contains(&kind) {
+        return kind.to_string();
+    }
+    if OPENAI_COMPATIBLE.contains(&provider_name) {
+        return provider_name.to_string();
+    }
+    if has_base_url {
+        return "openai-compat".into();
+    }
+    provider_name.to_string()
 }
 
 fn resolve_model(
     provider_name: &str,
     config: &Config,
     profile: Option<&ModelProviderConfig>,
+    listed_model: Option<String>,
 ) -> String {
     if let Some(m) = profile.and_then(|p| p.default_model.clone()) {
+        return m;
+    }
+    if let Some(m) = listed_model {
         return m;
     }
     if let Some(m) = config.default_model.clone() {
@@ -146,17 +220,7 @@ fn normalize_openai_base_url(provider_name: &str, url: String) -> String {
     }
 }
 
-fn resolve_base_url(
-    provider_name: &str,
-    config: &Config,
-    profile: Option<&ModelProviderConfig>,
-) -> Option<String> {
-    if let Some(url) = profile.and_then(|p| p.base_url.clone()) {
-        return Some(normalize_openai_base_url(provider_name, url));
-    }
-    if let Some(url) = config.api_url.clone() {
-        return Some(normalize_openai_base_url(provider_name, url));
-    }
+fn resolve_known_base_url(provider_name: &str) -> Option<String> {
     match provider_name {
         "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
         "ollama" => Some("http://localhost:11434/v1".to_string()),
@@ -187,6 +251,77 @@ fn resolve_base_url(
     }
 }
 
+fn resolve_listed_api_key(provider: &ProviderConfig) -> Option<String> {
+    provider
+        .api_key_env
+        .as_deref()
+        .and_then(resolve_secret_or_env)
+}
+
+fn resolve_secret_or_env(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(from_env) = std::env::var(trimmed) {
+        if !from_env.trim().is_empty() {
+            return Some(from_env);
+        }
+    }
+    if looks_like_raw_secret(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn looks_like_raw_secret(value: &str) -> bool {
+    value.len() >= 8
+        && (value.contains('-')
+            || value.chars().any(|ch| ch.is_ascii_lowercase())
+            || !value
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_listed_provider_uses_openai_compatible_client() {
+        let mut config = Config::default();
+        config.providers.push(ProviderConfig {
+            id: "custom-workbuddy".into(),
+            name: "WorkBuddy".into(),
+            provider_type: "openai".into(),
+            api_key_env: Some("sk-test-key".into()),
+            base_url: Some("https://api.example.com/v1".into()),
+            models: vec!["glm-5.1".into()],
+            enabled: true,
+        });
+        config.model_providers.insert(
+            "custom-workbuddy".into(),
+            ModelProviderConfig {
+                api_key_env: Some("sk-test-key".into()),
+                base_url: Some("https://api.example.com/v1".into()),
+                default_model: Some("glm-5.1".into()),
+                models: vec!["glm-5.1".into()],
+                enabled: true,
+                ..ModelProviderConfig::default()
+            },
+        );
+
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("custom-workbuddy".into()),
+                model: Some("glm-5.1".into()),
+            },
+        );
+        assert_eq!(provider.name(), "openai");
+    }
+}
+
 fn resolve_api_key(
     provider_name: &str,
     config: &Config,
@@ -196,10 +331,8 @@ fn resolve_api_key(
         return Some(k);
     }
     if let Some(env_key_name) = profile.and_then(|p| p.api_key_env.clone()) {
-        if let Ok(v) = std::env::var(env_key_name) {
-            if !v.trim().is_empty() {
-                return Some(v);
-            }
+        if let Some(value) = resolve_secret_or_env(&env_key_name) {
+            return Some(value);
         }
     }
     if let Some(k) = config.api_key.clone() {

@@ -169,6 +169,8 @@ export interface SetupProps {
   onConfigSuccess?: () => void;
   /** 由 AppShell 导航时使用：仅渲染内容区，不显示内置侧栏 */
   embedded?: boolean;
+  /** dialog：用于弹出设置，隐藏大标题与 JSON 预览 */
+  presentation?: "page" | "dialog";
   /** 受控当前标签（与 App 导航同步） */
   activeTab?: SetupTab;
   onTabChange?: (tab: SetupTab) => void;
@@ -306,9 +308,11 @@ const SETUP_PAGE_META: Record<
 export function Setup({
   onConfigSuccess,
   embedded = false,
+  presentation = "page",
   activeTab: activeTabProp,
   onTabChange,
 }: SetupProps) {
+  const dialogMode = presentation === "dialog";
   const [activeTabInternal, setActiveTabInternal] = useState<SetupTab>("general");
   const activeTab = activeTabProp ?? activeTabInternal;
   const setActiveTab = (tab: SetupTab) => {
@@ -1993,7 +1997,7 @@ export function Setup({
             </p>
           </div>
         </div>
-      ) : (
+      ) : dialogMode ? null : (
         <header className="setup-embed-hero">
           <h1 className="setup-embed-title">{meta.title}</h1>
           <p className="setup-embed-sub">{meta.subtitle}</p>
@@ -2004,13 +2008,19 @@ export function Setup({
 
       {embedded ? gatewayActions : null}
 
-      {setupPreviewBlock}
+      {dialogMode ? null : setupPreviewBlock}
     </>
   );
 
   if (embedded) {
     return (
-      <div className="setup-page setup-page--embedded">{setupMainInner}</div>
+      <div
+        className={`setup-page setup-page--embedded${
+          dialogMode ? " setup-page--dialog" : ""
+        }`}
+      >
+        {setupMainInner}
+      </div>
     );
   }
 
