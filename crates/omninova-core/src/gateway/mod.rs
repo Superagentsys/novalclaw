@@ -15,6 +15,7 @@ pub mod wecom_http;
 pub mod wecom_stream;
 pub mod wecom_inbound;
 pub mod wecom_outbound;
+pub mod wecom_http_stream;
 pub mod wecom_worker;
 
 /// Unified DingTalk Stream lifecycle state.
@@ -43,6 +44,7 @@ mod wecom_tests;
 
 use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
 use crate::gateway::feishu_store::FeishuStore;
+use crate::gateway::wecom_http::http_callback_enabled;
 use home;
 
 use crate::agent::sanitize_messages_for_provider;
@@ -495,6 +497,8 @@ pub struct GatewayRuntime {
     monitor_flights: Arc<MonitorFlightGuard>,
     /// Per-card DingTalk monitor single-flight guard.
     dingtalk_monitor_guard: Arc<DingtalkMonitorGuard>,
+    /// WeCom HTTP callback stream state (isolated from Long Connection).
+    wecom_http_stream_store: Arc<wecom_http_stream::WecomHttpStreamStore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1039,7 @@ impl GatewayRuntime {
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            wecom_http_stream_store: Arc::new(wecom_http_stream::WecomHttpStreamStore::new()),
         }
     }
 
@@ -1063,11 +1068,16 @@ impl GatewayRuntime {
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            wecom_http_stream_store: Arc::new(wecom_http_stream::WecomHttpStreamStore::new()),
         }
     }
 
     pub(crate) fn dedup_cache(&self) -> Arc<DedupCache> {
         self.dedup_cache.clone()
+    }
+
+    pub(crate) fn wecom_http_stream_store(&self) -> Arc<wecom_http_stream::WecomHttpStreamStore> {
+        self.wecom_http_stream_store.clone()
     }
 
     pub(crate) fn monitor_flight_guard(&self) -> Arc<MonitorFlightGuard> {
@@ -4734,13 +4744,93 @@ async fn http_wecom_callback_verify(
     }
 }
 
+/// Bounded, safe error class for agent-failure logs. Never logs full
+/// error bodies or internal stack details.
+fn classify_agent_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(64).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+/// Dispatch Agent for a WeCom HTTP callback in the background.
+///
+/// The initial HTTP stream placeholder reply is ALREADY built and
+/// returned before this task runs: the HTTP handler never awaits
+/// `runtime.process_inbound`. On completion this updates the shared
+/// HTTP stream state that stream refresh callbacks read.
+async fn wecom_http_dispatch_agent(
+    runtime: Arc<GatewayRuntime>,
+    inbound: InboundMessage,
+    stream_id: String,
+    job_id: String,
+    chat_type: &'static str,
+) {
+    let start_time = std::time::Instant::now();
+    println!(
+        "[wecom-http-agent] dispatch_started job_id={} stream_id={} chat_type={}",
+        job_id,
+        wecom_stream::short_hash(&stream_id),
+        chat_type
+    );
+
+    // Process through the EXISTING Agent Runtime (no second runtime).
+    match runtime.process_inbound(&inbound).await {
+        Ok(response) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let reply_text = response.reply.clone();
+
+            // Update stream with final content
+            let store = runtime.wecom_http_stream_store();
+            store.complete_stream(&stream_id, reply_text.clone()).await;
+
+            println!(
+                "[wecom-http-agent] dispatch_completed job_id={} stream_id={} reply_len={} duration_ms={}",
+                job_id,
+                wecom_stream::short_hash(&stream_id),
+                reply_text.chars().count(),
+                duration_ms
+            );
+        }
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let error_class = classify_agent_error(&e);
+
+            // Update stream with safe fallback (never the error body)
+            let store = runtime.wecom_http_stream_store();
+            store.fail_stream(&stream_id, error_class.clone()).await;
+
+            println!(
+                "[wecom-http-agent] dispatch_failed job_id={} stream_id={} error_class={} duration_ms={}",
+                job_id,
+                wecom_stream::short_hash(&stream_id),
+                error_class,
+                duration_ms
+            );
+        }
+    }
+}
+
 async fn http_wecom_callback_post(
     State(runtime): State<GatewayRuntime>,
     Query(query): Query<wecom_http::WecomCallbackQuery>,
     raw_body: String,
-) -> (StatusCode, String) {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     println!("[wecom-http] callback_received=true body_len={}", raw_body.len());
     let config = runtime.get_config().await;
+
+    // Transport guard: the HTTP handler stays inactive in long_connection
+    // mode; the long-connection lifecycle is completely untouched.
+    if !http_callback_enabled(&config) {
+        println!("[wecom-http] transport_inactive=true");
+        return Err((StatusCode::NOT_FOUND, "not_found".to_string()));
+    }
+
+    // verify → decrypt → JSON deserialize → normalize (same chain as 2A.1.x)
     let parsed = match wecom_http::parse_post(&config, &query, &raw_body) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -4749,30 +4839,175 @@ async fn http_wecom_callback_post(
                 "[wecom-http] signature_valid={} decrypt_ok={} inbound_parse_ok=false",
                 signature_valid, decrypt_ok
             );
-            return wecom_http_error_response(error);
+            return Err(wecom_http_error_response(error));
         }
     };
+
     println!("[wecom-http] signature_valid=true");
     println!("[wecom-http] decrypt_ok=true");
     println!(
-        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_len={}",
-        crate::gateway::wecom_stream::short_hash(&parsed.body.msgid),
+        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_len={} response_url_present={}",
+        wecom_stream::short_hash(&parsed.body.msgid),
         wecom_http::chat_type(&parsed.body),
         parsed.body.msgtype.as_deref().unwrap_or("unknown"),
-        parsed.inbound.text.chars().count()
+        parsed.inbound.text.chars().count(),
+        parsed.body.response_url.is_some()
     );
 
-    if !runtime.dedup_cache().check_and_insert(&parsed.body.msgid).await {
-        println!(
-            "[wecom-http] duplicate_msgid={} ignored=true",
-            crate::gateway::wecom_stream::short_hash(&parsed.body.msgid)
-        );
-    } else {
-        // Phase 2A.1 deliberately ends at the normalized inbound contract.
-        // Agent dispatch and HTTP replies are introduced in a later phase.
-        println!("[wecom-http] callback_accepted=true agent_dispatch=false");
+    match wecom_http::classify_callback(&parsed.body) {
+        // -----------------------------------------------------------------
+        // Stream refresh: NOT user input — never dispatch Agent.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::StreamRefresh => {
+            println!("[wecom-http] stream_refresh_received=true");
+            let stream_id = parsed
+                .body
+                .stream
+                .as_ref()
+                .and_then(|s| s.id.clone())
+                .unwrap_or_default();
+            if stream_id.is_empty() {
+                println!("[wecom-http] stream_refresh_missing_id=true");
+                return Ok(Json(serde_json::json!({})));
+            }
+            let store = runtime.wecom_http_stream_store();
+            match store.get_stream(&stream_id).await {
+                Some(state) => {
+                    println!("[wecom-http] stream_state={:?}", state.status);
+                    let plaintext = wecom_http::build_stream_reply_plaintext(
+                        &stream_id,
+                        &state.content,
+                        state.finish,
+                    );
+                    let reply = wecom_http::build_encrypted_reply(
+                        &config,
+                        &query.timestamp,
+                        &query.nonce,
+                        &plaintext,
+                    )
+                    .map_err(wecom_http_error_response)?;
+                    println!("[wecom-http] stream_refresh_response_encrypted=true");
+                    Ok(Json(reply))
+                }
+                None => {
+                    // Unknown stream: official behavior — safe empty result
+                    // with finish=true, never a new Agent job.
+                    println!(
+                        "[wecom-http] stream_id={} unknown=true",
+                        wecom_stream::short_hash(&stream_id)
+                    );
+                    let plaintext =
+                        wecom_http::build_stream_reply_plaintext(&stream_id, "", true);
+                    let reply = wecom_http::build_encrypted_reply(
+                        &config,
+                        &query.timestamp,
+                        &query.nonce,
+                        &plaintext,
+                    )
+                    .map_err(wecom_http_error_response)?;
+                    println!("[wecom-http] stream_refresh_unknown_finish=true");
+                    Ok(Json(reply))
+                }
+            }
+        }
+        // -----------------------------------------------------------------
+        // Non-user callbacks: ACK only, never enter the Agent.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::NonText => {
+            println!(
+                "[wecom-http] unsupported_msgtype={} ack_only=true",
+                parsed.body.msgtype.as_deref().unwrap_or("unknown")
+            );
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::MissingSender => {
+            println!("[wecom-http] missing_sender rejected=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::SystemSender => {
+            println!("[wecom-http] system_sender ignored=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::GroupMissingChatId => {
+            println!("[wecom-http] group_missing_chatid rejected=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        // -----------------------------------------------------------------
+        // Real user text message: stream state + async Agent + placeholder.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::UserText => {
+            let chat_type = wecom_http::chat_type(&parsed.body);
+            let store = runtime.wecom_http_stream_store();
+            let (stream, created) = store
+                .get_or_create_stream(
+                    Some(parsed.body.msgid.clone()),
+                    parsed.inbound.session_id.clone(),
+                    parsed.body.response_url.clone(),
+                )
+                .await;
+            let stream_id = stream.stream_id.clone();
+            if created {
+                println!(
+                    "[wecom-http] dedup=accepted stream_created=true stream_id={} chat_type={}",
+                    wecom_stream::short_hash(&stream_id),
+                    chat_type
+                );
+            } else {
+                // Duplicate callback: reuse the SAME stream and current
+                // state — never a second Agent job.
+                println!(
+                    "[wecom-http] dedup=duplicate stream_reused=true stream_id={}",
+                    wecom_stream::short_hash(&stream_id)
+                );
+            }
+
+            // Build the reply from the CURRENT state (placeholder for a
+            // new stream; current content/finish for a duplicate).
+            let plaintext = wecom_http::build_stream_reply_plaintext(
+                &stream_id,
+                &stream.content,
+                stream.finish,
+            );
+            let reply = wecom_http::build_encrypted_reply(
+                &config,
+                &query.timestamp,
+                &query.nonce,
+                &plaintext,
+            )
+            .map_err(wecom_http_error_response)?;
+
+            if created {
+                // Background Agent job — the handler does NOT await it.
+                let job_id = wecom_stream::short_hash(&parsed.body.msgid);
+                let runtime_for_job = Arc::new(runtime.clone());
+                let inbound_for_job = parsed.inbound.clone();
+                let stream_id_for_job = stream_id.clone();
+                tokio::spawn(async move {
+                    wecom_http_dispatch_agent(
+                        runtime_for_job,
+                        inbound_for_job,
+                        stream_id_for_job,
+                        job_id,
+                        chat_type,
+                    )
+                    .await;
+                });
+                println!(
+                    "[wecom-http] agent_dispatch_started stream_id={}",
+                    wecom_stream::short_hash(&stream_id)
+                );
+            }
+
+            println!(
+                "[wecom-http] initial_reply_encrypted=true stream_id={} finish={}",
+                wecom_stream::short_hash(&stream_id),
+                stream.finish
+            );
+            // Return the encrypted placeholder immediately — the Agent
+            // completes the stream state asynchronously.
+            Ok(Json(reply))
+        }
     }
-    (StatusCode::OK, String::new())
 }
 
 async fn http_wechat_webhook(

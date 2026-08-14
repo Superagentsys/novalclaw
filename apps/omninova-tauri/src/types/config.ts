@@ -208,8 +208,11 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     category: "im",
     tokenEnvHint: "WECOM_BOT_SECRET",
     fields: [
+      { key: "transport_mode", label: "连接方式", placeholder: "long_connection/http_callback", type: "text", isExtra: true },
       { key: "bot_id", label: "Bot ID", placeholder: "企业微信智能机器人 BotID", type: "text", isExtra: true },
       { key: "secret", label: "Secret (长连接密钥)", placeholder: "企业微信长连接专用密钥", type: "password", isExtra: true },
+      { key: "callback_token", label: "Callback Token (HTTP回调)", placeholder: "企业微信回调 Token", type: "password", isExtra: true },
+      { key: "encoding_aes_key", label: "EncodingAESKey (HTTP回调)", placeholder: "消息加解密密钥（43字符）", type: "password", isExtra: true },
     ],
   },
   {

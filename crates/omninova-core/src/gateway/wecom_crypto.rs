@@ -497,7 +497,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn sha1_digest(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1_digest(input: &[u8]) -> [u8; 20] {
     let bit_len = (input.len() as u64) * 8;
     let mut padded = input.to_vec();
     padded.push(0x80);
@@ -555,6 +555,90 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
     let mut output = [0u8; 20];
     for (index, value) in [h0, h1, h2, h3, h4].iter().enumerate() {
         output[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    output
+}
+
+/// Build a WeCom frame and encrypt it for HTTP callback responses.
+///
+/// Format: `random(16) + msg_len(BE32) + message + receive_id`
+/// with PKCS#7-32 padding, then AES-256-CBC, then base64.
+///
+/// Uses the same key decode, IV extraction, PKCS#7-32 and AES-256-CBC
+/// as the decrypt path — no second, divergent crypto implementation.
+/// The 16 random bytes come from UUID v4 (122 random bits), never from
+/// the key or any user-derived material.
+pub fn encrypt_message(
+    encoding_aes_key: &str,
+    message: &str,
+    receive_id: &str,
+) -> Result<String, WecomCryptoError> {
+    // Decode the EncodingAESKey to 32-byte AES key
+    let key = decode_encoding_aes_key(encoding_aes_key)
+        .map_err(WecomCryptoError::EncodingKeyDecodeFailed)?;
+
+    // Build the frame: random(16) + msg_len(4) + message + receive_id
+    let message_bytes = message.as_bytes();
+    let receive_id_bytes = receive_id.as_bytes();
+    let mut frame = Vec::with_capacity(20 + message_bytes.len() + receive_id_bytes.len());
+
+    // Random 16 bytes from UUID v4 (RFC 4122: 122 random bits).
+    let random_bytes: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+    frame.extend_from_slice(&random_bytes);
+
+    // Message length as big-endian u32
+    frame.extend_from_slice(&(message_bytes.len() as u32).to_be_bytes());
+
+    // Message content
+    frame.extend_from_slice(message_bytes);
+
+    // receive_id (may be empty)
+    frame.extend_from_slice(receive_id_bytes);
+
+    // PKCS#7 padding with block size 32
+    let padding = 32 - (frame.len() % 32);
+    frame.extend(std::iter::repeat_n(padding as u8, padding));
+
+    // AES-256-CBC encrypt
+    let encrypted = encrypt_aes256_cbc(&frame, &key);
+
+    // Base64 encode
+    Ok(BASE64.encode(&encrypted))
+}
+
+/// Build the reply `msgsignature` for an encrypted HTTP callback
+/// response: `sha1(sort(token, timestamp, nonce, encrypt))` as hex —
+/// the exact inverse of [`verify_signature`].
+pub fn build_signature(
+    token: &str,
+    timestamp: &str,
+    nonce: &str,
+    encrypted: &str,
+) -> String {
+    let mut parts = [token, timestamp, nonce, encrypted];
+    parts.sort_unstable();
+    let joined = parts.concat();
+    hex::encode(sha1_digest(joined.as_bytes()))
+}
+
+/// Raw AES-256-CBC encryption (CBC mode, no padding).
+fn encrypt_aes256_cbc(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    use aes::cipher::BlockEncrypt;
+
+    let cipher = Aes256::new_from_slice(key).expect("valid AES-256 key");
+    let iv = &key[..16]; // IV = first 16 bytes of key
+    let mut previous = iv.to_vec();
+    let mut output = Vec::with_capacity(plaintext.len());
+
+    for chunk in plaintext.chunks_exact(16) {
+        let mut xored = [0u8; 16];
+        for i in 0..16 {
+            xored[i] = chunk[i] ^ previous[i];
+        }
+        let mut block = aes::cipher::Block::<Aes256>::from(xored);
+        cipher.encrypt_block(&mut block);
+        output.extend_from_slice(&block);
+        previous.copy_from_slice(&block);
     }
     output
 }
@@ -1181,5 +1265,76 @@ mod tests {
         );
         assert!(skipped.result.is_ok());
         assert_eq!(skipped.stages.receive_id_check, ReceiveIdCheck::Skipped);
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        // Test that encrypt -> decrypt produces the original message
+        let message = r#"{"msgtype":"stream","stream":{"id":"test-123","content":"正在处理中...","finish":false}}"#;
+        let receive_id = "";
+
+        let encrypted = encrypt_message(TEST_ENCODING_AES_KEY, message, receive_id).unwrap();
+        let result = decrypt_message(TEST_ENCODING_AES_KEY, &encrypted, receive_id).unwrap();
+        assert_eq!(result.message, message);
+        assert_eq!(result.receive_id, receive_id);
+    }
+
+    #[test]
+    fn encrypt_uses_fresh_random_each_call() {
+        // Two encryptions of the same plaintext must differ (random16).
+        let message = r#"{"msgtype":"stream"}"#;
+        let first = encrypt_message(TEST_ENCODING_AES_KEY, message, "").unwrap();
+        let second = encrypt_message(TEST_ENCODING_AES_KEY, message, "").unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn build_signature_roundtrip_verifies() {
+        let encrypted = encrypt_message(TEST_ENCODING_AES_KEY, "payload", "").unwrap();
+        let signature = build_signature("reply-token", "1700000000", "reply-nonce", &encrypted);
+        assert!(verify_signature(
+            "reply-token",
+            "1700000000",
+            "reply-nonce",
+            &encrypted,
+            &signature
+        ));
+        assert!(!verify_signature(
+            "other-token",
+            "1700000000",
+            "reply-nonce",
+            &encrypted,
+            &signature
+        ));
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip_with_receive_id() {
+        // Test with a configured receive_id
+        let message = r#"{"msgtype":"stream"}"#;
+        let receive_id = "wxcrmb123456";
+
+        let encrypted = encrypt_message(TEST_ENCODING_AES_KEY, message, receive_id).unwrap();
+        let result = decrypt_message(TEST_ENCODING_AES_KEY, &encrypted, receive_id).unwrap();
+        assert_eq!(result.message, message);
+        assert_eq!(result.receive_id, receive_id);
+    }
+
+    #[test]
+    fn encrypt_deterministic_frame_format() {
+        // Verify the encrypted output can be decrypted correctly
+        let message = "test-message";
+        let receive_id = "corp-id";
+
+        let encrypted = encrypt_message(TEST_ENCODING_AES_KEY, message, receive_id).unwrap();
+        let result = decrypt_message(TEST_ENCODING_AES_KEY, &encrypted, receive_id).unwrap();
+
+        assert_eq!(result.message, message);
+        assert_eq!(result.receive_id, receive_id);
+
+        // Verify the encrypted string is base64 and not empty
+        assert!(!encrypted.is_empty());
+        // Verify it's not the plaintext
+        assert_ne!(encrypted, message);
     }
 }

@@ -148,6 +148,13 @@ pub struct WecomCallbackBody {
     /// Event details (for event callbacks).
     #[serde(rename = "event", skip_serializing_if = "Option::is_none")]
     pub event: Option<WecomEvent>,
+    /// Stream refresh info (for stream refresh callbacks).
+    #[serde(rename = "stream", skip_serializing_if = "Option::is_none")]
+    pub stream: Option<WecomStream>,
+    /// Response URL (callback may carry it for async replies).
+    /// Phase 2A.2: parsed/saved only — NOT pushed (see Phase 2A.3).
+    #[serde(rename = "response_url", skip_serializing_if = "Option::is_none")]
+    pub response_url: Option<String>,
     /// Event creation timestamp.
     #[serde(rename = "create_time", skip_serializing_if = "Option::is_none")]
     pub create_time: Option<i64>,
@@ -181,6 +188,14 @@ pub struct WecomEvent {
     /// Additional event fields.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Stream refresh info (for stream refresh callbacks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WecomStream {
+    /// Stream ID for polling.
+    #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
