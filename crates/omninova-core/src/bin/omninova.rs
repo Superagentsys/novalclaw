@@ -11,9 +11,9 @@ async fn main() {
     let cli = Cli::parse();
     let is_daemon_check = matches!(
         &cli.command,
-        Commands::Daemon {
+        Some(Commands::Daemon {
             command: DaemonCommands::Check { .. }
-        }
+        })
     );
     match run_cli(cli).await {
         Ok(output) => {

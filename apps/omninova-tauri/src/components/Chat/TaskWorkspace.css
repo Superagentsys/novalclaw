@@ -47,7 +47,7 @@
 
 .task-status-strip > button,
 .task-artifact-inspect,
-.task-onboarding-action button {
+.task-onboarding-action > button {
   display: inline-flex;
   min-height: 30px;
   align-items: center;
@@ -64,7 +64,7 @@
 
 .task-status-strip > button:hover,
 .task-artifact-inspect:hover,
-.task-onboarding-action button:hover {
+.task-onboarding-action > button:hover {
   border-color: var(--ui-accent);
   background: var(--ui-accent-soft);
   color: var(--ui-accent-strong);
@@ -278,7 +278,12 @@
   padding-right: 10px;
 }
 
-.chat-toolbar-model,
+.chat-toolbar-model {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+}
+
 .chat-toolbar-gateway {
   display: inline-flex;
   min-width: 0;
@@ -294,13 +299,23 @@
   white-space: nowrap;
 }
 
-.chat-toolbar-model select {
-  max-width: 118px;
-  border: 0;
-  outline: 0;
-  background: transparent;
+.chat-toolbar-model select option,
+.task-onboarding-action select option {
+  background-color: var(--ui-surface-2);
   color: var(--ui-text);
-  font-size: 10px;
+}
+
+.chat-toolbar-model select option:checked,
+.task-onboarding-action select option:checked {
+  background-color: var(--ui-accent);
+  color: var(--ui-text-on-accent);
+}
+
+:root[data-theme="midnight"] .chat-toolbar-model select,
+:root[data-theme="midnight"] .task-onboarding-action select,
+:root[data-theme="graphite"] .chat-toolbar-model select,
+:root[data-theme="graphite"] .task-onboarding-action select {
+  color-scheme: dark;
 }
 
 .chat-toolbar-gateway button,
@@ -573,6 +588,32 @@
 .task-inspector-process-list code { overflow-wrap: anywhere; color: var(--ui-text-muted); font-size: 8px; }
 .task-inspector-process-list time { color: var(--ui-text-muted); font-size: 8px; }
 
+.task-inspector-process-path {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid var(--ui-border);
+  border-radius: 5px;
+  background: var(--ui-surface-1);
+  color: var(--ui-accent-strong);
+  font-size: 8px;
+  text-align: left;
+}
+
+.task-inspector-process-path span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-inspector-process-path:hover {
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-soft);
+}
+
 .task-inspector-result {
   padding: 12px;
   border: 1px solid var(--ui-border);
@@ -781,6 +822,20 @@
   display: flex;
   min-height: 38px;
   align-items: center;
+}
+
+.task-onboarding-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+}
+
+.task-onboarding-model .model-picker-trigger {
+  min-height: 34px;
+  max-width: 280px;
+  font-size: 12px;
 }
 
 .task-onboarding-action label {

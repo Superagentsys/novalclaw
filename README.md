@@ -91,6 +91,41 @@ launchctl list com.omninova.gateway   # optional: see if loaded
 
 Config defaults to **`~/.omninova/config.toml`**; override with **`OMNINOVA_CONFIG_DIR`** if needed. All other CLI commands (`agent`, `skills`, `channels`, etc.) work the same as with the desktop app.
 
+### CLI (Claude Code style)
+
+```bash
+omninova                         # streaming REPL
+omninova -p "summarize this repo"  # one-shot
+omninova tui                     # fullscreen terminal UI
+omninova cron list
+omninova knowledge list
+omninova knowledge add --title "onboarding" --file ./handbook.md
+omninova knowledge search "wifi password"
+omninova models list
+omninova sessions list
+```
+
+### Web UI (same React app as desktop)
+
+The Gateway serves the desktop UI at `/app`. Build the frontend once, then start the gateway:
+
+```bash
+cd apps/omninova-tauri && npm install && npm run build:web
+# from repo root
+omninova gateway run
+# open http://127.0.0.1:10809/app
+omninova web
+```
+
+For live reload during development, run the Vite dev server (proxies API calls to the gateway):
+
+```bash
+omninova gateway run
+cd apps/omninova-tauri && npm run dev:web   # http://127.0.0.1:5173
+```
+
+Optional: `OMNINOVA_WEB_DIR=/path/to/dist` if the UI bundle is not next to the binary. Desktop-only actions (tray, native screenshot, OS file dialogs) are skipped in the browser; chat, sessions, skills, providers, channels, and automations use the same Gateway API.
+
 ### Prerequisites
 - **Rust**: Latest stable version (`rustup update`)
 - **CLI-only / headless**: Rust only; **Node.js is not required**.
@@ -196,7 +231,7 @@ omninovalclaw/
 ├── skills/                  # Bundled SKILL.md packs (import into workspace)
 │   └── phone-call-assistant/ # Mobile phone-agent skill (spam rules + key-info schema)
 ├── apps/
-│   ├── omninova-tauri/      # Desktop Frontend (React 19 + TypeScript) & Tauri Config
+│   ├── omninova-tauri/      # Desktop + Web Frontend (React 19 + TypeScript) & Tauri Config
 │   │   ├── src/             # UI Components (Setup, Chat, Console)
 │   │   ├── src-tauri/       # Tauri Backend Entrypoint
 │   │   └── public/          # Static Assets

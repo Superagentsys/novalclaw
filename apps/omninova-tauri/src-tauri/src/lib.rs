@@ -8,11 +8,17 @@ use omninova_core::config::{
     ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
     ProviderConfig, RobotConfig,
 };
+use omninova_core::cron::{
+    now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
+};
+use omninova_core::knowledge::{
+    KnowledgeDocument, KnowledgeHit, KnowledgeStore, KnowledgeUpsert,
+};
 use omninova_core::gateway::{
     check_dingtalk_public_route, check_gateway_public_health,
     dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
     feishu_public_callback_urls, normalize_gateway_public_config,
-    normalize_public_webhook_base_url, GatewayHealth, GatewayInboundResponse,
+    normalize_public_webhook_base_url, AgentJobExecutor, GatewayHealth, GatewayInboundResponse,
     DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
@@ -1065,6 +1071,383 @@ async fn cancel_agent_run(
         .cancel_agent_run(&run_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn workspace_dir_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> PathBuf {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime.get_config().await.workspace_dir
+}
+
+async fn open_cron_store(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<CronStore, String> {
+    let workspace = workspace_dir_from_state(state).await;
+    CronStore::open(workspace.join("cron.json"))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn open_cron_run_store(
+    state: &tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<CronRunStore, String> {
+    let workspace = workspace_dir_from_state(state).await;
+    CronRunStore::open(workspace.join("cron_runs.json"))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn open_knowledge_store(
+    state: &tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<KnowledgeStore, String> {
+    let workspace = workspace_dir_from_state(state).await;
+    KnowledgeStore::open_in(workspace)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn spawn_desktop_automation_scheduler(runtime: GatewayRuntime) {
+    let workspace = runtime.get_config().await.workspace_dir;
+    let store = match CronStore::open(workspace.join("cron.json")).await {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("[automation] failed to open store: {error}");
+            return;
+        }
+    };
+    let runs = match CronRunStore::open(workspace.join("cron_runs.json")).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!("[automation] failed to open run history: {error}");
+            return;
+        }
+    };
+    let executor = Arc::new(AgentJobExecutor::new(runtime));
+    if CronScheduler::new(store, runs, executor).spawn_once() {
+        eprintln!("[automation] scheduler started");
+    }
+}
+
+fn compute_next_run(schedule: &str, tz_offset_minutes: i32) -> Result<Option<String>, String> {
+    let parsed = Schedule::parse(schedule).map_err(|error| error.to_string())?;
+    Ok(parsed.next_run_iso(tz_offset_minutes))
+}
+
+fn local_tz_offset_minutes() -> i32 {
+    0
+}
+
+fn new_job_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("job-{nanos:x}")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationJobInput {
+    id: Option<String>,
+    name: String,
+    schedule: String,
+    prompt: String,
+    #[serde(default)]
+    description: String,
+    template_id: Option<String>,
+    tz_offset_minutes: Option<i32>,
+    enabled: Option<bool>,
+}
+
+fn build_cron_job(input: AutomationJobInput, existing: Option<CronJob>) -> Result<CronJob, String> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err("请填写任务名称".to_string());
+    }
+    let prompt = input.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("请填写要交给智能体执行的指令".to_string());
+    }
+    let tz_offset_minutes = input
+        .tz_offset_minutes
+        .unwrap_or_else(local_tz_offset_minutes);
+    let next_run = compute_next_run(&input.schedule, tz_offset_minutes)?;
+    let now = now_timestamp();
+    Ok(CronJob {
+        id: input
+            .id
+            .filter(|value| !value.is_empty())
+            .or_else(|| existing.as_ref().map(|job| job.id.clone()))
+            .unwrap_or_else(new_job_id),
+        name,
+        schedule: input.schedule.trim().to_string(),
+        prompt,
+        command: String::new(),
+        description: input.description.trim().to_string(),
+        template_id: input.template_id.filter(|value| !value.is_empty()),
+        tz_offset_minutes,
+        enabled: input.enabled.unwrap_or(existing.as_ref().map(|job| job.enabled).unwrap_or(true)),
+        last_run: existing.as_ref().and_then(|job| job.last_run.clone()),
+        last_status: existing.as_ref().and_then(|job| job.last_status),
+        next_run,
+        last_error: existing.as_ref().and_then(|job| job.last_error.clone()),
+        created_at: existing
+            .as_ref()
+            .map(|job| job.created_at.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(now),
+    })
+}
+
+#[tauri::command]
+async fn automation_list_jobs(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<CronJob>, String> {
+    let store = open_cron_store(&state).await?;
+    Ok(store.list().await)
+}
+
+#[tauri::command]
+async fn automation_upsert_job(
+    input: AutomationJobInput,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<CronJob, String> {
+    let store = open_cron_store(&state).await?;
+    let existing = match &input.id {
+        Some(id) if !id.is_empty() => store.get(id).await,
+        _ => None,
+    };
+    let job = build_cron_job(input, existing)?;
+    store.upsert(job.clone()).await.map_err(|error| error.to_string())?;
+    Ok(job)
+}
+
+#[tauri::command]
+async fn automation_delete_job(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let store = open_cron_store(&state).await?;
+    let removed = store.remove(&id).await.map_err(|error| error.to_string())?;
+    if removed {
+        let runs = open_cron_run_store(&state).await?;
+        let _ = runs.remove_for_job(&id).await;
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+async fn automation_set_enabled(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<CronJob>, String> {
+    let store = open_cron_store(&state).await?;
+    let found = store
+        .set_enabled(&id, enabled)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !found {
+        return Ok(None);
+    }
+    if enabled {
+        if let Some(job) = store.get(&id).await {
+            let next = compute_next_run(&job.schedule, job.tz_offset_minutes)?;
+            store
+                .set_next_run(&id, next)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(store.get(&id).await)
+}
+
+#[tauri::command]
+async fn automation_run_now(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<CronRun, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let workspace = runtime.get_config().await.workspace_dir;
+    let store = CronStore::open(workspace.join("cron.json"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let runs = CronRunStore::open(workspace.join("cron_runs.json"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let executor = Arc::new(AgentJobExecutor::new(runtime));
+    CronScheduler::new(store, runs, executor)
+        .trigger_now(&id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn automation_list_runs(
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<CronRun>, String> {
+    let runs = open_cron_run_store(&state).await?;
+    Ok(runs.list(limit).await)
+}
+
+#[tauri::command]
+async fn automation_clear_runs(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let runs = open_cron_run_store(&state).await?;
+    runs.clear().await.map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeUpsertInput {
+    id: Option<String>,
+    title: Option<String>,
+    collection: Option<String>,
+    source: Option<String>,
+    source_path: Option<String>,
+    kind: Option<String>,
+    tags: Option<Vec<String>>,
+    content: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeImportFile {
+    name: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeDocumentView {
+    document: KnowledgeDocument,
+    content: String,
+}
+
+#[tauri::command]
+async fn knowledge_list(
+    collection: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    let store = open_knowledge_store(&state).await?;
+    Ok(store.list(collection.as_deref()).await)
+}
+
+#[tauri::command]
+async fn knowledge_collections(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let store = open_knowledge_store(&state).await?;
+    Ok(store.collections().await)
+}
+
+#[tauri::command]
+async fn knowledge_get(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<KnowledgeDocumentView, String> {
+    let store = open_knowledge_store(&state).await?;
+    match store.get(&id).await.map_err(|error| error.to_string())? {
+        Some((document, content)) => Ok(KnowledgeDocumentView { document, content }),
+        None => Err(format!("document not found: {id}")),
+    }
+}
+
+#[tauri::command]
+async fn knowledge_upsert(
+    input: KnowledgeUpsertInput,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<KnowledgeDocument, String> {
+    let store = open_knowledge_store(&state).await?;
+    store
+        .upsert(KnowledgeUpsert {
+            id: input.id,
+            title: input.title.unwrap_or_default(),
+            collection: input.collection.unwrap_or_else(|| "default".into()),
+            source: input.source.unwrap_or_else(|| "note".into()),
+            source_path: input.source_path,
+            kind: input.kind.unwrap_or_else(|| "md".into()),
+            tags: input.tags.unwrap_or_default(),
+            content: input.content.unwrap_or_default(),
+            enabled: input.enabled.unwrap_or(true),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn knowledge_import(
+    paths: Option<Vec<String>>,
+    files: Option<Vec<KnowledgeImportFile>>,
+    collection: Option<String>,
+    tags: Option<Vec<String>>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    let store = open_knowledge_store(&state).await?;
+    let tags = tags.unwrap_or_default();
+    let mut imported = Vec::new();
+    for path in paths.unwrap_or_default() {
+        imported.push(
+            store
+                .import_path(Path::new(&path), collection.as_deref(), tags.clone())
+                .await
+                .map_err(|error| format!("{path}: {error}"))?,
+        );
+    }
+    for file in files.unwrap_or_default() {
+        imported.push(
+            store
+                .import_bytes(&file.name, file.content.as_bytes(), collection.as_deref(), tags.clone())
+                .await
+                .map_err(|error| format!("{}: {error}", file.name))?,
+        );
+    }
+    if imported.is_empty() {
+        return Err("provide paths or files".into());
+    }
+    Ok(imported)
+}
+
+#[tauri::command]
+async fn knowledge_delete(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<bool, String> {
+    let store = open_knowledge_store(&state).await?;
+    store.remove(&id).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn knowledge_set_enabled(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Option<KnowledgeDocument>, String> {
+    let store = open_knowledge_store(&state).await?;
+    store
+        .set_enabled(&id, enabled)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn knowledge_search(
+    query: String,
+    collection: Option<String>,
+    limit: Option<u32>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<KnowledgeHit>, String> {
+    let store = open_knowledge_store(&state).await?;
+    Ok(store
+        .search(&query, collection.as_deref(), limit.unwrap_or(12) as usize)
+        .await)
 }
 
 /// Debug-only: directly executes a shell command and streams output as agent-run-events.
@@ -3126,7 +3509,114 @@ struct TaskArtifactPreview {
     text_preview: Option<String>,
 }
 
-fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectedTaskArtifact {
+    path: String,
+    size: u64,
+    modified_at: u64,
+    extension: String,
+}
+
+fn should_skip_artifact_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git" | ".omninova" | "node_modules" | "target" | ".cache" | ".idea" | ".vscode"
+    )
+}
+
+fn collect_recent_workspace_files(
+    root: &Path,
+    current: &Path,
+    cutoff_ms: u64,
+    depth: usize,
+    visited: &mut usize,
+    output: &mut Vec<CollectedTaskArtifact>,
+) -> Result<(), String> {
+    const MAX_DEPTH: usize = 12;
+    const MAX_VISITED: usize = 20_000;
+    const MAX_RESULTS: usize = 1_000;
+    if depth > MAX_DEPTH || *visited >= MAX_VISITED || output.len() >= MAX_RESULTS {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(current)
+        .map_err(|error| format!("无法扫描 {}：{error}", current.display()))?;
+    for entry in entries {
+        if *visited >= MAX_VISITED || output.len() >= MAX_RESULTS {
+            break;
+        }
+        *visited += 1;
+        let entry = match entry {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !should_skip_artifact_dir(&name) {
+                let _ = collect_recent_workspace_files(root, &path, cutoff_ms, depth + 1, visited, output);
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or(0);
+        if modified_at < cutoff_ms {
+            continue;
+        }
+        let relative = match path.strip_prefix(root) {
+            Ok(value) => value.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        output.push(CollectedTaskArtifact {
+            extension: artifact_extension(&path),
+            path: relative,
+            size: metadata.len(),
+            modified_at,
+        });
+    }
+    Ok(())
+}
+
+/// 扫描任务开始后在 Workspace 内实际生成/更新的文件，补足后端未发送 file_changed 的场景。
+#[tauri::command]
+fn collect_task_artifacts(
+    workspace_path: String,
+    started_at: u64,
+) -> Result<Vec<CollectedTaskArtifact>, String> {
+    let root = expand_tilde_path(workspace_path.trim())
+        .canonicalize()
+        .map_err(|error| format!("Workspace 无法访问：{error}"))?;
+    if !root.is_dir() {
+        return Err("Workspace 不是目录。".to_string());
+    }
+    let cutoff_ms = started_at.saturating_sub(2_000);
+    let mut output = Vec::new();
+    let mut visited = 0;
+    collect_recent_workspace_files(&root, &root, cutoff_ms, 0, &mut visited, &mut output)?;
+    output.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    output.truncate(200);
+    Ok(output)
+}
+
+fn resolve_task_workspace_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
     let requested = expand_tilde_path(path.trim());
     let joined = if requested.is_absolute() {
         requested
@@ -3139,10 +3629,6 @@ fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Resul
     let canonical = joined
         .canonicalize()
         .map_err(|error| format!("文件不存在或无法访问：{}（{error}）", joined.display()))?;
-    if !canonical.is_file() {
-        return Err(format!("该路径不是文件：{}", canonical.display()));
-    }
-
     if let Some(workspace) = workspace_path.filter(|value| !value.trim().is_empty()) {
         let workspace = expand_tilde_path(workspace)
             .canonicalize()
@@ -3150,6 +3636,14 @@ fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Resul
         if !canonical.starts_with(&workspace) {
             return Err("为保护本机文件，任务检查器只能读取当前任务 Workspace 内的文件。".to_string());
         }
+    }
+    Ok(canonical)
+}
+
+fn resolve_task_artifact_path(path: &str, workspace_path: Option<&str>) -> Result<PathBuf, String> {
+    let canonical = resolve_task_workspace_path(path, workspace_path)?;
+    if !canonical.is_file() {
+        return Err(format!("该路径不是文件：{}", canonical.display()));
     }
     Ok(canonical)
 }
@@ -3232,7 +3726,7 @@ fn open_task_artifact(
     workspace_path: Option<String>,
     reveal: Option<bool>,
 ) -> Result<(), String> {
-    let resolved = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
+    let resolved = resolve_task_workspace_path(&path, workspace_path.as_deref())?;
     let reveal = reveal.unwrap_or(false);
 
     if !reveal {
@@ -3246,7 +3740,11 @@ fn open_task_artifact(
     #[cfg(target_os = "windows")]
     {
         let mut command = StdCommand::new("explorer.exe");
-        command.arg(format!("/select,{}", resolved.display()));
+        if resolved.is_dir() {
+            command.arg(&resolved);
+        } else {
+            command.arg(format!("/select,{}", resolved.display()));
+        }
         hide_std_command_window(&mut command);
         command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
     }
@@ -3258,7 +3756,11 @@ fn open_task_artifact(
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = resolved.parent().unwrap_or(&resolved);
+        let target = if resolved.is_dir() {
+            resolved.as_path()
+        } else {
+            resolved.parent().unwrap_or(&resolved)
+        };
         StdCommand::new("xdg-open")
             .arg(target)
             .spawn()
@@ -3457,6 +3959,21 @@ pub fn run() {
             process_inbound_message,
             process_inbound_message_streaming,
             cancel_agent_run,
+            automation_list_jobs,
+            automation_upsert_job,
+            automation_delete_job,
+            automation_set_enabled,
+            automation_run_now,
+            automation_list_runs,
+            automation_clear_runs,
+            knowledge_list,
+            knowledge_collections,
+            knowledge_get,
+            knowledge_upsert,
+            knowledge_import,
+            knowledge_delete,
+            knowledge_set_enabled,
+            knowledge_search,
             debug_shell_stream,
             get_chat_session_history,
             delete_chat_session,
@@ -3475,7 +3992,9 @@ pub fn run() {
             skillhub_rollback_skill,
             task_artifact_preview,
             open_task_artifact,
+            collect_task_artifacts,
             composer_attachments::read_composer_attachments,
+            composer_attachments::prepare_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
             restart_gateway,
             test_gateway_health,
@@ -3568,6 +4087,15 @@ pub fn run() {
                     Ok(s) => eprintln!("[gateway] background started: {}", s.url),
                     Err(e) => eprintln!("[gateway] auto-start failed: {e}"),
                 }
+            });
+
+            let state_scheduler = state.clone();
+            tauri::async_runtime::spawn(async move {
+                let runtime = {
+                    let app_state = state_scheduler.lock().await;
+                    app_state.runtime.clone()
+                };
+                spawn_desktop_automation_scheduler(runtime).await;
             });
 
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;

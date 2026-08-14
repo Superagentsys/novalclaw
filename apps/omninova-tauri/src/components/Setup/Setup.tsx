@@ -12,7 +12,6 @@ import {
 } from "../../types/config";
 import { ChannelConfigForm } from "./ChannelConfigForm";
 import { ProviderConfigForm } from "./ProviderConfigForm";
-import { RobotConfigForm } from "./RobotConfigForm";
 import { SkillsConfigForm } from "./SkillsConfigForm";
 import { PersonaConfigForm } from "./PersonaConfigForm";
 import { invokeTauri } from "../../utils/tauri";
@@ -170,6 +169,8 @@ export interface SetupProps {
   onConfigSuccess?: () => void;
   /** 由 AppShell 导航时使用：仅渲染内容区，不显示内置侧栏 */
   embedded?: boolean;
+  /** dialog：用于弹出设置，隐藏大标题与 JSON 预览 */
+  presentation?: "page" | "dialog";
   /** 受控当前标签（与 App 导航同步） */
   activeTab?: SetupTab;
   onTabChange?: (tab: SetupTab) => void;
@@ -288,7 +289,7 @@ const SETUP_PAGE_META: Record<
   },
   providers: {
     title: "模型",
-    subtitle: "启用模型服务、填写 API 与默认模型，供对话与路由使用。",
+    subtitle: "选择默认模型，再按需接入云端或本地服务。",
   },
   channels: {
     title: "频道",
@@ -307,9 +308,11 @@ const SETUP_PAGE_META: Record<
 export function Setup({
   onConfigSuccess,
   embedded = false,
+  presentation = "page",
   activeTab: activeTabProp,
   onTabChange,
 }: SetupProps) {
+  const dialogMode = presentation === "dialog";
   const [activeTabInternal, setActiveTabInternal] = useState<SetupTab>("general");
   const activeTab = activeTabProp ?? activeTabInternal;
   const setActiveTab = (tab: SetupTab) => {
@@ -379,34 +382,6 @@ export function Setup({
   const [dingtalkRouteLoading, setDingtalkRouteLoading] = useState(false);
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
-  const enabledProviders = useMemo(
-    () => config.providers.filter((provider) => provider.enabled),
-    [config.providers]
-  );
-  const defaultModelOptions = useMemo(() => {
-    if (config.default_provider) {
-      const activeProvider = enabledProviders.find(
-        (provider) => provider.id === config.default_provider
-      );
-
-      return activeProvider
-        ? [
-            {
-              providerId: activeProvider.id,
-              providerName: activeProvider.name,
-              models: activeProvider.models,
-            },
-          ]
-        : [];
-    }
-
-    return enabledProviders.map((provider) => ({
-      providerId: provider.id,
-      providerName: provider.name,
-      models: provider.models,
-    }));
-  }, [config.default_provider, enabledProviders]);
-
   const jsonPreview = useMemo(() => {
     const redacted = redactSensitiveFields(config);
     return JSON.stringify(redacted, null, 2);
@@ -426,26 +401,6 @@ export function Setup({
       default_model,
     });
   };
-
-  const handleDefaultModelChange = (value: string) => {
-    if (!value) {
-      setConfig({ ...config, default_model: "" });
-      return;
-    }
-
-    const [providerId, model] = value.split("::");
-
-    setConfig({
-      ...config,
-      default_provider: providerId,
-      default_model: model ?? "",
-    });
-  };
-
-  const selectedDefaultModelValue =
-    config.default_provider && config.default_model
-      ? `${config.default_provider}::${config.default_model}`
-      : "";
 
   const setActiveChannelId = useCallback((channelId: string) => {
     if (!channelIdIsKnown(channelId)) {
@@ -1124,77 +1079,6 @@ export function Setup({
                     </button>
                   </div>
                 </label>
-                <label>
-                  默认模型服务
-                  <select
-                    value={config.default_provider ?? ""}
-                    onChange={(event) =>
-                      setConfig({
-                        ...config,
-                        default_provider: event.target.value,
-                        default_model: "",
-                      })
-                    }
-                  >
-                    <option value="">
-                      {enabledProviders.length === 0
-                        ? "请先启用模型服务"
-                        : "选择默认模型服务"}
-                    </option>
-                    {enabledProviders.map((provider) => (
-                      <option key={provider.id} value={provider.id}>
-                        {provider.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  默认模型
-                  <select
-                    value={selectedDefaultModelValue}
-                    onChange={(event) => handleDefaultModelChange(event.target.value)}
-                    disabled={defaultModelOptions.length === 0}
-                  >
-                    <option value="">
-                      {defaultModelOptions.length === 0
-                        ? "请先启用模型服务"
-                        : "选择默认模型"}
-                    </option>
-                    {defaultModelOptions.map((provider) => (
-                      <optgroup key={provider.providerId} label={provider.providerName}>
-                        {provider.models.map((model) => (
-                          <option
-                            key={`${provider.providerId}-${model}`}
-                            value={`${provider.providerId}::${model}`}
-                          >
-                            {model}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  API 地址
-                  <input
-                    value={config.api_url ?? ""}
-                    onChange={(event) =>
-                      setConfig({ ...config, api_url: event.target.value })
-                    }
-                    placeholder="https://api.openai.com/v1"
-                  />
-                </label>
-                <label>
-                  API Key
-                  <input
-                    type="password"
-                    value={config.api_key ?? ""}
-                    onChange={(event) =>
-                      setConfig({ ...config, api_key: event.target.value })
-                    }
-                    placeholder="sk-..."
-                  />
-                </label>
               </div>
             </section>
 
@@ -1418,15 +1302,24 @@ export function Setup({
                 <p className="setup-action-hint">正在读取 CLI 状态…</p>
               )}
             </section>
-
-             <RobotConfigForm
-                value={config.robot ?? DEFAULT_ROBOT_CONFIG}
-                onChange={(robot) => setConfig({ ...config, robot })}
-              />
           </div>
         );
       case "providers":
-        return <ProviderConfigForm value={config.providers} onChange={handleProvidersChange} />;
+        return (
+          <ProviderConfigForm
+            value={config.providers}
+            onChange={handleProvidersChange}
+            defaultProvider={config.default_provider ?? ""}
+            defaultModel={config.default_model ?? ""}
+            onDefaultChange={(providerId, model) =>
+              setConfig({
+                ...config,
+                default_provider: providerId,
+                default_model: model,
+              })
+            }
+          />
+        );
       case "channels":
         return (
           <>
@@ -2104,7 +1997,7 @@ export function Setup({
             </p>
           </div>
         </div>
-      ) : (
+      ) : dialogMode ? null : (
         <header className="setup-embed-hero">
           <h1 className="setup-embed-title">{meta.title}</h1>
           <p className="setup-embed-sub">{meta.subtitle}</p>
@@ -2115,13 +2008,19 @@ export function Setup({
 
       {embedded ? gatewayActions : null}
 
-      {setupPreviewBlock}
+      {dialogMode ? null : setupPreviewBlock}
     </>
   );
 
   if (embedded) {
     return (
-      <div className="setup-page setup-page--embedded">{setupMainInner}</div>
+      <div
+        className={`setup-page setup-page--embedded${
+          dialogMode ? " setup-page--dialog" : ""
+        }`}
+      >
+        {setupMainInner}
+      </div>
     );
   }
 

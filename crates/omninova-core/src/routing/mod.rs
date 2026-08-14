@@ -10,26 +10,46 @@ pub struct RouteDecision {
 
 /// Resolve target agent/provider/model for an inbound message.
 pub fn resolve_agent_route(config: &Config, inbound: &InboundMessage) -> RouteDecision {
-    if let Some(agent_name) = inbound
+    let mut route = if let Some(agent_name) = inbound
         .metadata
         .get("agent")
         .and_then(serde_json::Value::as_str)
     {
-        return build_route_decision(config, agent_name);
+        build_route_decision(config, agent_name)
+    } else if let Some(agent_name) = resolve_agent_from_bindings(config, inbound) {
+        build_route_decision(config, &agent_name)
+    } else {
+        let fallback_agent_name = config
+            .acp
+            .default_agent
+            .clone()
+            .filter(|name| config.agents.contains_key(name))
+            .unwrap_or_else(|| config.agent.name.clone());
+        build_route_decision(config, &fallback_agent_name)
+    };
+    apply_preferred_model_overrides(inbound, &mut route);
+    route
+}
+
+fn apply_preferred_model_overrides(inbound: &InboundMessage, route: &mut RouteDecision) {
+    if let Some(provider) = inbound
+        .metadata
+        .get("preferred_provider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "auto")
+    {
+        route.provider = Some(provider.to_string());
     }
-
-    if let Some(agent_name) = resolve_agent_from_bindings(config, inbound) {
-        return build_route_decision(config, &agent_name);
+    if let Some(model) = inbound
+        .metadata
+        .get("preferred_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        route.model = Some(model.to_string());
     }
-
-    let fallback_agent_name = config
-        .acp
-        .default_agent
-        .clone()
-        .filter(|name| config.agents.contains_key(name))
-        .unwrap_or_else(|| config.agent.name.clone());
-
-    build_route_decision(config, &fallback_agent_name)
 }
 
 fn build_route_decision(config: &Config, agent_name: &str) -> RouteDecision {
@@ -307,5 +327,26 @@ mod tests {
         let route = resolve_agent_route(&config, &inbound);
         assert_eq!(route.provider.as_deref(), Some("defaults-provider"));
         assert_eq!(route.model.as_deref(), Some("defaults-model"));
+    }
+
+    #[test]
+    fn preferred_provider_and_model_override_defaults() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.default_model = Some("gpt-4o".into());
+
+        let mut metadata = HashMap::new();
+        metadata.insert("preferred_provider".into(), json!("custom-workbuddy"));
+        metadata.insert("preferred_model".into(), json!("glm-5.1"));
+        let inbound = InboundMessage {
+            channel: ChannelKind::Web,
+            text: "hello".into(),
+            metadata,
+            ..InboundMessage::default()
+        };
+
+        let route = resolve_agent_route(&config, &inbound);
+        assert_eq!(route.provider.as_deref(), Some("custom-workbuddy"));
+        assert_eq!(route.model.as_deref(), Some("glm-5.1"));
     }
 }

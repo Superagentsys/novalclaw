@@ -334,6 +334,7 @@ export function getToolLabel(toolName: string): string {
     http_request: "HTTP 请求",
     memory_store: "存储记忆",
     memory_recall: "回忆记忆",
+    knowledge_search: "检索知识库",
     browser: "浏览器",
     pdf_read: "读取 PDF",
   };

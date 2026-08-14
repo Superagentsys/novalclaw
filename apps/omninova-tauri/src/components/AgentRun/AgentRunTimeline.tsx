@@ -1,5 +1,5 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listenAgentRunEvents } from "../../utils/events";
 import type { AgentRunChangedFile, AgentRunEvent, AgentRunStep, RunEvent } from "./types";
 import { AgentRunEventCard } from "./AgentRunEventCard";
 import { AgentDiffPanel } from "../AgentDiff/AgentDiffPanel";
@@ -466,7 +466,7 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
         setLiveElapsed((Date.now() - startTime) / 1000);
       }, 250);
 
-      listen<AgentRunEvent>("agent-run-event", (event) => {
+      listenAgentRunEvents<AgentRunEvent>("agent-run-event", (event) => {
         const payload = event.payload as AgentRunEvent;
         if (import.meta.env.DEV && payload.type !== "model_delta") {
           console.log("[agent-run-event payload]", event.payload);
