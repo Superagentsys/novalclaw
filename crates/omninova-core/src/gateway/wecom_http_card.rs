@@ -396,8 +396,8 @@ mod tests {
             .expect("gateway_status must produce an updated card");
         let plaintext = decrypt_reply(&reply);
         assert!(plaintext.contains("\"template_card\""));
-        assert!(plaintext.contains("运行状态"));
-        assert!(plaintext.contains("网关：运行中"));
+        assert!(plaintext.contains("网关状态"));
+        assert!(plaintext.contains("运行正常 · 长连接"));
     }
 
     #[tokio::test]
@@ -515,7 +515,8 @@ mod tests {
             .await;
         assert!(store.try_start_monitor("task-himm", 30, 0).await);
         let immediate = render_monitor_running_card_text(30, 30);
-        assert!(immediate.contains("进行中"));
+        assert!(immediate.contains("处理中"));
+        assert!(immediate.contains("总时长：30 秒"));
         assert!(immediate.contains("剩余约 30 秒"));
     }
 
@@ -644,12 +645,12 @@ mod tests {
                 CardEventOutcome::Updated { card: ws_card, .. },
                 CardEventOutcome::Updated { card: http_card, .. },
             ) => {
-                // Same renderer core; only the connection line is
+                // Same renderer core; only the connection state is
                 // transport-aware (WS reads the socket state, HTTP
                 // proves connectivity via the callback itself).
                 let ws_text = ws_card["sub_title_text"].as_str().unwrap();
                 let http_text = http_card["sub_title_text"].as_str().unwrap();
-                for shared in ["运行状态", "网关：运行中", "连接方式：长连接"] {
+                for shared in ["网关状态", "长连接", "Agent："] {
                     assert!(ws_text.contains(shared), "WS missing {shared}");
                     assert!(http_text.contains(shared), "HTTP missing {shared}");
                 }
@@ -839,7 +840,7 @@ mod tests {
         let (plaintext, task_id) = run_update_for_action("gateway_status").await;
         assert!(plaintext.contains("\"response_type\":\"update_template_card\""));
         assert!(!plaintext.contains("\"msgtype\":\"template_card\""));
-        assert!(plaintext.contains("运行状态"));
+        assert!(plaintext.contains("网关状态"));
         assert!(plaintext.contains(&task_id));
     }
 
@@ -866,7 +867,8 @@ mod tests {
         let (plaintext, task_id) = run_update_for_action("monitor_30").await;
         crate::gateway::wecom_card::disable_monitor_execution_for_tests(false);
         assert!(plaintext.contains("\"response_type\":\"update_template_card\""));
-        assert!(plaintext.contains("进行中"));
+        assert!(plaintext.contains("处理中"));
+        assert!(plaintext.contains("总时长：30 秒"));
         assert!(plaintext.contains("剩余约 30 秒"));
         assert!(plaintext.contains(&task_id));
     }
@@ -877,7 +879,8 @@ mod tests {
         let (plaintext, _) = run_update_for_action("monitor_60").await;
         crate::gateway::wecom_card::disable_monitor_execution_for_tests(false);
         assert!(plaintext.contains("\"response_type\":\"update_template_card\""));
-        assert!(plaintext.contains("进行中"));
+        assert!(plaintext.contains("处理中"));
+        assert!(plaintext.contains("总时长：60 秒"));
         assert!(plaintext.contains("剩余约 60 秒"));
     }
 

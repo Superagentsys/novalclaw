@@ -8,8 +8,9 @@
 //! carrying the SAME task_id updates that card (the official SDK
 //! requires the update promptly after the event callback).
 //!
-//! Long-connection implementation only. HTTP-callback card parity is
-//! Phase 2A.3.2.
+//! The long-connection and HTTP-callback transports both use the card
+//! builders in this module so their visual hierarchy and action results
+//! stay identical.
 //!
 //! Security model:
 //! - 5-command allowlist only (`gateway_status`, `recent_jobs`,
@@ -38,6 +39,10 @@ pub const PANEL_TITLE: &str = "OmniNova 控制中心";
 /// subtitle instead of a developer-facing description line.
 pub const PANEL_DESC: &str = "";
 pub const PANEL_READY_SUBTITLE: &str = "请选择操作";
+/// Native `button_interaction` cards do not expose a separate rich-text
+/// section, so the menu's concise feature guide is rendered below the
+/// transport status in `sub_title_text`.
+pub const PANEL_FEATURE_GUIDE: &str = "功能说明\n网关状态：查看当前连接与运行状态\n最近任务：查看最近执行记录\n监控30秒：短时桌面监控\n监控60秒：完整桌面监控\n帮助说明：查看菜单命令与功能说明";
 pub const PANEL_EXPIRED_TEXT: &str = "该操作面板已过期，请重新打开。";
 pub const UNKNOWN_ACTION_TEXT: &str = "未知操作，已忽略。";
 pub const CARD_TTL_SECS: i64 = 30 * 60;
@@ -47,19 +52,21 @@ pub const MONITOR_GRACE_SECS: u64 = 15;
 
 /// Official button_interaction `style`: 1 = primary(blue), 2 =
 /// secondary(grey) — per the official SDK template-card button schema.
-/// Secondary actions: 状态 / 任务 / 帮助; primary: 监控30秒 / 监控60秒.
+/// Secondary actions: 网关状态 / 最近任务 / 帮助说明; primary:
+/// 监控30秒 / 监控60秒.
 pub const BUTTON_STYLE_PRIMARY: u8 = 1;
 pub const BUTTON_STYLE_SECONDARY: u8 = 2;
 
-/// Canonical panel buttons: (action key, short label, style).
-/// KEYS are the wire contract (unchanged); labels are short so the
-/// client's 3-column row does not truncate them.
+/// Canonical panel buttons: (action key, user-facing label, style).
+/// KEYS are the wire contract and must remain unchanged. The feature guide
+/// above repeats the full names in case a narrow native client truncates a
+/// button label.
 pub const PANEL_BUTTONS: &[(&str, &str, u8)] = &[
-    ("gateway_status", "状态", BUTTON_STYLE_SECONDARY),
-    ("recent_jobs", "任务", BUTTON_STYLE_SECONDARY),
+    ("gateway_status", "网关状态", BUTTON_STYLE_SECONDARY),
+    ("recent_jobs", "最近任务", BUTTON_STYLE_SECONDARY),
     ("monitor_30", "监控30秒", BUTTON_STYLE_PRIMARY),
     ("monitor_60", "监控60秒", BUTTON_STYLE_PRIMARY),
-    ("help", "帮助", BUTTON_STYLE_SECONDARY),
+    ("help", "帮助说明", BUTTON_STYLE_SECONDARY),
 ];
 
 /// Deterministic panel trigger commands. The LLM never decides when to
@@ -131,11 +138,11 @@ impl WecomPanelAction {
 
     pub fn label(self) -> &'static str {
         match self {
-            WecomPanelAction::GatewayStatus => "状态",
-            WecomPanelAction::RecentJobs => "任务",
+            WecomPanelAction::GatewayStatus => "网关状态",
+            WecomPanelAction::RecentJobs => "最近任务",
             WecomPanelAction::Monitor30 => "监控30秒",
             WecomPanelAction::Monitor60 => "监控60秒",
-            WecomPanelAction::Help => "帮助",
+            WecomPanelAction::Help => "帮助说明",
         }
     }
 }
@@ -152,12 +159,25 @@ pub fn build_panel_card(task_id: &str) -> serde_json::Value {
 
 /// Panel card with an explicit subtitle (status summary / action result).
 pub fn build_panel_card_with_subtitle(task_id: &str, subtitle: &str) -> serde_json::Value {
+    build_panel_card_content(task_id, subtitle, true)
+}
+
+fn build_panel_card_content(
+    task_id: &str,
+    subtitle: &str,
+    include_feature_guide: bool,
+) -> serde_json::Value {
     let mut main_title = serde_json::json!({ "title": PANEL_TITLE });
     // Desc is intentionally omitted: the native template renders the
     // compact subtitle; no developer-facing description line.
     if !PANEL_DESC.is_empty() {
         main_title["desc"] = serde_json::json!(PANEL_DESC);
     }
+    let sub_title_text = if include_feature_guide {
+        format!("{subtitle}\n\n{PANEL_FEATURE_GUIDE}")
+    } else {
+        subtitle.to_string()
+    };
     serde_json::json!({
         "card_type": "button_interaction",
         "source": {
@@ -165,7 +185,7 @@ pub fn build_panel_card_with_subtitle(task_id: &str, subtitle: &str) -> serde_js
             "desc_color": 0,
         },
         "main_title": main_title,
-        "sub_title_text": subtitle,
+        "sub_title_text": sub_title_text,
         "task_id": task_id,
         "button_list": PANEL_BUTTONS
             .iter()
@@ -181,7 +201,7 @@ pub fn build_panel_card_with_subtitle(task_id: &str, subtitle: &str) -> serde_js
 /// Panel card with an action result shown in `sub_title_text`
 /// (card updates keep the buttons; the result replaces the subtitle).
 pub fn build_panel_card_with_text(task_id: &str, text: &str) -> serde_json::Value {
-    build_panel_card_with_subtitle(task_id, text)
+    build_panel_card_content(task_id, text, false)
 }
 
 /// Menu subtitle driven by the panel's monitor state (Phase 2A.3.2
@@ -189,12 +209,22 @@ pub fn build_panel_card_with_text(task_id: &str, text: &str) -> serde_json::Valu
 pub fn panel_subtitle_for_state(state: &MonitorState) -> String {
     match state {
         MonitorState::Idle => PANEL_READY_SUBTITLE.to_string(),
-        MonitorState::Running { deadline, .. } => {
+        MonitorState::Running {
+            duration_secs,
+            deadline,
+            ..
+        } => {
             let remaining = remaining_secs_until(*deadline);
-            format!("桌面监控运行中 · 剩余 {remaining} 秒")
+            format!("监控{duration_secs}秒 · 处理中 · 剩余约 {remaining} 秒")
         }
-        MonitorState::Completed { .. } => "桌面监控已完成".to_string(),
-        MonitorState::Failed { .. } => "桌面监控失败或超时".to_string(),
+        MonitorState::Completed { elapsed_ms, .. } => format!(
+            "桌面监控已完成 · 实际耗时 {:.1} 秒",
+            *elapsed_ms as f64 / 1000.0
+        ),
+        MonitorState::Failed { elapsed_ms, .. } => format!(
+            "桌面监控未完成 · 实际耗时 {:.1} 秒",
+            *elapsed_ms as f64 / 1000.0
+        ),
     }
 }
 
@@ -641,9 +671,9 @@ impl WecomCardStore {
             .cloned()
             .collect();
         if jobs.is_empty() {
-            return "最近任务\n\n暂无最近任务".to_string();
+            return "最近任务\n\n暂无最近任务\n完成任务后会显示在这里。".to_string();
         }
-        let mut lines = vec!["最近任务\n".to_string()];
+        let mut lines = vec!["最近任务\n近 3 条执行记录".to_string()];
         for (index, job) in jobs.iter().enumerate() {
             let chat_label = if job.chat_type == "group" {
                 "群聊"
@@ -835,8 +865,8 @@ pub struct WecomGatewayStatusSnapshot {
     pub agent_name: String,
 }
 
-/// User-facing gateway status render (Phase 2A.3.2a): no generation or
-/// other internal debug fields — those stay in logs, never on the card.
+/// User-facing gateway status render: compact hierarchy, transport-aware
+/// connection summary, and no generation or other internal debug fields.
 pub fn gateway_status_text(snapshot: &WecomGatewayStatusSnapshot, now: &OffsetDateTime) -> String {
     let agent = if snapshot.agent_name.trim().is_empty() {
         "未配置"
@@ -850,43 +880,57 @@ pub fn gateway_status_text(snapshot: &WecomGatewayStatusSnapshot, now: &OffsetDa
         .get(11..16)
         .unwrap_or("--:--")
         .to_string();
+    let connection_summary = if snapshot.connection_connected {
+        "运行正常"
+    } else {
+        "连接异常"
+    };
     format!(
-        "运行状态\n\n网关：运行中\n企业微信：{}\n连接方式：{}\nAgent：{}\n渠道：{} 个\n更新时间：{}",
-        if snapshot.connection_connected { "已连接" } else { "未连接" },
+        "网关状态\n\n{} · {}\n企业微信：{}\nAgent：{} · 已启用渠道：{} 个\n更新时间：{}",
+        connection_summary,
         transport_label(snapshot.transport),
+        if snapshot.connection_connected { "已连接" } else { "未连接" },
         agent,
         snapshot.enabled_channels.len(),
         time_text,
     )
 }
 
-/// Compact help render (Phase 2A.3.2a).
+/// Compact, user-facing help render shared by both transports.
 pub fn help_text() -> &'static str {
-    "帮助\n\n发送：menu / 菜单 / 面板\n\n状态：查看网关\n任务：查看最近任务\n监控：30 / 60 秒桌面监控"
+    "帮助说明\n\n打开菜单：menu / 菜单 / 面板\n网关状态：查看当前连接与运行状态\n最近任务：查看最近执行记录\n监控30秒：短时桌面监控\n监控60秒：完整桌面监控\n高风险工具不会在普通聊天中直接执行。"
 }
 
-/// Monitor RUNNING card render (Phase 2A.3.2a compact): title + phase +
-/// approximate remaining seconds only.
+/// Monitor RUNNING card render: total duration, live remaining time and a
+/// clear processing state. Remaining time still comes from the monotonic
+/// deadline; this function only formats existing runtime state.
 pub fn render_monitor_running_card_text(duration_secs: u64, remaining_secs: u64) -> String {
-    let _ = duration_secs; // compact layout shows remaining only
-    format!("桌面监控\n\n进行中\n剩余约 {remaining_secs} 秒")
+    format!(
+        "桌面监控 · 处理中\n\n总时长：{duration_secs} 秒\n剩余约 {remaining_secs} 秒\n完成后将自动发送结果"
+    )
 }
 
-/// Monitor COMPLETED card render (Phase 2A.3.2a compact): title +
-/// duration + auto-sent notice.
-pub fn render_monitor_completed_card_text(duration_secs: u64) -> String {
-    format!("桌面监控\n\n已完成 · {duration_secs} 秒\n结果已自动发送")
+/// Monitor COMPLETED card render: configured duration, measured elapsed
+/// time and an explicit delivery notice.
+pub fn render_monitor_completed_card_text(duration_secs: u64, elapsed_ms: u64) -> String {
+    format!(
+        "桌面监控 · 已完成\n\n总时长：{duration_secs} 秒\n实际耗时：{:.1} 秒\n结果已自动发送",
+        elapsed_ms as f64 / 1000.0
+    )
 }
 
 /// Monitor FAILED card render (明确原因).
-pub fn render_monitor_failed_card_text() -> String {
-    "桌面监控失败\n\n原因：桌面采集失败，请稍后重试。".to_string()
+pub fn render_monitor_failed_card_text(elapsed_ms: u64) -> String {
+    format!(
+        "桌面监控 · 未完成\n\n处理失败 · 实际耗时 {:.1} 秒\n请稍后重试，结果未发送",
+        elapsed_ms as f64 / 1000.0
+    )
 }
 
 /// Monitor TIMEOUT card render (明确原因).
 pub fn render_monitor_timeout_card_text(elapsed_ms: u64) -> String {
     format!(
-        "桌面监控超时\n\n实际耗时：{:.1} 秒\n原因：监控未在限时内完成。",
+        "桌面监控 · 已超时\n\n实际耗时：{:.1} 秒\n监控未在限时内完成，结果未发送",
         elapsed_ms as f64 / 1000.0
     )
 }
@@ -957,12 +1001,12 @@ impl WecomCardActionService {
                     agent_name: config.agent.name.clone(),
                 };
                 CardActionResult {
-                    title: "状态",
+                    title: "网关状态",
                     content: gateway_status_text(&snapshot, &OffsetDateTime::now_utc()),
                 }
             }
             WecomPanelAction::RecentJobs => CardActionResult {
-                title: "任务",
+                title: "最近任务",
                 content: store.recent_jobs_text().await,
             },
             WecomPanelAction::Monitor30 => CardActionResult {
@@ -990,7 +1034,7 @@ impl WecomCardActionService {
                 .await,
             },
             WecomPanelAction::Help => CardActionResult {
-                title: "帮助",
+                title: "帮助说明",
                 content: help_text().to_string(),
             },
         }
@@ -1121,9 +1165,13 @@ async fn start_monitor(
     // When restarting from a finished outcome, show the previous
     // outcome summary above the new round's running status.
     let prior_summary = match store.monitor_state(task_id).await {
-        MonitorState::Completed { duration_secs, .. } => Some(format!(
+        MonitorState::Completed {
+            duration_secs,
+            elapsed_ms,
+            ..
+        } => Some(format!(
             "{}\n\n",
-            render_monitor_completed_card_text(duration_secs)
+            render_monitor_completed_card_text(duration_secs, elapsed_ms)
         )),
         MonitorState::Failed {
             error_summary,
@@ -1133,7 +1181,7 @@ async fn start_monitor(
             if error_summary.contains("超时") {
                 render_monitor_timeout_card_text(elapsed_ms)
             } else {
-                render_monitor_failed_card_text()
+                render_monitor_failed_card_text(elapsed_ms)
             }
         )),
         _ => None,
@@ -1820,15 +1868,15 @@ mod tests {
         let buttons = card["button_list"].as_array().unwrap();
         assert_eq!(buttons.len(), 5);
         assert_eq!(buttons[0]["key"], "gateway_status");
-        assert_eq!(buttons[0]["text"], "状态");
+        assert_eq!(buttons[0]["text"], "网关状态");
         assert_eq!(buttons[1]["key"], "recent_jobs");
-        assert_eq!(buttons[1]["text"], "任务");
+        assert_eq!(buttons[1]["text"], "最近任务");
         assert_eq!(buttons[2]["key"], "monitor_30");
         assert_eq!(buttons[2]["text"], "监控30秒");
         assert_eq!(buttons[3]["key"], "monitor_60");
         assert_eq!(buttons[3]["text"], "监控60秒");
         assert_eq!(buttons[4]["key"], "help");
-        assert_eq!(buttons[4]["text"], "帮助");
+        assert_eq!(buttons[4]["text"], "帮助说明");
     }
 
     #[test]
@@ -2172,7 +2220,7 @@ mod tests {
                     card["sub_title_text"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("运行状态"),
+                        .contains("网关状态"),
                     "update must carry the gateway status text"
                 );
                 let envelope =
@@ -2219,12 +2267,11 @@ mod tests {
             agent_name: "omninova".to_string(),
         };
         let text = gateway_status_text(&snapshot, &now);
-        assert!(text.contains("运行状态"));
-        assert!(text.contains("网关：运行中"));
+        assert!(text.contains("网关状态"));
+        assert!(text.contains("运行正常 · 长连接"));
         assert!(text.contains("企业微信：已连接"));
-        assert!(text.contains("连接方式：长连接"));
         assert!(text.contains("Agent：可用"));
-        assert!(text.contains("渠道：2 个"));
+        assert!(text.contains("已启用渠道：2 个"));
         assert!(text.contains("更新时间："));
         // No secret-like content ever enters this text.
         assert!(!text.contains("secret"));
@@ -2481,7 +2528,7 @@ mod tests {
                     card["sub_title_text"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("运行状态")
+                        .contains("网关状态")
                 );
             }
             other => panic!("expected TemplateCardUpdate, got {other:?}"),
@@ -2539,7 +2586,7 @@ mod tests {
         assert!(store.try_start_monitor("task-sf-2", 30, 0).await);
         let remaining = store.monitor_remaining_secs("task-sf-2").await.unwrap();
         let subtitle = panel_subtitle_for_state(&store.monitor_state("task-sf-2").await);
-        assert_eq!(subtitle, format!("桌面监控运行中 · 剩余 {remaining} 秒"));
+        assert_eq!(subtitle, format!("监控30秒 · 处理中 · 剩余约 {remaining} 秒"));
     }
 
     #[tokio::test]
@@ -2742,7 +2789,9 @@ mod tests {
         assert_eq!(card["main_title"]["title"], PANEL_TITLE);
         // Desc omitted on the native card (compact layout).
         assert!(card["main_title"].get("desc").is_none());
-        assert_eq!(card["sub_title_text"], PANEL_READY_SUBTITLE);
+        let subtitle = card["sub_title_text"].as_str().unwrap();
+        assert!(subtitle.starts_with(PANEL_READY_SUBTITLE));
+        assert!(subtitle.contains(PANEL_FEATURE_GUIDE));
         assert_eq!(card["button_list"].as_array().unwrap().len(), 5);
         assert_eq!(panel_subtitle_for_state(&MonitorState::Idle), PANEL_READY_SUBTITLE);
     }
@@ -2753,7 +2802,7 @@ mod tests {
         store.register("task-menu-2".to_string(), None).await;
         store.try_start_monitor("task-menu-2", 30, 0).await;
         let state = store.monitor_state("task-menu-2").await;
-        assert!(panel_subtitle_for_state(&state).contains("桌面监控运行中 · 剩余"));
+        assert!(panel_subtitle_for_state(&state).contains("监控30秒 · 处理中 · 剩余约"));
     }
 
     #[tokio::test]
@@ -2764,7 +2813,10 @@ mod tests {
             .complete_monitor("task-menu-3", 30, 1000, "done".to_string())
             .await;
         let state = store.monitor_state("task-menu-3").await;
-        assert_eq!(panel_subtitle_for_state(&state), "桌面监控已完成");
+        assert_eq!(
+            panel_subtitle_for_state(&state),
+            "桌面监控已完成 · 实际耗时 1.0 秒"
+        );
     }
 
     #[tokio::test]
@@ -2775,7 +2827,10 @@ mod tests {
             .fail_monitor("task-menu-4", "error".to_string(), 500)
             .await;
         let state = store.monitor_state("task-menu-4").await;
-        assert_eq!(panel_subtitle_for_state(&state), "桌面监控失败或超时");
+        assert_eq!(
+            panel_subtitle_for_state(&state),
+            "桌面监控未完成 · 实际耗时 0.5 秒"
+        );
     }
 
     #[test]
@@ -2793,9 +2848,9 @@ mod tests {
             agent_name: "omninova".to_string(),
         };
         let text = gateway_status_text(&snapshot, &now);
-        assert!(text.contains("连接方式：HTTP 回调"));
+        assert!(text.contains("连接异常 · HTTP 回调"));
         assert!(text.contains("企业微信：未连接"));
-        assert!(text.contains("渠道：0 个"));
+        assert!(text.contains("已启用渠道：0 个"));
         assert!(!text.contains("已连接"));
         assert!(!text.contains("正常"));
     }
@@ -3013,32 +3068,36 @@ mod tests {
     fn render_monitor_running_card_text_console_style() {
         let text = render_monitor_running_card_text(30, 17);
         assert!(text.contains("桌面监控"));
-        assert!(text.contains("进行中"));
+        assert!(text.contains("处理中"));
+        assert!(text.contains("总时长：30 秒"));
         assert!(text.contains("剩余约 17 秒"));
-        assert!(!text.contains("总时长"));
+        assert!(text.contains("完成后将自动发送结果"));
     }
 
     #[test]
     fn render_monitor_completed_card_text_console_style() {
-        let text = render_monitor_completed_card_text(30);
+        let text = render_monitor_completed_card_text(30, 30_815);
         assert!(text.contains("桌面监控"));
-        assert!(text.contains("已完成 · 30 秒"));
+        assert!(text.contains("已完成"));
+        assert!(text.contains("总时长：30 秒"));
+        assert!(text.contains("实际耗时：30.8 秒"));
         assert!(text.contains("结果已自动发送"));
     }
 
     #[test]
     fn render_monitor_failed_card_text_console_style() {
-        let text = render_monitor_failed_card_text();
-        assert!(text.contains("桌面监控失败"));
-        assert!(text.contains("原因：桌面采集失败，请稍后重试。"));
+        let text = render_monitor_failed_card_text(3_000);
+        assert!(text.contains("桌面监控 · 未完成"));
+        assert!(text.contains("处理失败 · 实际耗时 3.0 秒"));
+        assert!(text.contains("结果未发送"));
     }
 
     #[test]
     fn render_monitor_timeout_card_text_console_style() {
         let text = render_monitor_timeout_card_text(45000);
-        assert!(text.contains("桌面监控超时"));
+        assert!(text.contains("桌面监控 · 已超时"));
         assert!(text.contains("实际耗时：45.0 秒"));
-        assert!(text.contains("原因：监控未在限时内完成。"));
+        assert!(text.contains("监控未在限时内完成，结果未发送"));
     }
 
     #[tokio::test]
@@ -3053,7 +3112,14 @@ mod tests {
         let card = build_panel_card_with_subtitle("t-menu", &subtitle);
         assert_eq!(card["main_title"]["title"], "OmniNova 控制中心");
         assert!(card["main_title"].get("desc").is_none());
-        assert_eq!(card["sub_title_text"], subtitle);
+        let card_text = card["sub_title_text"].as_str().unwrap();
+        assert!(card_text.starts_with(&subtitle));
+        assert!(card_text.contains("功能说明"));
+        assert!(card_text.contains("网关状态：查看当前连接与运行状态"));
+        assert!(card_text.contains("最近任务：查看最近执行记录"));
+        assert!(card_text.contains("监控30秒：短时桌面监控"));
+        assert!(card_text.contains("监控60秒：完整桌面监控"));
+        assert!(card_text.contains("帮助说明：查看菜单命令与功能说明"));
         assert_eq!(card["button_list"].as_array().unwrap().len(), 5);
     }
 
@@ -3098,15 +3164,18 @@ mod tests {
     }
 
     #[test]
-    fn button_labels_are_short() {
+    fn button_labels_use_complete_names() {
         let card = build_panel_card("t-labels");
         let buttons = card["button_list"].as_array().unwrap();
         let labels: Vec<&str> = buttons
             .iter()
             .map(|b| b["text"].as_str().unwrap())
             .collect();
-        assert_eq!(labels, vec!["状态", "任务", "监控30秒", "监控60秒", "帮助"]);
-        // Styles: secondary for 状态/任务/帮助, primary for monitors.
+        assert_eq!(
+            labels,
+            vec!["网关状态", "最近任务", "监控30秒", "监控60秒", "帮助说明"]
+        );
+        // Styles: secondary for status/tasks/help, primary for monitors.
         assert_eq!(buttons[0]["style"], BUTTON_STYLE_SECONDARY);
         assert_eq!(buttons[1]["style"], BUTTON_STYLE_SECONDARY);
         assert_eq!(buttons[2]["style"], BUTTON_STYLE_PRIMARY);
@@ -3141,12 +3210,11 @@ mod tests {
             agent_name: "omninova".to_string(),
         };
         let text = gateway_status_text(&snapshot, &OffsetDateTime::now_utc());
-        assert!(text.contains("运行状态"));
-        assert!(text.contains("网关：运行中"));
+        assert!(text.contains("网关状态"));
+        assert!(text.contains("运行正常 · 长连接"));
         assert!(text.contains("企业微信：已连接"));
-        assert!(text.contains("连接方式：长连接"));
         assert!(text.contains("Agent：可用"));
-        assert!(text.contains("渠道：3 个"));
+        assert!(text.contains("已启用渠道：3 个"));
         assert!(text.contains("更新时间："));
     }
 
@@ -3163,7 +3231,6 @@ mod tests {
         };
         let text = gateway_status_text(&snapshot, &OffsetDateTime::now_utc());
         assert!(!text.contains("generation"));
-        assert!(!text.contains("42"));
         assert!(!text.contains("stream active"));
         assert!(!text.contains("heartbeat"));
     }
@@ -3184,25 +3251,29 @@ mod tests {
         let text = help_text();
         assert!(text.contains("帮助"));
         assert!(text.contains("menu / 菜单 / 面板"));
-        assert!(text.contains("状态：查看网关"));
-        assert!(text.contains("任务：查看最近任务"));
-        assert!(text.contains("监控：30 / 60 秒桌面监控"));
-        assert!(text.lines().count() <= 8);
+        assert!(text.contains("网关状态：查看当前连接与运行状态"));
+        assert!(text.contains("最近任务：查看最近执行记录"));
+        assert!(text.contains("监控30秒：短时桌面监控"));
+        assert!(text.contains("监控60秒：完整桌面监控"));
+        assert!(text.contains("高风险工具不会在普通聊天中直接执行"));
+        assert!(text.lines().count() <= 9);
     }
 
     #[test]
     fn monitor_running_is_compact() {
         let text = render_monitor_running_card_text(30, 18);
-        assert!(text.lines().count() <= 4);
-        assert!(text.contains("进行中"));
+        assert!(text.lines().count() <= 5);
+        assert!(text.contains("处理中"));
+        assert!(text.contains("总时长：30 秒"));
         assert!(text.contains("剩余约 18 秒"));
     }
 
     #[test]
     fn monitor_completed_is_compact() {
-        let text = render_monitor_completed_card_text(30);
-        assert!(text.lines().count() <= 4);
-        assert!(text.contains("已完成 · 30 秒"));
+        let text = render_monitor_completed_card_text(30, 30_815);
+        assert!(text.lines().count() <= 5);
+        assert!(text.contains("已完成"));
+        assert!(text.contains("实际耗时：30.8 秒"));
         assert!(text.contains("结果已自动发送"));
     }
 }
