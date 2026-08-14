@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::wecom_protocol::{
     build_ping_envelope, build_stream_respond_envelope, build_subscribe_envelope,
+    build_template_card_respond_envelope, build_template_card_update_envelope,
     parse_response_envelope, WecomCallbackEnvelope, WecomCommandType, WecomEventType,
     WecomResponseEnvelope,
 };
@@ -73,6 +74,14 @@ impl Drop for WecomStreamGuard {
 #[derive(Debug, Clone)]
 pub enum WecomOutboundMsg {
     Reply { req_id: String, text: String },
+    /// Initial interactive template_card reply (Phase 2A.3.1): sent as
+    /// `aibot_respond_msg` with `body.msgtype = "template_card"`.
+    TemplateCard { req_id: String, body: serde_json::Value },
+    /// Official template-card UPDATE (Phase 2A.3.1a): sent as
+    /// `aibot_respond_update_msg` with
+    /// `body.response_type = "update_template_card"`, replying to the
+    /// template_card_event frame's req_id within 5 seconds.
+    TemplateCardUpdate { req_id: String, body: serde_json::Value },
     Ping { req_id: String },
 }
 
@@ -191,6 +200,7 @@ pub async fn start(runtime: Arc<GatewayRuntime>) -> Option<WecomStreamGuard> {
         shutdown_rx,
         worker_tx,
         shared_rx,
+        shared_tx,
     ));
     runtime
         .register_wecom_stream_loop_handle(gen, reconnect_handle)
@@ -267,6 +277,7 @@ async fn run_reconnect_loop(
     mut shutdown: watch::Receiver<bool>,
     worker_tx: mpsc::Sender<crate::gateway::wecom_worker::WecomAsyncJob>,
     mut shared_rx: mpsc::Receiver<WecomOutboundMsg>,
+    shared_tx: mpsc::Sender<WecomOutboundMsg>,
 ) {
     let mut attempt: u32 = 0;
 
@@ -283,7 +294,7 @@ async fn run_reconnect_loop(
         let physical_id = short_hash(&format!("physical_{}_{}", gen, attempt));
         println!("[wecom-stream] state=connecting attempt={} gen={} physical_id={}", attempt, gen, physical_id);
 
-        match connect_and_run(&runtime, &bot_id, &secret, gen, attempt, &logical_id, shutdown.clone(), worker_tx.clone(), &mut shared_rx).await {
+        match connect_and_run(&runtime, &bot_id, &secret, gen, attempt, &logical_id, shutdown.clone(), worker_tx.clone(), &mut shared_rx, shared_tx.clone()).await {
             Ok(()) => attempt = 0,
             Err(e) => {
                 let kind = classify_error(&e);
@@ -344,6 +355,7 @@ async fn connect_and_run(
     mut shutdown: watch::Receiver<bool>,
     worker_tx: mpsc::Sender<crate::gateway::wecom_worker::WecomAsyncJob>,
     shared_rx: &mut mpsc::Receiver<WecomOutboundMsg>,
+    shared_tx: mpsc::Sender<WecomOutboundMsg>,
 ) -> Result<(), String> {
     if !runtime.is_wecom_stream_generation_active(gen) {
         return Err("stale_generation".to_string());
@@ -402,7 +414,7 @@ async fn connect_and_run(
             // Physical writer exited, connection is broken
             println!("[wecom-stream] physical_writer_exit physical_id={}", physical_id_clone);
         }
-        result = run_read_loop_inline(&mut read, runtime, gen, logical_id, shutdown, worker_tx, physical_id_clone.clone()) => {
+        result = run_read_loop_inline(&mut read, runtime, gen, logical_id, shutdown, worker_tx, shared_tx.clone(), physical_id_clone.clone()) => {
             // Read loop exited
             println!("[wecom-stream] read_loop_exit physical_id={}", physical_id_clone);
             // Return error to trigger reconnect
@@ -486,6 +498,44 @@ async fn run_physical_writer_inline<W>(
                             }
                         }
                     }
+                    Some(WecomOutboundMsg::TemplateCard { req_id, body }) => {
+                        if !runtime.is_wecom_stream_generation_active(gen) {
+                            println!("[wecom-stream] physical_writer_exit stale physical_id={}", physical_id);
+                            return;
+                        }
+                        let env = build_template_card_respond_envelope(&req_id, body);
+                        let json = serde_json::to_string(&env).unwrap_or_default();
+                        println!("[wecom-card] card_write_started req_id={} physical_id={}", short_hash(&req_id), physical_id);
+                        match write.send(Message::Text(json.into())).await {
+                            Ok(()) => {
+                                println!("[wecom-card] card_write_ok req_id={} physical_id={}", short_hash(&req_id), physical_id);
+                                runtime.increment_wecom_reply_success().await;
+                            }
+                            Err(e) => {
+                                println!("[wecom-card] card_write_failed req_id={} physical_id={} error={}", short_hash(&req_id), physical_id, e);
+                                return;
+                            }
+                        }
+                    }
+                    Some(WecomOutboundMsg::TemplateCardUpdate { req_id, body }) => {
+                        if !runtime.is_wecom_stream_generation_active(gen) {
+                            println!("[wecom-stream] physical_writer_exit stale physical_id={}", physical_id);
+                            return;
+                        }
+                        let env = build_template_card_update_envelope(&req_id, body);
+                        let json = serde_json::to_string(&env).unwrap_or_default();
+                        println!("[wecom-card] card_update_write_started req_id={} physical_id={}", short_hash(&req_id), physical_id);
+                        match write.send(Message::Text(json.into())).await {
+                            Ok(()) => {
+                                println!("[wecom-card] card_update_write_ok req_id={} physical_id={}", short_hash(&req_id), physical_id);
+                                runtime.increment_wecom_reply_success().await;
+                            }
+                            Err(e) => {
+                                println!("[wecom-card] card_update_write_failed req_id={} physical_id={} error={}", short_hash(&req_id), physical_id, e);
+                                return;
+                            }
+                        }
+                    }
                     None => {
                         println!("[wecom-stream] physical_writer_exit channel_closed physical_id={}", physical_id);
                         return;
@@ -546,6 +596,7 @@ async fn run_read_loop_inline<R>(
     logical_id: &str,
     mut shutdown: watch::Receiver<bool>,
     worker_tx: mpsc::Sender<crate::gateway::wecom_worker::WecomAsyncJob>,
+    shared_tx: mpsc::Sender<WecomOutboundMsg>,
     physical_id: String,
 ) -> Result<(), String>
 where
@@ -572,7 +623,7 @@ where
                             println!("[wecom-stream] read_loop_exit stale_generation gen={} physical_id={}", gen, physical_id);
                             return Err("stale_generation".to_string());
                         }
-                        if let Err(e) = handle_incoming_message(&msg, runtime, &dedup, &worker_tx, logical_id, &physical_id, gen).await {
+                        if let Err(e) = handle_incoming_message(&msg, runtime, &dedup, &worker_tx, &shared_tx, logical_id, &physical_id, gen).await {
                             let kind = classify_error(&e);
                             println!("[wecom-stream] handle_error reason={} gen={}", kind, gen);
                             // Superseded and auth/rate failures terminate this
@@ -601,6 +652,7 @@ async fn handle_incoming_message(
     runtime: &Arc<GatewayRuntime>,
     dedup: &Arc<DedupCache>,
     worker_tx: &mpsc::Sender<crate::gateway::wecom_worker::WecomAsyncJob>,
+    shared_tx: &mpsc::Sender<WecomOutboundMsg>,
     logical_id: &str,
     physical_id: &str,
     gen: u64,
@@ -625,6 +677,14 @@ async fn handle_incoming_message(
                 println!("[wecom-stream] heartbeat_ack_ok req_id={} physical_id={}", req_id_short, physical_id);
             } else {
                 println!("[wecom-stream] reply_ack_ok req_id={} errmsg={} physical_id={}", req_id_short, errmsg_short, physical_id);
+            }
+            // Card replies (template_card) are tracked separately so the
+            // panel lifecycle can log its own ACK (Phase 2A.3.1).
+            if crate::gateway::wecom_card::card_store()
+                .consume_card_reply_ack(&ack.headers.req_id)
+                .await
+            {
+                println!("[wecom-card] card_ack_ok req_id={} physical_id={}", req_id_short, physical_id);
             }
         } else {
             if is_heartbeat {
@@ -656,9 +716,27 @@ async fn handle_incoming_message(
 
     match WecomCommandType::from_cmd(cmd) {
         WecomCommandType::MessageCallback => {
-            handle_message_callback(runtime, dedup, body, req_id, worker_tx, logical_id, physical_id, gen).await
+            handle_message_callback(runtime, dedup, body, req_id, worker_tx, shared_tx, logical_id, physical_id, gen).await
         }
         WecomCommandType::EventCallback => {
+            // Official template-card click hierarchy (Phase 2A.3.1a):
+            // cmd=aibot_event_callback, body.msgtype="event",
+            // body.event.eventtype="template_card_event". Only that
+            // eventtype routes to the card handler; enter_chat /
+            // disconnected_event / feedback_event keep their logic.
+            if crate::gateway::wecom_card::is_template_card_event(body) {
+                println!("[wecom-card] card_event_frame msg_id={}", short_hash(&body.msgid));
+                // Application-level card-event isolation (Phase 2A.3.1c):
+                // any residual handler error is logged and consumed — a card
+                // event can never surface as a connection-level protocol
+                // error in the read loop.
+                if let Err(error) = crate::gateway::wecom_card::handle_card_event(runtime, body, req_id, shared_tx)
+                    .await
+                {
+                    println!("[wecom-card] event_handler_error isolated=true reason={error}");
+                }
+                return Ok(());
+            }
             handle_event_callback(body, req_id, physical_id).await
         }
         WecomCommandType::Unknown => {
@@ -674,6 +752,7 @@ async fn handle_message_callback(
     body: &crate::gateway::wecom_protocol::WecomCallbackBody,
     req_id: &str,
     worker_tx: &mpsc::Sender<crate::gateway::wecom_worker::WecomAsyncJob>,
+    shared_tx: &mpsc::Sender<WecomOutboundMsg>,
     logical_id: &str,
     physical_id: &str,
     gen: u64,
@@ -699,6 +778,45 @@ async fn handle_message_callback(
     if inbound.text.is_empty() {
         return Ok(());
     }
+
+    // Deterministic panel trigger: 菜单/面板/menu//menu/panel//panel
+    // short-circuit to a template_card reply and bypass the Agent
+    // entirely. This check MUST stay before worker enqueue.
+    match crate::gateway::wecom_card::panel_command(&inbound.text) {
+        Some(command) => {
+            println!(
+                "[wecom-card] panel_trigger_checked matched=true command={}",
+                command
+            );
+            println!("[wecom-card] panel_requested msg_id={}", short_hash(msg_id));
+            let task_id = crate::gateway::wecom_card::new_task_id();
+            crate::gateway::wecom_card::register_panel(&task_id, inbound.session_id.clone()).await;
+            let card = crate::gateway::wecom_card::build_panel_card(&task_id);
+            println!("[wecom-card] card_dispatch_requested task_id={}", short_hash(&task_id));
+            crate::gateway::wecom_card::card_store()
+                .note_card_reply_req_id(req_id)
+                .await;
+            shared_tx
+                .send(WecomOutboundMsg::TemplateCard {
+                    req_id: req_id.to_string(),
+                    body: card,
+                })
+                .await
+                .map_err(|_| "outbound_closed".to_string())?;
+            return Ok(());
+        }
+        None => {
+            println!(
+                "[wecom-card] panel_trigger_checked matched=false text_len={}",
+                inbound.text.chars().count()
+            );
+        }
+    }
+
+    // Normal text: keep the existing Agent path (worker enqueue).
+    crate::gateway::wecom_card::card_store()
+        .record_job(chat_type, "已受理")
+        .await;
 
     let job = crate::gateway::wecom_worker::WecomAsyncJob::new_with_writer(
         inbound,
@@ -792,5 +910,90 @@ mod tests {
         let msg2 = WecomOutboundMsg::Reply { req_id: "test2".to_string(), text: "hello".to_string() };
         let debug_str2 = format!("{:?}", msg2);
         assert!(debug_str2.contains("Reply"));
+
+        let msg3 = WecomOutboundMsg::TemplateCard { req_id: "test3".to_string(), body: serde_json::json!({"card_type": "button_interaction"}) };
+        let debug_str3 = format!("{:?}", msg3);
+        assert!(debug_str3.contains("TemplateCard"));
+
+        let msg4 = WecomOutboundMsg::TemplateCardUpdate { req_id: "test4".to_string(), body: serde_json::json!({"card_type": "button_interaction"}) };
+        let debug_str4 = format!("{:?}", msg4);
+        assert!(debug_str4.contains("TemplateCardUpdate"));
+    }
+
+    fn text_callback_body(msgid: &str, content: &str) -> crate::gateway::wecom_protocol::WecomCallbackBody {
+        serde_json::from_value(serde_json::json!({
+            "msgid": msgid,
+            "msgtype": "text",
+            "chattype": "single",
+            "from": {"userid": "u-1"},
+            "text": {"content": content}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn panel_command_routes_to_card_not_worker() {
+        let runtime = Arc::new(GatewayRuntime::new(crate::config::schema::Config::default()));
+        let dedup = DedupCache::global();
+        let (worker_tx, mut worker_rx) =
+            mpsc::channel::<crate::gateway::wecom_worker::WecomAsyncJob>(16);
+        let (shared_tx, mut shared_rx) = mpsc::channel::<WecomOutboundMsg>(16);
+
+        for command in ["菜单", "面板", "menu", "/menu", "panel", "/panel"] {
+            let msgid = format!("panel-routing-{}", uuid::Uuid::new_v4());
+            let body = text_callback_body(&msgid, command);
+            handle_message_callback(
+                &runtime,
+                &dedup,
+                &body,
+                "req-panel",
+                &worker_tx,
+                &shared_tx,
+                "logical",
+                "physical",
+                1,
+            )
+            .await
+            .unwrap();
+            // Panel command: exactly one TemplateCard queued…
+            let queued = shared_rx.try_recv().expect("panel must queue a TemplateCard");
+            assert!(
+                matches!(queued, WecomOutboundMsg::TemplateCard { .. }),
+                "command={command} must produce TemplateCard"
+            );
+            // …and ZERO worker jobs (Agent never dispatched).
+            assert!(
+                worker_rx.try_recv().is_err(),
+                "command={command} must not enqueue a worker job"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_text_routes_to_worker_not_card() {
+        let runtime = Arc::new(GatewayRuntime::new(crate::config::schema::Config::default()));
+        let dedup = DedupCache::global();
+        let (worker_tx, mut worker_rx) =
+            mpsc::channel::<crate::gateway::wecom_worker::WecomAsyncJob>(16);
+        let (shared_tx, mut shared_rx) = mpsc::channel::<WecomOutboundMsg>(16);
+
+        let body = text_callback_body(&format!("normal-{}", uuid::Uuid::new_v4()), "你好");
+        handle_message_callback(
+            &runtime,
+            &dedup,
+            &body,
+            "req-normal",
+            &worker_tx,
+            &shared_tx,
+            "logical",
+            "physical",
+            1,
+        )
+        .await
+        .unwrap();
+        // Normal text: one worker job (Agent path)…
+        assert!(worker_rx.try_recv().is_ok(), "normal text must enqueue a worker job");
+        // …and no card.
+        assert!(shared_rx.try_recv().is_err(), "normal text must not queue a card");
     }
 }

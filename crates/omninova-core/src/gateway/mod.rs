@@ -9,6 +9,7 @@ pub mod feishu_store;
 pub mod feishu_worker;
 pub mod pairing;
 pub mod ws;
+pub mod wecom_card;
 pub mod wecom_protocol;
 pub mod wecom_crypto;
 pub mod wecom_http;
@@ -4777,6 +4778,10 @@ async fn wecom_http_dispatch_agent(
         wecom_stream::short_hash(&stream_id),
         chat_type
     );
+    // Feed the WeCom recent-jobs card data source (Phase 2A.3.1).
+    crate::gateway::wecom_card::card_store()
+        .record_job(chat_type, "已受理")
+        .await;
 
     // Process through the EXISTING Agent Runtime (no second runtime).
     match runtime.process_inbound(&inbound).await {

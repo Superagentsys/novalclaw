@@ -63,6 +63,10 @@ pub const WECOM_CMD_EVENT_CALLBACK: &str = "aibot_event_callback";
 
 /// Reply message command name
 pub const WECOM_CMD_RESPOND_MSG: &str = "aibot_respond_msg";
+/// Official template-card UPDATE command (Phase 2A.3.1a): sent in reply
+/// to a template_card_event callback within 5 seconds, carrying the
+/// original card's task_id.
+pub const WECOM_CMD_RESPOND_UPDATE_MSG: &str = "aibot_respond_update_msg";
 
 /// Welcome message command name
 pub const WECOM_CMD_RESPOND_WELCOME: &str = "aibot_respond_welcome_msg";
@@ -179,12 +183,47 @@ pub struct WecomText {
     pub content: String,
 }
 
+/// Real-runtime nested template-card event payload (official SDK
+/// GitHub Issue #22): the WeCom runtime may deliver the card data under
+/// `body.event.template_card_event` instead of the flat
+/// `body.event.event_key` / `body.event.task_id` documented shape.
+/// Both shapes are supported; the normalizer prefers this nested one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WecomTemplateCardEventPayload {
+    #[serde(default, rename = "card_type", skip_serializing_if = "Option::is_none")]
+    pub card_type: Option<String>,
+    #[serde(default, rename = "event_key", skip_serializing_if = "Option::is_none")]
+    pub event_key: Option<String>,
+    #[serde(default, rename = "task_id", skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
 /// Event details.
+///
+/// Official template-card click events (Phase 2A.3.1a/2A.3.1d) arrive
+/// through the event callback with `eventtype = "template_card_event"`:
+/// `frame.cmd = aibot_event_callback`, `body.msgtype = "event"`.
+/// The card data may be FLAT (`event.event_key` / `event.task_id`) or
+/// NESTED (`event.template_card_event.{card_type,event_key,task_id}` —
+/// the shape the real runtime sends).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WecomEvent {
-    /// Event type (e.g., "enter_chat", "disconnected_event").
+    /// Event type (e.g., "enter_chat", "disconnected_event",
+    /// "template_card_event", "feedback_event").
     #[serde(rename = "eventtype", skip_serializing_if = "Option::is_none")]
     pub eventtype: Option<String>,
+    /// Pressed button key (template_card_event, SDK/document flat shape).
+    #[serde(rename = "event_key", skip_serializing_if = "Option::is_none")]
+    pub event_key: Option<String>,
+    /// The interacted card's task_id (template_card_event, flat shape).
+    #[serde(rename = "task_id", skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Card type of the source card (template_card_event, flat shape).
+    #[serde(rename = "card_type", skip_serializing_if = "Option::is_none")]
+    pub card_type: Option<String>,
+    /// REAL RUNTIME nested shape: `event.template_card_event.{...}`.
+    #[serde(default, rename = "template_card_event", skip_serializing_if = "Option::is_none")]
+    pub template_card_event: Option<WecomTemplateCardEventPayload>,
     /// Additional event fields.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -311,6 +350,52 @@ pub fn build_stream_respond_envelope(req_id: &str, text: &str) -> WecomRequestEn
 /// Build an aibot_respond_msg request envelope (DEPRECATED: use build_stream_respond_envelope for normal replies).
 pub fn build_respond_envelope(req_id: &str, text: &str) -> WecomRequestEnvelope {
     build_stream_respond_envelope(req_id, text)
+}
+
+/// Build an aibot_respond_msg envelope carrying a `template_card` reply.
+///
+/// Official smart-bot template_card protocol (Phase 2A.3.1):
+/// `body = {"msgtype": "template_card", "template_card": <card>}`.
+/// Replying to a `template_card_event` callback's req_id with a card
+/// carrying the SAME task_id updates that card (the official SDK
+/// requires the update promptly after the event callback).
+pub fn build_template_card_respond_envelope(
+    req_id: &str,
+    template_card: serde_json::Value,
+) -> WecomRequestEnvelope {
+    WecomRequestEnvelope {
+        cmd: WECOM_CMD_RESPOND_MSG.to_string(),
+        headers: WecomHeaders {
+            req_id: req_id.to_string(),
+        },
+        body: Some(serde_json::json!({
+            "msgtype": "template_card",
+            "template_card": template_card,
+        })),
+    }
+}
+
+/// Build the official template-card UPDATE envelope
+/// (`aibot_respond_update_msg`) — NOT a plain respond_msg.
+///
+/// `req_id` MUST be the original template_card_event frame's
+/// `headers.req_id`; the update must be sent within 5 seconds of the
+/// event callback; `template_card.task_id` MUST equal the original
+/// card's task_id.
+pub fn build_template_card_update_envelope(
+    req_id: &str,
+    template_card: serde_json::Value,
+) -> WecomRequestEnvelope {
+    WecomRequestEnvelope {
+        cmd: WECOM_CMD_RESPOND_UPDATE_MSG.to_string(),
+        headers: WecomHeaders {
+            req_id: req_id.to_string(),
+        },
+        body: Some(serde_json::json!({
+            "response_type": "update_template_card",
+            "template_card": template_card,
+        })),
+    }
 }
 
 /// Build an aibot_respond_msg request envelope with extended options.
