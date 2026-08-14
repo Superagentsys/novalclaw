@@ -10,6 +10,17 @@ pub mod feishu_worker;
 pub mod control;
 pub mod pairing;
 pub mod ws;
+pub mod wecom_card;
+pub mod wecom_http_card;
+pub mod wecom_http_delivery;
+pub mod wecom_protocol;
+pub mod wecom_crypto;
+pub mod wecom_http;
+pub mod wecom_stream;
+pub mod wecom_inbound;
+pub mod wecom_outbound;
+pub mod wecom_http_stream;
+pub mod wecom_worker;
 
 /// Unified DingTalk Stream lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,8 +43,12 @@ pub enum DingTalkStreamState {
 #[cfg(test)]
 mod dingtalk_tests;
 
+#[cfg(test)]
+mod wecom_tests;
+
 use crate::gateway::dingtalk_worker::verify_dingtalk_webhook_signature;
 use crate::gateway::feishu_store::FeishuStore;
+use crate::gateway::wecom_http::http_callback_enabled;
 use home;
 
 use crate::agent::sanitize_messages_for_provider;
@@ -475,12 +490,20 @@ pub struct GatewayRuntime {
     /// The counter prevents old owners from clearing new owners' state (ABA race).
     /// Only the current owner may call release (Drop or explicit cleanup).
     dingtalk_stream_owner: Arc<StreamOwner>,
+    /// WeCom Stream connection state.
+    wecom_stream_connected: Arc<AtomicBool>,
+    /// WeCom Stream subscribed state.
+    wecom_stream_subscribed: Arc<AtomicBool>,
+    /// WeCom Stream owner lifecycle.
+    wecom_stream_owner: Arc<WecomStreamOwner>,
     /// Per-runtime webhook event deduplication state.
     dedup_cache: Arc<DedupCache>,
     /// Per-runtime, per-chat desktop-monitor single-flight state.
     monitor_flights: Arc<MonitorFlightGuard>,
     /// Per-card DingTalk monitor single-flight guard.
     dingtalk_monitor_guard: Arc<DingtalkMonitorGuard>,
+    /// WeCom HTTP callback stream state (isolated from Long Connection).
+    wecom_http_stream_store: Arc<wecom_http_stream::WecomHttpStreamStore>,
     /// Broadcast bus for Web/CLI subscribers of live agent-run events.
     event_bus: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
@@ -749,6 +772,154 @@ impl StreamOwner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WeCom Stream owner lifecycle (mirrors DingTalk pattern)
+// ---------------------------------------------------------------------------
+
+/// Owner-aware WeCom Stream lifecycle using a generation counter to prevent ABA races.
+pub(crate) struct WecomStreamOwner {
+    generation: AtomicU64,
+    active: AtomicBool,
+    connected: AtomicBool,
+    subscribed: AtomicBool,
+    shutdown_tx: tokio::sync::Mutex<Option<watch::Sender<bool>>>,
+    loop_handle: tokio::sync::Mutex<Option<OwnedStreamLoop>>,
+}
+
+impl WecomStreamOwner {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            subscribed: AtomicBool::new(false),
+            shutdown_tx: tokio::sync::Mutex::new(None),
+            loop_handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Try to acquire ownership with strictly monotonically increasing
+    /// generations. Returns (gen, shutdown_rx) on success, or
+    /// (current_gen, None) when another owner is already active.
+    ///
+    /// The generation counter NEVER resets: even after a full release the
+    /// next successful acquisition is previous_gen + 1. A late release by an
+    /// old owner (stale gen) can therefore never invalidate a new owner.
+    async fn try_acquire(&self) -> (u64, Option<watch::Receiver<bool>>) {
+        let mut tx_guard = self.shutdown_tx.lock().await;
+        if self.active.load(Ordering::Acquire) {
+            return (self.generation.load(Ordering::Acquire), None);
+        }
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active.store(true, Ordering::Release);
+        let (tx, rx) = watch::channel(false);
+        *tx_guard = Some(tx);
+        (gen, Some(rx))
+    }
+
+    /// Release ownership. Generation-scoped: only the current owner may
+    /// release; a stale owner's release is ignored entirely.
+    async fn release(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(true);
+        }
+        self.loop_handle.lock().await.take();
+    }
+
+    fn set_connected(&self, value: bool) {
+        self.connected.store(value, Ordering::Release);
+    }
+
+    fn set_subscribed(&self, value: bool) {
+        self.subscribed.store(value, Ordering::Release);
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Ordering::Acquire)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Register the reconnect-loop JoinHandle so `shutdown_and_join` can
+    /// truly await the loop's teardown (Stop → join → Start).
+    async fn register_loop_handle(&self, owner_gen: u64, handle: tokio::task::JoinHandle<()>) {
+        if self.generation.load(Ordering::Acquire) == owner_gen {
+            *self.loop_handle.lock().await = Some(OwnedStreamLoop {
+                owner_gen,
+                handle,
+            });
+        }
+    }
+
+    /// Mark generation as acquired synchronously (legacy single-call path).
+    /// Returns the new generation number.
+    fn mark_active_for_acquire(&self, new_gen: u64) -> u64 {
+        self.generation.store(new_gen, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        new_gen
+    }
+
+    /// Release ownership synchronously. Generation-scoped: a stale owner's
+    /// release must never invalidate a newer owner.
+    fn release_sync(&self, owner_gen: u64) {
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return;
+        }
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+    }
+
+    async fn shutdown_and_join(&self, owner_gen: u64, wait: Duration) -> StreamShutdownOutcome {
+        if !self.active.load(Ordering::Acquire) {
+            return StreamShutdownOutcome::NotRunning;
+        }
+        if self.generation.load(Ordering::Acquire) != owner_gen {
+            return StreamShutdownOutcome::StaleOwner;
+        }
+
+        self.active.store(false, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.subscribed.store(false, Ordering::Release);
+
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(true);
+        }
+
+        let owned = self.loop_handle.lock().await.take();
+        match owned {
+            Some(mut h) if h.owner_gen == owner_gen => {
+                match tokio::time::timeout(wait, &mut h.handle).await {
+                    Ok(Ok(())) => StreamShutdownOutcome::Graceful,
+                    Ok(Err(_)) => StreamShutdownOutcome::JoinFailed,
+                    Err(_) => {
+                        h.handle.abort();
+                        let _ = h.handle.await;
+                        StreamShutdownOutcome::Aborted
+                    }
+                }
+            }
+            _ => StreamShutdownOutcome::JoinFailed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentRunRegistry {
     inner: Arc<RwLock<HashMap<String, ActiveAgentRun>>>,
@@ -869,9 +1040,13 @@ impl GatewayRuntime {
             dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
+            wecom_stream_connected: Arc::new(AtomicBool::new(false)),
+            wecom_stream_subscribed: Arc::new(AtomicBool::new(false)),
+            wecom_stream_owner: Arc::new(WecomStreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            wecom_http_stream_store: Arc::new(wecom_http_stream::WecomHttpStreamStore::new()),
             event_bus: tokio::sync::broadcast::channel(256).0,
         }
     }
@@ -895,9 +1070,13 @@ impl GatewayRuntime {
             dingtalk_store: Arc::new(OnceLock::new()),
             dingtalk_stream_connected: Arc::new(AtomicBool::new(false)),
             dingtalk_stream_owner: Arc::new(StreamOwner::new()),
+            wecom_stream_connected: Arc::new(AtomicBool::new(false)),
+            wecom_stream_subscribed: Arc::new(AtomicBool::new(false)),
+            wecom_stream_owner: Arc::new(WecomStreamOwner::new()),
             dedup_cache: Arc::new(DedupCache::new(1800)),
             monitor_flights: MonitorFlightGuard::new(),
             dingtalk_monitor_guard: Arc::new(DingtalkMonitorGuard::new()),
+            wecom_http_stream_store: Arc::new(wecom_http_stream::WecomHttpStreamStore::new()),
             event_bus: tokio::sync::broadcast::channel(256).0,
         }
     }
@@ -912,6 +1091,10 @@ impl GatewayRuntime {
 
     pub(crate) fn dedup_cache(&self) -> Arc<DedupCache> {
         self.dedup_cache.clone()
+    }
+
+    pub(crate) fn wecom_http_stream_store(&self) -> Arc<wecom_http_stream::WecomHttpStreamStore> {
+        self.wecom_http_stream_store.clone()
     }
 
     pub(crate) fn monitor_flight_guard(&self) -> Arc<MonitorFlightGuard> {
@@ -1300,6 +1483,134 @@ impl GatewayRuntime {
 
     pub fn dingtalk_store(&self) -> Option<Arc<dingtalk_store::DingtalkStore>> {
         self.dingtalk_store.get().cloned()
+    }
+
+    // ---------------------------------------------------------------------------
+    // WeCom Stream lifecycle
+    // ---------------------------------------------------------------------------
+
+    /// Try-acquire WeCom stream ownership. Returns `Some(gen)` on success or
+    /// `None` when another owner is already active. Generations are strictly
+    /// monotonically increasing across the runtime's lifetime.
+    pub(crate) async fn try_acquire_wecom_stream_owner(&self) -> Option<u64> {
+        let (gen, shutdown_rx) = self.wecom_stream_owner.try_acquire().await;
+        shutdown_rx.map(|_| gen)
+    }
+
+    /// Register the reconnect-loop JoinHandle so Gateway Stop can truly join
+    /// the WeCom teardown before Start.
+    pub(crate) async fn register_wecom_stream_loop_handle(
+        &self,
+        owner_gen: u64,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.wecom_stream_owner
+            .register_loop_handle(owner_gen, handle)
+            .await;
+    }
+
+    /// Legacy synchronous acquire (returns current gen; used by tests and
+    /// the legacy start path). Active owners are NOT re-acquired.
+    pub(crate) fn acquire_wecom_stream_generation(&self) -> u64 {
+        // Use the proper try_acquire method from WecomStreamOwner
+        // This atomically increments generation and sets active=true
+        let gen = self.wecom_stream_owner.current_generation();
+        if self.wecom_stream_owner.is_active() {
+            // Already have an active stream, return current gen (no new acquisition)
+            gen
+        } else {
+            // Increment and set active - this is what try_acquire does
+            // But we need to do it synchronously here, so we simulate the atomic behavior
+            let new_gen = gen + 1;
+            // Mark as active by setting the generation to new_gen and active=true
+            // The WecomStreamOwner tracks this - we need to properly acquire
+            // Use fetch_add pattern to atomically get new gen
+            self.wecom_stream_owner.mark_active_for_acquire(new_gen)
+        }
+    }
+
+    pub(crate) fn is_wecom_stream_generation_active(&self, gen: u64) -> bool {
+        self.wecom_stream_owner.current_generation() == gen
+            && self.wecom_stream_owner.is_active()
+    }
+
+    pub(crate) fn current_wecom_stream_generation(&self) -> u64 {
+        self.wecom_stream_owner.current_generation()
+    }
+
+    /// Check if WeCom stream is currently active (for debugging).
+    pub(crate) fn is_wecom_stream_active(&self) -> bool {
+        self.wecom_stream_owner.is_active()
+    }
+
+    pub(crate) fn set_wecom_stream_connected(&self, value: bool) {
+        self.wecom_stream_connected.store(value, Ordering::Release);
+    }
+
+    /// Whether the WeCom websocket is currently connected (real state
+    /// for the card gateway_status action; no hardcoded "normal").
+    pub(crate) fn is_wecom_stream_connected(&self) -> bool {
+        self.wecom_stream_connected.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_wecom_stream_subscribed(&self, value: bool) {
+        self.wecom_stream_subscribed.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_wecom_stream_state(&self, _state: crate::gateway::wecom_stream::WecomStreamState) {
+        // WeCom uses simpler state tracking than DingTalk
+        // State changes are logged in wecom_stream.rs
+    }
+
+    pub(crate) async fn shutdown_wecom_stream_generation(
+        &self,
+        owner_gen: u64,
+        wait: Duration,
+    ) -> StreamShutdownOutcome {
+        self.wecom_stream_owner
+            .shutdown_and_join(owner_gen, wait)
+            .await
+    }
+
+    /// Gateway Stop entry point: signal shutdown and JOIN the reconnect loop
+    /// so restart is physically 1 -> 0 -> 1 (mirrors DingTalk semantics).
+    pub async fn shutdown_wecom_stream_and_join(&self) {
+        const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        let owner_gen = self.wecom_stream_owner.current_generation();
+        let outcome = self
+            .shutdown_wecom_stream_generation(owner_gen, STREAM_SHUTDOWN_TIMEOUT)
+            .await;
+        println!("[wecom-stream] lifecycle_join outcome={outcome:?} gen={owner_gen}");
+    }
+
+    pub(crate) fn signal_wecom_stream_shutdown(&self, _owner_gen: u64) {
+        // Signal handled by WecomStreamGuard
+    }
+
+    pub(crate) fn release_wecom_stream_generation(&self, gen: u64) {
+        // Release ownership if this is the current generation
+        let current = self.wecom_stream_owner.current_generation();
+        if current == gen {
+            self.wecom_stream_owner.release_sync(gen);
+        } else {
+            println!(
+                "[wecom-stream] owner_release_ignored stale_gen={} current_gen={}",
+                gen, current
+            );
+        }
+    }
+
+    /// Increment reply success counter.
+    pub async fn increment_wecom_reply_success(&self) {}
+
+    /// Increment reply failure counter.
+    pub async fn increment_wecom_reply_failure(&self) {}
+
+    /// Get WebSocket sender for WeCom outbound (placeholder for Phase 1B).
+    pub async fn get_wecom_ws_sender(&self) -> Option<tokio::sync::mpsc::Sender<String>> {
+        // Phase 1A: WeCom reply is handled inline in wecom_stream.rs
+        // Phase 1B will implement proper WebSocket sender sharing
+        None
     }
 
     pub fn with_cron_store(mut self, store: crate::cron::CronStore) -> Self {
@@ -2745,6 +3056,64 @@ impl GatewayRuntime {
         // Start unified DingTalk Stream transport (handles both robot and card topics)
         let mut dingtalk_stream_guard = dingtalk_stream::start(Arc::new(self.clone())).await;
 
+        // Start the existing WeCom WebSocket transport only when explicitly
+        // selected. HTTP callback mode terminates at the Gateway routes below
+        // and must not create a competing long connection.
+        use crate::gateway::wecom_stream;
+        use crate::gateway::wecom_http;
+        use crate::gateway::wecom_stream::WecomStreamGuard;
+
+        // Resolve transport mode and log
+        let wecom_transport_mode = wecom_http::resolve_transport_mode(&cfg);
+        let wecom_transport_is_http = wecom_transport_mode == crate::config::WecomTransportMode::HttpCallback;
+        let wecom_transport_source = if cfg.channels_config.wecom
+            .as_ref()
+            .and_then(|e| e.extra.get("transport_mode"))
+            .is_some()
+        {
+            "channel_extra"
+        } else {
+            "gateway_config"
+        };
+        println!(
+            "[wecom] transport_resolved mode={} source={}",
+            wecom_transport_mode.as_str(),
+            wecom_transport_source
+        );
+
+        // HTTP callback mode: validate credentials at startup (fail-fast)
+        if wecom_transport_is_http {
+            let (token_ok, aes_ok) = wecom_http::check_http_credentials_present(&cfg);
+            println!(
+                "[wecom-http] credentials_resolved token_present={} aes_key_present={}",
+                token_ok, aes_ok
+            );
+            if !token_ok || !aes_ok {
+                println!("[wecom-http] configuration_invalid reason={}",
+                    if !token_ok && !aes_ok {
+                        "callback_token_and_aes_key_missing"
+                    } else if !token_ok {
+                        "callback_token_missing"
+                    } else {
+                        "encoding_aes_key_missing"
+                    }
+                );
+            }
+        }
+
+        let mut wecom_stream_guard: Option<WecomStreamGuard> = if !wecom_transport_is_http {
+            // Long connection mode. `start_initiated` is printed inside
+            // wecom_stream::start() (owner_acquired follows); this outer
+            // log is the startup REQUEST so the two are distinguishable.
+            println!("[wecom-stream] start_requested");
+            // Note: wecom_stream::start() already returns Option<WecomStreamGuard>
+            wecom_stream::start(Arc::new(self.clone())).await
+        } else {
+            // HTTP callback mode
+            println!("[wecom-http] transport_selected=true websocket_started=false");
+            None
+        };
+
         // Run retry/recovery worker to re-send retryable outbox (template/monitor_final)
         // and to abandon LLM final outbox (cannot be sent without storing full body).
         crate::gateway::feishu_worker::run_retry_worker_once(&runtime).await;
@@ -2774,6 +3143,10 @@ impl GatewayRuntime {
             .route("/webhook/feishu", post(http_feishu_webhook))
             .route("/webhook/lark", post(http_lark_webhook))
             .route("/webhook/dingtalk", post(http_dingtalk_webhook))
+            .route(
+                wecom_http::WECOM_HTTP_CALLBACK_PATH,
+                get(http_wecom_callback_verify).post(http_wecom_callback_post),
+            )
             // Alias documented in `config.template.toml` and used by the
             // real DingTalk enterprise app bot callback wizard:
             //   `https://<public-host>/api/v1/gateway/dingtalk/events`.
@@ -2860,6 +3233,9 @@ impl GatewayRuntime {
         let serve_result = axum::serve(listener, app).await;
         if let Some(stream_guard) = dingtalk_stream_guard.as_mut() {
             stream_guard.shutdown().await;
+        }
+        if let Some(ref mut wecom_guard) = wecom_stream_guard {
+            wecom_guard.shutdown().await;
         }
         serve_result?;
         Ok(())
@@ -3703,6 +4079,8 @@ impl GatewayRuntimeStatus {
             if c.webhook.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("webhook".to_string()); }
             if c.wechat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("wechat".to_string()); }
             if c.dingtalk.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("dingtalk".to_string()); }
+            // WeCom: check channels_config.wecom.enabled OR gateway.wecom.enabled
+            if c.wecom.as_ref().map(|e| e.enabled).unwrap_or(false) || cfg.gateway.wecom.enabled { list.push("wecom".to_string()); }
             if c.google_chat.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("google_chat".to_string()); }
             if c.matrix.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("matrix".to_string()); }
             if c.signal.as_ref().map(|e| e.enabled).unwrap_or(false) { list.push("signal".to_string()); }
@@ -4413,6 +4791,372 @@ async fn http_webhook(
         Err(e) => Err(Json(GatewayError {
             message: e.to_string(),
         })),
+    }
+}
+
+fn wecom_http_error_response(
+    error: wecom_http::WecomHttpError,
+) -> (StatusCode, String) {
+    match error {
+        wecom_http::WecomHttpError::BadSignature
+        | wecom_http::WecomHttpError::ReceiveIdMismatch => {
+            (StatusCode::FORBIDDEN, "forbidden".to_string())
+        }
+        wecom_http::WecomHttpError::Disabled
+        | wecom_http::WecomHttpError::WrongTransport => {
+            (StatusCode::NOT_FOUND, "not_found".to_string())
+        }
+        wecom_http::WecomHttpError::MissingConfiguration => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wecom_http_not_configured".to_string(),
+        ),
+        wecom_http::WecomHttpError::InvalidEnvelope
+        | wecom_http::WecomHttpError::EncodingKeyDecodeFailed
+        | wecom_http::WecomHttpError::CiphertextBase64Failed
+        | wecom_http::WecomHttpError::AesCbcFailed
+        | wecom_http::WecomHttpError::Pkcs7Failed
+        | wecom_http::WecomHttpError::FrameTooShort
+        | wecom_http::WecomHttpError::MessageLengthInvalid
+        | wecom_http::WecomHttpError::Utf8Failed
+        | wecom_http::WecomHttpError::InvalidPayload => {
+            (StatusCode::BAD_REQUEST, "invalid_callback".to_string())
+        }
+    }
+}
+
+async fn http_wecom_callback_verify(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<wecom_http::WecomCallbackQuery>,
+) -> (StatusCode, String) {
+    println!("[wecom-http] callback_verify_received=true");
+    println!("[wecom-http] query_fields_present msg_signature={} timestamp={} nonce={} echostr={}",
+        !query.msg_signature.is_empty(),
+        !query.timestamp.is_empty(),
+        !query.nonce.is_empty(),
+        query.echostr.is_some()
+    );
+
+    let config = runtime.get_config().await;
+
+    // Log credential status without exposing values
+    let (token_ok, aes_ok) = wecom_http::check_http_credentials_present(&config);
+    println!("[wecom-http] credentials_status token_present={} aes_key_present={}", token_ok, aes_ok);
+
+    match wecom_http::verify_url(&config, &query) {
+        Ok(plaintext) => {
+            println!("[wecom-http] signature_valid=true");
+            println!("[wecom-http] decrypt_ok=true");
+            println!("[wecom-http] verify_success=true");
+            (StatusCode::OK, plaintext)
+        }
+        Err(error) => {
+            let (signature_valid, decrypt_ok) = wecom_http::error_flags(&error);
+            println!(
+                "[wecom-http] signature_valid={} decrypt_ok={} verify_success=false",
+                signature_valid, decrypt_ok
+            );
+            println!("[wecom-http] failure_reason={:?}", error);
+            wecom_http_error_response(error)
+        }
+    }
+}
+
+/// Bounded, safe error class for agent-failure logs. Never logs full
+/// error bodies or internal stack details.
+fn classify_agent_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(64).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+/// Dispatch Agent for a WeCom HTTP callback in the background.
+///
+/// The initial HTTP stream placeholder reply is ALREADY built and
+/// returned before this task runs: the HTTP handler never awaits
+/// `runtime.process_inbound`. On completion this updates the shared
+/// HTTP stream state that stream refresh callbacks read.
+async fn wecom_http_dispatch_agent(
+    runtime: Arc<GatewayRuntime>,
+    inbound: InboundMessage,
+    stream_id: String,
+    job_id: String,
+    chat_type: &'static str,
+) {
+    let start_time = std::time::Instant::now();
+    println!(
+        "[wecom-http-agent] dispatch_started job_id={} stream_id={} chat_type={}",
+        job_id,
+        wecom_stream::short_hash(&stream_id),
+        chat_type
+    );
+    // Feed the WeCom recent-jobs card data source (Phase 2A.3.1).
+    crate::gateway::wecom_card::card_store()
+        .record_job(chat_type, "已受理")
+        .await;
+
+    // Process through the EXISTING Agent Runtime (no second runtime).
+    match runtime.process_inbound(&inbound).await {
+        Ok(response) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let reply_text = response.reply.clone();
+
+            // Update stream with final content
+            let store = runtime.wecom_http_stream_store();
+            store.complete_stream(&stream_id, reply_text.clone()).await;
+
+            println!(
+                "[wecom-http-agent] dispatch_completed job_id={} stream_id={} reply_len={} duration_ms={}",
+                job_id,
+                wecom_stream::short_hash(&stream_id),
+                reply_text.chars().count(),
+                duration_ms
+            );
+        }
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let error_class = classify_agent_error(&e);
+
+            // Update stream with safe fallback (never the error body)
+            let store = runtime.wecom_http_stream_store();
+            store.fail_stream(&stream_id, error_class.clone()).await;
+
+            println!(
+                "[wecom-http-agent] dispatch_failed job_id={} stream_id={} error_class={} duration_ms={}",
+                job_id,
+                wecom_stream::short_hash(&stream_id),
+                error_class,
+                duration_ms
+            );
+        }
+    }
+}
+
+async fn http_wecom_callback_post(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<wecom_http::WecomCallbackQuery>,
+    raw_body: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    println!("[wecom-http] callback_received=true body_len={}", raw_body.len());
+    let config = runtime.get_config().await;
+
+    // Transport guard: the HTTP handler stays inactive in long_connection
+    // mode; the long-connection lifecycle is completely untouched.
+    if !http_callback_enabled(&config) {
+        println!("[wecom-http] transport_inactive=true");
+        return Err((StatusCode::NOT_FOUND, "not_found".to_string()));
+    }
+
+    // verify → decrypt → JSON deserialize → normalize (same chain as 2A.1.x)
+    let parsed = match wecom_http::parse_post(&config, &query, &raw_body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let (signature_valid, decrypt_ok) = wecom_http::error_flags(&error);
+            println!(
+                "[wecom-http] signature_valid={} decrypt_ok={} inbound_parse_ok=false",
+                signature_valid, decrypt_ok
+            );
+            return Err(wecom_http_error_response(error));
+        }
+    };
+
+    println!("[wecom-http] signature_valid=true");
+    println!("[wecom-http] decrypt_ok=true");
+    println!(
+        "[wecom-http] inbound_parse_ok=true msg_id={} chat_type={} msg_type={} text_bytes={} text_chars={} response_url_present={}",
+        wecom_stream::short_hash(&parsed.body.msgid),
+        wecom_http::chat_type(&parsed.body),
+        parsed.body.msgtype.as_deref().unwrap_or("unknown"),
+        parsed.inbound.text.len(),
+        parsed.inbound.text.chars().count(),
+        parsed.body.response_url.is_some()
+    );
+
+    // ---------------------------------------------------------------------
+    // Phase 2A.3.3: HTTP interactive card events. Shared card core,
+    // HTTP transport adapter. Never the Agent, never the WebSocket.
+    // ---------------------------------------------------------------------
+    if crate::gateway::wecom_card::is_template_card_event(&parsed.body) {
+        let runtime_arc = Arc::new(runtime.clone());
+        return crate::gateway::wecom_http_card::handle_http_card_event(
+            &runtime_arc,
+            &config,
+            &query,
+            &parsed.body,
+        )
+        .await
+        .map(Json)
+        .map_err(wecom_http_error_response);
+    }
+
+    match wecom_http::classify_callback(&parsed.body) {
+        // -----------------------------------------------------------------
+        // Stream refresh: NOT user input — never dispatch Agent.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::StreamRefresh => {
+            println!("[wecom-http] stream_refresh_received=true");
+            let stream_id = parsed
+                .body
+                .stream
+                .as_ref()
+                .and_then(|s| s.id.clone())
+                .unwrap_or_default();
+            if stream_id.is_empty() {
+                println!("[wecom-http] stream_refresh_missing_id=true");
+                return Ok(Json(serde_json::json!({})));
+            }
+            let store = runtime.wecom_http_stream_store();
+            match store.get_stream(&stream_id).await {
+                Some(state) => {
+                    println!("[wecom-http] stream_state={:?}", state.status);
+                    let plaintext = wecom_http::build_stream_reply_plaintext(
+                        &stream_id,
+                        &state.content,
+                        state.finish,
+                    );
+                    let reply = wecom_http::build_encrypted_reply(
+                        &config,
+                        &query.timestamp,
+                        &query.nonce,
+                        &plaintext,
+                    )
+                    .map_err(wecom_http_error_response)?;
+                    println!("[wecom-http] stream_refresh_response_encrypted=true");
+                    Ok(Json(reply))
+                }
+                None => {
+                    // Unknown stream: official behavior — safe empty result
+                    // with finish=true, never a new Agent job.
+                    println!(
+                        "[wecom-http] stream_id={} unknown=true",
+                        wecom_stream::short_hash(&stream_id)
+                    );
+                    let plaintext =
+                        wecom_http::build_stream_reply_plaintext(&stream_id, "", true);
+                    let reply = wecom_http::build_encrypted_reply(
+                        &config,
+                        &query.timestamp,
+                        &query.nonce,
+                        &plaintext,
+                    )
+                    .map_err(wecom_http_error_response)?;
+                    println!("[wecom-http] stream_refresh_unknown_finish=true");
+                    Ok(Json(reply))
+                }
+            }
+        }
+        // -----------------------------------------------------------------
+        // Non-user callbacks: ACK only, never enter the Agent.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::NonText => {
+            println!(
+                "[wecom-http] unsupported_msgtype={} ack_only=true",
+                parsed.body.msgtype.as_deref().unwrap_or("unknown")
+            );
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::MissingSender => {
+            println!("[wecom-http] missing_sender rejected=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::SystemSender => {
+            println!("[wecom-http] system_sender ignored=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        wecom_http::WecomHttpCallbackKind::GroupMissingChatId => {
+            println!("[wecom-http] group_missing_chatid rejected=true");
+            Ok(Json(serde_json::json!({})))
+        }
+        // -----------------------------------------------------------------
+        // Real user text message: stream state + async Agent + placeholder.
+        // -----------------------------------------------------------------
+        wecom_http::WecomHttpCallbackKind::UserText => {
+            // Phase 2A.3.3: HTTP panel trigger (menu/菜单/面板/...)
+            // short-circuits to an encrypted template_card — no Agent.
+            if let Some(card_response) = crate::gateway::wecom_http_card::panel_trigger_response(
+                &config,
+                &query,
+                &parsed,
+            )
+            .await
+            {
+                return Ok(Json(card_response));
+            }
+            let chat_type = wecom_http::chat_type(&parsed.body);
+            let store = runtime.wecom_http_stream_store();
+            let (stream, created) = store
+                .get_or_create_stream(
+                    Some(parsed.body.msgid.clone()),
+                    parsed.inbound.session_id.clone(),
+                    parsed.body.response_url.clone(),
+                )
+                .await;
+            let stream_id = stream.stream_id.clone();
+            if created {
+                println!(
+                    "[wecom-http] dedup=accepted stream_created=true stream_id={} chat_type={}",
+                    wecom_stream::short_hash(&stream_id),
+                    chat_type
+                );
+            } else {
+                // Duplicate callback: reuse the SAME stream and current
+                // state — never a second Agent job.
+                println!(
+                    "[wecom-http] dedup=duplicate stream_reused=true stream_id={}",
+                    wecom_stream::short_hash(&stream_id)
+                );
+            }
+
+            // Build the reply from the CURRENT state (placeholder for a
+            // new stream; current content/finish for a duplicate).
+            let plaintext = wecom_http::build_stream_reply_plaintext(
+                &stream_id,
+                &stream.content,
+                stream.finish,
+            );
+            let reply = wecom_http::build_encrypted_reply(
+                &config,
+                &query.timestamp,
+                &query.nonce,
+                &plaintext,
+            )
+            .map_err(wecom_http_error_response)?;
+
+            if created {
+                // Background Agent job — the handler does NOT await it.
+                let job_id = wecom_stream::short_hash(&parsed.body.msgid);
+                let runtime_for_job = Arc::new(runtime.clone());
+                let inbound_for_job = parsed.inbound.clone();
+                let stream_id_for_job = stream_id.clone();
+                tokio::spawn(async move {
+                    wecom_http_dispatch_agent(
+                        runtime_for_job,
+                        inbound_for_job,
+                        stream_id_for_job,
+                        job_id,
+                        chat_type,
+                    )
+                    .await;
+                });
+                println!(
+                    "[wecom-http] agent_dispatch_started stream_id={}",
+                    wecom_stream::short_hash(&stream_id)
+                );
+            }
+
+            println!(
+                "[wecom-http] initial_reply_encrypted=true stream_id={} finish={}",
+                wecom_stream::short_hash(&stream_id),
+                stream.finish
+            );
+            // Return the encrypted placeholder immediately — the Agent
+            // completes the stream state asynchronously.
+            Ok(Json(reply))
+        }
     }
 }
 

@@ -144,6 +144,7 @@ fn channel_name(channel: &ChannelKind) -> String {
         ChannelKind::Tlon => "tlon".to_string(),
         ChannelKind::Twitch => "twitch".to_string(),
         ChannelKind::Wechat => "wechat".to_string(),
+        ChannelKind::Wecom => "wecom".to_string(),
         ChannelKind::Zalo => "zalo".to_string(),
         ChannelKind::ZaloPersonal => "zalo_personal".to_string(),
         ChannelKind::Lark => "lark".to_string(),

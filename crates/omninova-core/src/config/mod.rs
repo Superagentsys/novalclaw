@@ -18,7 +18,7 @@ pub use schema::{
     SecretsConfig, SecurityConfig, SensorsConfig, SkillsConfig, Stm32Config,
     StorageConfig, StorageProviderConfig, StorageProviderInner, SyscallAnomalyConfig,
     TranscriptionConfig, TunnelConfig, WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig,
-    WebSearchConfig,
+    WebSearchConfig, WecomTransportMode,
 };
 
 pub use schema::resolve_effective_workspace_dir;

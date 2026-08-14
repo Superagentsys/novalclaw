@@ -37,6 +37,7 @@ function getWebhookPath(channelId: string): string {
     case "lark": return "/webhook/lark";
     case "wechat": return "/webhook/wechat";
     case "dingtalk": return "/api/v1/gateway/dingtalk/events";
+    case "wecom": return ""; // WeCom uses WebSocket, not webhook
     case "webhook": return "/webhook";
     default: return "/webhook";
   }
@@ -100,11 +101,96 @@ export function ChannelConfigForm({
     [selectedId]
   );
 
+  // Dependency order (TDZ-safe): helpers first, then derived state that
+  // consumes them, then lists, then memoized UI state.
+  const getEntry = (id: keyof ChannelsConfig): ChannelEntryConfig =>
+    value[id] ?? { ...EMPTY_ENTRY, extra: {} };
+
+  const setEntry = (id: keyof ChannelsConfig, entry: ChannelEntryConfig) => {
+    // Clean up empty strings and empty extra
+    const cleanedEntry: ChannelEntryConfig = {
+      ...entry,
+      token: entry.token?.trim() || undefined,
+      token_env: entry.token_env?.trim() || undefined,
+      extra: entry.extra
+        ? Object.fromEntries(
+            Object.entries(entry.extra).filter(([, v]) => v.trim() !== "")
+          )
+        : undefined,
+    };
+    if (Object.keys(cleanedEntry.extra || {}).length === 0) {
+      cleanedEntry.extra = undefined;
+    }
+    onChange({ ...value, [id]: cleanedEntry });
+  };
+
+  const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
+  const dingtalkTransportMode = selectedPreset?.id === "dingtalk"
+    ? entry.extra?.["transport_mode"] || "http"
+    : "http";
+  const wecomTransportMode = selectedPreset?.id === "wecom"
+    ? entry.extra?.["transport_mode"] || "long_connection"
+    : "long_connection";
+
   const webhookPath = useMemo(() => getWebhookPath(selectedId), [selectedId]);
   const cardCallbackPath = useMemo(
     () => selectedId === "feishu" ? getCardCallbackPath() : "",
     [selectedId]
   );
+
+  const displayedEnabledChannelIds = enabledChannelIds
+    ?? CHANNEL_PRESETS.filter((preset) => getEntry(preset.id).enabled).map(
+      (preset) => preset.id
+    );
+  const enabledList = CHANNEL_PRESETS.filter((preset) =>
+    displayedEnabledChannelIds.includes(preset.id)
+  ).map((preset) => preset.name);
+
+  const visibleFields = useMemo(() => {
+    if (!selectedPreset) return [];
+    // Lark remains limited to its existing credentials. Feishu alone exposes
+    // webhook security controls because its inbound endpoint is handled here.
+    if (FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset.id)) {
+      const base = new Set(["app_id", "app_secret", "outbound_mode"]);
+      return selectedPreset.fields.filter((field) =>
+        selectedPreset.id === "feishu"
+          ? base.has(field.key)
+            || field.key === "security_mode"
+            || field.key === "verification_token"
+            || field.key === "encrypt_key"
+          : base.has(field.key)
+      );
+    }
+    // WeCom: filter fields based on transport mode
+    if (selectedPreset.id === "wecom") {
+      const isLongConnection = wecomTransportMode === "long_connection" || !wecomTransportMode;
+      return selectedPreset.fields.filter((field) => {
+        // transport_mode is always visible
+        if (field.key === "transport_mode") return true;
+        // Long connection fields
+        if (field.key === "bot_id" || field.key === "secret") return isLongConnection;
+        // HTTP callback fields
+        if (field.key === "callback_token" || field.key === "encoding_aes_key") return !isLongConnection;
+        return true;
+      });
+    }
+    return selectedPreset.fields;
+  }, [selectedPreset, wecomTransportMode]);
+
+  const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
+    ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
+    : "";
+  const webhookBaseUrl = normalizePublicWebhookBaseUrl(publicBaseUrl ?? "")
+    || publicWebhookBaseUrl
+    || gatewayUrl?.trim()
+    || "";
+  const fullWebhookUrl = webhookBaseUrl
+    ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
+    : "";
+  const fullCardCallbackUrl = webhookBaseUrl
+    ? `${webhookBaseUrl.replace(/\/$/, "")}${cardCallbackPath}`
+    : "";
+  const isLocal = webhookBaseUrl ? isLocalhost(webhookBaseUrl) : false;
 
   /** Handle health check button click */
   const handleHealthCheck = async () => {
@@ -151,72 +237,6 @@ export function ChannelConfigForm({
     setUncontrolledSelectedId(channelId);
     onSelectedChannelChange?.(channelId);
   };
-
-  const visibleFields = useMemo(() => {
-    if (!selectedPreset) return [];
-    // Lark remains limited to its existing credentials. Feishu alone exposes
-    // webhook security controls because its inbound endpoint is handled here.
-    if (FEISHU_LIKE_CHANNEL_IDS.has(selectedPreset.id)) {
-      const base = new Set(["app_id", "app_secret", "outbound_mode"]);
-      return selectedPreset.fields.filter((field) =>
-        selectedPreset.id === "feishu"
-          ? base.has(field.key)
-            || field.key === "security_mode"
-            || field.key === "verification_token"
-            || field.key === "encrypt_key"
-          : base.has(field.key)
-      );
-    }
-    return selectedPreset.fields;
-  }, [selectedPreset]);
-
-  const getEntry = (id: keyof ChannelsConfig): ChannelEntryConfig =>
-    value[id] ?? { ...EMPTY_ENTRY, extra: {} };
-
-  const setEntry = (id: keyof ChannelsConfig, entry: ChannelEntryConfig) => {
-    // Clean up empty strings and empty extra
-    const cleanedEntry: ChannelEntryConfig = {
-      ...entry,
-      token: entry.token?.trim() || undefined,
-      token_env: entry.token_env?.trim() || undefined,
-      extra: entry.extra
-        ? Object.fromEntries(
-            Object.entries(entry.extra).filter(([, v]) => v.trim() !== "")
-          )
-        : undefined,
-    };
-    if (Object.keys(cleanedEntry.extra || {}).length === 0) {
-      cleanedEntry.extra = undefined;
-    }
-    onChange({ ...value, [id]: cleanedEntry });
-  };
-
-  const displayedEnabledChannelIds = enabledChannelIds
-    ?? CHANNEL_PRESETS.filter((preset) => getEntry(preset.id).enabled).map(
-      (preset) => preset.id
-    );
-  const enabledList = CHANNEL_PRESETS.filter((preset) =>
-    displayedEnabledChannelIds.includes(preset.id)
-  ).map((preset) => preset.name);
-
-  const entry = selectedPreset ? getEntry(selectedPreset.id) : { ...EMPTY_ENTRY, extra: {} };
-  const dingtalkTransportMode = selectedPreset?.id === "dingtalk"
-    ? entry.extra?.["transport_mode"] || "http"
-    : "http";
-  const publicWebhookBaseUrl = selectedPreset?.id === "feishu"
-    ? normalizePublicWebhookBaseUrl(entry.extra?.["public_webhook_base_url"] ?? "")
-    : "";
-  const webhookBaseUrl = normalizePublicWebhookBaseUrl(publicBaseUrl ?? "")
-    || publicWebhookBaseUrl
-    || gatewayUrl?.trim()
-    || "";
-  const fullWebhookUrl = webhookBaseUrl
-    ? `${webhookBaseUrl.replace(/\/$/, "")}${webhookPath}`
-    : "";
-  const fullCardCallbackUrl = webhookBaseUrl
-    ? `${webhookBaseUrl.replace(/\/$/, "")}${cardCallbackPath}`
-    : "";
-  const isLocal = webhookBaseUrl ? isLocalhost(webhookBaseUrl) : false;
 
   /** Get field value: check extra for extra fields, otherwise direct property */
   const getFieldValue = (field: ChannelField): string => {
@@ -497,6 +517,42 @@ export function ChannelConfigForm({
                   </label>
                 );
               }
+              // Special handling for WeCom transport_mode
+              if (field.key === "transport_mode" && selectedPreset.id === "wecom") {
+                return (
+                  <div key={field.key} className="transport-mode-selector">
+                    <span className="transport-mode-label">{field.label}</span>
+                    <div className="transport-mode-options">
+                      <label className="transport-mode-option">
+                        <input
+                          type="radio"
+                          name="wecom-transport-mode"
+                          value="long_connection"
+                          checked={getFieldValue(field) === "long_connection" || !getFieldValue(field)}
+                          onChange={() => handleFieldChange(field, "long_connection")}
+                        />
+                        <span className="transport-mode-option-content">
+                          <span className="transport-mode-title">长连接</span>
+                          <span className="transport-mode-desc">WebSocket，无需公网回调地址</span>
+                        </span>
+                      </label>
+                      <label className="transport-mode-option">
+                        <input
+                          type="radio"
+                          name="wecom-transport-mode"
+                          value="http_callback"
+                          checked={getFieldValue(field) === "http_callback"}
+                          onChange={() => handleFieldChange(field, "http_callback")}
+                        />
+                        <span className="transport-mode-option-content">
+                          <span className="transport-mode-title">HTTP 回调</span>
+                          <span className="transport-mode-desc">需要公网 HTTPS 回调地址</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                );
+              }
               // Special handling for outbound_mode - render as dropdown
               if (field.key === "outbound_mode") {
                 return (
@@ -658,7 +714,7 @@ export function ChannelConfigForm({
 
           {selectedPreset.id === "wechat" && (
             <div className="channel-guide">
-              <h3>企业微信接入指引</h3>
+              <h3>微信/企业微信（Webhook）接入指引</h3>
               <ol>
                 <li>
                   登录{" "}
@@ -676,6 +732,52 @@ export function ChannelConfigForm({
                   ，获取 Token 和 EncodingAESKey
                 </li>
               </ol>
+            </div>
+          )}
+
+          {selectedPreset.id === "wecom" && (
+            <div className="channel-guide">
+              <h3>企业微信 WeCom 智能机器人接入指引</h3>
+              {wecomTransportMode === "long_connection" ? (
+                <>
+                  <ol>
+                    <li>
+                      登录{" "}
+                      <a
+                        href="https://work.weixin.qq.com"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        企业微信管理后台
+                      </a>
+                    </li>
+                    <li>在「智能机器人」中创建机器人，获取 BotID 和长连接专用 Secret</li>
+                    <li>长连接模式无需配置公网回调地址，无需消息加解密</li>
+                  </ol>
+                </>
+              ) : (
+                <>
+                  <div className="wecom-http-callback-url">
+                    <strong>HTTP 回调地址：</strong>
+                    <code>{fullWebhookUrl || (gatewayUrl ? `${gatewayUrl.replace(/\/$/, "")}/webhook/wecom` : "/webhook/wecom")}</code>
+                  </div>
+                  <ol>
+                    <li>
+                      登录{" "}
+                      <a
+                        href="https://work.weixin.qq.com"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        企业微信管理后台
+                      </a>
+                    </li>
+                    <li>在「智能机器人」中创建机器人，配置 HTTP 回调地址</li>
+                    <li>获取 Callback Token 和 EncodingAESKey</li>
+                    <li>HTTP 回调需要公网可访问的 HTTPS 地址</li>
+                  </ol>
+                </>
+              )}
             </div>
           )}
         </div>

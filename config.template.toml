@@ -275,6 +275,18 @@
 # max_results = 10
 # timeout_secs = 15
 
+# --- WeCom Smart Bot ---
+# Exactly one inbound transport is active. Existing configurations default to
+# `long_connection`; HTTP callback mode does not start the WebSocket transport.
+# [gateway.wecom]
+# enabled = false
+# transport_mode = "long_connection" # long_connection | http_callback
+# bot_id_env = "WECOM_BOT_ID"          # long_connection only
+# secret_env = "WECOM_BOT_SECRET"      # long_connection only
+# callback_token_env = "WECOM_CALLBACK_TOKEN"       # http_callback only
+# encoding_aes_key_env = "WECOM_ENCODING_AES_KEY"   # http_callback only
+# HTTP callback URL: https://<public-host>/webhook/wecom
+
 # --- Composio ---
 # [composio]
 # enabled = false
