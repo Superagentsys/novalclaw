@@ -37,7 +37,7 @@ interface SkillInstallLogEntry {
   at: number;
   skill: string;
   slug: string;
-  action: "install" | "update" | "rollback";
+  action: "install" | "update" | "rollback" | "remove";
   status: "running" | "success" | "error";
   detail: string;
 }
@@ -232,6 +232,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const [marketError, setMarketError] = useState<string | null>(null);
   const [installingSlug, setInstallingSlug] = useState<string | null>(null);
   const [rollingBackSlug, setRollingBackSlug] = useState<string | null>(null);
+  const [removingSlug, setRemovingSlug] = useState<string | null>(null);
   const [installNote, setInstallNote] = useState<StatusNote | null>(null);
   const [expandedSlugs, setExpandedSlugs] = useState<Set<string>>(() => new Set());
   const [installLog, setInstallLog] = useState<SkillInstallLogEntry[]>(loadInstallLog);
@@ -286,7 +287,12 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
           slug: item.slug,
           action,
           status: "running" as const,
-          detail: action === "rollback" ? "正在恢复上一版本" : "正在下载并验证技能包",
+          detail:
+            action === "rollback"
+              ? "正在恢复上一版本"
+              : action === "remove"
+                ? "正在移除当前版本与回滚备份"
+                : "正在下载并验证技能包",
         },
         ...prev,
       ].slice(0, 60));
@@ -430,6 +436,32 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     [finishInstallLog, refreshSummary, startInstallLog]
   );
 
+  const handleRemove = useCallback(
+    async (item: SkillHubItem) => {
+      if (!window.confirm(`移除「${item.name}」？当前版本和本机保留的回滚版本都会删除。`)) {
+        return;
+      }
+      const logId = startInstallLog(item, "remove");
+      setRemovingSlug(item.slug);
+      setInstallNote(null);
+      try {
+        await invokeTauri<SkillHubInstallResult>("skillhub_remove_skill", {
+          slug: item.slug,
+        });
+        setInstallNote({ tone: "ok", message: `已移除「${item.name}」` });
+        finishInstallLog(logId, "success", "已删除当前版本与本机回滚备份。");
+        await refreshSummary();
+      } catch (e) {
+        const detail = String(e);
+        setInstallNote({ tone: "error", message: `移除「${item.name}」失败：${detail}` });
+        finishInstallLog(logId, "error", detail);
+      } finally {
+        setRemovingSlug(null);
+      }
+    },
+    [finishInstallLog, refreshSummary, startInstallLog]
+  );
+
   const allItems: SkillItem[] = useMemo(() => {
     if (summary?.items?.length) return summary.items;
     return (summary?.names ?? []).map((name) => ({ name, description: "" }));
@@ -465,7 +497,10 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
   const renderMarketCard = (item: SkillHubItem) => {
     const installed = installedSlugs.has(item.slug);
-    const busy = installingSlug === item.slug || rollingBackSlug === item.slug;
+    const busy =
+      installingSlug === item.slug ||
+      rollingBackSlug === item.slug ||
+      removingSlug === item.slug;
     const expanded = expandedSlugs.has(item.slug);
     return (
       <div className={`market-card${expanded ? " is-expanded" : ""}`} key={`${item.namespace ?? ""}/${item.slug}`}>
@@ -527,16 +562,28 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             )}
           </button>
           {installed ? (
-            <button
-              type="button"
-              className="market-card-rollback-btn"
-              disabled={busy}
-              onClick={() => void handleRollback(item)}
-              title="恢复更新前保留的上一版本"
-            >
-              <UiIcon name="history" size={12} />
-              {rollingBackSlug === item.slug ? "回滚中…" : "回滚"}
-            </button>
+            <>
+              <button
+                type="button"
+                className="market-card-rollback-btn"
+                disabled={busy}
+                onClick={() => void handleRollback(item)}
+                title="恢复更新前保留的上一版本"
+              >
+                <UiIcon name="history" size={12} />
+                {rollingBackSlug === item.slug ? "回滚中…" : "回滚"}
+              </button>
+              <button
+                type="button"
+                className="market-card-remove-btn"
+                disabled={busy}
+                onClick={() => void handleRemove(item)}
+                title="移除当前版本和回滚备份"
+              >
+                <UiIcon name="delete" size={12} />
+                {removingSlug === item.slug ? "移除中…" : "移除"}
+              </button>
+            </>
           ) : null}
         </div>
       </div>
@@ -728,7 +775,13 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                           </span>
                           <span>
                             <strong>
-                              {entry.action === "install" ? "安装" : entry.action === "update" ? "更新" : "回滚"}
+                              {entry.action === "install"
+                                ? "安装"
+                                : entry.action === "update"
+                                  ? "更新"
+                                  : entry.action === "rollback"
+                                    ? "回滚"
+                                    : "移除"}
                               「{entry.skill}」
                             </strong>
                             <small>{entry.detail}</small>

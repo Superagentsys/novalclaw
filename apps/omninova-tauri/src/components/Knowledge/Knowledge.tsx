@@ -313,13 +313,15 @@ export function Knowledge() {
             检索
           </button>
         </form>
-        <button type="button" className="knowledge-primary" onClick={() => setEditor(blankEditor(collection))}>
-          <UiIcon name="plus" />
-          新建笔记
-        </button>
-        <button type="button" onClick={() => void handleImportClick()} disabled={busy === "import"}>
-          导入文件
-        </button>
+        <div className="knowledge-toolbar-actions">
+          <button type="button" className="knowledge-primary" onClick={() => setEditor(blankEditor(collection))}>
+            <UiIcon name="plus" />
+            新建笔记
+          </button>
+          <button type="button" onClick={() => void handleImportClick()} disabled={busy === "import"}>
+            导入文件
+          </button>
+        </div>
         <input
           ref={fileInputRef}
           type="file"
