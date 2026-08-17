@@ -26,7 +26,8 @@ use omninova_core::providers::{ProviderSelection, build_provider_with_selection}
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
     import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
-    skillhub_install, skillhub_list, skillhub_rollback, SkillHubCategory, SkillHubItem,
+    skillhub_install, skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory,
+    SkillHubItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2401,6 +2402,24 @@ async fn skillhub_rollback_skill(
     })
 }
 
+#[tauri::command]
+async fn skillhub_remove_skill(
+    slug: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<SkillHubInstallResult, String> {
+    let target = {
+        let app_state = state.lock().await;
+        let config = app_state.runtime.get_config().await;
+        skills_target_dir(&config)
+    };
+    let removed_slug = skillhub_remove(&target, &slug).map_err(|e| e.to_string())?;
+    Ok(SkillHubInstallResult {
+        slug: removed_slug,
+        installed: 0,
+        dir: target.to_string_lossy().into_owned(),
+    })
+}
+
 async fn gateway_status_from_state(state: &Arc<Mutex<AppState>>) -> GatewayStatusPayload {
     let (runtime, running, last_started_at, last_error, error_code, last_public_health): (
         GatewayRuntime,
@@ -3990,6 +4009,7 @@ pub fn run() {
             skillhub_category_list,
             skillhub_install_skill,
             skillhub_rollback_skill,
+            skillhub_remove_skill,
             task_artifact_preview,
             open_task_artifact,
             collect_task_artifacts,

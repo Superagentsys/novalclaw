@@ -1296,6 +1296,30 @@ export function Chat({
     setSelectedTaskRunId(null);
   };
 
+  const handleRenameAvatar = (id: string) => {
+    const target = avatars.find((avatar) => avatar.id === id);
+    if (!target) return;
+    const requested = window.prompt("重命名智能体", target.name);
+    if (requested === null) return;
+    const name = requested.trim();
+    if (!name) {
+      setError("智能体名称不能为空。");
+      return;
+    }
+    if (name.length > 40) {
+      setError("智能体名称最多 40 个字符。");
+      return;
+    }
+    setError(null);
+    setAvatars((prev) =>
+      prev.map((avatar) => avatar.id === id ? { ...avatar, name } : avatar)
+    );
+    // 历史任务保留会话关联，同时同步展示名称，避免新旧名称混用。
+    setTaskHistory((prev) =>
+      prev.map((task) => task.avatarId === id ? { ...task, agentName: name } : task)
+    );
+  };
+
   const handleDeleteAvatar = (id: string) => {
     setPendingDeleteAvatarId(id);
   };
@@ -2111,6 +2135,18 @@ export function Chat({
                     ) : (
                       <span className="chat-avatar-time">{a.lastAt}</span>
                     )}
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-avatar-edit"
+                    title="重命名智能体"
+                    aria-label={`重命名智能体 ${a.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRenameAvatar(a.id);
+                    }}
+                  >
+                    <UiIcon name="edit" size={13} />
                   </button>
                   <button
                     type="button"

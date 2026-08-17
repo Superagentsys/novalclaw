@@ -558,6 +558,26 @@ pub fn skillhub_rollback(target_dir: &Path, slug: &str) -> Result<(String, usize
     Ok((slug.to_string(), count))
 }
 
+/// Remove an installed SkillHub package and the one-version rollback backup.
+/// The validated slug keeps deletion strictly inside the configured skills root.
+pub fn skillhub_remove(target_dir: &Path, slug: &str) -> Result<String> {
+    validate_skillhub_slug(slug)?;
+    let dest_root = target_dir.join(slug);
+    let backup_root = target_dir.join(format!("{slug}.omninova-backup"));
+    if !dest_root.exists() && !backup_root.exists() {
+        anyhow::bail!("Skill is not installed");
+    }
+    if dest_root.exists() {
+        fs::remove_dir_all(&dest_root)
+            .with_context(|| format!("Failed to remove installed skill: {:?}", dest_root))?;
+    }
+    if backup_root.exists() {
+        fs::remove_dir_all(&backup_root)
+            .with_context(|| format!("Failed to remove skill rollback backup: {:?}", backup_root))?;
+    }
+    Ok(slug.to_string())
+}
+
 /// Return the set of top-level directory names under `dir` that contain a skill.
 pub fn installed_skill_slugs(dir: &Path) -> Result<Vec<String>> {
     let mut slugs = std::collections::BTreeSet::new();
@@ -594,8 +614,10 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod skillhub_tests {
-    use super::{parse_skillhub_items, skillhub_download_url};
+    use super::{parse_skillhub_items, skillhub_download_url, skillhub_remove};
     use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_regular_marketplace_envelope() {
@@ -654,5 +676,33 @@ mod skillhub_tests {
         assert!(url.contains("namespace=user_ec205dbb"));
         assert!(url.contains("version=1.0.2"));
         assert!(!url.contains("tag="));
+    }
+
+    #[test]
+    fn remove_deletes_active_skill_and_rollback_backup() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("omninova-skill-remove-{nonce}"));
+        let active = root.join("demo-skill");
+        let backup = root.join("demo-skill.omninova-backup");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(active.join("SKILL.md"), "---\nname: demo\ndescription: demo\n---\nbody").unwrap();
+        fs::write(backup.join("SKILL.md"), "---\nname: demo\ndescription: old\n---\nbody").unwrap();
+
+        let removed = skillhub_remove(&root, "demo-skill").unwrap();
+
+        assert_eq!(removed, "demo-skill");
+        assert!(!active.exists());
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_rejects_unsafe_slug() {
+        let error = skillhub_remove(&std::env::temp_dir(), "../outside").unwrap_err();
+        assert!(error.to_string().contains("unsupported path characters"));
     }
 }

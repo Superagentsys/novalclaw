@@ -2625,13 +2625,13 @@
 .chat-avatar-row .chat-avatar-item {
   flex: 1;
   min-width: 0;
-  /* 给右侧常显的删除按钮预留空间，避免压住时间戳 */
-  padding-right: 30px;
+  /* 给右侧重命名与删除操作预留空间，避免压住时间戳 */
+  padding-right: 54px;
 }
 
+.chat-avatar-edit,
 .chat-avatar-delete {
   position: absolute;
-  right: 6px;
   top: 50%;
   transform: translateY(-50%);
   width: 22px;
@@ -2652,9 +2652,24 @@
     color var(--transition-fast);
 }
 
+.chat-avatar-edit {
+  right: 30px;
+}
+
+.chat-avatar-delete {
+  right: 6px;
+}
+
+.chat-avatar-row:hover .chat-avatar-edit,
+.chat-avatar-row.is-active .chat-avatar-edit,
 .chat-avatar-row:hover .chat-avatar-delete,
 .chat-avatar-row.is-active .chat-avatar-delete {
   opacity: 1;
+}
+
+.chat-avatar-edit:hover {
+  background: var(--accent-blue-soft);
+  color: var(--accent-blue);
 }
 
 .chat-avatar-delete:hover {

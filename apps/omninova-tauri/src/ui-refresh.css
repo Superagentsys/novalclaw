@@ -738,9 +738,15 @@
   color: var(--ui-text-on-accent);
 }
 
+.chat-avatar-edit,
 .chat-avatar-delete,
 .chat-attachment-chip-remove {
   color: var(--ui-text-muted);
+}
+
+.chat-avatar-edit:hover {
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
 }
 
 .chat-avatar-delete:hover,
@@ -1532,7 +1538,8 @@
 
 .market-card-btn,
 .market-card-detail-btn,
-.market-card-rollback-btn {
+.market-card-rollback-btn,
+.market-card-remove-btn {
   display: inline-flex;
   min-height: 28px;
   align-items: center;
@@ -1563,6 +1570,16 @@
 }
 
 .market-card-rollback-btn { color: var(--ui-warning); }
+
+.market-card-remove-btn {
+  color: var(--ui-danger);
+}
+
+.market-card-remove-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ui-danger) 60%, var(--ui-border));
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
+}
 
 .market-card-details {
   display: grid;
