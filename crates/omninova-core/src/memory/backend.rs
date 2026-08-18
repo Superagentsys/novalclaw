@@ -6,6 +6,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// A truncated or corrupt store starts empty rather than failing to open.
+fn parse_entries(raw: &str) -> HashMap<String, MemoryEntry> {
+    let list: Vec<MemoryEntry> = serde_json::from_str(raw).unwrap_or_default();
+    list.into_iter().map(|e| (e.key.clone(), e)).collect()
+}
+
 pub struct MockMemory;
 
 #[async_trait]
@@ -206,18 +212,39 @@ impl JsonFileMemory {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let entries = if path.exists() {
-            let raw = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-            let list: Vec<MemoryEntry> = serde_json::from_str(&raw).unwrap_or_default();
-            list.into_iter()
-                .map(|e| (e.key.clone(), e))
-                .collect::<HashMap<_, _>>()
+        let raw = if path.exists() {
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
         } else {
-            HashMap::new()
+            String::new()
         };
 
         Ok(Self {
-            entries: Arc::new(RwLock::new(entries)),
+            entries: Arc::new(RwLock::new(parse_entries(&raw))),
+            path,
+            search_options,
+        })
+    }
+
+    /// Synchronous opener for constructors that cannot await.
+    pub fn open_blocking_with_options(
+        path: impl Into<PathBuf>,
+        search_options: SearchOptions,
+    ) -> anyhow::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let raw = if path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(Self {
+            entries: Arc::new(RwLock::new(parse_entries(&raw))),
             path,
             search_options,
         })

@@ -625,8 +625,16 @@ fn default_max_actions_per_hour() -> u32 {
 fn default_max_cost_per_day_cents() -> u32 {
     500
 }
+/// `memory_store` is auto-approved alongside `memory_recall`: it only writes to
+/// the local memory store, and prompting for approval on every remembered fact
+/// makes long-term memory unusable under the default supervised autonomy.
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into(), "knowledge_search".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "memory_store".into(),
+        "knowledge_search".into(),
+    ]
 }
 
 impl Default for AutonomyConfig {
@@ -996,6 +1004,8 @@ pub struct GatewayConfig {
     pub require_pairing: bool,
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// How long conversation history is retained. `0` disables expiry, keeping
+    /// history until the user deletes the session explicitly.
     #[serde(default = "default_gateway_session_ttl_secs")]
     pub session_ttl_secs: u64,
     #[serde(default = "default_gateway_max_sessions")]
@@ -1195,8 +1205,10 @@ fn default_gateway_host() -> String {
 fn default_gateway_port() -> u16 {
     10809
 }
+/// 30 days. The previous 24-hour default silently emptied history overnight,
+/// which users experienced as memory loss rather than as expiry.
 fn default_gateway_session_ttl_secs() -> u64 {
-    24 * 60 * 60
+    30 * 24 * 60 * 60
 }
 fn default_gateway_max_sessions() -> usize {
     500

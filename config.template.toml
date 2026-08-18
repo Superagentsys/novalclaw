@@ -176,16 +176,25 @@
 # module_hash_policy = "warn"            # warn, enforce, ignore
 
 # --- Memory ---
+# 长期记忆（跨会话、跨重启保留），由 memory_store / memory_recall 工具读写。
+# db_path 留空时数据库落在当前 workspace 目录下的 .omninova-memory.db；
+# workspace 未设置时退化为进程内存储（退出即丢失）。
 # [memory]
-# backend = "sqlite"            # sqlite, markdown, none
+# backend = "sqlite"            # sqlite（默认，增量写入）, json, in_memory, none
 # db_path = "~/.omninova/memory.db"
 # search_expand_query = true
 # search_recency_weight = 2.0
 # search_recency_half_life_days = 7.0
 #
+# 配置 provider 后启用语义检索：关键词检索与向量相似度按倒数排名融合。
+# 本地推理服务（Ollama / vLLM）可省略 api_key。embedding 请求失败会自动
+# 降级为纯关键词检索，不会导致写入或搜索失败。
+# 注意：启用后每轮对话都会额外产生一次 embedding 请求。
 # [memory.embedding]
 # provider = "openai"
 # model = "text-embedding-3-small"
+# api_key = ""
+# base_url = "https://api.openai.com/v1"
 
 # --- Storage ---
 # [storage.provider.config]
@@ -197,7 +206,7 @@
 # host = "0.0.0.0"          # 手机/局域网访问需监听所有网卡（默认 127.0.0.1 仅本机）
 # port = 10809
 # allow_public_bind = true  # 绑定 0.0.0.0 时建议开启
-# session_ttl_secs = 86400
+# session_ttl_secs = 2592000   # 会话历史保留时长，默认 30 天；0 表示永不过期
 # max_sessions = 500
 # webhook_require_nonce = false
 # webhook_max_skew_secs = 300

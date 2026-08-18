@@ -5,6 +5,14 @@ release-assets
 .DS_Store
 apps/omninova-tauri/src-tauri/resources/cli/omninova
 
+# Runtime state written into the active workspace
+.omninova-memory.db
+.omninova-memory.db-wal
+.omninova-memory.db-shm
+.omninova-memory.json
+.omninova-sessions.json
+.omninova-sessions.corrupt.*.json
+
 # Android
 apps/omninova-android/.gradle/
 apps/omninova-android/**/build/

@@ -1,12 +1,15 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::event_bus::EventBus;
+use crate::agent::history::{
+    apply_compaction, plan_compaction, render_for_summary, truncate_history_preserving_system,
+};
 use crate::agent::planner::{self, Reflection};
 use crate::agent::prompt::bootstrap_system_messages;
 use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
-use crate::providers::{ChatMessage, Provider};
+use crate::providers::{ChatMessage, ChatRequest, Provider};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
@@ -36,6 +39,10 @@ fn truncate_chars_with_ellipsis(input: &str, max_chars: usize) -> String {
 
 /// Cap on per-step result text quoted back into reflector prompts.
 const REFLECT_RESULT_SNIPPET_CHARS: usize = 2_000;
+
+const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对话浓缩成简洁要点，必须保留：\
+用户的目标与偏好、已确认的事实与决定、未完成的任务、关键文件路径与命令。\
+省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 300 字。";
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -90,6 +97,8 @@ impl Agent {
             )
             .await;
 
+        self.compact_context_if_needed().await;
+
         if images.is_empty() {
             self.messages.push(ChatMessage::user(message));
         } else {
@@ -136,6 +145,7 @@ impl Agent {
             )
             .await;
 
+        self.compact_context_if_needed().await;
         self.messages.push(ChatMessage::user(message));
 
         let budget = BudgetTracker::new(self.config.budget.clone());
@@ -185,6 +195,7 @@ impl Agent {
             )
             .await;
 
+        self.compact_context_if_needed().await;
         self.messages.push(ChatMessage::user(message));
 
         let budget = BudgetTracker::new(self.config.budget.clone());
@@ -283,6 +294,7 @@ impl Agent {
             )
             .await;
 
+        self.compact_context_if_needed().await;
         self.messages.push(ChatMessage::user(message));
 
         let budget = BudgetTracker::new(self.config.budget.clone());
@@ -452,6 +464,46 @@ impl Agent {
         );
         self.messages.push(ChatMessage::assistant(&text));
         Ok(text)
+    }
+
+    /// Condense older turns into a summary once history outgrows
+    /// `max_history_messages`, instead of dropping them outright.
+    ///
+    /// A failed summarizer call degrades to truncation that still preserves the
+    /// leading system messages, so a provider hiccup never blocks the turn.
+    async fn compact_context_if_needed(&mut self) {
+        if !self.config.compact_context {
+            return;
+        }
+        let max_history = self.config.max_history_messages;
+        let Some(plan) = plan_compaction(&self.messages, max_history) else {
+            return;
+        };
+
+        let request_messages = vec![
+            ChatMessage::system(SUMMARIZER_PROMPT),
+            ChatMessage::user(render_for_summary(&plan.summarize)),
+        ];
+        let summary = match self
+            .provider
+            .chat(ChatRequest {
+                messages: &request_messages,
+                tools: None,
+            })
+            .await
+        {
+            Ok(response) => response.text.unwrap_or_default(),
+            Err(error) => {
+                warn!("context compaction failed, truncating instead: {error}");
+                self.messages = truncate_history_preserving_system(
+                    std::mem::take(&mut self.messages),
+                    max_history,
+                );
+                return;
+            }
+        };
+
+        self.messages = apply_compaction(plan, &summary);
     }
 
     pub fn import_messages(&mut self, messages: Vec<ChatMessage>) {

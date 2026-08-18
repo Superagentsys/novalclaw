@@ -51,7 +51,7 @@ use crate::gateway::feishu_store::FeishuStore;
 use crate::gateway::wecom_http::http_callback_enabled;
 use home;
 
-use crate::agent::sanitize_messages_for_provider;
+use crate::agent::{sanitize_messages_for_provider, truncate_history_preserving_system};
 use crate::agent::{AgentCancellationToken, ToolExecutionEvent};
 use crate::channels::adapters::outbound::{
     ChannelOutboundSender, FeishuOutboundSender, LarkOutboundSender, MockOutboundSender,
@@ -66,7 +66,10 @@ use crate::config::{
     resolve_effective_workspace_dir, Config, GatewayPublicConfig, GatewayPublicMode,
 };
 use crate::gateway::feishu_worker::FeishuJobSender;
-use crate::memory::{factory::build_memory_from_config, Memory};
+use crate::memory::{
+    factory::{build_memory_from_config, build_memory_from_config_blocking},
+    Memory,
+};
 use crate::providers::ChatMessage;
 use crate::providers::{
     build_provider_from_config, build_provider_with_selection, ProviderSelection,
@@ -464,7 +467,10 @@ fn now_ts() -> String {
 #[derive(Clone)]
 pub struct GatewayRuntime {
     config: Arc<RwLock<Config>>,
-    pub(crate) memory: Arc<dyn Memory>,
+    /// Long-term memory backend. Behind a lock because `set_config` may point
+    /// it at a different workspace (or backend) while the gateway is running,
+    /// which happens during first-run setup.
+    pub(crate) memory: Arc<RwLock<Arc<dyn Memory>>>,
     cron_store: Option<crate::cron::CronStore>,
     webhook_nonces: Arc<RwLock<HashMap<String, i64>>>,
     session_store_guard: Arc<tokio::sync::Mutex<()>>,
@@ -1022,9 +1028,10 @@ impl Drop for ActiveRunGuard {
 
 impl GatewayRuntime {
     pub fn new(config: Config) -> Self {
+        let memory = build_memory_from_config_blocking(&config);
         Self {
             config: Arc::new(RwLock::new(config)),
-            memory: Arc::new(crate::InMemoryMemory::new()),
+            memory: Arc::new(RwLock::new(memory)),
             cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
@@ -1054,7 +1061,7 @@ impl GatewayRuntime {
     pub fn with_memory(config: Config, memory: Arc<dyn Memory>) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            memory,
+            memory: Arc::new(RwLock::new(memory)),
             cron_store: None,
             webhook_nonces: Arc::new(RwLock::new(HashMap::new())),
             session_store_guard: Arc::new(tokio::sync::Mutex::new(())),
@@ -1650,7 +1657,7 @@ impl GatewayRuntime {
             ok: true,
             provider: provider.name().to_string(),
             provider_healthy: provider.health_check().await,
-            memory_healthy: self.memory.health_check().await,
+            memory_healthy: self.memory().await.health_check().await,
         }
     }
 
@@ -1660,19 +1667,37 @@ impl GatewayRuntime {
 
     pub async fn set_config(&self, mut config: Config) -> anyhow::Result<()> {
         config.validate_or_bail()?;
-        let mut lock = self.config.write().await;
-        config.config_path = lock.config_path.clone();
-        *lock = config;
+        let rebuild_memory = {
+            let lock = self.config.read().await;
+            memory_identity(&lock) != memory_identity(&config)
+        };
+        {
+            let mut lock = self.config.write().await;
+            config.config_path = lock.config_path.clone();
+            *lock = config;
+        }
+        // First-run setup saves the workspace after the runtime was already
+        // constructed, so without this the memory backend would stay in-process
+        // for the whole session and every entry would be lost on exit.
+        if rebuild_memory {
+            self.refresh_memory_from_config().await?;
+        }
         Ok(())
+    }
+
+    /// Current long-term memory backend.
+    pub async fn memory(&self) -> Arc<dyn Memory> {
+        self.memory.read().await.clone()
     }
 
     pub async fn cancel_agent_run(&self, run_id: &str) -> anyhow::Result<()> {
         self.run_registry.cancel_run(run_id).await
     }
 
-    pub async fn refresh_memory_from_config(&mut self) -> anyhow::Result<()> {
+    pub async fn refresh_memory_from_config(&self) -> anyhow::Result<()> {
         let cfg = self.config.read().await.clone();
-        self.memory = build_memory_from_config(&cfg).await?;
+        let memory = build_memory_from_config(&cfg).await?;
+        *self.memory.write().await = memory;
         Ok(())
     }
 
@@ -1691,7 +1716,7 @@ impl GatewayRuntime {
         let mut tools = create_tools_for_route(
             &cfg,
             &route_agent_name,
-            self.memory.clone(),
+            self.memory().await,
             &effective_workspace,
         );
         attach_delegate_tool(
@@ -1724,7 +1749,7 @@ impl GatewayRuntime {
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
-        let mut agent = Agent::new(provider, tools, self.memory.clone(), agent_cfg, security);
+        let mut agent = Agent::new(provider, tools, self.memory().await, agent_cfg, security);
         agent.process_message(message).await
     }
 
@@ -1745,7 +1770,7 @@ impl GatewayRuntime {
         let mut tools = create_tools_for_route(
             &cfg,
             &route_agent_name,
-            self.memory.clone(),
+            self.memory().await,
             &effective_workspace,
         );
         // Give the interactive agent the delegate tool so it can hand subtasks
@@ -1784,7 +1809,7 @@ impl GatewayRuntime {
         Ok(Agent::new(
             provider,
             tools,
-            self.memory.clone(),
+            self.memory().await,
             agent_cfg,
             security,
         ))
@@ -1901,7 +1926,7 @@ impl GatewayRuntime {
         let mut tools = create_tools_for_route(
             &cfg,
             &route.agent_name,
-            self.memory.clone(),
+            self.memory().await,
             &effective_workspace,
         );
         if attach_delegate_tool(
@@ -1989,7 +2014,7 @@ impl GatewayRuntime {
         let mut agent = Agent::new(
             provider,
             tools,
-            self.memory.clone(),
+            self.memory().await,
             agent_cfg.clone(),
             agent_security,
         );
@@ -2003,15 +2028,21 @@ impl GatewayRuntime {
         } else if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
             match load_session_history(&cfg, &inbound.channel, session_id).await {
-                Ok(history) if !history.is_empty() => {
-                    let sanitized = sanitize_messages_for_provider(history);
-                    steps.push(ExecutionStep::done(
-                        "加载会话历史",
-                        format!("历史消息数：{}", sanitized.len()),
-                    ));
-                    agent.import_messages(sanitized)
+                Ok(loaded) => {
+                    if let Some(warning) = loaded.warning {
+                        steps.push(ExecutionStep::error("会话历史存储", warning));
+                    }
+                    if loaded.messages.is_empty() {
+                        steps.push(ExecutionStep::done("加载会话历史", "无历史消息"));
+                    } else {
+                        let sanitized = sanitize_messages_for_provider(loaded.messages);
+                        steps.push(ExecutionStep::done(
+                            "加载会话历史",
+                            format!("历史消息数：{}", sanitized.len()),
+                        ));
+                        agent.import_messages(sanitized)
+                    }
                 }
-                Ok(_) => steps.push(ExecutionStep::done("加载会话历史", "无历史消息")),
                 Err(e) => {
                     steps.push(ExecutionStep::error("加载会话历史", e.to_string()));
                     warn!("failed to load session history for {}: {}", session_id, e)
@@ -2204,7 +2235,7 @@ impl GatewayRuntime {
         let mut tools = create_tools_for_route(
             &cfg,
             &route.agent_name,
-            self.memory.clone(),
+            self.memory().await,
             &effective_workspace,
         );
 
@@ -2267,7 +2298,7 @@ impl GatewayRuntime {
         let mut agent = Agent::new(
             build_provider_from_config(&cfg),
             tools,
-            self.memory.clone(),
+            self.memory().await,
             agent_cfg.clone(),
             agent_security.clone(),
         );
@@ -2282,15 +2313,21 @@ impl GatewayRuntime {
         } else if let Some(session_id) = inbound.session_id.as_deref() {
             let _guard = self.session_store_guard.lock().await;
             match load_session_history(&cfg, &inbound.channel, session_id).await {
-                Ok(history) if !history.is_empty() => {
-                    let sanitized = sanitize_messages_for_provider(history);
-                    steps.push(ExecutionStep::done(
-                        "加载会话历史",
-                        format!("历史消息数：{}", sanitized.len()),
-                    ));
-                    agent.import_messages(sanitized);
+                Ok(loaded) => {
+                    if let Some(warning) = loaded.warning {
+                        steps.push(ExecutionStep::error("会话历史存储", warning));
+                    }
+                    if loaded.messages.is_empty() {
+                        steps.push(ExecutionStep::done("加载会话历史", "无历史消息"));
+                    } else {
+                        let sanitized = sanitize_messages_for_provider(loaded.messages);
+                        steps.push(ExecutionStep::done(
+                            "加载会话历史",
+                            format!("历史消息数：{}", sanitized.len()),
+                        ));
+                        agent.import_messages(sanitized);
+                    }
                 }
-                Ok(_) => steps.push(ExecutionStep::done("加载会话历史", "无历史消息")),
                 Err(e) => {
                     steps.push(ExecutionStep::error("加载会话历史", e.to_string()));
                     warn!("failed to load session history for {}: {}", session_id, e);
@@ -2747,6 +2784,7 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let messages = load_session_history(&cfg, channel, session_id)
             .await
+            .map(|loaded| loaded.messages)
             .unwrap_or_default();
         let updated_at = load_session_record(&cfg, channel, session_id)
             .await
@@ -2779,7 +2817,7 @@ impl GatewayRuntime {
 
         // ?????
         let path = session_store_path(&cfg);
-        let mut store = load_session_store(&path).await?;
+        let mut store = load_session_store(&path).await?.store;
         let removed = store.sessions.remove(&key).is_some();
         if removed {
             let serialized = serde_json::to_string_pretty(&store)?;
@@ -2803,9 +2841,9 @@ impl GatewayRuntime {
         let path = session_store_path(&cfg);
         let mut merged: HashMap<String, GatewaySessionTreeNode> = HashMap::new();
 
-        let persisted = load_session_store(&path).await?;
+        let persisted = load_session_store(&path).await?.store;
         for (session_key, record) in persisted.sessions {
-            if now - record.updated_at > cfg.gateway.session_ttl_secs as i64 {
+            if session_expired(now, record.updated_at, cfg.gateway.session_ttl_secs) {
                 continue;
             }
             merged.insert(
@@ -8977,22 +9015,40 @@ fn assistant_text_for_ui(content: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Loaded conversation history plus any store-level warning worth surfacing.
+struct SessionHistoryLoad {
+    messages: Vec<ChatMessage>,
+    warning: Option<String>,
+}
+
 async fn load_session_history(
     config: &Config,
     channel: &ChannelKind,
     session_id: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
+) -> anyhow::Result<SessionHistoryLoad> {
     let path = session_store_path(config);
-    let store = load_session_store(&path).await?;
+    let loaded = load_session_store(&path).await?;
     let key = session_key(channel, session_id);
-    let Some(record) = store.sessions.get(&key) else {
-        return Ok(Vec::new());
+    let Some(record) = loaded.store.sessions.get(&key) else {
+        return Ok(SessionHistoryLoad {
+            messages: Vec::new(),
+            warning: loaded.warning,
+        });
     };
-    let age = now_unix_ts() - record.updated_at;
-    if age > config.gateway.session_ttl_secs as i64 {
-        return Ok(Vec::new());
+    if session_expired(
+        now_unix_ts(),
+        record.updated_at,
+        config.gateway.session_ttl_secs,
+    ) {
+        return Ok(SessionHistoryLoad {
+            messages: Vec::new(),
+            warning: loaded.warning,
+        });
     }
-    Ok(record.messages.clone())
+    Ok(SessionHistoryLoad {
+        messages: record.messages.clone(),
+        warning: loaded.warning,
+    })
 }
 
 async fn save_session_history(
@@ -9006,10 +9062,9 @@ async fn save_session_history(
     agent_name: String,
     spawn_depth: u32,
 ) -> anyhow::Result<()> {
-    if max_history_messages > 0 && messages.len() > max_history_messages {
-        let start = messages.len() - max_history_messages;
-        messages = messages.split_off(start);
-    }
+    // Backstop for the in-agent summarizer: keeps the bootstrap prompt and any
+    // compaction summary instead of blindly slicing off the oldest messages.
+    messages = truncate_history_preserving_system(messages, max_history_messages);
     messages = sanitize_messages_for_provider(messages);
 
     let path = session_store_path(config);
@@ -9017,11 +9072,13 @@ async fn save_session_history(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let mut store = load_session_store(&path).await?;
+    let mut store = load_session_store(&path).await?.store;
     let now = now_unix_ts();
     store
         .sessions
-        .retain(|_, record| now - record.updated_at <= config.gateway.session_ttl_secs as i64);
+        .retain(|_, record| {
+            !session_expired(now, record.updated_at, config.gateway.session_ttl_secs)
+        });
 
     let key = session_key(channel, session_id);
     store.sessions.insert(
@@ -9062,32 +9119,116 @@ async fn load_session_record_by_key(
     key: &str,
 ) -> anyhow::Result<Option<SessionRecord>> {
     let path = session_store_path(config);
-    let store = load_session_store(&path).await?;
+    let store = load_session_store(&path).await?.store;
     Ok(store.sessions.get(key).cloned())
 }
 
-async fn load_session_store(path: &PathBuf) -> anyhow::Result<SessionStoreFile> {
+/// Result of reading the session store, including a user-facing warning when
+/// the file could not be parsed cleanly.
+///
+/// Corruption used to be swallowed here, which surfaced to users as "all my
+/// conversations vanished for no reason". Now recoverable records are kept and
+/// the caller is told what happened.
+struct SessionStoreLoad {
+    store: SessionStoreFile,
+    warning: Option<String>,
+}
+
+impl SessionStoreLoad {
+    fn intact(store: SessionStoreFile) -> Self {
+        Self {
+            store,
+            warning: None,
+        }
+    }
+}
+
+async fn load_session_store(path: &PathBuf) -> anyhow::Result<SessionStoreLoad> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let _guard = acquire_lockfile_guard(path, 5_000, 60_000).await?;
     if !path.exists() {
-        return Ok(SessionStoreFile::default());
+        return Ok(SessionStoreLoad::intact(SessionStoreFile::default()));
     }
     let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    match serde_json::from_str::<SessionStoreFile>(&raw) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let corrupt_path = path.with_extension(format!("corrupt.{}.json", now_unix_ts()));
-            let _ = tokio::fs::rename(path, &corrupt_path).await;
-            warn!(
-                "session store corrupted (moved to {}): {}",
-                corrupt_path.display(),
-                e
-            );
-            Ok(SessionStoreFile::default())
+    let parse_error = match serde_json::from_str::<SessionStoreFile>(&raw) {
+        Ok(store) => return Ok(SessionStoreLoad::intact(store)),
+        Err(error) => error,
+    };
+
+    let backup_path = path.with_extension(format!("corrupt.{}.json", now_unix_ts()));
+    let (recovered, lost) = recover_session_store(&raw);
+
+    if recovered.sessions.is_empty() {
+        // Nothing salvageable: move the file aside so the next write starts
+        // from a clean slate instead of failing forever.
+        let _ = tokio::fs::rename(path, &backup_path).await;
+        warn!(
+            "session store unreadable (moved to {}): {}",
+            backup_path.display(),
+            parse_error
+        );
+        return Ok(SessionStoreLoad {
+            store: SessionStoreFile::default(),
+            warning: Some(format!(
+                "会话历史文件无法解析，已备份到 {}，本次以空历史继续",
+                backup_path.display()
+            )),
+        });
+    }
+
+    // Keep a copy of the damaged file; the next save rewrites `path` from the
+    // recovered records, which self-heals the store.
+    let _ = tokio::fs::copy(path, &backup_path).await;
+    warn!(
+        "session store partially recovered ({} sessions kept, {} dropped, backup at {}): {}",
+        recovered.sessions.len(),
+        lost,
+        backup_path.display(),
+        parse_error
+    );
+    let warning = Some(format!(
+        "会话历史文件部分损坏：已恢复 {} 个会话，丢弃 {} 个，备份在 {}",
+        recovered.sessions.len(),
+        lost,
+        backup_path.display()
+    ));
+    Ok(SessionStoreLoad {
+        store: recovered,
+        warning,
+    })
+}
+
+/// Salvage individually-parseable session records from a damaged store.
+/// Returns the recovered file and how many records had to be dropped.
+fn recover_session_store(raw: &str) -> (SessionStoreFile, usize) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (SessionStoreFile::default(), 0);
+    };
+    let Some(sessions) = value.get("sessions").and_then(|s| s.as_object()) else {
+        return (SessionStoreFile::default(), 0);
+    };
+
+    let mut recovered = SessionStoreFile::default();
+    let mut lost = 0usize;
+    for (key, record) in sessions {
+        match serde_json::from_value::<SessionRecord>(record.clone()) {
+            Ok(record) => {
+                recovered.sessions.insert(key.clone(), record);
+            }
+            Err(_) => lost += 1,
         }
     }
+    (recovered, lost)
+}
+
+/// `session_ttl_secs == 0` disables expiry entirely.
+fn session_expired(now: i64, updated_at: i64, ttl_secs: u64) -> bool {
+    if ttl_secs == 0 {
+        return false;
+    }
+    now.saturating_sub(updated_at) > ttl_secs as i64
 }
 
 async fn atomic_write_string(path: &PathBuf, content: &str) -> anyhow::Result<()> {
@@ -9327,7 +9468,7 @@ struct ApiMemoryForgetRequest {
 async fn http_api_memory_list(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
-    let entries = runtime.memory.list(None, None).await.map_err(|e| {
+    let entries = runtime.memory().await.list(None, None).await.map_err(|e| {
         Json(GatewayError {
             message: e.to_string(),
         })
@@ -9359,7 +9500,8 @@ async fn http_api_memory_store(
         _ => MemoryCategory::Core,
     };
     runtime
-        .memory
+        .memory()
+        .await
         .store(&req.key, &req.content, category, None)
         .await
         .map_err(|e| {
@@ -9374,7 +9516,7 @@ async fn http_api_memory_forget(
     State(runtime): State<GatewayRuntime>,
     Json(req): Json<ApiMemoryForgetRequest>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
-    let removed = runtime.memory.forget(&req.key).await.map_err(|e| {
+    let removed = runtime.memory().await.forget(&req.key).await.map_err(|e| {
         Json(GatewayError {
             message: e.to_string(),
         })
@@ -9391,7 +9533,7 @@ async fn http_api_doctor(
     let cfg = runtime.get_config().await;
     let estop = runtime.estop_status().await.ok();
     let session_tree = runtime.session_tree_snapshot().await.ok();
-    let memory_count = runtime.memory.count().await.unwrap_or(0);
+    let memory_count = runtime.memory().await.count().await.unwrap_or(0);
 
     let mut checks = Vec::new();
     checks.push(serde_json::json!({
@@ -9713,13 +9855,33 @@ fn attach_delegate_tool(
     true
 }
 
+/// Everything that decides which memory backend a config resolves to. Compared
+/// on `set_config` to avoid rebuilding the backend on unrelated config edits.
+fn memory_identity(config: &Config) -> (String, String, String, String, String, String) {
+    let embedding = &config.memory.embedding;
+    (
+        config.memory.backend.trim().to_lowercase(),
+        config.memory.db_path.clone().unwrap_or_default(),
+        config.workspace_dir.display().to_string(),
+        embedding.provider.clone().unwrap_or_default(),
+        embedding.model.clone().unwrap_or_default(),
+        embedding.base_url.clone().unwrap_or_default(),
+    )
+}
+
 fn create_tools_for_route(
     config: &Config,
     route_agent_name: &str,
-    _memory: Arc<dyn Memory>,
+    memory: Arc<dyn Memory>,
     effective_workspace: &PathBuf,
 ) -> Vec<Box<dyn Tool>> {
-    let tools = create_workspace_tools(effective_workspace, config);
+    let mut tools = create_workspace_tools(effective_workspace, config);
+    // Long-term memory is what lets the agent carry facts across sessions and
+    // restarts, so it belongs in the default toolset rather than only in
+    // `create_all_tools`.
+    tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
+    tools.push(Box::new(MemoryRecallTool::new(memory)));
+
     let Some(delegate) = config.agents.get(route_agent_name) else {
         return tools;
     };
@@ -9749,9 +9911,10 @@ mod tests {
         create_tools_for_route, dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
         feishu_public_callback_urls, http_dingtalk_card_callback_post,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
-        normalize_public_webhook_base_url, resolve_agent_max_tool_iterations,
-        resolve_public_webhook_base_url, split_session_key, DedupCache, GatewayRuntime,
-        GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard, SessionLineageMeta,
+        normalize_public_webhook_base_url, recover_session_store, resolve_agent_max_tool_iterations,
+        resolve_public_webhook_base_url, session_expired, split_session_key, DedupCache,
+        GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard,
+        SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{
@@ -9784,6 +9947,67 @@ mod tests {
         let tools = create_tools_for_route(&config, "researcher", memory, &effective_ws);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
+    }
+
+    #[test]
+    fn default_toolset_includes_long_term_memory() {
+        let config = Config::default();
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
+
+        let tools = create_tools_for_route(
+            &config,
+            "omninova",
+            memory,
+            &PathBuf::from("/fake/workspace"),
+        );
+
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert!(names.contains(&"memory_store"), "names={names:?}");
+        assert!(names.contains(&"memory_recall"), "names={names:?}");
+    }
+
+    #[test]
+    fn session_expiry_can_be_disabled_with_zero_ttl() {
+        let now = 1_000_000_i64;
+        let long_ago = now - 400 * 24 * 60 * 60;
+
+        assert!(session_expired(now, long_ago, 24 * 60 * 60));
+        assert!(!session_expired(now, long_ago, 0));
+        assert!(!session_expired(now, now - 60, 24 * 60 * 60));
+    }
+
+    #[test]
+    fn corrupt_session_store_keeps_parseable_records() {
+        // The second record has a non-numeric `updated_at`, which makes strict
+        // parsing of the whole file fail.
+        let raw = json!({
+            "sessions": {
+                "cli:good": {
+                    "messages": [{ "role": "user", "content": "hello" }],
+                    "updated_at": 100,
+                    "spawn_depth": 0
+                },
+                "cli:bad": {
+                    "messages": [],
+                    "updated_at": "not-a-number",
+                    "spawn_depth": 0
+                }
+            }
+        })
+        .to_string();
+
+        let (recovered, lost) = recover_session_store(&raw);
+
+        assert_eq!(lost, 1);
+        assert_eq!(recovered.sessions.len(), 1);
+        assert!(recovered.sessions.contains_key("cli:good"));
+    }
+
+    #[test]
+    fn unparseable_session_store_recovers_nothing() {
+        let (recovered, lost) = recover_session_store("{not json at all");
+        assert_eq!(lost, 0);
+        assert!(recovered.sessions.is_empty());
     }
 
     #[test]

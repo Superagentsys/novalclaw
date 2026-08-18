@@ -13,7 +13,7 @@ pub use agent::Agent;
 pub use agent_event::{AgentRunEvent, DiffStats, StepStatus, ChangeType};
 pub use budget::BudgetTracker;
 pub use event_bus::{EventBus, EventBusDrainHandle, build_tool_summary, build_tool_prepare_summary, build_tool_start_summary, truncate_for_display, extract_diff_stats, compute_content_diff, TimedBlock};
-pub use history::sanitize_messages_for_provider;
+pub use history::{sanitize_messages_for_provider, truncate_history_preserving_system};
 pub use run_control::AgentCancellationToken;
 
 /// Legacy event type — kept for internal dispatcher use.
