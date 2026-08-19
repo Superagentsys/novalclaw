@@ -5,8 +5,8 @@ mod desktop_capture;
 use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
-    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
-    ProviderConfig, RobotConfig,
+    resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
+    GatewayPublicMode, ModelProviderConfig, ProviderConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -25,9 +25,8 @@ use omninova_core::gateway::{
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
-    import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
-    skillhub_install, skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory,
-    SkillHubItem,
+    import_skills_from_dir, skill_runtime_snapshot, skillhub_categories, skillhub_install,
+    skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory, SkillHubItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -536,6 +535,32 @@ struct SetupAppConfig {
     /// Per-agent settings (workspace_dir, system_prompt, etc.) from the Agent tab.
     #[serde(default)]
     agent: Option<AgentPersonaSetup>,
+    #[serde(default)]
+    skills: SetupSkillsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupSkillsConfig {
+    #[serde(default = "default_setup_open_skills_enabled")]
+    open_skills_enabled: bool,
+    #[serde(default)]
+    open_skills_dir: Option<String>,
+    #[serde(default)]
+    prompt_injection_mode: Option<String>,
+}
+
+impl Default for SetupSkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
+            open_skills_dir: None,
+            prompt_injection_mode: None,
+        }
+    }
+}
+
+fn default_setup_open_skills_enabled() -> bool {
+    DEFAULT_OPEN_SKILLS_ENABLED
 }
 
 /// Corresponds to the frontend `AgentPersonaConfig`.
@@ -1568,11 +1593,15 @@ struct SkillSummaryItem {
 #[serde(rename_all = "camelCase")]
 struct SkillsPackageSummaryPayload {
     dir: String,
+    configured_skills_dir: String,
+    open_skills_enabled: bool,
+    generation: u64,
     total: usize,
     names: Vec<String>,
     items: Vec<SkillSummaryItem>,
-    /// Top-level directory names (slugs) of installed skills, for install-state marking.
+    /// Top-level directory names (slugs) of installed skills. Files exist; not Runtime-visible by itself.
     slugs: Vec<String>,
+    runtime_visible_slugs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2258,9 +2287,7 @@ async fn import_skills(
     let app_state = state.lock().await;
     let config = app_state.runtime.get_config().await;
     
-    let target = config.skills.open_skills_dir.as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+    let target = resolve_configured_skills_dir(&config);
 
     let source = PathBuf::from(source_dir);
     
@@ -2277,14 +2304,9 @@ async fn skills_package_summary(
     let app_state = state.lock().await;
     let config = app_state.runtime.get_config().await;
 
-    let target = config
-        .skills
-        .open_skills_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"));
-
-    let skills = load_skills_from_dir(&target).map_err(|e| e.to_string())?;
+    let snapshot = skill_runtime_snapshot(&config);
+    let target = snapshot.skills_dir.clone();
+    let skills = omninova_core::skills::load_skills_from_dir(&target).map_err(|e| e.to_string())?;
     let names = skills
         .iter()
         .map(|skill| skill.metadata.name.clone())
@@ -2315,24 +2337,21 @@ async fn skills_package_summary(
         })
         .collect::<Vec<_>>();
 
-    let slugs = installed_skill_slugs(&target).unwrap_or_default();
-
     Ok(SkillsPackageSummaryPayload {
         dir: target.to_string_lossy().into_owned(),
+        configured_skills_dir: snapshot.configured_skills_dir.to_string_lossy().into_owned(),
+        open_skills_enabled: snapshot.open_skills_enabled,
+        generation: snapshot.generation,
         total: names.len(),
         names,
         items,
-        slugs,
+        slugs: snapshot.installed_slugs,
+        runtime_visible_slugs: snapshot.runtime_visible_slugs,
     })
 }
 
 fn skills_target_dir(config: &Config) -> PathBuf {
-    config
-        .skills
-        .open_skills_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"))
+    resolve_configured_skills_dir(config)
 }
 
 #[tauri::command]
@@ -2656,6 +2675,11 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             max_history_messages: Some(config.agent.max_history_messages),
             mbti_type: None,
         }),
+        skills: SetupSkillsConfig {
+            open_skills_enabled: config.skills.open_skills_enabled,
+            open_skills_dir: config.skills.open_skills_dir.clone(),
+            prompt_injection_mode: config.skills.prompt_injection_mode.clone(),
+        },
     }
 }
 
@@ -2927,6 +2951,11 @@ fn setup_config_to_core(
             }
         }
     }
+
+    current.skills.open_skills_enabled = setup.skills.open_skills_enabled;
+    current.skills.open_skills_dir = normalize_optional_string(setup.skills.open_skills_dir);
+    current.skills.prompt_injection_mode =
+        normalize_optional_string(setup.skills.prompt_injection_mode);
 
     current.multimodal.desktop_vision_enabled = setup.multimodal.desktop_vision_enabled;
     current.multimodal.desktop_vision_max_dimension_px = setup

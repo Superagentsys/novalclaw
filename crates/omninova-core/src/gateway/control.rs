@@ -11,7 +11,7 @@ use crate::cron::{
 use crate::gateway::{AgentJobExecutor, GatewayRuntime};
 use crate::knowledge::{KnowledgeStore, KnowledgeUpsert};
 use crate::skills::{
-    import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
+    import_skills_from_dir, load_skills_from_dir, skill_runtime_snapshot, skillhub_categories,
     skillhub_install, skillhub_list, skillhub_rollback,
 };
 use axum::extract::State;
@@ -534,18 +534,22 @@ async fn upsert_job(runtime: &GatewayRuntime, input: Value) -> Result<Value, Str
 
 async fn skills_summary(runtime: &GatewayRuntime) -> Result<Value, String> {
     let cfg = runtime.get_config().await;
-    let dir = skills_dir(&cfg);
+    let snapshot = skill_runtime_snapshot(&cfg);
+    let dir = snapshot.skills_dir.clone();
     let skills = load_skills_from_dir(&dir).unwrap_or_default();
-    let slugs = installed_skill_slugs(&dir).unwrap_or_default();
     Ok(json!({
         "dir": dir.to_string_lossy(),
+        "configuredSkillsDir": snapshot.configured_skills_dir.to_string_lossy(),
+        "openSkillsEnabled": snapshot.open_skills_enabled,
+        "generation": snapshot.generation,
         "total": skills.len(),
-        "names": skills.iter().map(|s| s.metadata.name.clone()).collect::<Vec<_>>(),
+        "names": snapshot.loaded_names,
         "items": skills.iter().map(|s| json!({
             "name": s.metadata.name,
             "description": s.metadata.description,
         })).collect::<Vec<_>>(),
-        "slugs": slugs,
+        "slugs": snapshot.installed_slugs,
+        "runtimeVisibleSlugs": snapshot.runtime_visible_slugs,
     }))
 }
 
@@ -784,9 +788,5 @@ fn parse_channel_str(label: &str) -> ChannelKind {
 }
 
 fn skills_dir(cfg: &crate::config::Config) -> PathBuf {
-    cfg.skills
-        .open_skills_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cfg.workspace_dir.join("skills"))
+    crate::config::resolve_configured_skills_dir(cfg)
 }

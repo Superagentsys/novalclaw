@@ -2046,9 +2046,7 @@ fn daemon_info(config: &Config) -> String {
 }
 
 async fn run_skills(cmd: Option<&SkillsCommands>, config: &Config) -> Result<String> {
-    let skills_dir = config.skills.open_skills_dir.as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+    let skills_dir = crate::config::resolve_configured_skills_dir(config);
     match cmd {
         Some(SkillsCommands::List) => {
             let skills = crate::skills::load_skills_from_dir(&skills_dir)?;

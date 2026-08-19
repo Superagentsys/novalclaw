@@ -119,9 +119,27 @@ pub async fn run_tui(config: Config) -> Result<String> {
     let agent: Agent = runtime.build_interactive_agent().await?;
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let runtime_for_worker = runtime.clone();
     tokio::spawn(async move {
         let mut agent = agent;
+        let mut seen_generation = crate::skills::skills_generation();
         while let Some(prompt) = prompt_rx.recv().await {
+            let current_generation = crate::skills::skills_generation();
+            if current_generation != seen_generation {
+                match runtime_for_worker.build_interactive_agent().await {
+                    Ok(mut fresh) => {
+                        fresh.restore_history_with_fresh_system(agent.export_non_system_messages());
+                        agent = fresh;
+                        seen_generation = current_generation;
+                    }
+                    Err(error) => {
+                        let _ = evt_tx.send(AgentEvent::Error(format!(
+                            "刷新技能失败：{error}"
+                        )));
+                        continue;
+                    }
+                }
+            }
             if let Err(e) = agent.process_message_streaming(&prompt, &evt_tx).await {
                 let _ = evt_tx.send(AgentEvent::Error(format!("请求失败：{e}")));
             }

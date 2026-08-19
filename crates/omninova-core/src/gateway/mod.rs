@@ -79,7 +79,7 @@ use crate::security::{
     is_tool_globally_allowed, resolve_shell_allowlist, ApprovalController, EstopController,
     EstopState, PendingApproval, SecurityContext,
 };
-use crate::skills::{format_skills_prompt, load_skills_from_dir};
+use crate::skills::{inject_enabled_skills_prompt, skills_store_identity};
 use crate::knowledge::append_knowledge_prompt;
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
@@ -1671,10 +1671,17 @@ impl GatewayRuntime {
             let lock = self.config.read().await;
             memory_identity(&lock) != memory_identity(&config)
         };
+        let bump_skills = {
+            let lock = self.config.read().await;
+            skills_store_identity(&lock) != skills_store_identity(&config)
+        };
         {
             let mut lock = self.config.write().await;
             config.config_path = lock.config_path.clone();
             *lock = config;
+        }
+        if bump_skills {
+            crate::skills::bump_skills_generation();
         }
         // First-run setup saves the workspace after the runtime was already
         // constructed, so without this the memory backend would stay in-process
@@ -1731,21 +1738,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                }
-            }
-        }
+        inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg);
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
@@ -1787,21 +1780,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                }
-            }
-        }
+        inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg);
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
@@ -1966,18 +1945,8 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg.skills.open_skills_dir.as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
-                }
-            }
+        if inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg) > 0 {
+            steps.push(ExecutionStep::done("加载技能提示", "已注入已安装技能"));
         }
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
@@ -2272,24 +2241,11 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done(
-                        "加载技能提示",
-                        "已注入 workspace skills",
-                    ));
-                }
-            }
+        if inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg) > 0 {
+            steps.push(ExecutionStep::done(
+                "加载技能提示",
+                "已注入已安装技能",
+            ));
         }
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;

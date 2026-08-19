@@ -506,6 +506,23 @@ impl Agent {
         self.messages = apply_compaction(plan, &summary);
     }
 
+    pub fn export_non_system_messages(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .cloned()
+            .collect()
+    }
+
+    pub fn restore_history_with_fresh_system(&mut self, history: Vec<ChatMessage>) {
+        self.messages = bootstrap_system_messages(&self.config);
+        self.messages.extend(
+            history
+                .into_iter()
+                .filter(|message| message.role != "system"),
+        );
+    }
+
     pub fn import_messages(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
     }

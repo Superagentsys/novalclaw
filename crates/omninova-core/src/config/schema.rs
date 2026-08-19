@@ -493,6 +493,37 @@ pub fn resolve_effective_workspace_dir(
         })
 }
 
+/// Canonical installed-skill store used by install, discovery, status,
+/// remove, rollback, and Agent injection.
+///
+/// `open_skills_dir` when set and non-empty; otherwise `<global workspace>/skills`.
+/// Session and per-agent workspace overrides do not change this directory:
+/// Setup/UI cannot observe those overrides, so using them would split
+/// install writes from runtime reads.
+pub fn resolve_configured_skills_dir(config: &Config) -> PathBuf {
+    nonempty_open_skills_dir(config).unwrap_or_else(|| config.workspace_dir.join("skills"))
+}
+
+/// Skills directory implied by an effective (session/per-agent) workspace.
+/// Runtime loading in S1 does **not** use this path unless it happens to
+/// equal [`resolve_configured_skills_dir`]. Exposed so tests can detect a split.
+pub fn resolve_effective_workspace_skills_dir(
+    config: &Config,
+    effective_workspace: &Path,
+) -> PathBuf {
+    nonempty_open_skills_dir(config).unwrap_or_else(|| effective_workspace.join("skills"))
+}
+
+fn nonempty_open_skills_dir(config: &Config) -> Option<PathBuf> {
+    config
+        .skills
+        .open_skills_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct OmninovalAgentsCompat {
@@ -1448,12 +1479,31 @@ pub struct ComposioConfig {
 // Skills
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Source of truth for whether workspace skills are injected into the Agent.
+/// UI and serde defaults must use this constant so an unsaved form cannot
+/// disagree with Runtime.
+pub const DEFAULT_OPEN_SKILLS_ENABLED: bool = true;
+
+fn default_open_skills_enabled() -> bool {
+    DEFAULT_OPEN_SKILLS_ENABLED
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsConfig {
-    #[serde(default)]
+    #[serde(default = "default_open_skills_enabled")]
     pub open_skills_enabled: bool,
     pub open_skills_dir: Option<String>,
     pub prompt_injection_mode: Option<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
+            open_skills_dir: None,
+            prompt_injection_mode: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

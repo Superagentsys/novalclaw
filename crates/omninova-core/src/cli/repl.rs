@@ -180,12 +180,7 @@ async fn handle_slash(
             Ok(Some(serde_json::to_string_pretty(&snapshot)?))
         }
         "/skills" => {
-            let dir = config
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| config.workspace_dir.join("skills"));
+            let dir = crate::config::resolve_configured_skills_dir(config);
             let skills = load_skills_from_dir(&dir).unwrap_or_default();
             let names: Vec<_> = skills.iter().map(|s| s.metadata.name.clone()).collect();
             Ok(Some(serde_json::to_string_pretty(&serde_json::json!({
