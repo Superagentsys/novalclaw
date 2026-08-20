@@ -63,11 +63,28 @@ export function Knowledge() {
   const [hits, setHits] = useState<KnowledgeHit[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ document: KnowledgeDocument; content: string } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailReloadKey, setDetailReloadKey] = useState(0);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
+  const [editorBaseline, setEditorBaseline] = useState("");
+  const [searchAttempted, setSearchAttempted] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const editorDirty = Boolean(editor && JSON.stringify(editor) !== editorBaseline);
+
+  const openEditor = useCallback((next: EditorState) => {
+    setEditor(next);
+    setEditorBaseline(JSON.stringify(next));
+  }, []);
+
+  const closeEditor = useCallback(() => {
+    if (editorDirty && !window.confirm("当前笔记有未保存的修改，确定放弃吗？")) return;
+    setEditor(null);
+    setEditorBaseline("");
+  }, [editorDirty]);
 
   const loadList = useCallback(async () => {
     setLoading(true);
@@ -93,32 +110,72 @@ export function Knowledge() {
   }, [loadList]);
 
   useEffect(() => {
+    setHits([]);
+    setSearchAttempted(false);
+  }, [collection]);
+
+  useEffect(() => {
+    if (!editorDirty) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeEditor();
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [closeEditor, editorDirty]);
+
+  useEffect(() => {
     if (!selectedId) {
       setDetail(null);
+      setDetailError(null);
+      setDetailLoading(false);
       return;
     }
     let cancelled = false;
+    setDetail(null);
+    setDetailError(null);
+    setDetailLoading(true);
     void invokeTauri<{ document: KnowledgeDocument; content: string }>("knowledge_get", {
       id: selectedId,
     })
       .then((next) => {
-        if (!cancelled) setDetail(next);
+        if (cancelled) return;
+        if (next.document.char_count > 0 && !next.content.trim()) {
+          throw new Error("正文读取为空，已停止编辑以避免覆盖原文。请重试或检查知识库文件。");
+        }
+        setDetail(next);
       })
       .catch((reason) => {
-        if (!cancelled) setError(String(reason));
+        if (cancelled) return;
+        const message = String(reason);
+        setDetail(null);
+        setDetailError(message);
+        setError(message);
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [selectedId]);
+  }, [selectedId, detailReloadKey]);
 
   const runSearch = async () => {
     const q = query.trim();
     if (!q) {
       setHits([]);
+      setSearchAttempted(false);
       return;
     }
     setBusy("search");
+    setSearchAttempted(true);
     try {
       const next = await invokeTauri<KnowledgeHit[]>("knowledge_search", {
         query: q,
@@ -158,6 +215,9 @@ export function Knowledge() {
         },
       });
       setEditor(null);
+      setEditorBaseline("");
+      setDetail({ document: saved, content: editor.content.trim() });
+      setDetailError(null);
       setSelectedId(saved.id);
       await loadList();
     } catch (reason) {
@@ -260,7 +320,7 @@ export function Knowledge() {
 
   const editSelected = () => {
     if (!detail) return;
-    setEditor({
+    openEditor({
       id: detail.document.id,
       title: detail.document.title,
       collection: detail.document.collection,
@@ -305,16 +365,19 @@ export function Knowledge() {
           <UiIcon name="search" />
           <input
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setSearchAttempted(false);
+            }}
             placeholder="检索知识库…"
             aria-label="检索知识库"
           />
           <button type="submit" disabled={busy === "search"}>
-            检索
+            {busy === "search" ? "检索中…" : "检索"}
           </button>
         </form>
         <div className="knowledge-toolbar-actions">
-          <button type="button" className="knowledge-primary" onClick={() => setEditor(blankEditor(collection))}>
+          <button type="button" className="knowledge-primary" onClick={() => openEditor(blankEditor(collection))}>
             <UiIcon name="plus" />
             新建笔记
           </button>
@@ -353,7 +416,9 @@ export function Knowledge() {
       </div>
 
       {visibleHits.length > 0 ? (
-        <section className="knowledge-hits" aria-label="检索结果">
+        <section className="knowledge-search-panel" aria-label="检索结果" aria-live="polite">
+          <header><strong>检索结果</strong><span>{visibleHits.length} 个匹配片段</span></header>
+          <div className="knowledge-hits">
           {visibleHits.map((hit) => (
             <button
               key={`${hit.document_id}-${hit.chunk_index}`}
@@ -369,7 +434,12 @@ export function Knowledge() {
               <p>{hit.snippet}</p>
             </button>
           ))}
+          </div>
         </section>
+      ) : searchAttempted && query.trim() && busy !== "search" ? (
+        <div className="knowledge-search-empty" role="status">
+          未找到与“{query.trim()}”匹配的内容，可更换关键词或分类后重试。
+        </div>
       ) : null}
 
       <div className="knowledge-split">
@@ -404,7 +474,20 @@ export function Knowledge() {
         </section>
 
         <section className="knowledge-preview" aria-label="文档预览">
-          {detail ? (
+          {detailLoading ? (
+            <div className="knowledge-empty" role="status">
+              <h2>正在读取原文…</h2>
+              <p>正在从知识库正文文件加载内容。</p>
+            </div>
+          ) : detailError ? (
+            <div className="knowledge-empty" role="alert">
+              <h2>原文读取失败</h2>
+              <p>{detailError}</p>
+              <button type="button" onClick={() => setDetailReloadKey((current) => current + 1)}>
+                重试
+              </button>
+            </div>
+          ) : detail ? (
             <>
               <div className="knowledge-preview-head">
                 <div>
@@ -439,10 +522,19 @@ export function Knowledge() {
       </div>
 
       {editor ? (
-        <div className="knowledge-modal" role="dialog" aria-modal="true" aria-labelledby="knowledge-editor-title">
-          <div className="knowledge-modal-card">
+        <div
+          className="knowledge-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="knowledge-editor-title"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) closeEditor();
+          }}
+        >
+          <div className="knowledge-modal-card" aria-describedby={editorDirty ? "knowledge-unsaved-hint" : undefined}>
             <header>
               <h2 id="knowledge-editor-title">{editor.id ? "编辑笔记" : "新建笔记"}</h2>
+              {editorDirty ? <span id="knowledge-unsaved-hint" className="knowledge-unsaved">有未保存修改</span> : null}
             </header>
             <label>
               标题
@@ -476,7 +568,7 @@ export function Knowledge() {
               />
             </label>
             <footer>
-              <button type="button" onClick={() => setEditor(null)}>
+              <button type="button" onClick={closeEditor}>
                 取消
               </button>
               <button type="button" className="knowledge-primary" onClick={() => void saveEditor()} disabled={busy === "save"}>

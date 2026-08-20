@@ -1,3 +1,4 @@
+use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -92,6 +93,7 @@ impl BrowserTool {
 
     async fn run_agent_browser(&self, args: &[&str]) -> anyhow::Result<(bool, String)> {
         let mut cmd = Command::new(Self::resolve_agent_browser_bin());
+        configure_background_command(&mut cmd);
 
         if self.headless {
             // headless is the default for agent-browser, no flag needed

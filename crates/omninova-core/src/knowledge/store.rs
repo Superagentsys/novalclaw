@@ -2,7 +2,7 @@
 
 use super::chunk::{chunk_text, Chunk};
 use crate::cron::now_timestamp;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -135,11 +135,21 @@ impl KnowledgeStore {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<(KnowledgeDocument, String)>> {
-        let file = self.read_all().await;
-        let Some(doc) = file.documents.into_iter().find(|doc| doc.id == id) else {
+        let StoreFile { documents, chunks } = self.read_all().await;
+        let Some(doc) = documents.into_iter().find(|doc| doc.id == id) else {
             return Ok(None);
         };
-        let content = self.read_body(&doc.id).await.unwrap_or_default();
+        let content = match self.read_body(&doc.id).await {
+            Ok(content) if !content.is_empty() || doc.char_count == 0 => content,
+            _ => {
+                let recovered = self.recover_body(&doc, &chunks).await?;
+                // Older knowledge indexes did not always persist `{id}.md`. Repair the
+                // canonical body as soon as we can recover it, so later reads and edits
+                // no longer depend on the compatibility path.
+                self.write_body(&doc.id, &recovered).await?;
+                recovered
+            }
+        };
         Ok(Some((doc, content)))
     }
 
@@ -187,8 +197,7 @@ impl KnowledgeStore {
         };
         file.documents.retain(|item| item.id != id);
         file.chunks.retain(|chunk| chunk.document_id != id);
-        file.chunks
-            .extend(stored_chunks(&id, &chunks));
+        file.chunks.extend(stored_chunks(&id, &chunks));
         file.documents.push(doc.clone());
         self.write_body(&id, &content).await?;
         self.write_all(&file).await?;
@@ -391,11 +400,100 @@ impl KnowledgeStore {
         Ok(tokio::fs::read_to_string(self.docs_dir.join(format!("{id}.md"))).await?)
     }
 
+    async fn recover_body(
+        &self,
+        doc: &KnowledgeDocument,
+        chunks: &[StoredChunk],
+    ) -> Result<String> {
+        // Compatibility with early/demo indexes that stored `<title>.md` instead of
+        // the canonical `<id>.md`. Scan file stems rather than joining an untrusted
+        // title into a path.
+        if let Ok(mut entries) = tokio::fs::read_dir(&self.docs_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.file_stem().and_then(|stem| stem.to_str()) == Some(doc.title.as_str()) {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        if !content.is_empty() || doc.char_count == 0 {
+                            return Ok(content);
+                        }
+                    }
+                }
+            }
+        }
+
+        let recovered = reconstruct_content(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.document_id == doc.id)
+                .collect(),
+        );
+        if !recovered.is_empty() || doc.char_count == 0 {
+            return Ok(recovered);
+        }
+
+        Err(anyhow!(
+            "knowledge document body is missing and cannot be recovered: {} ({})",
+            doc.title,
+            doc.id
+        ))
+    }
+
     async fn write_body(&self, id: &str, content: &str) -> Result<()> {
         tokio::fs::create_dir_all(&self.docs_dir).await?;
         tokio::fs::write(self.docs_dir.join(format!("{id}.md")), content).await?;
         Ok(())
     }
+}
+
+fn reconstruct_content(mut chunks: Vec<&StoredChunk>) -> String {
+    chunks.sort_by_key(|chunk| chunk.index);
+    let mut content = String::new();
+    let mut previous_heading: Option<&str> = None;
+
+    for chunk in chunks {
+        let heading = chunk
+            .heading
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if heading != previous_heading {
+            if let Some(heading) = heading {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str("# ");
+                content.push_str(heading);
+                content.push_str("\n\n");
+            }
+            previous_heading = heading;
+        }
+        append_without_overlap(&mut content, chunk.text.trim());
+    }
+
+    content.trim().to_string()
+}
+
+fn append_without_overlap(content: &mut String, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    if content.is_empty() {
+        content.push_str(next);
+        return;
+    }
+
+    let existing_chars: Vec<char> = content.chars().collect();
+    let next_chars: Vec<char> = next.chars().collect();
+    let max_overlap = existing_chars.len().min(next_chars.len()).min(512);
+    let overlap = (1..=max_overlap)
+        .rev()
+        .find(|count| existing_chars[existing_chars.len() - count..] == next_chars[..*count])
+        .unwrap_or(0);
+
+    if overlap == 0 {
+        content.push_str("\n\n");
+    }
+    content.extend(next_chars[overlap..].iter());
 }
 
 pub async fn append_knowledge_prompt(system_prompt: &mut Option<String>, workspace: &Path) {
@@ -549,7 +647,10 @@ async fn extract_file_text(path: &Path) -> Result<String> {
 fn extract_pdf_bytes(bytes: &[u8]) -> Result<String> {
     let dir = std::env::temp_dir().join("omninova-knowledge");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("upload-{}.pdf", now_timestamp().replace([':', '.'], "-")));
+    let path = dir.join(format!(
+        "upload-{}.pdf",
+        now_timestamp().replace([':', '.'], "-")
+    ));
     std::fs::write(&path, bytes)?;
     let text = pdf_extract::extract_text(&path).context("pdf extract")?;
     let _ = std::fs::remove_file(&path);

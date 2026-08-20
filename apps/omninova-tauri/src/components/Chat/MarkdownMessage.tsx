@@ -16,6 +16,7 @@ import rehypeHighlight from "rehype-highlight";
 import mermaid from "mermaid";
 import { useTheme } from "../../theme/themeState";
 import { invokeTauri } from "../../utils/tauri";
+import { writeClipboardText } from "../../utils/clipboard";
 
 import "katex/dist/katex.min.css";
 import "./MarkdownMessage.css";
@@ -128,6 +129,74 @@ function fileBasename(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
+function normalizeLocalHref(href: string): string | null {
+  if (href.startsWith("file://")) {
+    try {
+      const decoded = decodeURIComponent(href.slice("file://".length));
+      return /^\/[A-Za-z]:\//.test(decoded) ? decoded.slice(1) : decoded;
+    } catch {
+      return null;
+    }
+  }
+  return looksLikeFilePath(href) ? href : null;
+}
+
+function InlineCode({
+  className,
+  children,
+}: {
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const workspacePath = useContext(WorkspacePathContext);
+  const source = collectNodeText(children).trim();
+  const filePath = !className && looksLikeFilePath(source) ? source : null;
+  if (!filePath) {
+    return <code className={className || "md-inline-code"}>{children}</code>;
+  }
+  return (
+    <button
+      type="button"
+      className="md-inline-file"
+      title={`打开文件：${filePath}`}
+      aria-label={`打开文件 ${fileBasename(filePath)}`}
+      onClick={() => {
+        void invokeTauri("open_task_artifact", {
+          path: filePath,
+          workspacePath: workspacePath || undefined,
+          reveal: false,
+        }).catch(() => {});
+      }}
+    >
+      <code>{children}</code>
+    </button>
+  );
+}
+
+function MarkdownLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+  const workspacePath = useContext(WorkspacePathContext);
+  const localPath = href ? normalizeLocalHref(href) : null;
+  if (!href || !localPath) {
+    return href ? <a href={href} target="_blank" rel="noreferrer noopener">{children}</a> : <>{children}</>;
+  }
+  return (
+    <button
+      type="button"
+      className="md-local-link"
+      title={`打开文件：${localPath}`}
+      onClick={() => {
+        void invokeTauri("open_task_artifact", {
+          path: localPath,
+          workspacePath: workspacePath || undefined,
+          reveal: false,
+        }).catch(() => {});
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** Fenced code: copy, collapse long blocks, and preview workspace file paths. */
 function CodeBlock({
   className,
@@ -138,6 +207,7 @@ function CodeBlock({
 }) {
   const workspacePath = useContext(WorkspacePathContext);
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -158,12 +228,16 @@ function CodeBlock({
 
   const onCopy = () => {
     const text = previewing && previewText ? previewText : source;
-    navigator.clipboard?.writeText(text).then(
+    setCopyFailed(false);
+    writeClipboardText(text).then(
       () => {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       },
-      () => {},
+      () => {
+        setCopyFailed(true);
+        setTimeout(() => setCopyFailed(false), 2000);
+      },
     );
   };
 
@@ -260,7 +334,7 @@ function CodeBlock({
             </button>
           ) : null}
           <button type="button" className="md-code-copy" onClick={onCopy}>
-            {copied ? "已复制" : "复制"}
+              {copied ? "已复制" : copyFailed ? "复制失败" : "复制"}
           </button>
         </div>
       </div>
@@ -310,14 +384,8 @@ function PreBlock({ children }: { children?: React.ReactNode }) {
 
 const components: Components = {
   pre: PreBlock as Components["pre"],
-  code: ({ className, children }) => (
-    <code className={className || "md-inline-code"}>{children}</code>
-  ),
-  a: ({ href, children }) => (
-    <a href={href} target="_blank" rel="noreferrer noopener">
-      {children}
-    </a>
-  ),
+  code: InlineCode as Components["code"],
+  a: MarkdownLink as Components["a"],
   table: ({ children }) => (
     <div className="md-table-wrap">
       <table>{children}</table>

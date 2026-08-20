@@ -1,3 +1,4 @@
+use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -88,6 +89,7 @@ impl Tool for GitOperationsTool {
         }
 
         let mut cmd = Command::new("git");
+        configure_background_command(&mut cmd);
         cmd.arg(operation);
         for arg in &extra_args {
             cmd.arg(arg);
