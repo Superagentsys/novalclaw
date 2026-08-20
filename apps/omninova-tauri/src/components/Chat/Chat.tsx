@@ -65,10 +65,15 @@ import {
   type PickerProvider,
 } from "./ModelPicker";
 import { CommandPalette as CommandPaletteMenu } from "./CommandPalette";
-import { ContractReviewPanel } from "./ContractReviewPanel";
+import { ContractReviewPanel, ContractReviewReport } from "./ContractReviewPanel";
 import type {
+  ContractReviewStage,
   ContractReviewEngineCard,
   PreparedContractReview,
+} from "./contractReviewModel";
+import {
+  DEFAULT_CONTRACT_REVIEW_ENGINES,
+  friendlyContractReviewError,
 } from "./contractReviewModel";
 import {
   commandTokenAt,
@@ -341,6 +346,11 @@ interface ChatMessage extends StoredChatMessage {
   steps?: ExecutionStep[];
 }
 
+interface ContractReviewUiState {
+  stage: ContractReviewStage;
+  error?: string;
+}
+
 type SidebarTab = "avatars" | "history";
 
 interface ChatProps {
@@ -412,6 +422,7 @@ export function Chat({
   const elapsedTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const safetyTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const runAvatarIdsRef = useRef<Record<string, string>>({});
+  const contractReviewRunAvatarIdsRef = useRef<Record<string, string>>({});
   const activeRunIdRef = useRef<string | null>(null);
   const terminalRunIdsRef = useRef<Set<string>>(new Set());
   const completedRunIdsRef = useRef<Set<string>>(new Set());
@@ -419,10 +430,14 @@ export function Chat({
   const runsRef = useRef(runs);
   const [selectedSkills, setSelectedSkills] = useState<Record<string, SelectedSkill>>({});
   const [selectedSystemTools, setSelectedSystemTools] = useState<Record<string, SelectedSystemTool>>({});
-  const [contractReviewEngines, setContractReviewEngines] = useState<ContractReviewEngineCard[]>([]);
+  const [contractReviewEngines, setContractReviewEngines] = useState<ContractReviewEngineCard[]>(
+    DEFAULT_CONTRACT_REVIEW_ENGINES
+  );
   const [selectedContractEngine, setSelectedContractEngine] = useState("omninova-contract-risk");
   const [contractExtraInstructions, setContractExtraInstructions] = useState("");
-  const [contractReviewStarting, setContractReviewStarting] = useState(false);
+  const [contractReviewUiByAvatar, setContractReviewUiByAvatar] = useState<
+    Record<string, ContractReviewUiState>
+  >({});
   const [lastRiskExport, setLastRiskExport] = useState<unknown>(null);
   const [commandPalette, setCommandPalette] = useState<CommandPalette>(() => emptyCommandPalette());
   const [composerCursor, setComposerCursor] = useState(0);
@@ -487,6 +502,24 @@ export function Chat({
     () => messagesBySession[activeAvatarId] ?? [],
     [messagesBySession, activeAvatarId]
   );
+  const contractReportMessageIndexes = useMemo(() => {
+    const indexes = new Set<number>();
+    messages.forEach((message, index) => {
+      const request = messages[index - 1];
+      if (
+        message.role === "assistant" &&
+        request?.role === "user" &&
+        request.toolId === "tool:contract-review"
+      ) {
+        indexes.add(index);
+      }
+    });
+    return indexes;
+  }, [messages]);
+  const latestContractReportIndex = useMemo(() => {
+    const indexes = Array.from(contractReportMessageIndexes);
+    return indexes.length ? indexes[indexes.length - 1] : -1;
+  }, [contractReportMessageIndexes]);
 
   // 仅反映「当前查看的会话」的运行/输入状态。
   const activeRun = runs[activeAvatarId];
@@ -498,6 +531,9 @@ export function Chat({
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
   const selectedSkill = selectedSkills[activeAvatarId];
   const selectedSystemTool = selectedSystemTools[activeAvatarId];
+  const contractReviewUi = contractReviewUiByAvatar[activeAvatarId] ?? {
+    stage: "idle" as const,
+  };
   const commandToken = commandTokenAt(input, composerCursor);
   const filteredPalette = useMemo(
     () => filterCommandPalette(commandPalette, commandToken?.token ?? ""),
@@ -1324,6 +1360,13 @@ export function Chat({
         });
       } else if (eventType === "model_completed" || eventType === "modelCompleted") {
         const title = stringValue("title") || "模型阶段已完成";
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "generating" },
+          }));
+        }
         appendTaskActivity(runId, title, "success", {
           kind: "model",
           status: "completed",
@@ -1390,6 +1433,12 @@ export function Chat({
           if (!finalReply.trim()) {
             const emptyOutputError = "模型本次未返回可显示的内容，请重试或更换技能。";
             setError(emptyOutputError);
+            if (contractReviewRunAvatarIdsRef.current[runId]) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [avatarId]: { stage: "failed", error: emptyOutputError },
+              }));
+            }
             if (!cancelledRef.current[avatarId]) {
               appendAssistantMessageOnce(runId, `任务失败：${emptyOutputError}`, avatarId);
             }
@@ -1399,6 +1448,12 @@ export function Chat({
             if (!cancelledRef.current[avatarId]) {
               appendAssistantMessageOnce(runId, finalReply, avatarId);
             }
+            if (contractReviewRunAvatarIdsRef.current[runId]) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [avatarId]: { stage: "completed" },
+              }));
+            }
             appendTaskActivity(runId, "任务已完成", "success");
             finalizeTask(runId, "completed", finalReply);
           }
@@ -1407,6 +1462,7 @@ export function Chat({
         if (import.meta.env.DEV) {
           console.log("[finishRun] run_id=" + runId);
         }
+        delete contractReviewRunAvatarIdsRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1417,8 +1473,15 @@ export function Chat({
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
           appendTaskActivity(runId, "任务已取消", "warning");
           finalizeTask(runId, "cancelled");
+          if (contractReviewRunAvatarIdsRef.current[runId]) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [avatarId]: { stage: "cancelled", error: "审核已取消，可以调整文件或审核要求后重新开始。" },
+            }));
+          }
           void refreshTaskArtifacts(runId);
         }
+        delete contractReviewRunAvatarIdsRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1426,14 +1489,26 @@ export function Chat({
       if (!completedRunIdsRef.current.has(runId)) {
         completedRunIdsRef.current.add(runId);
         const rawError = payload.error || payload.message || "Agent run failed";
-        setError(rawError);
-        if (!cancelledRef.current[avatarId]) {
-          appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
+        const displayError = contractAvatarId ? friendlyContractReviewError(rawError) : rawError;
+        setError(displayError);
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "failed", error: displayError },
+          }));
+          if (import.meta.env.DEV) {
+            console.warn("[contract-review] run_failed", rawError);
+          }
         }
-        appendTaskActivity(runId, `任务失败：${rawError}`, "error");
-        finalizeTask(runId, "failed", rawError);
+        if (!cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
+        }
+        appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+        finalizeTask(runId, "failed", displayError);
         void refreshTaskArtifacts(runId);
       }
+      delete contractReviewRunAvatarIdsRef.current[runId];
       finishRun(runId);
     }).then((fn) => {
       if (disposed) {
@@ -1676,13 +1751,26 @@ export function Chat({
       setError("请先配置 AI 模型服务。");
       return;
     }
+    if (gatewayStatus !== "connected") {
+      const message = "Gateway 尚未连接，请启动 Gateway 后再开始审核。";
+      setError(message);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "failed", error: message },
+      }));
+      return;
+    }
     const pending = attachmentsBySession[activeAvatarId] ?? [];
     const paths = pending.map((item) => item.sourcePath).filter((path): path is string => Boolean(path));
     if (!paths.length) {
       setError("请先上传合同文件（DOCX、文字层 PDF、TXT 或 MD）。");
       return;
     }
-    setContractReviewStarting(true);
+    setLastRiskExport(null);
+    setContractReviewUiByAvatar((prev) => ({
+      ...prev,
+      [activeAvatarId]: { stage: "preparing" },
+    }));
     setError(null);
     try {
       const prepared = await invokeTauri<PreparedContractReview>("prepare_contract_review", {
@@ -1691,6 +1779,10 @@ export function Chat({
         selectedEngine: selectedContractEngine,
       });
       setLastRiskExport(prepared.export);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "reviewing" },
+      }));
       await handleSend({
         text: prepared.prompt,
         displayText: `合同智能审核：${pending.map((item) => item.name).join("、")}`,
@@ -1698,9 +1790,15 @@ export function Chat({
         contractEngineName: prepared.engine.name,
       });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setContractReviewStarting(false);
+      const displayError = friendlyContractReviewError(reason);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "failed", error: displayError },
+      }));
+      setError(displayError);
+      if (import.meta.env.DEV) {
+        console.warn("[contract-review] prepare_failed", reason);
+      }
     }
   };
 
@@ -1876,6 +1974,9 @@ export function Chat({
           : localSteps.map((step, i) => (i === idx ? nextStep : step))
       );
     };
+    if (opts?.contractEngineName) {
+      contractReviewRunAvatarIdsRef.current[runId] = avatarId;
+    }
     setActiveInput("");
     setSelectedSkills((prev) => {
       if (!prev[avatarId]) return prev;
@@ -1883,20 +1984,14 @@ export function Chat({
       delete next[avatarId];
       return next;
     });
-    if (opts?.contractEngineName) {
-      setSelectedSystemTools((prev) => {
-        if (!prev[avatarId]) return prev;
+    if (!opts?.contractEngineName) {
+      setAttachmentsBySession((prev) => {
+        if (!prev[avatarId]?.length) return prev;
         const next = { ...prev };
         delete next[avatarId];
         return next;
       });
     }
-    setAttachmentsBySession((prev) => {
-      if (!prev[avatarId]?.length) return prev;
-      const next = { ...prev };
-      delete next[avatarId];
-      return next;
-    });
     setError(null);
     cancelledRef.current[avatarId] = false;
     activeRunIdRef.current = runId;
@@ -2098,9 +2193,19 @@ export function Chat({
             console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
           }
           const message = e instanceof Error ? e.message : String(e);
-          setError(`任务启动失败：${message}`);
-          appendTaskActivity(runId, `任务启动失败：${message}`, "error");
-          finalizeTask(runId, "failed", message);
+          const displayError = opts?.contractEngineName
+            ? friendlyContractReviewError(message)
+            : `任务启动失败：${message}`;
+          setError(displayError);
+          if (opts?.contractEngineName) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [avatarId]: { stage: "failed", error: displayError },
+            }));
+            delete contractReviewRunAvatarIdsRef.current[runId];
+          }
+          appendTaskActivity(runId, displayError, "error");
+          finalizeTask(runId, "failed", displayError);
           // If the invoke itself failed, no terminal event can arrive from the
           // backend. Clean up locally so the composer never remains locked.
           finishRun(runId);
@@ -2110,9 +2215,19 @@ export function Chat({
         console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
       const message = e instanceof Error ? e.message : String(e);
-      setError(`任务启动失败：${message}`);
-      appendTaskActivity(runId, `任务启动失败：${message}`, "error");
-      finalizeTask(runId, "failed", message);
+      const displayError = opts?.contractEngineName
+        ? friendlyContractReviewError(message)
+        : `任务启动失败：${message}`;
+      setError(displayError);
+      if (opts?.contractEngineName) {
+        setContractReviewUiByAvatar((prev) => ({
+          ...prev,
+          [avatarId]: { stage: "failed", error: displayError },
+        }));
+        delete contractReviewRunAvatarIdsRef.current[runId];
+      }
+      appendTaskActivity(runId, displayError, "error");
+      finalizeTask(runId, "failed", displayError);
       finishRun(runId);
     } finally {
       // outer finally (safety timer cleanup)
@@ -2816,13 +2931,23 @@ export function Chat({
                 </div>
               </div>
             ) : (
-              messages.map((msg, i) => (
+              messages.map((msg, i) => {
+                const isContractReport = contractReportMessageIndexes.has(i);
+                const contractRequest = isContractReport ? messages[i - 1] : undefined;
+                return (
                 <div
                   key={i}
-                  className={`chat-bubble chat-bubble-${msg.role}`}
+                  className={`chat-bubble chat-bubble-${msg.role}${isContractReport ? " chat-bubble-contract-review" : ""}`}
                 >
                   <div className="chat-bubble-content">
-                    {msg.role === "assistant" ? (
+                    {isContractReport ? (
+                      <ContractReviewReport
+                        content={msg.content}
+                        engineName={contractRequest?.contractEngineName}
+                        exportData={i === latestContractReportIndex ? lastRiskExport : undefined}
+                        onExport={i === latestContractReportIndex && lastRiskExport ? handleExportRiskJson : undefined}
+                      />
+                    ) : msg.role === "assistant" ? (
                       <MarkdownMessage content={msg.content} workspacePath={activeWorkspaceDir} />
                     ) : (
                       msg.content
@@ -2842,7 +2967,8 @@ export function Chat({
                   )}
                   {msg.steps?.length ? <ExecutionSteps steps={msg.steps} /> : null}
                 </div>
-              ))
+                );
+              })
             )}
             {sending && (
               <div className="chat-bubble chat-bubble-assistant chat-bubble-typing">
@@ -2882,6 +3008,7 @@ export function Chat({
               id={CHAT_ATTACHMENT_INPUT_ID}
               type="file"
               multiple
+              accept={selectedSystemTool?.id === "tool:contract-review" ? ".docx,.pdf,.txt,.md" : undefined}
               disabled={sending}
               className="chat-file-input-hidden"
               aria-label="选择附件文件"
@@ -2902,16 +3029,47 @@ export function Chat({
             ) : null}
             {selectedSystemTool?.id === "tool:contract-review" ? (
               <ContractReviewPanel
-                attachmentCount={attachments.length}
+                attachments={attachments}
                 engines={contractReviewEngines}
                 selectedEngine={selectedContractEngine}
                 extraInstructions={contractExtraInstructions}
-                starting={contractReviewStarting}
-                exportReady={lastRiskExport != null}
+                stage={contractReviewUi.stage}
+                documentsPrepared={lastRiskExport != null}
+                elapsedSec={elapsedSec}
+                error={contractReviewUi.error}
+                onChooseFiles={() => {
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                  if (isTauriEnvironment()) {
+                    void handleAttachTauri();
+                  } else {
+                    document.getElementById(CHAT_ATTACHMENT_INPUT_ID)?.click();
+                  }
+                }}
+                onDropFiles={(files) => {
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                  void mergeDroppedIntoInput(files).catch((reason) => {
+                    setError(reason instanceof Error ? reason.message : String(reason));
+                  });
+                }}
+                onRemoveAttachment={(id) => {
+                  removeAttachment(id);
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                }}
                 onEngineChange={setSelectedContractEngine}
                 onInstructionsChange={setContractExtraInstructions}
                 onStart={() => void handleStartContractReview()}
-                onExport={handleExportRiskJson}
               />
             ) : null}
             <div className="chat-composer-card">
@@ -2976,7 +3134,7 @@ export function Chat({
                   </span>
                 </div>
               ) : null}
-              {attachments.length ? (
+              {attachments.length && selectedSystemTool?.id !== "tool:contract-review" ? (
                 <div className="chat-attachment-chips" aria-label="待发送附件">
                   {attachments.map((a) => (
                     <span

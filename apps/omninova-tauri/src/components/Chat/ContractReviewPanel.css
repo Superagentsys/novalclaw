@@ -1,2 +1,948 @@
-.contract-review-panel{margin:8px 10px 0;padding:12px;border:1px solid color-mix(in srgb,var(--accent-color,#5b7cfa) 24%,transparent);border-radius:12px;background:color-mix(in srgb,var(--panel-bg,#15171c) 96%,var(--accent-color,#5b7cfa) 4%)}
-.contract-review-panel header>div{display:flex;align-items:center;gap:8px}.contract-review-panel header p,.contract-review-hint{margin:4px 0;color:var(--text-secondary,#8e95a3);font-size:12px}.contract-review-badge{padding:2px 6px;border-radius:999px;background:color-mix(in srgb,var(--accent-color,#5b7cfa) 15%,transparent);font-size:11px}.contract-review-mode{margin:10px 0 4px;font-size:12px;font-weight:600}.contract-review-engines{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:10px 0}.contract-review-engines button{display:flex;flex-direction:column;gap:3px;padding:9px;text-align:left;border:1px solid var(--border-color,rgba(255,255,255,.1));border-radius:9px;background:transparent;color:inherit}.contract-review-engines button span{font-size:11px;color:var(--text-secondary,#8e95a3)}.contract-review-engines button.is-selected{border-color:var(--accent-color,#5b7cfa);background:color-mix(in srgb,var(--accent-color,#5b7cfa) 9%,transparent)}.contract-review-instructions{display:flex;flex-direction:column;gap:5px;font-size:12px}.contract-review-instructions textarea{resize:vertical;padding:8px;border:1px solid var(--border-color,rgba(255,255,255,.1));border-radius:8px;background:var(--input-bg,rgba(0,0,0,.15));color:inherit}.contract-review-actions{display:flex;gap:8px;margin-top:10px}.contract-review-actions button{padding:7px 12px;border:0;border-radius:8px;background:var(--accent-color,#5b7cfa);color:#fff}.contract-review-actions button:disabled{opacity:.5}@media(max-width:720px){.contract-review-engines{grid-template-columns:1fr}}
+.contract-review-panel {
+  max-height: min(62vh, 640px);
+  margin: 0;
+  padding: 16px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-lg);
+  background: var(--ui-surface-2);
+  color: var(--ui-text);
+  box-shadow: var(--shadow-sm);
+  scrollbar-color: var(--ui-scrollbar) transparent;
+}
+
+.contract-review-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.contract-review-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.contract-review-title-row > .anticon {
+  color: var(--ui-accent);
+}
+
+.contract-review-title-row h2,
+.contract-review-report-header h2 {
+  margin: 0;
+  color: var(--ui-text);
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 680;
+  letter-spacing: -0.01em;
+}
+
+.contract-review-header p {
+  margin: 4px 0 0 26px;
+  color: var(--ui-text-muted);
+  font-size: 12px;
+}
+
+.contract-review-badge,
+.contract-review-recommended {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--ui-accent) 20%, var(--ui-border));
+  border-radius: var(--radius-pill);
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.contract-review-setup-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(230px, 0.75fr);
+  gap: 10px;
+}
+
+.contract-review-section,
+.contract-review-progress {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-md);
+  background: var(--ui-surface-1);
+  box-shadow: var(--shadow-xs);
+}
+
+.contract-review-engine-section,
+.contract-review-progress {
+  margin-top: 10px;
+}
+
+.contract-review-section-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 10px;
+}
+
+.contract-review-step-number {
+  display: grid;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--ui-surface-3);
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.contract-review-section-heading h3,
+.contract-review-version-diff h3 {
+  margin: 0;
+  color: var(--ui-text);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.contract-review-section-heading p {
+  margin: 1px 0 0;
+  color: var(--ui-text-muted);
+  font-size: 11px;
+}
+
+.contract-review-dropzone {
+  display: flex;
+  width: 100%;
+  min-height: 92px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px;
+  border: 1px dashed var(--ui-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--ui-surface-2);
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.contract-review-dropzone:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-border));
+  background: color-mix(in srgb, var(--ui-accent-soft) 36%, var(--ui-surface-2));
+}
+
+.contract-review-dropzone.is-dragging {
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-accent) 22%, transparent);
+}
+
+.contract-review-dropzone:focus-visible,
+.contract-review-engines button:focus-visible,
+.contract-review-file-remove:focus-visible,
+.contract-review-primary-action:focus-visible,
+.contract-review-report-actions button:focus-visible,
+.contract-review-report-sections summary:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 2px;
+}
+
+.contract-review-dropzone:disabled,
+.contract-review-engines button:disabled,
+.contract-review-file-remove:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.contract-review-dropzone-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  margin-bottom: 2px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-1);
+  color: var(--ui-accent);
+}
+
+.contract-review-dropzone strong {
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.contract-review-dropzone > span:last-child {
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.contract-review-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contract-review-file-list li {
+  display: flex;
+  min-width: 0;
+  min-height: 48px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-file-icon {
+  display: grid;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--ui-surface-3);
+  color: var(--ui-text-secondary);
+}
+
+.contract-review-file-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.contract-review-file-copy strong {
+  overflow: hidden;
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contract-review-file-copy small {
+  overflow: hidden;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contract-review-version-label {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  margin-right: 6px;
+  border-radius: 5px;
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+  font-size: 9px;
+  vertical-align: middle;
+}
+
+.contract-review-file-status {
+  flex: 0 0 auto;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.contract-review-file-status.is-已解析 {
+  color: var(--ui-success);
+}
+
+.contract-review-file-status.is-解析中 {
+  color: var(--ui-accent);
+}
+
+.contract-review-file-status.is-解析失败 {
+  color: var(--ui-danger);
+}
+
+.contract-review-file-remove {
+  display: grid;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ui-text-muted);
+  cursor: pointer;
+}
+
+.contract-review-file-remove:hover:not(:disabled) {
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
+}
+
+.contract-review-mode-summary {
+  display: flex;
+  min-height: 92px;
+  align-items: center;
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-md);
+  background: var(--ui-surface-2);
+  color: var(--ui-accent);
+}
+
+.contract-review-mode-summary > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.contract-review-mode-summary strong {
+  color: var(--ui-text);
+  font-size: 13px;
+}
+
+.contract-review-mode-summary span {
+  color: var(--ui-text-muted);
+  font-size: 11px;
+}
+
+.contract-review-engines {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.contract-review-engines button {
+  display: flex;
+  min-width: 0;
+  min-height: 58px;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.contract-review-engines button:hover:not(:disabled) {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
+}
+
+.contract-review-engines button.is-selected {
+  border-color: color-mix(in srgb, var(--ui-accent) 68%, var(--ui-border));
+  background: color-mix(in srgb, var(--ui-accent-soft) 52%, var(--ui-surface-1));
+  box-shadow: inset 3px 0 0 var(--ui-accent);
+}
+
+.contract-review-radio {
+  display: grid;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 50%;
+  color: var(--ui-text-on-accent);
+}
+
+.contract-review-engines button.is-selected .contract-review-radio {
+  border-color: var(--ui-accent);
+  background: var(--ui-accent);
+}
+
+.contract-review-engine-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.contract-review-engine-copy strong {
+  overflow: hidden;
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contract-review-engine-copy small {
+  overflow: hidden;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contract-review-recommended {
+  min-height: 20px;
+  padding: 1px 6px;
+  font-size: 9px;
+}
+
+.contract-review-instructions {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.contract-review-instructions small {
+  color: var(--ui-text-muted);
+  font-weight: 400;
+}
+
+.contract-review-instructions textarea {
+  min-height: 60px;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  outline: 0;
+  background: var(--ui-surface-2);
+  color: var(--ui-text);
+  font: inherit;
+  font-weight: 400;
+  line-height: 1.55;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.contract-review-instructions textarea:focus {
+  border-color: var(--ui-accent);
+  box-shadow: 0 0 0 3px var(--ui-accent-soft);
+}
+
+.contract-review-progress ol {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contract-review-progress li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+}
+
+.contract-review-progress li.is-done {
+  color: var(--ui-success);
+}
+
+.contract-review-progress li.is-active {
+  color: var(--ui-accent-strong);
+  font-weight: 650;
+}
+
+.contract-review-progress li.is-skipped {
+  opacity: 0.58;
+}
+
+.contract-review-progress-icon {
+  display: grid;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--ui-border);
+  border-radius: 50%;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-progress li.is-done .contract-review-progress-icon {
+  border-color: color-mix(in srgb, var(--ui-success) 30%, var(--ui-border));
+  background: var(--ui-success-soft);
+}
+
+.contract-review-progress li.is-active .contract-review-progress-icon {
+  border-color: color-mix(in srgb, var(--ui-accent) 35%, var(--ui-border));
+  background: var(--ui-accent-soft);
+}
+
+.contract-review-progress-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ui-border-strong);
+}
+
+.contract-review-progress-spin {
+  animation: contract-review-spin 1s linear infinite;
+}
+
+@keyframes contract-review-spin {
+  to { transform: rotate(360deg); }
+}
+
+.contract-review-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--ui-danger) 28%, var(--ui-border));
+  border-radius: 9px;
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
+}
+
+.contract-review-error > div {
+  display: flex;
+  flex-direction: column;
+}
+
+.contract-review-error strong {
+  font-size: 12px;
+}
+
+.contract-review-error span {
+  font-size: 11px;
+}
+
+.contract-review-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.contract-review-primary-action {
+  display: inline-flex;
+  min-width: 132px;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 15px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: var(--accent-gradient);
+  color: var(--ui-text-on-accent);
+  box-shadow: var(--shadow-accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+  transition: filter var(--transition-fast), box-shadow var(--transition-fast), opacity var(--transition-fast);
+}
+
+.contract-review-primary-action:hover:not(:disabled) {
+  filter: brightness(1.04);
+  box-shadow: var(--shadow-md);
+}
+
+.contract-review-primary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+  box-shadow: none;
+}
+
+.contract-review-elapsed {
+  padding-left: 7px;
+  border-left: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.contract-review-actions p {
+  margin: 0;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+}
+
+.chat-bubble-contract-review {
+  width: min(920px, 92%);
+  max-width: 92%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  white-space: normal;
+}
+
+.contract-review-report {
+  overflow: hidden;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-lg);
+  background: var(--ui-surface-1);
+  color: var(--ui-text);
+  box-shadow: var(--shadow-sm);
+}
+
+.contract-review-report-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--ui-border);
+  background: var(--ui-surface-2);
+}
+
+.contract-review-report-eyebrow {
+  color: var(--ui-accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.contract-review-report-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  margin-top: 7px;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+}
+
+.contract-review-report-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.contract-review-report-actions button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 9px;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.contract-review-report-actions button:hover {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.contract-review-risk-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px 16px 0;
+}
+
+.contract-review-risk-overview > div {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 11px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-risk-overview span {
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+}
+
+.contract-review-risk-overview strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.contract-review-risk-overview .is-high strong { color: var(--ui-danger); }
+.contract-review-risk-overview .is-medium strong { color: var(--ui-warning); }
+.contract-review-risk-overview .is-notice strong { color: var(--ui-text-secondary); }
+
+.contract-review-version-flow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 16px 0;
+}
+
+.contract-review-version-flow > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+}
+
+.contract-review-version-flow span {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+  font-weight: 700;
+}
+
+.contract-review-version-flow strong {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--ui-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contract-review-report-sections {
+  display: flex;
+  max-height: min(54vh, 560px);
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px 16px;
+  overflow-y: auto;
+}
+
+.contract-review-report-sections details {
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-report-sections summary {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  color: var(--ui-text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  list-style: none;
+}
+
+.contract-review-report-sections summary::-webkit-details-marker {
+  display: none;
+}
+
+.contract-review-report-sections summary .anticon {
+  color: var(--ui-text-muted);
+  transition: transform var(--transition-fast);
+}
+
+.contract-review-report-sections details[open] summary .anticon {
+  transform: rotate(45deg);
+}
+
+.contract-review-report-copy {
+  padding: 0 11px 10px;
+  border-top: 1px solid var(--ui-border);
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.contract-review-report-copy p {
+  margin: 8px 0 0;
+}
+
+.contract-review-report-bullet {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.contract-review-report-bullet > span {
+  flex: 0 0 4px;
+  width: 4px;
+  height: 4px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--ui-accent);
+}
+
+.contract-review-report-note {
+  padding: 8px 9px;
+  border-left: 2px solid var(--ui-border-strong);
+  border-radius: 0 7px 7px 0;
+  background: var(--ui-surface-3);
+  color: var(--ui-text-muted);
+}
+
+.contract-review-risk-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+}
+
+.contract-review-risk-item > span {
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.contract-review-risk-item > p {
+  margin: 0;
+}
+
+.contract-review-risk-item.is-high > span {
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
+}
+
+.contract-review-risk-item.is-medium > span {
+  background: var(--ui-warning-soft);
+  color: var(--ui-warning);
+}
+
+.contract-review-risk-item.is-notice > span {
+  background: var(--ui-surface-3);
+  color: var(--ui-text-secondary);
+}
+
+.contract-review-version-diff {
+  padding: 0 16px 14px;
+}
+
+.contract-review-version-diff-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.contract-review-version-diff article {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-version-diff article > div {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  color: var(--ui-text-muted);
+  font-size: 9px;
+}
+
+.contract-review-version-diff article strong {
+  color: var(--ui-text);
+  font-size: 11px;
+}
+
+.contract-review-version-diff article p {
+  margin: 4px 0 0;
+  color: var(--ui-text-secondary);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.contract-review-report footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--ui-border);
+  background: var(--ui-surface-2);
+  color: var(--ui-text-muted);
+  font-size: 9px;
+}
+
+@media (max-width: 980px) {
+  .contract-review-setup-grid,
+  .contract-review-version-diff-list {
+    grid-template-columns: 1fr;
+  }
+
+  .contract-review-mode-summary {
+    min-height: 64px;
+  }
+
+  .contract-review-progress ol {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    row-gap: 7px;
+  }
+}
+
+@media (max-width: 720px) {
+  .contract-review-panel {
+    max-height: 58vh;
+    padding: 12px;
+  }
+
+  .contract-review-engines,
+  .contract-review-risk-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .contract-review-progress ol {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .contract-review-actions,
+  .contract-review-report-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .contract-review-primary-action {
+    width: 100%;
+  }
+
+  .contract-review-report-actions {
+    width: 100%;
+  }
+
+  .contract-review-report-actions button {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .chat-bubble-contract-review {
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .contract-review-progress-spin {
+    animation: none;
+  }
+
+  .contract-review-dropzone,
+  .contract-review-engines button,
+  .contract-review-report-sections summary .anticon {
+    transition: none;
+  }
+}
