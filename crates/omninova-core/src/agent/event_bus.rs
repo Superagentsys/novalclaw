@@ -511,10 +511,18 @@ impl EventBusDrainHandle {
     /// Drives the drain task to completion, forwarding all events to `emit_fn`.
     /// Call this after the run completes.
     pub async fn drain(mut self) {
+        let run_id = self.inner.run_id.clone();
         {
             let mut closed = self.inner.closed.lock().unwrap();
             *closed = true;
         }
+        // Release the shared inner Arc BEFORE draining: it holds the bus's
+        // sender (`tx`). Keeping it alive here would keep the internal channel
+        // open forever, so the drain task would never exit — leaking one task
+        // per run and keeping the caller's forwarded-channel sender alive
+        // (which hangs any caller that awaits channel close, e.g. the CLI
+        // streaming printer).
+        drop(self.inner);
         let mut rx = self.rx.lock().unwrap().take();
         if let Some(ref mut r) = rx {
             while let Some(evt) = r.recv().await {
@@ -539,7 +547,7 @@ impl EventBusDrainHandle {
                     AgentRunEvent::run_cancelled { .. } => "run_cancelled",
                     AgentRunEvent::approval_required { .. } => "approval_required",
                 };
-                tracing::debug!(target: "e2e", "[e2e-bus-drain] timestamp={} run_id={} type={}", now_ts(), self.inner.run_id, type_name);
+                tracing::debug!(target: "e2e", "[e2e-bus-drain] timestamp={} run_id={} type={}", now_ts(), run_id, type_name);
                 (self.emit_fn)(evt);
             }
         }
@@ -779,4 +787,50 @@ fn preview(s: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_event::AgentRunEvent;
+
+    #[tokio::test]
+    async fn drain_completes_when_the_bus_is_dropped() {
+        // Regression test for the drain leak: the drain handle used to keep the
+        // bus's sender alive via the shared inner Arc, so the channel never
+        // closed and the drain task never exited. Dropping every EventBus must
+        // let drain() finish and release its emit_fn.
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let forwarded_inner = Arc::clone(&forwarded);
+        let (bus, drain_handle) = EventBus::new("test-run".into(), move |evt| {
+            forwarded_inner.lock().unwrap().push(evt);
+        });
+        bus.run_started("test-agent".into(), None, None);
+        bus.model_delta("m1".into(), "hello".into());
+        bus.run_completed("done".into(), "done".into());
+        drop(bus);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::spawn(async move { drain_handle.drain().await }),
+        )
+        .await
+        .expect("drain must complete once all senders are dropped")
+        .expect("drain task must not panic");
+
+        let mut events = forwarded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|evt| match evt {
+                AgentRunEvent::run_started { .. } => "run_started",
+                AgentRunEvent::model_delta { .. } => "model_delta",
+                AgentRunEvent::run_completed { .. } => "run_completed",
+                _ => "other",
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        events.sort();
+        assert_eq!(events, vec!["model_delta", "run_completed", "run_started"]);
+    }
 }
