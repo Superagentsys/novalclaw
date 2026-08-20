@@ -17,6 +17,9 @@ function isSetupTab(id: AppNavId): id is SetupTab {
 function App() {
   const [nav, setNav] = useState<AppNavId>("chat");
   const [settingsTab, setSettingsTab] = useState<SetupTab | null>(null);
+  const [mountedViews, setMountedViews] = useState<Set<AppNavId>>(
+    () => new Set<AppNavId>(["chat"])
+  );
 
   const openSettings = useCallback((tab: SetupTab) => {
     setSettingsTab(tab);
@@ -31,6 +34,14 @@ function App() {
         return current === id ? null : id;
       });
       return;
+    }
+    if (id === "automation" || id === "knowledge") {
+      setMountedViews((current) => {
+        if (current.has(id)) return current;
+        const next = new Set(current);
+        next.add(id);
+        return next;
+      });
     }
     setNav(id);
     setSettingsTab(null);
@@ -49,20 +60,29 @@ function App() {
         */}
         <div
           className="app-view"
-          style={{ display: nav === "chat" ? "flex" : "none" }}
+          hidden={nav !== "chat"}
+          aria-hidden={nav !== "chat"}
         >
           <Chat
             isActive={nav === "chat"}
             onOpenSettings={openSettings}
           />
         </div>
-        {nav === "automation" ? (
-          <div className="app-view">
+        {mountedViews.has("automation") ? (
+          <div
+            className="app-view"
+            hidden={nav !== "automation"}
+            aria-hidden={nav !== "automation"}
+          >
             <Automation />
           </div>
         ) : null}
-        {nav === "knowledge" ? (
-          <div className="app-view">
+        {mountedViews.has("knowledge") ? (
+          <div
+            className="app-view"
+            hidden={nav !== "knowledge"}
+            aria-hidden={nav !== "knowledge"}
+          >
             <Knowledge />
           </div>
         ) : null}

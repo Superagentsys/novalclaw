@@ -1,4 +1,5 @@
 use crate::security::sandbox::resolve_workspace_relative;
+use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -81,7 +82,9 @@ impl Tool for ContentSearchTool {
             }
         };
 
-        let has_rg = Command::new("rg")
+        let mut rg_probe = Command::new("rg");
+        configure_background_command(&mut rg_probe);
+        let has_rg = rg_probe
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -92,6 +95,7 @@ impl Tool for ContentSearchTool {
 
         let output = if has_rg {
             let mut cmd = Command::new("rg");
+            configure_background_command(&mut cmd);
             cmd.arg("--line-number").arg("--no-heading").arg("--color=never");
             if !case_sensitive {
                 cmd.arg("-i");
@@ -111,6 +115,7 @@ impl Tool for ContentSearchTool {
             cmd.output().await
         } else {
             let mut cmd = Command::new("grep");
+            configure_background_command(&mut cmd);
             cmd.arg("-rn").arg("-E");
             if !case_sensitive {
                 cmd.arg("-i");

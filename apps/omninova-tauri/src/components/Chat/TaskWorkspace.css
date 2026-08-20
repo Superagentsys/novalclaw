@@ -220,7 +220,7 @@
   color: var(--ui-accent-strong);
 }
 
-.task-artifact-thumbnail.has-image { background: #0a0d11; }
+.task-artifact-thumbnail.has-image { background: var(--ui-code-bg); }
 .task-artifact-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
 
 .task-artifact-files li span {
@@ -692,7 +692,7 @@
 .task-artifact-preview > header > span:nth-child(2) { display: grid; min-width: 0; }
 .task-artifact-preview strong { overflow: hidden; color: var(--ui-text); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .task-artifact-preview small { color: var(--ui-text-muted); font-size: 8px; }
-.task-artifact-preview-actions { display: flex; gap: 4px; }
+.task-artifact-preview-actions { display: flex; max-width: 190px; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
 .task-artifact-preview-actions button {
   min-height: 25px;
   padding: 0 7px;
@@ -719,8 +719,54 @@
 
 .task-artifact-preview-state { padding: 12px; border-radius: 6px; background: var(--ui-surface-2); color: var(--ui-text-muted); font-size: 9px; text-align: center; }
 .task-artifact-preview-state.is-error { background: var(--ui-danger-soft); color: var(--ui-danger); }
-.task-artifact-preview-image { display: block; width: 100%; max-height: 260px; border: 1px solid var(--ui-border); border-radius: 6px; background: #090b0e; object-fit: contain; }
+.task-artifact-preview-state.is-success { background: var(--ui-success-soft); color: var(--ui-success); }
+.task-artifact-preview-image { display: block; width: 100%; max-height: 260px; border: 1px solid var(--ui-border); border-radius: 6px; background: var(--ui-code-bg); object-fit: contain; }
 .task-artifact-preview-text { max-height: 300px; overflow: auto; margin: 0; padding: 9px; border-radius: 6px; background: var(--ui-code-bg); color: var(--ui-code-text); font: 9px/1.55 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+
+.task-artifact-context-menu {
+  position: fixed;
+  z-index: 240;
+  display: grid;
+  width: 180px;
+  padding: 5px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+  box-shadow: var(--shadow-lg);
+}
+
+.task-artifact-context-menu button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ui-text-secondary);
+  font-size: 10px;
+  text-align: left;
+}
+
+.task-artifact-context-menu button:hover:not(:disabled) {
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+}
+
+.task-artifact-context-menu button:disabled { color: var(--ui-text-disabled); }
+
+.task-inspector-toast {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 5;
+  max-width: calc(100% - 24px);
+  padding: 7px 10px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 7px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text-secondary);
+  box-shadow: var(--shadow-md);
+  font-size: 9px;
+}
 
 /* Explicit three-way delete choice: cancel, retain task record, or remove all. */
 .chat-delete-dialog-backdrop {
@@ -730,7 +776,7 @@
   display: grid;
   padding: 22px;
   place-items: center;
-  background: color-mix(in srgb, #05080d 62%, transparent);
+  background: color-mix(in srgb, var(--ui-code-bg) 62%, transparent);
   backdrop-filter: blur(5px);
 }
 

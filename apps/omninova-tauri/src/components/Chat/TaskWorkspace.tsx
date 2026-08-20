@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AgentRunTimeline } from "../AgentRun/AgentRunTimeline";
 import { UiIcon, type UiIconName } from "../UiIcon";
 import type { ExecutionStep } from "../../types/config";
 import { invokeTauri } from "../../utils/tauri";
+import { writeClipboardText } from "../../utils/clipboard";
 import {
   formatDuration,
   taskNeedsAttention,
@@ -77,6 +78,12 @@ function artifactMetadata(file: TaskChangedFile): string {
     file.size != null ? formatFileSize(file.size) : null,
     file.modifiedAt ? formatArtifactTime(file.modifiedAt) : null,
   ].filter(Boolean).join(" · ");
+}
+
+function changeTypeLabel(value?: TaskChangedFile["changeType"]): string {
+  if (value === "created" || value === "added") return "新建";
+  if (value === "deleted" || value === "removed") return "删除";
+  return "修改";
 }
 
 function ArtifactThumbnail({
@@ -270,6 +277,7 @@ export function TaskInspector({
   task,
   liveSessionId,
   activeSteps,
+  onAddArtifactToChat,
 }: {
   open: boolean;
   tab: InspectorTab;
@@ -278,6 +286,7 @@ export function TaskInspector({
   task: TaskHistoryEntry | null;
   liveSessionId: string | null;
   activeSteps: ExecutionStep[];
+  onAddArtifactToChat?: (path: string) => void;
 }) {
   const tabs: Array<{ id: InspectorTab; label: string; icon: UiIconName }> = [
     { id: "process", label: "过程", icon: "sync" },
@@ -292,16 +301,98 @@ export function TaskInspector({
     [activity]
   );
   const [selectedArtifactPath, setSelectedArtifactPath] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ file: TaskChangedFile; x: number; y: number } | null>(null);
+  const [contextFeedback, setContextFeedback] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     queueMicrotask(() => {
-      if (!cancelled) setSelectedArtifactPath(files[0]?.path ?? null);
+      if (cancelled) return;
+      setSelectedArtifactPath((current) => {
+        if (current && files.some((file) => file.path === current)) {
+          return current;
+        }
+        return files[0]?.path ?? null;
+      });
     });
     return () => { cancelled = true; };
   }, [files, task?.runId]);
 
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contextMenu]);
+
   const selectedArtifact = files.find((file) => file.path === selectedArtifactPath) ?? null;
+
+  const showArtifactMenu = (event: ReactMouseEvent, file: TaskChangedFile) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedArtifactPath(file.path);
+    setContextFeedback(null);
+    setContextMenu({
+      file,
+      x: Math.min(event.clientX, window.innerWidth - 190),
+      y: Math.min(event.clientY, window.innerHeight - 270),
+    });
+  };
+
+  const resolveArtifact = (file: TaskChangedFile) => invokeTauri<ArtifactPreview>("task_artifact_preview", {
+    path: file.path,
+    workspacePath: task?.workspacePath,
+  });
+
+  const runMenuAction = async (action: "preview" | "open" | "reveal" | "save" | "copy" | "attach") => {
+    const file = contextMenu?.file;
+    if (!file) return;
+    setContextMenu(null);
+    setContextFeedback(null);
+    if (action === "preview") {
+      onTabChange("results");
+      return;
+    }
+    try {
+      if (action === "open" || action === "reveal") {
+        await invokeTauri("open_task_artifact", {
+          path: file.path,
+          workspacePath: task?.workspacePath,
+          reveal: action === "reveal",
+        });
+        return;
+      }
+      const resolved = await resolveArtifact(file);
+      if (action === "copy") {
+        await writeClipboardText(resolved.path);
+        setContextFeedback("文件路径已复制");
+      } else if (action === "attach") {
+        onAddArtifactToChat?.(resolved.path);
+        setContextFeedback("已重新加入对话附件");
+      } else {
+        const { save } = await import("@tauri-apps/plugin-dialog");
+        const destination = await save({ title: "成果文件另存为", defaultPath: resolved.name });
+        if (!destination) return;
+        await invokeTauri("save_task_artifact_as", {
+          path: file.path,
+          workspacePath: task?.workspacePath,
+          destination,
+        });
+        setContextFeedback("文件已另存");
+      }
+    } catch (reason) {
+      setContextFeedback(`操作失败：${String(reason)}`);
+    }
+  };
 
   const openProcessArtifact = (path: string) => {
     const normalized = path.replace(/\\/g, "/");
@@ -399,18 +490,18 @@ export function TaskInspector({
               <ul className="task-inspector-file-list">
                 {files.map((file, index) => (
                   <li key={file.path} className={selectedArtifactPath === file.path ? "is-selected" : ""}>
-                    <button type="button" onClick={() => setSelectedArtifactPath(file.path)}>
+                    <button type="button" onClick={() => setSelectedArtifactPath(file.path)} onContextMenu={(event) => showArtifactMenu(event, file)}>
                       <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
                       <span>
                         <strong title={file.path}>{file.path}</strong>
-                        <small>{artifactMetadata(file)} · {file.changeType || "modified"}</small>
+                        <small>{artifactMetadata(file)} · {changeTypeLabel(file.changeType)}</small>
                       </span>
                       <code>+{file.additions} -{file.deletions}</code>
                     </button>
                   </li>
                 ))}
               </ul>
-              {selectedArtifact ? <ArtifactPreviewPane file={selectedArtifact} workspacePath={task?.workspacePath} /> : null}
+              {selectedArtifact ? <ArtifactPreviewPane file={selectedArtifact} workspacePath={task?.workspacePath} onAddToChat={onAddArtifactToChat} /> : null}
             </>
           ) : <InspectorEmpty icon="file" title="暂无文件变更" detail="只有后端确认的真实变更才会写入此处。" />
         ) : null}
@@ -444,6 +535,7 @@ export function TaskInspector({
                         key={file.path}
                         className={selectedArtifactPath === file.path ? "is-selected" : ""}
                         onClick={() => setSelectedArtifactPath(file.path)}
+                        onContextMenu={(event) => showArtifactMenu(event, file)}
                         title={file.path}
                       >
                         <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
@@ -454,11 +546,27 @@ export function TaskInspector({
                   </div>
                 </section>
               ) : null}
-              {selectedArtifact ? <ArtifactPreviewPane file={selectedArtifact} workspacePath={task?.workspacePath} /> : null}
+              {selectedArtifact ? <ArtifactPreviewPane file={selectedArtifact} workspacePath={task?.workspacePath} onAddToChat={onAddArtifactToChat} /> : null}
             </div>
           ) : <InspectorEmpty icon="check" title="暂无成果" detail="任务完成后的摘要与成果文件会集中显示在这里。" />
         ) : null}
       </div>
+      {contextFeedback ? <div className="task-inspector-toast" role="status">{contextFeedback}</div> : null}
+      {contextMenu ? (
+        <div
+          className="task-artifact-context-menu"
+          role="menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("preview")}>预览内容</button>
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("open")} disabled={contextMenu.file.changeType === "deleted"}>打开文件</button>
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("reveal")} disabled={contextMenu.file.changeType === "deleted"}>在文件夹中定位</button>
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("save")} disabled={contextMenu.file.changeType === "deleted"}>另存为…</button>
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("copy")} disabled={contextMenu.file.changeType === "deleted"}>复制完整路径</button>
+          <button type="button" role="menuitem" onClick={() => void runMenuAction("attach")} disabled={contextMenu.file.changeType === "deleted" || !onAddArtifactToChat}>重新加入对话</button>
+        </div>
+      ) : null}
     </aside>
   );
 }
@@ -466,14 +574,17 @@ export function TaskInspector({
 function ArtifactPreviewPane({
   file,
   workspacePath,
+  onAddToChat,
 }: {
   file: TaskChangedFile;
   workspacePath?: string;
+  onAddToChat?: (path: string) => void;
 }) {
   const [preview, setPreview] = useState<ArtifactPreview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -482,6 +593,7 @@ function ArtifactPreviewPane({
       setPreview(null);
       setError(null);
       setActionError(null);
+      setActionFeedback(null);
       if (file.changeType === "deleted") {
         setError("该文件已删除，只保留变更记录，无法生成预览。");
         return;
@@ -514,6 +626,38 @@ function ArtifactPreviewPane({
     }
   };
 
+  const copyPath = async () => {
+    setActionError(null);
+    try {
+      await writeClipboardText(preview?.path || file.path);
+      setActionFeedback("路径已复制");
+    } catch (reason) {
+      setActionError(String(reason));
+    }
+  };
+
+  const saveAs = async () => {
+    setActionError(null);
+    try {
+      const resolved = preview ?? await invokeTauri<ArtifactPreview>("task_artifact_preview", {
+        path: file.path,
+        workspacePath,
+      });
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const destination = await save({ title: "成果文件另存为", defaultPath: resolved.name });
+      if (!destination) return;
+      await invokeTauri("save_task_artifact_as", { path: file.path, workspacePath, destination });
+      setActionFeedback("已另存到所选位置");
+    } catch (reason) {
+      setActionError(String(reason));
+    }
+  };
+
+  const addToChat = () => {
+    onAddToChat?.(preview?.path || file.path);
+    setActionFeedback("已加入输入区附件");
+  };
+
   return (
     <section className="task-artifact-preview" aria-label="文件预览">
       <header>
@@ -525,6 +669,9 @@ function ArtifactPreviewPane({
         <span className="task-artifact-preview-actions">
           <button type="button" onClick={() => void openArtifact(false)} disabled={file.changeType === "deleted"}>打开</button>
           <button type="button" onClick={() => void openArtifact(true)} disabled={file.changeType === "deleted"}>定位</button>
+          <button type="button" onClick={() => void saveAs()} disabled={file.changeType === "deleted"}>另存为</button>
+          <button type="button" onClick={() => void copyPath()} disabled={file.changeType === "deleted"}>复制路径</button>
+          {onAddToChat ? <button type="button" onClick={addToChat} disabled={file.changeType === "deleted"}>加入对话</button> : null}
         </span>
       </header>
       <button
@@ -539,6 +686,7 @@ function ArtifactPreviewPane({
       {loading ? <div className="task-artifact-preview-state">正在读取安全预览…</div> : null}
       {error ? <div className="task-artifact-preview-state is-error">{error}</div> : null}
       {actionError ? <div className="task-artifact-preview-state is-error">{actionError}</div> : null}
+      {actionFeedback ? <div className="task-artifact-preview-state is-success" role="status">{actionFeedback}</div> : null}
       {preview?.dataUrl ? <img className="task-artifact-preview-image" src={preview.dataUrl} alt={`${preview.name} 缩略图`} /> : null}
       {preview?.textPreview ? <pre className="task-artifact-preview-text">{preview.textPreview}</pre> : null}
       {preview && !preview.dataUrl && !preview.textPreview ? (

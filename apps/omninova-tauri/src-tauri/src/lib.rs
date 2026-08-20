@@ -3788,6 +3788,34 @@ fn open_task_artifact(
     Ok(())
 }
 
+#[tauri::command]
+fn save_task_artifact_as(
+    path: String,
+    workspace_path: Option<String>,
+    destination: String,
+) -> Result<String, String> {
+    let source = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
+    let destination = expand_tilde_path(destination.trim());
+    if destination.as_os_str().is_empty() {
+        return Err("没有选择保存位置。".to_string());
+    }
+    if destination.is_dir() {
+        return Err("保存位置必须包含文件名。".to_string());
+    }
+    if source == destination {
+        return Ok(destination.to_string_lossy().to_string());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "保存位置无效。".to_string())?;
+    if !parent.is_dir() {
+        return Err(format!("保存目录不存在：{}", parent.display()));
+    }
+    std::fs::copy(&source, &destination)
+        .map_err(|error| format!("另存文件失败：{error}"))?;
+    Ok(destination.to_string_lossy().to_string())
+}
+
 fn parse_gateway_url(value: &str) -> Result<(String, u16), String> {
     let normalized = value
         .trim()
@@ -4012,6 +4040,7 @@ pub fn run() {
             skillhub_remove_skill,
             task_artifact_preview,
             open_task_artifact,
+            save_task_artifact_as,
             collect_task_artifacts,
             composer_attachments::read_composer_attachments,
             composer_attachments::prepare_composer_attachments,

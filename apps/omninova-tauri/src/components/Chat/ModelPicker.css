@@ -112,7 +112,7 @@
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--ui-surface-1);
   transform: translateX(0);
   transition: transform 160ms ease;
 }

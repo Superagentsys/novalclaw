@@ -95,6 +95,37 @@
   background: var(--ui-accent-soft);
 }
 
+.md-inline-file,
+.md-local-link {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ui-accent, #2f6fed);
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.md-inline-file code {
+  color: inherit;
+}
+
+.md-inline-file:hover,
+.md-local-link:hover {
+  color: var(--ui-accent-strong, #1f57c8);
+}
+
+.md-inline-file:focus-visible,
+.md-local-link:focus-visible {
+  outline: 2px solid var(--ui-accent, #4f8cff);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
 /* Code blocks */
 .md-code-wrap {
   margin: 0.7em 0;
