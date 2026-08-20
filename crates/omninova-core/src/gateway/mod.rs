@@ -13389,66 +13389,44 @@ mod tests {
 
     #[tokio::test]
     async fn public_health_connection_failure_is_structured() {
-        // Use a reserved RFC-5737 / TEST-NET IP + port 1 to make sure the OS
-        // can't accidentally resolve a real service. 192.0.2.0/24 (TEST-NET-1)
-        // and 198.51.100.0/24 (TEST-NET-2) are guaranteed unreachable for
-        // documentation purposes per RFC 6761.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral loopback port");
+        let closed_addr = listener.local_addr().expect("read loopback address");
+        drop(listener);
+
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
-            Some("http://192.0.2.1:1".to_string());
+            Some(format!("http://{closed_addr}"));
         let status = check_gateway_public_health(&config).await;
 
         assert!(status.configured);
         assert!(!status.ok);
-        // The OS-platform connection-error classifier is intentionally broad:
-        // any of these "connectivity family" kinds is acceptable, since
-        // reqwest + rustls + Windows can label the same event as
-        // connection_error, request_error, timeout, dns_error, or tls_error
-        // depending on the host resolver, the IPv4/IPv6 stack state, and
-        // registry-level TLS settings. The structural invariant we DO check
-        // is that the failure is classified into a recognized category,
-        // not silently dropped into `None`.
-        let kind = status.error_kind.as_deref().unwrap_or_default();
-        assert!(
-            matches!(
-                kind,
-                "connection_error"
-                    | "request_error"
-                    | "timeout"
-                    | "dns_error"
-                    | "tls_error"
-            ),
-            "unexpected error_kind from unreachable host: {kind}"
-        );
+        assert_eq!(status.error_kind.as_deref(), Some("connection_error"));
+        assert_eq!(status.status_code, None);
         assert!(!status.error.as_deref().unwrap_or_default().is_empty());
     }
 
     /// Run twice to confirm this test is stable across runs.
     #[tokio::test]
     async fn public_health_connection_failure_is_structured_twice() {
-        // Same logic as the sibling test, but exercises the classifier twice
-        // back-to-back so a flaky OS error classification cannot pass.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral loopback port");
+        let closed_addr = listener.local_addr().expect("read loopback address");
+        drop(listener);
+
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
-            Some("http://198.51.100.1:1".to_string());
+            Some(format!("http://{closed_addr}"));
         let status1 = check_gateway_public_health(&config).await;
         let status2 = check_gateway_public_health(&config).await;
+
         assert!(!status1.ok);
         assert!(!status2.ok);
-        let kind1 = status1.error_kind.as_deref().unwrap_or_default();
-        let kind2 = status2.error_kind.as_deref().unwrap_or_default();
-        for kind in [kind1, kind2] {
-            assert!(
-                matches!(
-                    kind,
-                    "connection_error"
-                        | "request_error"
-                        | "timeout"
-                        | "dns_error"
-                        | "tls_error"
-                ),
-                "unexpected error_kind from unreachable host: {kind}"
-            );
+        for status in [&status1, &status2] {
+            assert!(status.configured);
+            assert_eq!(status.error_kind.as_deref(), Some("connection_error"));
+            assert_eq!(status.status_code, None);
+            assert!(!status.error.as_deref().unwrap_or_default().is_empty());
         }
     }
 
