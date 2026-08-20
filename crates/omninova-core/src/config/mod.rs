@@ -21,6 +21,9 @@ pub use schema::{
     WebSearchConfig, WecomTransportMode,
 };
 
-pub use schema::resolve_effective_workspace_dir;
+pub use schema::{
+    resolve_configured_skills_dir, resolve_effective_workspace_dir,
+    resolve_effective_workspace_skills_dir, DEFAULT_OPEN_SKILLS_ENABLED,
+};
 pub use loader::resolve_config_path;
 pub use validation::ValidationReport;

@@ -94,6 +94,10 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// Provider-reported completion reason, when the API exposes one (for
+    /// example `stop`, `tool_calls`, or `length`). This is diagnostic metadata;
+    /// it does not by itself mean that user-visible text was produced.
+    pub finish_reason: Option<String>,
 }
 
 impl ChatResponse {

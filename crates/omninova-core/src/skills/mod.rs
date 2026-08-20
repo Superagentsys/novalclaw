@@ -1,9 +1,37 @@
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::fs;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::config::{resolve_configured_skills_dir, Config};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+pub mod activation;
+pub mod catalog;
+pub mod commands;
+pub mod prompt;
+
+pub use activation::{
+    activate_skill, activation_system_message, apply_skill_runtime_prompt,
+    invocations_from_inbound_metadata, is_skill_working_context_system,
+    parse_skill_invocations, resolve_skill_from_store, sanitize_skill_working_context,
+    SkillInvocation, SkillRuntimePromptResult,
+};
+pub use catalog::{
+    estimate_prompt_tokens, is_safe_skill_locator, list_skill_catalog, normalize_skill_id,
+    source_badge_label, SkillCatalog, SkillCatalogEntry, SkillResource, MAX_ACTIVE_SKILLS,
+};
+pub use commands::{
+    command_token_at, filter_command_palette, list_command_palette, parse_slash_command,
+    CommandPalette, CommandPaletteItem, ParsedSlashCommand,
+};
+pub use prompt::{
+    parse_skill_prompt, SkillPrompt, SkillPromptIdentity, SkillPromptValidation,
+    ACTIVE_SKILL_INSTRUCTION_BUDGET_CHARS,
+};
+
+static SKILLS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -124,10 +152,123 @@ pub fn import_skills_from_dir(source_dir: &Path, target_dir: &Path, overwrite: b
         copy_dir_recursive(skill_root, &target_skill_dir)?;
         count += 1;
     }
+    if count > 0 {
+        bump_skills_generation();
+    }
     Ok(count)
 }
 
-fn discover_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// Monotonic revision bumped after skill filesystem or skills-config mutation.
+pub fn skills_generation() -> u64 {
+    SKILLS_GENERATION.load(Ordering::SeqCst)
+}
+
+/// Increment the skills revision so long-lived agents can detect stale snapshots.
+pub fn bump_skills_generation() -> u64 {
+    SKILLS_GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+}
+
+/// Directory names that must never be treated as a loadable skill tree.
+pub fn is_runtime_skill_dir_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".omninova-backup") || lower.contains(".omninova-backup") {
+        return false;
+    }
+    if name.starts_with('.') {
+        return false;
+    }
+    if lower.starts_with("omninova-install-") || lower.starts_with("omninova-rollback-") {
+        return false;
+    }
+    true
+}
+
+/// True when every normal path component is a runtime skill directory.
+/// Inspect relative paths (from the skills root), not absolute paths that may
+/// contain `.omninova` in a parent of the store.
+pub fn is_runtime_skill_directory(path: &Path) -> bool {
+    path.components().all(|component| match component {
+        std::path::Component::Normal(name) => is_runtime_skill_dir_name(&name.to_string_lossy()),
+        _ => true,
+    })
+}
+
+pub fn load_enabled_skills(config: &Config) -> Vec<Skill> {
+    if !config.skills.open_skills_enabled {
+        return Vec::new();
+    }
+    load_skills_from_dir(&resolve_configured_skills_dir(config)).unwrap_or_default()
+}
+
+/// Inject catalog metadata (not full SKILL.md). Explicit activations are applied
+/// separately via [`apply_skill_runtime_prompt`].
+pub fn inject_enabled_skills_prompt(system_prompt: &mut Option<String>, config: &Config) -> usize {
+    apply_skill_runtime_prompt(system_prompt, config, &[]).catalog_count
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRuntimeSnapshot {
+    pub skills_dir: PathBuf,
+    pub configured_skills_dir: PathBuf,
+    pub open_skills_enabled: bool,
+    pub generation: u64,
+    pub installed_slugs: Vec<String>,
+    pub runtime_visible_slugs: Vec<String>,
+    pub loaded_names: Vec<String>,
+}
+
+pub fn skill_runtime_snapshot(config: &Config) -> SkillRuntimeSnapshot {
+    let skills_dir = resolve_configured_skills_dir(config);
+    let installed_slugs = installed_skill_slugs(&skills_dir).unwrap_or_default();
+    let loaded = if config.skills.open_skills_enabled {
+        load_skills_from_dir(&skills_dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let loaded_names = loaded
+        .iter()
+        .map(|skill| skill.metadata.name.clone())
+        .collect::<Vec<_>>();
+    let mut runtime_visible = std::collections::BTreeSet::new();
+    if config.skills.open_skills_enabled {
+        for skill in &loaded {
+            if let Some(slug) = slug_for_skill_path(&skills_dir, &skill.path) {
+                runtime_visible.insert(slug);
+            }
+        }
+    }
+    SkillRuntimeSnapshot {
+        configured_skills_dir: skills_dir.clone(),
+        skills_dir,
+        open_skills_enabled: config.skills.open_skills_enabled,
+        generation: skills_generation(),
+        installed_slugs,
+        runtime_visible_slugs: runtime_visible.into_iter().collect(),
+        loaded_names,
+    }
+}
+
+fn slug_for_skill_path(skills_dir: &Path, skill_path: &Path) -> Option<String> {
+    let rel = skill_path.strip_prefix(skills_dir).ok()?;
+    rel.components()
+        .next()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+}
+
+pub fn skills_store_identity(config: &Config) -> String {
+    format!(
+        "{}|{}",
+        config.skills.open_skills_enabled,
+        resolve_configured_skills_dir(config).display()
+    )
+}
+
+pub(crate) fn discover_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     discover_skill_files_inner(root, &mut files)?;
     files.sort();
@@ -144,6 +285,10 @@ fn discover_skill_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            if !is_runtime_skill_dir_name(&dir_name) {
+                continue;
+            }
             discover_skill_files_inner(&path, out)?;
             continue;
         }
@@ -438,6 +583,7 @@ pub async fn skillhub_install(
         let _ = fs::remove_dir_all(&stage_root);
         return Err(error).context("Failed to activate the validated SkillHub package");
     }
+    bump_skills_generation();
     Ok((slug.to_string(), count))
 }
 
@@ -555,6 +701,7 @@ pub fn skillhub_rollback(target_dir: &Path, slug: &str) -> Result<(String, usize
         return Err(error).context("Rollback was reverted because the replaced version could not be preserved");
     }
     let count = discover_skill_files(&dest_root)?.len();
+    bump_skills_generation();
     Ok((slug.to_string(), count))
 }
 
@@ -575,6 +722,7 @@ pub fn skillhub_remove(target_dir: &Path, slug: &str) -> Result<String> {
         fs::remove_dir_all(&backup_root)
             .with_context(|| format!("Failed to remove skill rollback backup: {:?}", backup_root))?;
     }
+    bump_skills_generation();
     Ok(slug.to_string())
 }
 
@@ -585,7 +733,7 @@ pub fn installed_skill_slugs(dir: &Path) -> Result<Vec<String>> {
         if let Ok(rel) = skill_file.strip_prefix(dir) {
             if let Some(first) = rel.components().next() {
                 let slug = first.as_os_str().to_string_lossy().to_string();
-                if !slug.ends_with(".omninova-backup") && !slug.starts_with(".omninova-") {
+                if is_runtime_skill_dir_name(&slug) {
                     slugs.insert(slug);
                 }
             }
@@ -706,3 +854,8 @@ mod skillhub_tests {
         assert!(error.to_string().contains("unsupported path characters"));
     }
 }
+
+#[cfg(test)]
+mod runtime_s1;
+#[cfg(test)]
+mod runtime_s2;

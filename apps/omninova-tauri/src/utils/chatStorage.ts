@@ -14,6 +14,13 @@ export interface StoredChatMessage {
   role: "user" | "assistant" | "error";
   content: string;
   agent?: string;
+  /** Request-scoped Skill shown in local conversation history. */
+  skillId?: string;
+  skillName?: string;
+  /** First-class system tool metadata; never contains tool instructions. */
+  toolId?: string;
+  toolName?: string;
+  contractEngineName?: string;
 }
 
 export interface ChatStorageSnapshot {
@@ -124,11 +131,48 @@ export function areStoredMessagesEqual(
       left.role !== right.role ||
       left.content !== right.content ||
       (left.agent ?? "") !== (right.agent ?? "")
+      || (left.skillId ?? "") !== (right.skillId ?? "")
+      || (left.skillName ?? "") !== (right.skillName ?? "")
+      || (left.toolId ?? "") !== (right.toolId ?? "")
+      || (left.toolName ?? "") !== (right.toolName ?? "")
+      || (left.contractEngineName ?? "") !== (right.contractEngineName ?? "")
     ) {
       return false;
     }
   }
   return true;
+}
+
+/**
+ * Gateway history intentionally stores the canonical message text only. Keep
+ * local request-scoped display metadata (such as the activated Skill) when a
+ * background history refresh returns the same canonical messages.
+ */
+export function mergeLocalMessageMetadata(
+  remote: StoredChatMessage[],
+  local: StoredChatMessage[]
+): StoredChatMessage[] {
+  let localIndex = 0;
+  return remote.map((message) => {
+    while (localIndex < local.length) {
+      const candidate = local[localIndex];
+      localIndex += 1;
+      if (
+        candidate.role === message.role &&
+        candidate.content === message.content
+      ) {
+        return {
+          ...message,
+          ...(candidate.skillId ? { skillId: candidate.skillId } : {}),
+          ...(candidate.skillName ? { skillName: candidate.skillName } : {}),
+          ...(candidate.toolId ? { toolId: candidate.toolId } : {}),
+          ...(candidate.toolName ? { toolName: candidate.toolName } : {}),
+          ...(candidate.contractEngineName ? { contractEngineName: candidate.contractEngineName } : {}),
+        };
+      }
+    }
+    return message;
+  });
 }
 
 export function toUiMessages(

@@ -3,6 +3,7 @@ pub mod acp;
 pub mod channels;
 pub mod cli;
 pub mod config;
+pub mod contract_review;
 pub mod cron;
 pub mod daemon;
 pub mod desktop_capture;

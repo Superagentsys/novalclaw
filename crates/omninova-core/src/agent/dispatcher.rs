@@ -10,6 +10,150 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing;
 
+const EMPTY_MODEL_OUTPUT_ERROR: &str =
+    "模型本次未返回可显示的内容，请重试或更换技能。";
+const SKILL_PROVIDER_CONTENT_FILTER_ERROR: &str =
+    "当前模型服务拒绝了该技能的提示内容。技能已成功加载，但与当前模型/服务的安全策略不兼容。请更换技能或模型。";
+const PROVIDER_CONTENT_FILTER_ERROR: &str =
+    "当前模型服务拒绝了本次请求内容。请调整请求或更换模型。";
+
+fn has_active_skill(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.role == "system"
+            && crate::skills::is_skill_working_context_system(&message.content)
+    })
+}
+
+fn ensure_visible_model_output(
+    text: String,
+    finish_reason: Option<&str>,
+    skill_active: bool,
+) -> Result<String> {
+    if finish_reason.is_some_and(|reason| reason.eq_ignore_ascii_case("content_filter")) {
+        return Err(anyhow::anyhow!(if skill_active {
+            SKILL_PROVIDER_CONTENT_FILTER_ERROR
+        } else {
+            PROVIDER_CONTENT_FILTER_ERROR
+        }));
+    }
+    if text.trim().is_empty() {
+        return Err(anyhow::anyhow!(EMPTY_MODEL_OUTPUT_ERROR));
+    }
+    Ok(text)
+}
+
+fn structural_tool_call_count(message: &ChatMessage) -> usize {
+    if message.role != "assistant" {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(&message.content)
+        .ok()
+        .and_then(|value| value.get("tool_calls").and_then(|calls| calls.as_array()).cloned())
+        .map(|calls| calls.len())
+        .unwrap_or(0)
+}
+
+fn structural_message_kind(message: &ChatMessage) -> &'static str {
+    match message.role.as_str() {
+        "system" if crate::skills::is_skill_working_context_system(&message.content) => {
+            "active_skill"
+        }
+        "system" => "system",
+        "user" if message.images.as_ref().is_some_and(|images| !images.is_empty()) => {
+            "multimodal_user"
+        }
+        "user" => "user",
+        "assistant" if structural_tool_call_count(message) > 0 => "assistant_tool_calls",
+        "assistant" => "assistant",
+        "tool" => "tool_result",
+        _ => "other",
+    }
+}
+
+fn log_provider_request_structure(run_id: &str, skill_active: bool, messages: &[ChatMessage]) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    eprintln!(
+        "[provider-request] run_id={} skill_active={} message_count={}",
+        run_id,
+        skill_active,
+        messages.len()
+    );
+    for (index, message) in messages.iter().enumerate() {
+        eprintln!(
+            "[provider-request] run_id={} index={} role={} kind={} content_len={} tool_call_count={}",
+            run_id,
+            index,
+            message.role,
+            structural_message_kind(message),
+            message.content.chars().count(),
+            structural_tool_call_count(message)
+        );
+    }
+}
+
+fn log_model_result(
+    run_id: &str,
+    skill_active: bool,
+    model: &str,
+    text_delta_count: usize,
+    result: &Result<ChatResponse>,
+) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    match result {
+        Ok(response) => eprintln!(
+            "[model-result] run_id={} skill_active={} model={} finish_reason={} text_deltas={} text_chars={} tool_calls={} output_tokens={} provider_error=false",
+            run_id,
+            skill_active,
+            model,
+            response.finish_reason.as_deref().unwrap_or("-"),
+            text_delta_count,
+            response.text.as_deref().unwrap_or("").chars().count(),
+            response.tool_calls.len(),
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        Err(_) => eprintln!(
+            "[model-result] run_id={} skill_active={} model={} finish_reason=- text_deltas={} text_chars=0 tool_calls=0 output_tokens=- provider_error=true",
+            run_id, skill_active, model, text_delta_count
+        ),
+    }
+}
+
+fn log_skill_provider_compatibility(
+    provider: &str,
+    model: &str,
+    skill_active: bool,
+    response: &ChatResponse,
+) {
+    if !cfg!(debug_assertions) || !skill_active {
+        return;
+    }
+    let status = if response
+        .finish_reason
+        .as_deref()
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("content_filter"))
+    {
+        "PROVIDER_INCOMPATIBLE"
+    } else {
+        "VALID_FOR_PROVIDER_RESPONSE"
+    };
+    eprintln!(
+        "[skill-runtime] compatibility={} provider={} model={} finish_reason={}",
+        status,
+        provider,
+        model,
+        response.finish_reason.as_deref().unwrap_or("-")
+    );
+}
+
 fn now_ts() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -157,9 +301,24 @@ impl<'a> AgentDispatcher<'a> {
             }
 
             let response = chat_result?;
+            log_skill_provider_compatibility(
+                &provider_name,
+                self.security
+                    .audit()
+                    .context()
+                    .model
+                    .as_deref()
+                    .unwrap_or("-"),
+                has_active_skill(messages),
+                &response,
+            );
 
             if response.tool_calls.is_empty() {
-                let text = response.text.unwrap_or_default();
+                let text = ensure_visible_model_output(
+                    response.text.unwrap_or_default(),
+                    response.finish_reason.as_deref(),
+                    has_active_skill(messages),
+                )?;
                 messages.push(ChatMessage::assistant(&text));
                 return Ok(text);
             }
@@ -183,6 +342,7 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
+                push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
             }
         }
 
@@ -246,7 +406,6 @@ impl<'a> AgentDispatcher<'a> {
                 .unwrap_or_else(|| "default".to_string());
 
             let (tok_tx, mut tok_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let tok_tx_clone = tok_tx.clone();
             let model_title = if iteration == 0 {
                 "正在分析项目文件".to_string()
             } else {
@@ -258,14 +417,45 @@ impl<'a> AgentDispatcher<'a> {
                 .map(|bus| bus.model_started(model_title.clone()));
             let bus_for_delta = self.event_bus.clone();
             let model_step_for_delta = model_step_id.clone();
-            let _handle = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                let mut text_delta_count = 0usize;
                 while let Some(delta) = tok_rx.recv().await {
+                    text_delta_count = text_delta_count.saturating_add(1);
                     if let (Some(bus), Some(step_id)) = (&bus_for_delta, &model_step_for_delta) {
                         bus.model_delta(step_id.clone(), delta);
                     }
                 }
+                text_delta_count
             });
-            let chat_result = self.stream_once(messages, true, tok_tx_clone).await;
+            let run_id = self
+                .event_bus
+                .as_ref()
+                .map(|bus| bus.run_id().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let skill_active = messages.iter().any(|message| {
+                message.role == "system"
+                    && crate::skills::is_skill_working_context_system(&message.content)
+            });
+            let model = self
+                .security
+                .audit()
+                .context()
+                .model
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            log_provider_request_structure(&run_id, skill_active, messages);
+            let chat_result = self.stream_once(messages, true, tok_tx).await;
+            // `chat_stream` owns the final sender. Once it returns, draining the
+            // forwarder guarantees every accepted delta is emitted before
+            // `model_completed` and any terminal run event.
+            let text_delta_count = handle.await.unwrap_or(0);
+            log_model_result(
+                &run_id,
+                skill_active,
+                &model,
+                text_delta_count,
+                &chat_result,
+            );
 
             if let Ok(response) = &chat_result {
                 self.budget.record_call(response.usage.as_ref());
@@ -290,6 +480,12 @@ impl<'a> AgentDispatcher<'a> {
                 }
             }
             let response = chat_result?;
+            log_skill_provider_compatibility(
+                &provider_name,
+                &model,
+                skill_active,
+                &response,
+            );
             if let Some(token) = &self.cancel_token {
                 token.check()?;
             }
@@ -308,6 +504,11 @@ impl<'a> AgentDispatcher<'a> {
                         text.push_str(&summary);
                     }
                 }
+                let text = ensure_visible_model_output(
+                    text,
+                    response.finish_reason.as_deref(),
+                    skill_active,
+                )?;
                 messages.push(ChatMessage::assistant(&text));
                 return Ok(text);
             }
@@ -361,6 +562,7 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
+                push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
             }
         }
 
@@ -443,7 +645,11 @@ impl<'a> AgentDispatcher<'a> {
             let response = chat_result?;
 
             if response.tool_calls.is_empty() {
-                let text = response.text.unwrap_or_default();
+                let text = ensure_visible_model_output(
+                    response.text.unwrap_or_default(),
+                    response.finish_reason.as_deref(),
+                    has_active_skill(messages),
+                )?;
                 messages.push(ChatMessage::assistant(&text));
                 let _ = events.send(AgentEvent::Done(text.clone()));
                 return Ok(text);
@@ -478,6 +684,7 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
+                push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
             }
         }
 
@@ -550,7 +757,11 @@ impl<'a> AgentDispatcher<'a> {
             let response = chat_result?;
 
             if response.tool_calls.is_empty() {
-                let text = response.text.unwrap_or_default();
+                let text = ensure_visible_model_output(
+                    response.text.unwrap_or_default(),
+                    response.finish_reason.as_deref(),
+                    has_active_skill(messages),
+                )?;
                 messages.push(ChatMessage::assistant(&text));
                 return Ok(text);
             }
@@ -577,6 +788,7 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
+                push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
             }
         }
 
@@ -852,6 +1064,67 @@ impl<'a> AgentDispatcher<'a> {
             .with_event_bus(event_bus)
             .with_cancel_token(self.cancel_token.clone());
         runner.run_tool(tool_call, args).await
+    }
+}
+
+fn push_skill_activation_if_needed(
+    messages: &mut Vec<ChatMessage>,
+    tool_name: &str,
+    tool_result: &str,
+) {
+    if let Some(message) = crate::skills::activation_system_message(tool_name, tool_result) {
+        if let Some(tool_message) = messages.last_mut().filter(|item| item.role == "tool") {
+            tool_message.content = crate::skills::activation::compact_use_skill_payload(
+                &tool_message.content,
+            );
+        }
+        messages.push(ChatMessage::system(message));
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn content_filter_maps_to_specific_skill_error() {
+        let error = ensure_visible_model_output(String::new(), Some("content_filter"), true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, SKILL_PROVIDER_CONTENT_FILTER_ERROR);
+    }
+
+    #[test]
+    fn ordinary_empty_output_keeps_generic_error() {
+        let error = ensure_visible_model_output(String::new(), Some("stop"), false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, EMPTY_MODEL_OUTPUT_ERROR);
+    }
+
+    #[test]
+    fn auto_skill_activation_compacts_tool_result_before_next_request() {
+        let inner = serde_json::json!({
+            "ok": true,
+            "skill_id": "skill:test",
+            "display_name": "Test Skill",
+            "instructions": "PRIVATE_ACTIONABLE_INSTRUCTIONS",
+            "resource_prompt": "PRIVATE_RESOURCE_PROMPT",
+            "provider_envelope": "## Active Skill\n\nSAFE_PROVIDER_ENVELOPE"
+        })
+        .to_string();
+        let outer = serde_json::json!({
+            "tool_call_id": "call-skill",
+            "content": inner,
+        })
+        .to_string();
+        let mut messages = vec![ChatMessage::tool(outer)];
+        push_skill_activation_if_needed(&mut messages, "use_skill", &inner);
+
+        assert_eq!(messages.len(), 2);
+        assert!(!messages[0].content.contains("PRIVATE_ACTIONABLE_INSTRUCTIONS"));
+        assert!(!messages[0].content.contains("SAFE_PROVIDER_ENVELOPE"));
+        assert!(messages[1].content.contains("SAFE_PROVIDER_ENVELOPE"));
     }
 }
 

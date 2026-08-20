@@ -196,6 +196,15 @@ pub enum AgentRunEvent {
         diff_stats: Option<DiffStats>,
     },
 
+    /// A request-scoped Skill was validated and activated. This event carries
+    /// catalog identity only; instructions and resource contents are omitted.
+    skill_activated {
+        run_id: String,
+        skill_id: String,
+        display_name: String,
+        source: String,
+    },
+
     /// A tool requires user approval before executing.
     approval_required {
         run_id: String,
@@ -256,6 +265,7 @@ impl AgentRunEvent {
             Self::patch_applied { run_id, .. } => run_id,
             Self::patch_failed { run_id, .. } => run_id,
             Self::tool_completed { run_id, .. } => run_id,
+            Self::skill_activated { run_id, .. } => run_id,
             Self::approval_required { run_id, .. } => run_id,
             Self::run_completed { run_id, .. } => run_id,
             Self::run_failed { run_id, .. } => run_id,
@@ -280,6 +290,7 @@ impl AgentRunEvent {
             Self::patch_applied { step_id, .. } => Some(step_id),
             Self::patch_failed { step_id, .. } => Some(step_id),
             Self::tool_completed { step_id, .. } => Some(step_id),
+            Self::skill_activated { .. } => None,
             Self::approval_required { step_id, .. } => Some(step_id),
             Self::run_completed { .. } => None,
             Self::run_failed { .. } => None,

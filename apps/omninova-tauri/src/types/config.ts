@@ -256,6 +256,8 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
   },
 ];
 
+export const DEFAULT_OPEN_SKILLS_ENABLED = true;
+
 export interface SkillsConfig {
   open_skills_enabled: boolean;
   open_skills_dir?: string;

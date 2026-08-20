@@ -15,6 +15,7 @@ pub mod memory_store;
 pub mod pdf_read;
 pub mod shell;
 pub mod traits;
+pub mod use_skill;
 pub mod web_fetch;
 pub mod web_search;
 
@@ -34,6 +35,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use pdf_read::PdfReadTool;
 pub use shell::ShellTool;
+pub use use_skill::{SkillActivationGate, UseSkillTool};
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;

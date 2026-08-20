@@ -11,43 +11,41 @@ const ACTIVE_WORKSPACE_FILE: &str = "active_workspace.toml";
 const CONFIG_SAVE_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Resolve the config directory with the following priority:
-///   1. `OMNINOVA_CONFIG_DIR` env var
+///   1. `OMNINOVA_CONFIG_DIR` env var (explicit launch-time override)
 ///   2. `OMNINOVA_WORKSPACE` env var (config inferred as `<workspace>/../.omninova`)
-///   3. `~/.omninova/active_workspace.toml` pointer
-///   4. `~/.omninova/`
+///   3. `~/.omninova/`
+///
+/// `active_workspace.toml` is intentionally not consulted here. Older demo
+/// launchers wrote a persistent pointer to that file, which made every later
+/// normal launch silently reuse the demo configuration. Demo launches must use
+/// the explicit `OMNINOVA_CONFIG_DIR` override instead.
 pub fn resolve_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OMNINOVA_CONFIG_DIR") {
+    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    resolve_config_dir_from(
+        std::env::var_os("OMNINOVA_CONFIG_DIR"),
+        std::env::var_os("OMNINOVA_WORKSPACE"),
+        &home,
+    )
+}
+
+fn resolve_config_dir_from(
+    explicit_config_dir: Option<std::ffi::OsString>,
+    workspace: Option<std::ffi::OsString>,
+    home: &Path,
+) -> PathBuf {
+    if let Some(dir) = explicit_config_dir.filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
     }
-
-    if let Ok(ws) = std::env::var("OMNINOVA_WORKSPACE") {
-        let ws_path = PathBuf::from(&ws);
-        if let Some(parent) = ws_path.parent() {
+    if let Some(workspace) = workspace.filter(|value| !value.is_empty()) {
+        let workspace = PathBuf::from(workspace);
+        if let Some(parent) = workspace.parent() {
             let candidate = parent.join(APP_DIR_NAME);
             if candidate.exists() {
                 return candidate;
             }
         }
     }
-
-    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let default_dir = home.join(APP_DIR_NAME);
-
-    let active_ws_path = default_dir.join(ACTIVE_WORKSPACE_FILE);
-    if active_ws_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&active_ws_path) {
-            if let Ok(table) = content.parse::<toml::Table>() {
-                if let Some(toml::Value::String(dir)) = table.get("config_dir") {
-                    let p = PathBuf::from(dir);
-                    if p.exists() {
-                        return p;
-                    }
-                }
-            }
-        }
-    }
-
-    default_dir
+    home.join(APP_DIR_NAME)
 }
 
 /// Resolve the full path to `config.toml`.
@@ -62,7 +60,10 @@ impl Config {
         if config_path.exists() {
             Self::load_from(&config_path)
         } else {
-            info!("No config found at {}, creating default", config_path.display());
+            info!(
+                "No config found at {}, creating default",
+                config_path.display()
+            );
             let mut cfg = Config::default();
             cfg.config_path = config_path.clone();
             cfg.ensure_dirs()?;
@@ -104,8 +105,8 @@ impl Config {
 
     /// Load from a TOML string (useful for testing).
     pub fn load_from_str(toml_str: &str) -> Result<Self> {
-        let mut cfg: Config = toml::from_str(toml_str)
-            .context("Failed to parse TOML config string")?;
+        let mut cfg: Config =
+            toml::from_str(toml_str).context("Failed to parse TOML config string")?;
         super::env::apply_env_overrides(&mut cfg);
         Ok(cfg)
     }
@@ -125,12 +126,12 @@ impl Config {
     }
 
     fn save_inner(&self) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config to TOML")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
 
         if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory {}", parent.display())
+            })?;
         }
 
         std::fs::write(&self.config_path, content)
@@ -144,7 +145,10 @@ impl Config {
     fn ensure_dirs(&self) -> Result<()> {
         if !self.workspace_dir.as_os_str().is_empty() {
             std::fs::create_dir_all(&self.workspace_dir).with_context(|| {
-                format!("Failed to create workspace dir {}", self.workspace_dir.display())
+                format!(
+                    "Failed to create workspace dir {}",
+                    self.workspace_dir.display()
+                )
             })?;
         }
         Ok(())
@@ -166,10 +170,10 @@ impl Config {
 
         let mut table = toml::Table::new();
         table.insert("config_dir".to_string(), toml::Value::String(dir_str));
-        let body = toml::to_string(&table).context("Failed to serialize active workspace pointer")?;
-        let content = format!(
-            "# Auto-generated – points to the active OmniNova workspace\n{body}\n"
-        );
+        let body =
+            toml::to_string(&table).context("Failed to serialize active workspace pointer")?;
+        let content =
+            format!("# Auto-generated – points to the active OmniNova workspace\n{body}\n");
         std::fs::write(&active_path, content)?;
         Ok(())
     }
@@ -350,5 +354,29 @@ http_proxy = "http://proxy:3128"
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn normal_config_does_not_follow_legacy_demo_pointer() {
+        let home = tempdir();
+        let normal = home.join(APP_DIR_NAME);
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(
+            normal.join(ACTIVE_WORKSPACE_FILE),
+            "config_dir = 'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\OmniNova-Demo'\n",
+        )
+        .unwrap();
+
+        assert_eq!(resolve_config_dir_from(None, None, &home), normal);
+    }
+
+    #[test]
+    fn explicit_demo_config_override_is_preserved() {
+        let home = tempdir();
+        let demo = home.join("OmniNova-Demo");
+        assert_eq!(
+            resolve_config_dir_from(Some(demo.clone().into_os_string()), None, &home),
+            demo
+        );
     }
 }

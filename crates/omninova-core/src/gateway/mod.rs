@@ -79,13 +79,16 @@ use crate::security::{
     is_tool_globally_allowed, resolve_shell_allowlist, ApprovalController, EstopController,
     EstopState, PendingApproval, SecurityContext,
 };
-use crate::skills::{format_skills_prompt, load_skills_from_dir};
+use crate::skills::{
+    apply_skill_runtime_prompt, invocations_from_inbound_metadata, skills_store_identity,
+    SkillInvocation,
+};
 use crate::knowledge::append_knowledge_prompt;
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
     FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
-    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool,
-    WebSearchTool,
+    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool,
+    ShellTool, SkillActivationGate, Tool, UseSkillTool, WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
@@ -1671,10 +1674,17 @@ impl GatewayRuntime {
             let lock = self.config.read().await;
             memory_identity(&lock) != memory_identity(&config)
         };
+        let bump_skills = {
+            let lock = self.config.read().await;
+            skills_store_identity(&lock) != skills_store_identity(&config)
+        };
         {
             let mut lock = self.config.write().await;
             config.config_path = lock.config_path.clone();
             *lock = config;
+        }
+        if bump_skills {
+            crate::skills::bump_skills_generation();
         }
         // First-run setup saves the workspace after the runtime was already
         // constructed, so without this the memory backend would stay in-process
@@ -1731,21 +1741,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                }
-            }
-        }
+        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
@@ -1787,21 +1783,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                }
-            }
-        }
+        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
@@ -1966,18 +1948,39 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg.skills.open_skills_dir.as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done("加载技能提示", "已注入 workspace skills"));
-                }
-            }
+        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
+        let skill_runtime = apply_skills_for_request(
+            &cfg,
+            &skill_invocations,
+            &mut tools,
+            &mut agent_cfg.system_prompt,
+        );
+        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
+            let reason = skill_runtime
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "所选技能当前不可用".to_string());
+            println!(
+                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
+                skill_invocations.len(),
+                reason.chars().count()
+            );
+            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
+            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
+        }
+        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
+            steps.push(ExecutionStep::done(
+                "加载技能提示",
+                if skill_runtime.activated.is_empty() {
+                    "已注入技能目录（按需 use_skill）".to_string()
+                } else {
+                    format!(
+                        "已激活技能 {}",
+                        skill_runtime.activated[0].skill_id
+                    )
+                },
+            ));
         }
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
@@ -2272,24 +2275,36 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if cfg.skills.open_skills_enabled {
-            let skills_dir = cfg
-                .skills
-                .open_skills_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| effective_workspace.join("skills"));
-            if let Ok(skills) = load_skills_from_dir(&skills_dir) {
-                let prompt = format_skills_prompt(&skills);
-                if !prompt.is_empty() {
-                    let current = agent_cfg.system_prompt.unwrap_or_default();
-                    agent_cfg.system_prompt = Some(format!("{}\n{}", current, prompt));
-                    steps.push(ExecutionStep::done(
-                        "加载技能提示",
-                        "已注入 workspace skills",
-                    ));
-                }
-            }
+        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
+        let skill_runtime = apply_skills_for_request(
+            &cfg,
+            &skill_invocations,
+            &mut tools,
+            &mut agent_cfg.system_prompt,
+        );
+        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
+            let reason = skill_runtime
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "所选技能当前不可用".to_string());
+            println!(
+                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
+                skill_invocations.len(),
+                reason.chars().count()
+            );
+            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
+            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
+        }
+        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
+            steps.push(ExecutionStep::done(
+                "加载技能提示",
+                if skill_runtime.activated.is_empty() {
+                    "已注入技能目录（按需 use_skill）".to_string()
+                } else {
+                    format!("已激活技能 {}", skill_runtime.activated[0].skill_id)
+                },
+            ));
         }
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
@@ -9066,6 +9081,7 @@ async fn save_session_history(
 ) -> anyhow::Result<()> {
     // Backstop for the in-agent summarizer: keeps the bootstrap prompt and any
     // compaction summary instead of blindly slicing off the oldest messages.
+    messages = crate::skills::sanitize_skill_working_context(messages);
     messages = truncate_history_preserving_system(messages, max_history_messages);
     messages = sanitize_messages_for_provider(messages);
 
@@ -9869,6 +9885,23 @@ fn memory_identity(config: &Config) -> (String, String, String, String, String, 
         embedding.model.clone().unwrap_or_default(),
         embedding.base_url.clone().unwrap_or_default(),
     )
+}
+
+fn apply_skills_for_request(
+    config: &Config,
+    invocations: &[SkillInvocation],
+    tools: &mut Vec<Box<dyn Tool>>,
+    system_prompt: &mut Option<String>,
+) -> crate::skills::SkillRuntimePromptResult {
+    let result = apply_skill_runtime_prompt(system_prompt, config, invocations);
+    if config.skills.open_skills_enabled {
+        let explicit = result.activated.first().map(|item| item.skill_id.clone());
+        tools.push(Box::new(UseSkillTool::new(
+            config.clone(),
+            Arc::new(SkillActivationGate::with_explicit(explicit)),
+        )));
+    }
+    result
 }
 
 fn create_tools_for_route(
@@ -13358,66 +13391,44 @@ mod tests {
 
     #[tokio::test]
     async fn public_health_connection_failure_is_structured() {
-        // Use a reserved RFC-5737 / TEST-NET IP + port 1 to make sure the OS
-        // can't accidentally resolve a real service. 192.0.2.0/24 (TEST-NET-1)
-        // and 198.51.100.0/24 (TEST-NET-2) are guaranteed unreachable for
-        // documentation purposes per RFC 6761.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral loopback port");
+        let closed_addr = listener.local_addr().expect("read loopback address");
+        drop(listener);
+
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
-            Some("http://192.0.2.1:1".to_string());
+            Some(format!("http://{closed_addr}"));
         let status = check_gateway_public_health(&config).await;
 
         assert!(status.configured);
         assert!(!status.ok);
-        // The OS-platform connection-error classifier is intentionally broad:
-        // any of these "connectivity family" kinds is acceptable, since
-        // reqwest + rustls + Windows can label the same event as
-        // connection_error, request_error, timeout, dns_error, or tls_error
-        // depending on the host resolver, the IPv4/IPv6 stack state, and
-        // registry-level TLS settings. The structural invariant we DO check
-        // is that the failure is classified into a recognized category,
-        // not silently dropped into `None`.
-        let kind = status.error_kind.as_deref().unwrap_or_default();
-        assert!(
-            matches!(
-                kind,
-                "connection_error"
-                    | "request_error"
-                    | "timeout"
-                    | "dns_error"
-                    | "tls_error"
-            ),
-            "unexpected error_kind from unreachable host: {kind}"
-        );
+        assert_eq!(status.error_kind.as_deref(), Some("connection_error"));
+        assert_eq!(status.status_code, None);
         assert!(!status.error.as_deref().unwrap_or_default().is_empty());
     }
 
     /// Run twice to confirm this test is stable across runs.
     #[tokio::test]
     async fn public_health_connection_failure_is_structured_twice() {
-        // Same logic as the sibling test, but exercises the classifier twice
-        // back-to-back so a flaky OS error classification cannot pass.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral loopback port");
+        let closed_addr = listener.local_addr().expect("read loopback address");
+        drop(listener);
+
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
-            Some("http://198.51.100.1:1".to_string());
+            Some(format!("http://{closed_addr}"));
         let status1 = check_gateway_public_health(&config).await;
         let status2 = check_gateway_public_health(&config).await;
+
         assert!(!status1.ok);
         assert!(!status2.ok);
-        let kind1 = status1.error_kind.as_deref().unwrap_or_default();
-        let kind2 = status2.error_kind.as_deref().unwrap_or_default();
-        for kind in [kind1, kind2] {
-            assert!(
-                matches!(
-                    kind,
-                    "connection_error"
-                        | "request_error"
-                        | "timeout"
-                        | "dns_error"
-                        | "tls_error"
-                ),
-                "unexpected error_kind from unreachable host: {kind}"
-            );
+        for status in [&status1, &status2] {
+            assert!(status.configured);
+            assert_eq!(status.error_kind.as_deref(), Some("connection_error"));
+            assert_eq!(status.status_code, None);
+            assert!(!status.error.as_deref().unwrap_or_default().is_empty());
         }
     }
 

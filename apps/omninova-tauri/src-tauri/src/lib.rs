@@ -5,8 +5,8 @@ mod desktop_capture;
 use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
-    ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig, GatewayPublicMode, ModelProviderConfig,
-    ProviderConfig, RobotConfig,
+    resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
+    GatewayPublicMode, ModelProviderConfig, ProviderConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -25,9 +25,8 @@ use omninova_core::gateway::{
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
-    import_skills_from_dir, installed_skill_slugs, load_skills_from_dir, skillhub_categories,
-    skillhub_install, skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory,
-    SkillHubItem,
+    import_skills_from_dir, skill_runtime_snapshot, skillhub_categories, skillhub_install,
+    skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory, SkillHubItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -536,6 +535,32 @@ struct SetupAppConfig {
     /// Per-agent settings (workspace_dir, system_prompt, etc.) from the Agent tab.
     #[serde(default)]
     agent: Option<AgentPersonaSetup>,
+    #[serde(default)]
+    skills: SetupSkillsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupSkillsConfig {
+    #[serde(default = "default_setup_open_skills_enabled")]
+    open_skills_enabled: bool,
+    #[serde(default)]
+    open_skills_dir: Option<String>,
+    #[serde(default)]
+    prompt_injection_mode: Option<String>,
+}
+
+impl Default for SetupSkillsConfig {
+    fn default() -> Self {
+        Self {
+            open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
+            open_skills_dir: None,
+            prompt_injection_mode: None,
+        }
+    }
+}
+
+fn default_setup_open_skills_enabled() -> bool {
+    DEFAULT_OPEN_SKILLS_ENABLED
 }
 
 /// Corresponds to the frontend `AgentPersonaConfig`.
@@ -663,6 +688,8 @@ struct UiInboundPayload {
     text: String,
     #[serde(default)]
     metadata: HashMap<String, Value>,
+    #[serde(default)]
+    skill_invocations: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,6 +1017,20 @@ async fn process_inbound_message_streaming(
         app_state.runtime.clone()
     };
     let inbound = inbound_from_payload(payload);
+
+    if cfg!(debug_assertions) {
+        let invocations = inbound
+            .metadata
+            .get("skill_invocations")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        eprintln!(
+            "[skill-runtime] inbound skill_invocations_count={} metadata_present={}",
+            invocations,
+            inbound.metadata.contains_key("skill_invocations")
+        );
+    }
 
     let run_id = inbound
         .metadata
@@ -1568,11 +1609,15 @@ struct SkillSummaryItem {
 #[serde(rename_all = "camelCase")]
 struct SkillsPackageSummaryPayload {
     dir: String,
+    configured_skills_dir: String,
+    open_skills_enabled: bool,
+    generation: u64,
     total: usize,
     names: Vec<String>,
     items: Vec<SkillSummaryItem>,
-    /// Top-level directory names (slugs) of installed skills, for install-state marking.
+    /// Top-level directory names (slugs) of installed skills. Files exist; not Runtime-visible by itself.
     slugs: Vec<String>,
+    runtime_visible_slugs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2258,9 +2303,7 @@ async fn import_skills(
     let app_state = state.lock().await;
     let config = app_state.runtime.get_config().await;
     
-    let target = config.skills.open_skills_dir.as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"));
+    let target = resolve_configured_skills_dir(&config);
 
     let source = PathBuf::from(source_dir);
     
@@ -2277,14 +2320,9 @@ async fn skills_package_summary(
     let app_state = state.lock().await;
     let config = app_state.runtime.get_config().await;
 
-    let target = config
-        .skills
-        .open_skills_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"));
-
-    let skills = load_skills_from_dir(&target).map_err(|e| e.to_string())?;
+    let snapshot = skill_runtime_snapshot(&config);
+    let target = snapshot.skills_dir.clone();
+    let skills = omninova_core::skills::load_skills_from_dir(&target).map_err(|e| e.to_string())?;
     let names = skills
         .iter()
         .map(|skill| skill.metadata.name.clone())
@@ -2315,24 +2353,102 @@ async fn skills_package_summary(
         })
         .collect::<Vec<_>>();
 
-    let slugs = installed_skill_slugs(&target).unwrap_or_default();
-
     Ok(SkillsPackageSummaryPayload {
         dir: target.to_string_lossy().into_owned(),
+        configured_skills_dir: snapshot.configured_skills_dir.to_string_lossy().into_owned(),
+        open_skills_enabled: snapshot.open_skills_enabled,
+        generation: snapshot.generation,
         total: names.len(),
         names,
         items,
-        slugs,
+        slugs: snapshot.installed_slugs,
+        runtime_visible_slugs: snapshot.runtime_visible_slugs,
     })
 }
 
 fn skills_target_dir(config: &Config) -> PathBuf {
-    config
-        .skills
-        .open_skills_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.workspace_dir.join("skills"))
+    resolve_configured_skills_dir(config)
+}
+
+#[tauri::command]
+async fn list_skill_catalog(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::skills::SkillCatalog, String> {
+    let app_state = state.lock().await;
+    let config = app_state.runtime.get_config().await;
+    Ok(omninova_core::skills::list_skill_catalog(&config))
+}
+
+#[tauri::command]
+async fn list_command_palette(
+    query: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::skills::CommandPalette, String> {
+    let app_state = state.lock().await;
+    let config = app_state.runtime.get_config().await;
+    let palette = omninova_core::skills::list_command_palette(&config);
+    Ok(omninova_core::skills::filter_command_palette(
+        &palette,
+        query.as_deref().unwrap_or(""),
+    ))
+}
+
+#[tauri::command]
+fn list_contract_review_engines(
+) -> Vec<omninova_core::contract_review::ContractReviewEngineProfile> {
+    omninova_core::contract_review::contract_review_engines()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn prepare_contract_review(
+    paths: Vec<String>,
+    extra_instructions: Option<String>,
+    selected_engine: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let config = {
+        let app_state = state.lock().await;
+        app_state.runtime.get_config().await
+    };
+    let provider_id = config.default_provider.as_deref().unwrap_or("").trim();
+    let provider_configured = !provider_id.is_empty()
+        && config.default_model.as_deref().is_some_and(|model| !model.trim().is_empty())
+        && (config.model_providers.get(provider_id).is_some_and(|provider| provider.enabled)
+            || config.providers.iter().any(|provider| provider.id == provider_id && provider.enabled)
+            || config.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()));
+    if !provider_configured {
+        return Err("请先配置 AI 模型服务。".into());
+    }
+    if paths.is_empty() {
+        return Err("请至少上传一份合同后再开始审核。".into());
+    }
+    let mut documents = Vec::with_capacity(paths.len());
+    for path in paths {
+        let extracted = omninova_core::contract_review::extract_document_text(Path::new(&path))
+            .map_err(|error| error.to_string())?;
+        documents.push(omninova_core::contract_review::ContractDocument {
+            name: extracted.name,
+            text: extracted.text,
+        });
+    }
+    let request = omninova_core::contract_review::ContractReviewRequest {
+        documents,
+        extra_instructions: extra_instructions.unwrap_or_default(),
+        selected_engine: selected_engine.unwrap_or_else(|| {
+            omninova_core::contract_review::DEFAULT_CONTRACT_REVIEW_ENGINE.into()
+        }),
+    };
+    let report = omninova_core::contract_review::review_contracts(&request)
+        .map_err(|error| error.to_string())?;
+    let prompt = omninova_core::contract_review::build_provider_request(&request, &report)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "mode": report.mode,
+        "prompt": prompt,
+        "markdown": report.to_markdown(),
+        "export": report.to_export_json(),
+        "engine": report.engine,
+    }))
 }
 
 #[tauri::command]
@@ -2656,6 +2772,11 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             max_history_messages: Some(config.agent.max_history_messages),
             mbti_type: None,
         }),
+        skills: SetupSkillsConfig {
+            open_skills_enabled: config.skills.open_skills_enabled,
+            open_skills_dir: config.skills.open_skills_dir.clone(),
+            prompt_injection_mode: config.skills.prompt_injection_mode.clone(),
+        },
     }
 }
 
@@ -2759,12 +2880,18 @@ fn channels_from_core(config: &Config) -> SetupChannelsConfig {
 }
 
 fn inbound_from_payload(payload: UiInboundPayload) -> InboundMessage {
+    let mut metadata = payload.metadata;
+    if let Some(invocations) = payload.skill_invocations {
+        metadata
+            .entry("skill_invocations".to_string())
+            .or_insert(invocations);
+    }
     InboundMessage {
         channel: payload.channel.unwrap_or(ChannelKind::Cli),
         user_id: normalize_optional_string(payload.user_id),
         session_id: normalize_optional_string(payload.session_id),
         text: payload.text.trim().to_string(),
-        metadata: payload.metadata,
+        metadata,
     }
 }
 
@@ -2927,6 +3054,11 @@ fn setup_config_to_core(
             }
         }
     }
+
+    current.skills.open_skills_enabled = setup.skills.open_skills_enabled;
+    current.skills.open_skills_dir = normalize_optional_string(setup.skills.open_skills_dir);
+    current.skills.prompt_injection_mode =
+        normalize_optional_string(setup.skills.prompt_injection_mode);
 
     current.multimodal.desktop_vision_enabled = setup.multimodal.desktop_vision_enabled;
     current.multimodal.desktop_vision_max_dimension_px = setup
@@ -4033,6 +4165,10 @@ pub fn run() {
             cli_install_to_user_path,
             import_skills,
             skills_package_summary,
+            list_skill_catalog,
+            list_command_palette,
+            list_contract_review_engines,
+            prepare_contract_review,
             skillhub_browse,
             skillhub_category_list,
             skillhub_install_skill,

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CHANNEL_PRESETS,
+  DEFAULT_OPEN_SKILLS_ENABLED,
   DEFAULT_PROVIDERS,
   DEFAULT_ROBOT_CONFIG,
   type Config,
@@ -198,7 +199,7 @@ const initialConfig: Config = {
     named_tunnel_hostname: null,
   },
   skills: {
-    open_skills_enabled: true,
+    open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
     prompt_injection_mode: "full",
   },
   agent: {
@@ -1871,7 +1872,7 @@ export function Setup({
       case "skills":
         return (
           <SkillsConfigForm
-            config={config.skills || { open_skills_enabled: true }}
+            config={config.skills ?? { open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED }}
             onChange={(skills) => setConfig({ ...config, skills })}
           />
         );

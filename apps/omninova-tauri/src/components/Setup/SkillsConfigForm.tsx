@@ -21,10 +21,14 @@ interface SkillItem {
 
 interface SkillsPackageSummary {
   dir: string;
+  configuredSkillsDir?: string;
+  openSkillsEnabled?: boolean;
+  generation?: number;
   total: number;
   names: string[];
   items?: SkillItem[];
   slugs?: string[];
+  runtimeVisibleSlugs?: string[];
 }
 
 interface StatusNote {
@@ -241,11 +245,6 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
   const MARKET_PAGE_SIZE = 24;
 
   const refreshSummary = useCallback(async () => {
-    if (!config.open_skills_enabled) {
-      setSummary(null);
-      setSummaryError(null);
-      return;
-    }
     setIsLoadingSummary(true);
     setSummaryError(null);
     try {
@@ -256,7 +255,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     } finally {
       setIsLoadingSummary(false);
     }
-  }, [config.open_skills_enabled]);
+  }, []);
 
   useEffect(() => {
     void refreshSummary();
@@ -266,6 +265,12 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     () => new Set(summary?.slugs ?? []),
     [summary]
   );
+  const runtimeVisibleSlugs = useMemo(
+    () => new Set(summary?.runtimeVisibleSlugs ?? []),
+    [summary]
+  );
+  const runtimeEnabled = summary?.openSkillsEnabled ?? false;
+  const enableUnsaved = config.open_skills_enabled !== runtimeEnabled;
 
   useEffect(() => {
     try {
@@ -497,6 +502,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
   const renderMarketCard = (item: SkillHubItem) => {
     const installed = installedSlugs.has(item.slug);
+    const runtimeVisible = runtimeVisibleSlugs.has(item.slug);
     const busy =
       installingSlug === item.slug ||
       rollingBackSlug === item.slug ||
@@ -508,7 +514,14 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
           <MarketBrandIcon item={item} />
         </div>
         <div className="market-card-body">
-          <div className="market-card-name">{item.name}</div>
+          <div className="market-card-name">
+            {item.name}
+            {installed ? (
+              <span className="market-card-tag" style={{ marginLeft: 8 }}>
+                {runtimeVisible ? "已安装 · Runtime 可见" : "已安装"}
+              </span>
+            ) : null}
+          </div>
           <div className="market-card-desc">
             {item.description || "（该技能未提供描述）"}
           </div>
@@ -551,7 +564,13 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             className={`market-card-btn${installed ? " is-installed" : ""}`}
             disabled={busy}
             onClick={() => void handleInstall(item, installed)}
-            title={installed ? "下载最新版并保留当前版本用于回滚" : "安装到本地技能库"}
+            title={
+              installed
+                ? runtimeVisible
+                  ? "磁盘已安装，且当前 Runtime 会注入"
+                  : "已安装表示文件存在，不等于 Runtime 正在使用"
+                : "安装到本地技能库"
+            }
           >
             {installingSlug === item.slug ? (
               "处理中…"
@@ -612,6 +631,15 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
           >
             <span className="skill-switch-knob" />
           </button>
+        </div>
+        <div className="skill-dir-hint" style={{ marginTop: 10 }}>
+          Runtime 启用（已保存）：<strong>{runtimeEnabled ? "是" : "否"}</strong>
+          {enableUnsaved ? " · 开关有未保存更改，保存配置后 Agent 才会使用" : null}
+          <br />
+          已安装目录：<code>{summary?.dir || config.open_skills_dir || "（尚未扫描）"}</code>
+          {summary?.generation != null ? ` · generation ${summary.generation}` : null}
+          <br />
+          「已安装」只表示文件存在；Agent 注入还需 Runtime 启用以保存配置为准。
         </div>
       </section>
 

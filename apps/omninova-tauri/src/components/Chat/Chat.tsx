@@ -16,6 +16,7 @@ import {
   formatTime,
   loadChatStorage,
   mergeAvatarSessions,
+  mergeLocalMessageMetadata,
   saveChatStorage,
   type StoredAvatarSession,
   type StoredChatMessage,
@@ -64,6 +65,28 @@ import {
   readStoredModelSelection,
   type PickerProvider,
 } from "./ModelPicker";
+import { CommandPalette as CommandPaletteMenu } from "./CommandPalette";
+import { ContractReviewPanel, ContractReviewReport } from "./ContractReviewPanel";
+import type {
+  ContractReviewStage,
+  ContractReviewEngineCard,
+  PreparedContractReview,
+} from "./contractReviewModel";
+import {
+  DEFAULT_CONTRACT_REVIEW_ENGINES,
+  friendlyContractReviewError,
+} from "./contractReviewModel";
+import {
+  commandTokenAt,
+  emptyCommandPalette,
+  filterCommandPalette,
+  paletteRows,
+  resolveComposerSend,
+  type CommandPalette,
+  type CommandPaletteItem,
+  type SelectedSkill,
+  type SelectedSystemTool,
+} from "./commandPaletteModel";
 
 const GATEWAY_STATUS_POLL_MS = 8000;
 import omninovalLogo from "../../assets/omninoval-logo.png";
@@ -90,6 +113,8 @@ const SESSION_WORKSPACE_STORAGE_KEY = "omninova.chat.sessionWorkspaces.v1";
 const COMPOSER_HEIGHT_STORAGE_KEY = "omninova.chat.composerHeight.v1";
 const COMPOSER_MIN_HEIGHT = 54;
 const COMPOSER_MAX_HEIGHT = 240;
+const COMPOSER_HELP_TEXT =
+  "可用命令：\n/help — 显示帮助\n/skills — 打开技能设置\n输入 / 打开命令面板，选择已安装技能后再发送任务。";
 
 const TEXT_FILE_EXTENSIONS = new Set([
   "txt",
@@ -322,6 +347,11 @@ interface ChatMessage extends StoredChatMessage {
   steps?: ExecutionStep[];
 }
 
+interface ContractReviewUiState {
+  stage: ContractReviewStage;
+  error?: string;
+}
+
 type SidebarTab = "avatars" | "history";
 
 interface ChatProps {
@@ -397,11 +427,27 @@ export function Chat({
   const safetyTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const commandFallbackTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const runAvatarIdsRef = useRef<Record<string, string>>({});
+  const contractReviewRunAvatarIdsRef = useRef<Record<string, string>>({});
   const activeRunIdRef = useRef<string | null>(null);
   const terminalRunIdsRef = useRef<Set<string>>(new Set());
   const completedRunIdsRef = useRef<Set<string>>(new Set());
   const insertedReplyRunIdsRef = useRef<Set<string>>(new Set());
   const runsRef = useRef(runs);
+  const [selectedSkills, setSelectedSkills] = useState<Record<string, SelectedSkill>>({});
+  const [selectedSystemTools, setSelectedSystemTools] = useState<Record<string, SelectedSystemTool>>({});
+  const [contractReviewEngines, setContractReviewEngines] = useState<ContractReviewEngineCard[]>(
+    DEFAULT_CONTRACT_REVIEW_ENGINES
+  );
+  const [selectedContractEngine, setSelectedContractEngine] = useState("omninova-contract-risk");
+  const [contractExtraInstructions, setContractExtraInstructions] = useState("");
+  const [contractReviewUiByAvatar, setContractReviewUiByAvatar] = useState<
+    Record<string, ContractReviewUiState>
+  >({});
+  const [lastRiskExport, setLastRiskExport] = useState<unknown>(null);
+  const [commandPalette, setCommandPalette] = useState<CommandPalette>(() => emptyCommandPalette());
+  const [composerCursor, setComposerCursor] = useState(0);
+  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [paletteDismissedToken, setPaletteDismissedToken] = useState<string | null>(null);
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [composerInputHeight, setComposerInputHeight] = useState(() => {
     const stored = Number(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
@@ -461,6 +507,24 @@ export function Chat({
     () => messagesBySession[activeAvatarId] ?? [],
     [messagesBySession, activeAvatarId]
   );
+  const contractReportMessageIndexes = useMemo(() => {
+    const indexes = new Set<number>();
+    messages.forEach((message, index) => {
+      const request = messages[index - 1];
+      if (
+        message.role === "assistant" &&
+        request?.role === "user" &&
+        request.toolId === "tool:contract-review"
+      ) {
+        indexes.add(index);
+      }
+    });
+    return indexes;
+  }, [messages]);
+  const latestContractReportIndex = useMemo(() => {
+    const indexes = Array.from(contractReportMessageIndexes);
+    return indexes.length ? indexes[indexes.length - 1] : -1;
+  }, [contractReportMessageIndexes]);
 
   // 仅反映「当前查看的会话」的运行/输入状态。
   const activeRun = runs[activeAvatarId];
@@ -470,6 +534,19 @@ export function Chat({
   const activeRunId = activeRun?.runId ?? null;
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
+  const selectedSkill = selectedSkills[activeAvatarId];
+  const selectedSystemTool = selectedSystemTools[activeAvatarId];
+  const contractReviewUi = contractReviewUiByAvatar[activeAvatarId] ?? {
+    stage: "idle" as const,
+  };
+  const commandToken = commandTokenAt(input, composerCursor);
+  const filteredPalette = useMemo(
+    () => filterCommandPalette(commandPalette, commandToken?.token ?? ""),
+    [commandPalette, commandToken?.token]
+  );
+  const paletteRowItems = useMemo(() => paletteRows(filteredPalette), [filteredPalette]);
+  const paletteVisible =
+    Boolean(commandToken) && paletteDismissedToken !== commandToken?.token;
   const activeTask = useMemo(() => {
     const selected = selectedTaskRunId
       ? taskHistory.find((task) => task.runId === selectedTaskRunId)
@@ -604,6 +681,129 @@ export function Chat({
     [activeAvatarId]
   );
 
+  const syncComposerCursor = useCallback((target: HTMLTextAreaElement) => {
+    setComposerCursor(target.selectionStart ?? target.value.length);
+  }, []);
+
+  useEffect(() => {
+    if (!commandToken) {
+      setPaletteDismissedToken(null);
+      return;
+    }
+    let cancelled = false;
+    const handle = window.setTimeout(() => {
+      void invokeTauri<CommandPalette>("list_command_palette", { query: "" })
+        .then((result) => {
+          if (!cancelled) setCommandPalette(result);
+        })
+        .catch((reason) => {
+          if (!cancelled) {
+            setCommandPalette(emptyCommandPalette());
+            setError("命令面板加载失败，请检查网关连接后重试。");
+          }
+          if (import.meta.env.DEV) {
+            console.warn("[skill-ui] palette_load_failed", reason);
+          }
+        });
+    }, 60);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [commandToken?.token]);
+
+  useEffect(() => {
+    setPaletteIndex(0);
+  }, [commandToken?.token, filteredPalette.generation, paletteRowItems.length]);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    void invokeTauri<ContractReviewEngineCard[]>("list_contract_review_engines")
+      .then(setContractReviewEngines)
+      .catch((reason) => {
+        if (import.meta.env.DEV) console.warn("[contract-review] engine_list_failed", reason);
+      });
+  }, []);
+
+  const applyPaletteSelection = useCallback(
+    (item: CommandPaletteItem) => {
+      if (!commandToken) return;
+      if (import.meta.env.DEV) {
+        console.log(`[skill-ui] palette_select id=${item.id} kind=${item.kind} enabled=${item.enabled}`);
+      }
+      const next = `${input.slice(0, commandToken.start)}${input.slice(commandToken.end)}`.replace(
+        /^\s+/,
+        ""
+      );
+      setActiveInput(next);
+      setComposerCursor(Math.min(commandToken.start, next.length));
+      // Selection exits command mode immediately. The slash token must not
+      // remain active while the user types the actual task.
+      setPaletteDismissedToken(commandToken.token);
+      if (item.id === "system:help") {
+        setMessagesBySession((prev) => ({
+          ...prev,
+          [activeAvatarId]: [
+            ...(prev[activeAvatarId] ?? []),
+            { role: "assistant", content: COMPOSER_HELP_TEXT },
+          ],
+        }));
+        return;
+      }
+      if (item.id === "system:skills") {
+        onOpenSettings?.("skills");
+        return;
+      }
+      if (item.kind === "system_tool" && item.id === "tool:contract-review") {
+        setSelectedSystemTools((prev) => ({
+          ...prev,
+          [activeAvatarId]: {
+            id: "tool:contract-review",
+            displayName: item.displayName,
+            commandAlias: item.commandAlias,
+          },
+        }));
+        setSelectedSkills((prev) => {
+          if (!prev[activeAvatarId]) return prev;
+          const nextSkills = { ...prev };
+          delete nextSkills[activeAvatarId];
+          return nextSkills;
+        });
+        return;
+      }
+      if (item.kind === "skill") {
+        if (!item.enabled) {
+          setError("所选技能当前不可用，请重新选择。");
+          setMessagesBySession((prev) => ({
+            ...prev,
+            [activeAvatarId]: [
+              ...(prev[activeAvatarId] ?? []),
+              { role: "assistant", content: "所选技能当前不可用。" },
+            ],
+          }));
+          return;
+        }
+        // Keep the selected catalog identity synchronously. A refresh is still
+        // performed at send time, but it must not race the chip/input state.
+        setSelectedSkills((prev) => ({
+          ...prev,
+          [activeAvatarId]: {
+            id: item.id,
+            displayName: item.displayName,
+            commandAlias: item.commandAlias,
+          },
+        }));
+        setSelectedSystemTools((prev) => {
+          if (!prev[activeAvatarId]) return prev;
+          const nextTools = { ...prev };
+          delete nextTools[activeAvatarId];
+          return nextTools;
+        });
+      }
+    },
+    [activeAvatarId, commandToken, input, onOpenSettings, setActiveInput]
+  );
+
   useEffect(() => {
     setSidebarTab(initialSidebarTab);
   }, [initialSidebarTab]);
@@ -628,7 +828,9 @@ export function Chat({
 
         setMessagesBySession((prev) => {
           const current = prev[avatarId] ?? [];
-          const next = remote.length > 0 ? remote : current;
+          const next = remote.length > 0
+            ? mergeLocalMessageMetadata(remote, current)
+            : current;
           if (areStoredMessagesEqual(current, next)) {
             return prev;
           }
@@ -822,31 +1024,60 @@ export function Chat({
 
         terminalRunIdsRef.current.add(runId);
         completedRunIdsRef.current.add(runId);
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
 
         if (cancelledRef.current[avatarId]) {
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
           appendTaskActivity(runId, "任务已取消（由命令结果确认）", "warning");
           finalizeTask(runId, "cancelled");
+          if (contractAvatarId) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [contractAvatarId]: { stage: "cancelled" },
+            }));
+          }
         } else if ("reply" in outcome) {
           const reply = outcome.reply.trim();
           if (reply) {
             appendAssistantMessageOnce(runId, reply, avatarId);
             appendTaskActivity(runId, "任务已完成（终态事件兜底）", "success");
             finalizeTask(runId, "completed", reply);
+            if (contractAvatarId) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [contractAvatarId]: { stage: "completed" },
+              }));
+            }
           } else {
             const message = "模型请求已结束，但没有返回可显示的内容。";
             setError(message);
             appendAssistantMessageOnce(runId, `任务失败：${message}`, avatarId);
             appendTaskActivity(runId, message, "error");
             finalizeTask(runId, "failed", message);
+            if (contractAvatarId) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [contractAvatarId]: { stage: "failed", error: message },
+              }));
+            }
           }
         } else {
-          setError(outcome.error);
-          appendAssistantMessageOnce(runId, `任务失败：${outcome.error}`, avatarId);
-          appendTaskActivity(runId, `任务失败：${outcome.error}`, "error");
-          finalizeTask(runId, "failed", outcome.error);
+          const displayError = contractAvatarId
+            ? friendlyContractReviewError(outcome.error)
+            : outcome.error;
+          setError(displayError);
+          appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
+          appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+          finalizeTask(runId, "failed", displayError);
+          if (contractAvatarId) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [contractAvatarId]: { stage: "failed", error: displayError },
+            }));
+          }
         }
 
+        delete contractReviewRunAvatarIdsRef.current[runId];
         void refreshTaskArtifacts(runId);
         finishRun(runId);
       }, 600);
@@ -1196,6 +1427,35 @@ export function Chat({
           toolName,
           detail: summary || undefined,
         });
+      } else if (eventType === "skill_activated" || eventType === "skillActivated") {
+        const skillId = stringValue("skill_id", "skillId");
+        const skillName = stringValue("display_name", "displayName") || skillId;
+        const avatarId = findAvatarIdByRunId(runId);
+        if (avatarId && skillId) {
+          setMessagesBySession((prev) => {
+            const existing = prev[avatarId] ?? [];
+            let index = -1;
+            for (let i = existing.length - 1; i >= 0; i -= 1) {
+              if (existing[i]?.role === "user") {
+                index = i;
+                break;
+              }
+            }
+            if (index < 0) return prev;
+            const nextMessages = existing.slice();
+            nextMessages[index] = {
+              ...nextMessages[index],
+              skillId,
+              skillName,
+            };
+            return { ...prev, [avatarId]: nextMessages };
+          });
+        }
+        appendTaskActivity(runId, `已启用技能：${skillName}`, "info", {
+          kind: "lifecycle",
+          status: "completed",
+          detail: skillId,
+        });
       } else if (eventType === "model_started" || eventType === "modelStarted") {
         const title = stringValue("title") || "模型开始分析";
         appendTaskActivity(runId, title, "info", {
@@ -1205,6 +1465,13 @@ export function Chat({
         });
       } else if (eventType === "model_completed" || eventType === "modelCompleted") {
         const title = stringValue("title") || "模型阶段已完成";
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "generating" },
+          }));
+        }
         appendTaskActivity(runId, title, "success", {
           kind: "model",
           status: "completed",
@@ -1268,16 +1535,39 @@ export function Chat({
           if (import.meta.env.DEV) {
             console.log("[appendAssistantMessageOnce] run_id=" + runId + " reply_len=" + finalReply.length);
           }
-          if (!cancelledRef.current[avatarId]) {
-            appendAssistantMessageOnce(runId, finalReply, avatarId);
+          if (!finalReply.trim()) {
+            const emptyOutputError = "模型本次未返回可显示的内容，请重试或更换技能。";
+            setError(emptyOutputError);
+            if (contractReviewRunAvatarIdsRef.current[runId]) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [avatarId]: { stage: "failed", error: emptyOutputError },
+              }));
+            }
+            if (!cancelledRef.current[avatarId]) {
+              appendAssistantMessageOnce(runId, `任务失败：${emptyOutputError}`, avatarId);
+            }
+            appendTaskActivity(runId, `任务失败：${emptyOutputError}`, "error");
+            finalizeTask(runId, "failed", emptyOutputError);
+          } else {
+            if (!cancelledRef.current[avatarId]) {
+              appendAssistantMessageOnce(runId, finalReply, avatarId);
+            }
+            if (contractReviewRunAvatarIdsRef.current[runId]) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [avatarId]: { stage: "completed" },
+              }));
+            }
+            appendTaskActivity(runId, "任务已完成", "success");
+            finalizeTask(runId, "completed", finalReply);
           }
-          appendTaskActivity(runId, "任务已完成", "success");
-          finalizeTask(runId, "completed", finalReply);
           void refreshTaskArtifacts(runId);
         }
         if (import.meta.env.DEV) {
           console.log("[finishRun] run_id=" + runId);
         }
+        delete contractReviewRunAvatarIdsRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1288,8 +1578,15 @@ export function Chat({
           appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
           appendTaskActivity(runId, "任务已取消", "warning");
           finalizeTask(runId, "cancelled");
+          if (contractReviewRunAvatarIdsRef.current[runId]) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [avatarId]: { stage: "cancelled", error: "审核已取消，可以调整文件或审核要求后重新开始。" },
+            }));
+          }
           void refreshTaskArtifacts(runId);
         }
+        delete contractReviewRunAvatarIdsRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1297,14 +1594,26 @@ export function Chat({
       if (!completedRunIdsRef.current.has(runId)) {
         completedRunIdsRef.current.add(runId);
         const rawError = payload.error || payload.message || "Agent run failed";
-        setError(rawError);
-        if (!cancelledRef.current[avatarId]) {
-          appendAssistantMessageOnce(runId, `任务失败：${rawError}`, avatarId);
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
+        const displayError = contractAvatarId ? friendlyContractReviewError(rawError) : rawError;
+        setError(displayError);
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "failed", error: displayError },
+          }));
+          if (import.meta.env.DEV) {
+            console.warn("[contract-review] run_failed", rawError);
+          }
         }
-        appendTaskActivity(runId, `任务失败：${rawError}`, "error");
-        finalizeTask(runId, "failed", rawError);
+        if (!cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
+        }
+        appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+        finalizeTask(runId, "failed", displayError);
         void refreshTaskArtifacts(runId);
       }
+      delete contractReviewRunAvatarIdsRef.current[runId];
       finishRun(runId);
     }).then((fn) => {
       if (disposed) {
@@ -1460,6 +1769,12 @@ export function Chat({
         delete next[id];
         return next;
       });
+      setSelectedSkills((prev) => {
+        if (!prev[id]) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       setAttachmentsBySession((prev) => {
         if (!prev[id]) return prev;
         const next = { ...prev };
@@ -1525,14 +1840,150 @@ export function Chat({
     });
   }, [activeAvatarId, activeRunId]);
 
-  const handleSend = async () => {
+  const handleExportRiskJson = useCallback(() => {
+    if (!lastRiskExport) return;
+    const blob = new Blob([JSON.stringify(lastRiskExport, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "contract-review.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [lastRiskExport]);
+
+  const handleStartContractReview = async () => {
+    if (!modelReady) {
+      setError("请先配置 AI 模型服务。");
+      return;
+    }
+    if (gatewayStatus !== "connected") {
+      const message = "Gateway 尚未连接，请启动 Gateway 后再开始审核。";
+      setError(message);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "failed", error: message },
+      }));
+      return;
+    }
+    const pending = attachmentsBySession[activeAvatarId] ?? [];
+    const paths = pending.map((item) => item.sourcePath).filter((path): path is string => Boolean(path));
+    if (!paths.length) {
+      setError("请先上传合同文件（DOCX、文字层 PDF、TXT 或 MD）。");
+      return;
+    }
+    setLastRiskExport(null);
+    setContractReviewUiByAvatar((prev) => ({
+      ...prev,
+      [activeAvatarId]: { stage: "preparing" },
+    }));
+    setError(null);
+    try {
+      const prepared = await invokeTauri<PreparedContractReview>("prepare_contract_review", {
+        paths,
+        extraInstructions: contractExtraInstructions,
+        selectedEngine: selectedContractEngine,
+      });
+      setLastRiskExport(prepared.export);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "reviewing" },
+      }));
+      await handleSend({
+        text: prepared.prompt,
+        displayText: `合同智能审核：${pending.map((item) => item.name).join("、")}`,
+        includeAttachments: false,
+        contractEngineName: prepared.engine.name,
+      });
+    } catch (reason) {
+      const displayError = friendlyContractReviewError(reason);
+      setContractReviewUiByAvatar((prev) => ({
+        ...prev,
+        [activeAvatarId]: { stage: "failed", error: displayError },
+      }));
+      setError(displayError);
+      if (import.meta.env.DEV) {
+        console.warn("[contract-review] prepare_failed", reason);
+      }
+    }
+  };
+
+  async function handleSend(opts?: {
+    text?: string;
+    displayText?: string;
+    includeAttachments?: boolean;
+    contractEngineName?: string;
+  }) {
     // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
     // 即使用户中途切换到其它会话也互不影响。
     const avatarId = activeAvatarId;
     const targetSessionId = sessionId;
-    const text = input.trim();
+    const selectedForSend = opts?.text == null ? selectedSkills[avatarId] : undefined;
+    if (import.meta.env.DEV) {
+      console.log(
+        `[skill-ui] handle_send text_len=${input.trim().length} skill_id=${selectedForSend?.id ?? "none"}`
+      );
+    }
+    const resolved = opts?.text == null
+      ? resolveComposerSend(input.trim(), selectedForSend, commandPalette)
+      : { text: opts.text.trim(), invocations: [], local: undefined, systemTool: undefined };
+    if (resolved.local === "help") {
+      setActiveInput("");
+      setMessagesBySession((prev) => ({
+        ...prev,
+        [avatarId]: [...(prev[avatarId] ?? []), { role: "assistant", content: COMPOSER_HELP_TEXT }],
+      }));
+      return;
+    }
+    if (resolved.local === "skills") {
+      setActiveInput("");
+      onOpenSettings?.("skills");
+      return;
+    }
+    if (resolved.systemTool === "contract-review") {
+      const tool = commandPalette.system.find((item) => item.id === "tool:contract-review");
+      if (tool) applyPaletteSelection(tool);
+      setActiveInput(resolved.text);
+      return;
+    }
+    const text = resolved.text;
+    const skillInvocations = resolved.invocations;
+    if (selectedForSend) {
+      try {
+        if (import.meta.env.DEV) {
+          console.log(`[skill-ui] validating skill id=${selectedForSend.id}`);
+        }
+        const latest = await invokeTauri<CommandPalette>("list_command_palette", { query: "" });
+        const live = latest.skills.find((item) => item.id === selectedForSend.id && item.enabled);
+        if (!live) {
+          setError("所选技能当前不可用，请重新选择。");
+          if (import.meta.env.DEV) {
+            console.warn(`[skill-ui] stale_skill id=${selectedForSend.id}`);
+          }
+          setSelectedSkills((prev) => {
+            if (!prev[avatarId]) return prev;
+            const next = { ...prev };
+            delete next[avatarId];
+            return next;
+          });
+          return;
+        }
+      } catch (reason) {
+        const detail = reason instanceof Error ? reason.message : String(reason);
+        setError(`技能列表刷新失败，请重试发送。${detail ? `（${detail}）` : ""}`);
+        if (import.meta.env.DEV) {
+          console.error(`[skill-ui] skill_validation_failed id=${selectedForSend.id}`, reason);
+        }
+        return;
+      }
+    }
     // bug#1/#2：附件在发送时才拼接进正文；聊天气泡只显示简洁的附件名。
-    let pendingAttachments = attachmentsBySession[avatarId] ?? [];
+    let pendingAttachments = opts?.includeAttachments === false
+      ? []
+      : attachmentsBySession[avatarId] ?? [];
+    if (selectedSystemTools[avatarId]?.id === "tool:contract-review" && opts?.text == null) {
+      setError("合同智能审核已激活，请在审核面板中上传合同并点击开始审核。");
+      return;
+    }
     const active = runsRef.current[avatarId]?.runId ?? (avatarId === activeAvatarId ? activeRunIdRef.current : null);
     if (active && terminalRunIdsRef.current.has(active)) {
       finishRun(active);
@@ -1540,6 +1991,8 @@ export function Chat({
       setError("当前 Agent 仍在执行，请等待完成或取消。");
       return;
     }
+    // Selecting a skill is metadata, not a user request. Do not let Enter
+    // bypass the disabled send button and start an empty agent run.
     if (!text && pendingAttachments.length === 0) return;
     // Generate a run_id for real-time event correlation.
     const runId = crypto.randomUUID();
@@ -1594,9 +2047,9 @@ export function Chat({
       .filter(Boolean)
       .join("\n\n");
     const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
-    const displayText = pendingAttachments.length
+    const displayText = opts?.displayText ?? (pendingAttachments.length
       ? `${text ? `${text}\n\n` : ""}附件：${pendingAttachments.map((attachment) => attachment.name).join("、")}`
-      : text;
+      : text || (selectedForSend ? `使用技能 ${selectedForSend.displayName}` : text));
 
     // 本地维护该会话的步骤列表，避免依赖共享状态。
     let localSteps: ExecutionStep[] = [
@@ -1626,13 +2079,24 @@ export function Chat({
           : localSteps.map((step, i) => (i === idx ? nextStep : step))
       );
     };
+    if (opts?.contractEngineName) {
+      contractReviewRunAvatarIdsRef.current[runId] = avatarId;
+    }
     setActiveInput("");
-    setAttachmentsBySession((prev) => {
-      if (!prev[avatarId]?.length) return prev;
+    setSelectedSkills((prev) => {
+      if (!prev[avatarId]) return prev;
       const next = { ...prev };
       delete next[avatarId];
       return next;
     });
+    if (!opts?.contractEngineName) {
+      setAttachmentsBySession((prev) => {
+        if (!prev[avatarId]?.length) return prev;
+        const next = { ...prev };
+        delete next[avatarId];
+        return next;
+      });
+    }
     setError(null);
     cancelledRef.current[avatarId] = false;
     activeRunIdRef.current = runId;
@@ -1645,7 +2109,19 @@ export function Chat({
     stickToBottomRef.current = true;
     setMessagesBySession((prev) => ({
       ...prev,
-      [avatarId]: [...(prev[avatarId] ?? []), { role: "user", content: displayText }],
+      [avatarId]: [
+        ...(prev[avatarId] ?? []),
+        {
+          role: "user",
+          content: displayText,
+          ...(selectedForSend
+            ? { skillId: selectedForSend.id, skillName: selectedForSend.displayName }
+            : {}),
+          ...(opts?.contractEngineName
+            ? { toolId: "tool:contract-review", toolName: "合同智能审核", contractEngineName: opts.contractEngineName }
+            : {}),
+        },
+      ],
     }));
     setAvatars((prev) =>
       prev.map((a) =>
@@ -1713,7 +2189,16 @@ export function Chat({
         ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
         // Run ID for real-time event correlation between frontend and backend.
         run_id: runId,
+        ...(skillInvocations.length ? { skill_invocations: skillInvocations } : {}),
+        ...(opts?.contractEngineName
+          ? { system_tool: "tool:contract-review", contract_review_engine: opts.contractEngineName }
+          : {}),
       };
+      if (import.meta.env.DEV) {
+        console.log(
+          `[skill-ui] invoking skill_invocations=${skillInvocations.map((item) => item.skillId).join(",") || "none"}`
+        );
+      }
 
       if (desktopVisionOn && desktopVisionMaster && isTauriEnvironment()) {
         updateStep("桌面视觉", "running", "正在截取主屏幕…");
@@ -1740,6 +2225,9 @@ export function Chat({
             [avatarId]: (prev[avatarId] ?? []).slice(0, -1),
           }));
           setInputs((prev) => ({ ...prev, [avatarId]: text }));
+          if (selectedForSend) {
+            setSelectedSkills((prev) => ({ ...prev, [avatarId]: selectedForSend }));
+          }
           if (pendingAttachments.length) {
             setAttachmentsBySession((prev) => ({
               ...prev,
@@ -1756,10 +2244,16 @@ export function Chat({
         sessionId: targetSessionId,
         userId: USER_ID,
         metadata,
+        ...(skillInvocations.length ? { skillInvocations } : {}),
       };
       route = await invokeTauri<RouteDecision>("route_inbound_message", {
         payload,
-      }).catch(() => null);
+      }).catch((reason) => {
+        if (import.meta.env.DEV) {
+          console.warn("[skill-ui] route_preview_failed", reason);
+        }
+        return null;
+      });
       if (route) {
         updateStep(
           "路由选择",
@@ -1809,17 +2303,62 @@ export function Chat({
         console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
       const message = e instanceof Error ? e.message : String(e);
-      setError(`任务启动失败：${message}`);
-      appendTaskActivity(runId, `任务启动失败：${message}`, "error");
-      finalizeTask(runId, "failed", message);
+      const displayError = opts?.contractEngineName
+        ? friendlyContractReviewError(message)
+        : `任务启动失败：${message}`;
+      setError(displayError);
+      if (opts?.contractEngineName) {
+        setContractReviewUiByAvatar((prev) => ({
+          ...prev,
+          [avatarId]: { stage: "failed", error: displayError },
+        }));
+        delete contractReviewRunAvatarIdsRef.current[runId];
+      }
+      appendTaskActivity(runId, displayError, "error");
+      finalizeTask(runId, "failed", displayError);
       finishRun(runId);
     } finally {
       // outer finally (safety timer cleanup)
     }
-  };
+  }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const composing = e.nativeEvent.isComposing || e.key === "Process";
+    if (paletteVisible && !composing) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (!paletteRowItems.length) return;
+        setPaletteIndex((index) => (index + 1) % paletteRowItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (!paletteRowItems.length) return;
+        setPaletteIndex((index) => (index - 1 + paletteRowItems.length) % paletteRowItems.length);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setPaletteDismissedToken(commandToken?.token ?? "/");
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const item = paletteRowItems[paletteIndex];
+        if (item) applyPaletteSelection(item);
+        return;
+      }
+    }
+    if (e.key === "Backspace" && !input && selectedSkill && !composing) {
+      setSelectedSkills((prev) => {
+        if (!prev[activeAvatarId]) return prev;
+        const next = { ...prev };
+        delete next[activeAvatarId];
+        return next;
+      });
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey && !composing) {
       e.preventDefault();
       void handleSend();
     }
@@ -2480,13 +3019,23 @@ export function Chat({
                 </div>
               </div>
             ) : (
-              messages.map((msg, i) => (
+              messages.map((msg, i) => {
+                const isContractReport = contractReportMessageIndexes.has(i);
+                const contractRequest = isContractReport ? messages[i - 1] : undefined;
+                return (
                 <div
                   key={i}
-                  className={`chat-bubble chat-bubble-${msg.role}`}
+                  className={`chat-bubble chat-bubble-${msg.role}${isContractReport ? " chat-bubble-contract-review" : ""}`}
                 >
                   <div className="chat-bubble-content">
-                    {msg.role === "assistant" ? (
+                    {isContractReport ? (
+                      <ContractReviewReport
+                        content={msg.content}
+                        engineName={contractRequest?.contractEngineName}
+                        exportData={i === latestContractReportIndex ? lastRiskExport : undefined}
+                        onExport={i === latestContractReportIndex && lastRiskExport ? handleExportRiskJson : undefined}
+                      />
+                    ) : msg.role === "assistant" ? (
                       <MarkdownMessage content={msg.content} workspacePath={activeWorkspaceDir} />
                     ) : (
                       msg.content
@@ -2510,9 +3059,19 @@ export function Chat({
                   {msg.agent && (
                     <div className="chat-bubble-meta">Agent: {msg.agent}</div>
                   )}
+                  {msg.skillName && (
+                    <div className="chat-bubble-meta">使用技能：{msg.skillName}</div>
+                  )}
+                  {msg.toolName && (
+                    <div className="chat-bubble-meta">使用工具：{msg.toolName}</div>
+                  )}
+                  {msg.contractEngineName && (
+                    <div className="chat-bubble-meta">审核引擎：{msg.contractEngineName}</div>
+                  )}
                   {msg.steps?.length ? <ExecutionSteps steps={msg.steps} /> : null}
                 </div>
-              ))
+                );
+              })
             )}
             {sending && (
               <div className="chat-bubble chat-bubble-assistant chat-bubble-typing">
@@ -2568,11 +3127,70 @@ export function Chat({
               id={CHAT_ATTACHMENT_INPUT_ID}
               type="file"
               multiple
+              accept={selectedSystemTool?.id === "tool:contract-review" ? ".docx,.pdf,.txt,.md" : undefined}
               disabled={sending}
               className="chat-file-input-hidden"
               aria-label="选择附件文件"
               onChange={handleAttachFilesChange}
             />
+            <div className="chat-composer-stack">
+            {paletteVisible ? (
+              <CommandPaletteMenu
+                palette={filteredPalette}
+                selectedIndex={
+                  paletteRowItems.length
+                    ? Math.min(paletteIndex, paletteRowItems.length - 1)
+                    : 0
+                }
+                onHover={setPaletteIndex}
+                onSelect={applyPaletteSelection}
+              />
+            ) : null}
+            {selectedSystemTool?.id === "tool:contract-review" ? (
+              <ContractReviewPanel
+                attachments={attachments}
+                engines={contractReviewEngines}
+                selectedEngine={selectedContractEngine}
+                extraInstructions={contractExtraInstructions}
+                stage={contractReviewUi.stage}
+                documentsPrepared={lastRiskExport != null}
+                elapsedSec={elapsedSec}
+                error={contractReviewUi.error}
+                onChooseFiles={() => {
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                  if (isTauriEnvironment()) {
+                    void handleAttachTauri();
+                  } else {
+                    document.getElementById(CHAT_ATTACHMENT_INPUT_ID)?.click();
+                  }
+                }}
+                onDropFiles={(files) => {
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                  void mergeDroppedIntoInput(files).catch((reason) => {
+                    setError(reason instanceof Error ? reason.message : String(reason));
+                  });
+                }}
+                onRemoveAttachment={(id) => {
+                  removeAttachment(id);
+                  setLastRiskExport(null);
+                  setContractReviewUiByAvatar((prev) => ({
+                    ...prev,
+                    [activeAvatarId]: { stage: "idle" },
+                  }));
+                }}
+                onEngineChange={setSelectedContractEngine}
+                onInstructionsChange={setContractExtraInstructions}
+                onStart={() => void handleStartContractReview()}
+              />
+            ) : null}
             <div className="chat-composer-card">
               <div
                 className="chat-composer-resize-handle"
@@ -2589,7 +3207,53 @@ export function Chat({
               >
                 <span aria-hidden />
               </div>
-              {attachments.length ? (
+              {selectedSkill ? (
+                <div className="chat-skill-chips" aria-label="已选择技能">
+                  <span className="chat-skill-chip">
+                    <UiIcon name="apps" size={13} />
+                    <span className="chat-skill-chip-name">{selectedSkill.displayName}</span>
+                    <button
+                      type="button"
+                      className="chat-skill-chip-remove"
+                      aria-label={`取消技能 ${selectedSkill.displayName}`}
+                      onClick={() =>
+                        setSelectedSkills((prev) => {
+                          if (!prev[activeAvatarId]) return prev;
+                          const next = { ...prev };
+                          delete next[activeAvatarId];
+                          return next;
+                        })
+                      }
+                      disabled={sending}
+                    >
+                      <UiIcon name="close" size={11} />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
+              {selectedSystemTool ? (
+                <div className="chat-skill-chips" aria-label="已选择系统工具">
+                  <span className="chat-skill-chip">
+                    <UiIcon name="settings" size={13} />
+                    <span className="chat-skill-chip-name">{selectedSystemTool.displayName}</span>
+                    <button
+                      type="button"
+                      className="chat-skill-chip-remove"
+                      aria-label={`取消工具 ${selectedSystemTool.displayName}`}
+                      onClick={() => setSelectedSystemTools((prev) => {
+                        if (!prev[activeAvatarId]) return prev;
+                        const next = { ...prev };
+                        delete next[activeAvatarId];
+                        return next;
+                      })}
+                      disabled={sending}
+                    >
+                      <UiIcon name="close" size={11} />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
+              {attachments.length && selectedSystemTool?.id !== "tool:contract-review" ? (
                 <div className="chat-attachment-chips" aria-label="待发送附件">
                   {attachments.map((a) => (
                     <span
@@ -2630,14 +3294,24 @@ export function Chat({
                   ref={composerInputRef}
                   className="chat-input"
                   value={input}
-                  onChange={(e) => setActiveInput(e.target.value)}
+                  onChange={(e) => {
+                    setActiveInput(e.target.value);
+                    syncComposerCursor(e.target);
+                  }}
+                  onClick={(e) => syncComposerCursor(e.currentTarget)}
+                  onKeyUp={(e) => syncComposerCursor(e.currentTarget)}
+                  onSelect={(e) => syncComposerCursor(e.currentTarget)}
                   onKeyDown={handleKeyDown}
                   onDragOver={handleComposerDragOverFiles}
                   onDrop={handleComposerDropFiles}
                   onPaste={handleComposerPaste}
                   placeholder={
                     gatewayStatus === "connected"
-                      ? "输入消息，Enter 发送…（支持拖入/粘贴文件）"
+                      ? selectedSystemTool
+                        ? "合同审核要求可在上方面板填写；请添加合同附件。"
+                        : selectedSkill
+                        ? `已选择 ${selectedSkill.displayName}，输入任务后发送…`
+                        : "输入 / 选择技能，或直接发消息…（支持拖入/粘贴文件）"
                       : "网关未连接…（仍可拖入文件编辑草稿）"
                   }
                   rows={2}
@@ -2807,6 +3481,7 @@ export function Chat({
                         : "启动网关"}
                 </button>
               </div>
+            </div>
             </div>
           </div>
 
