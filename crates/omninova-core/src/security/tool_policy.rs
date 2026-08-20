@@ -30,6 +30,9 @@ const READ_ONLY_WORKSPACE_TOOLS: &[&str] = &[
     "grep",
     "search",
     "knowledge_search",
+    // Loads instructions from the already-discovered local skill catalog. It
+    // does not mutate the workspace or contact an external service.
+    "use_skill",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,6 +300,40 @@ mod tests {
             "shell",
             &serde_json::json!({"command": "rm -rf /"}),
         );
+        assert!(matches!(decision, ToolPolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn supervised_use_skill_is_auto_approved_as_read_only() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+
+        let decision = evaluate_tool_call(
+            &config,
+            "use_skill",
+            &serde_json::json!({"skill_id": "skill:demo"}),
+        );
+
+        assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[test]
+    fn explicitly_denied_use_skill_remains_denied() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config
+            .security
+            .tool_policy
+            .denied_tools
+            .push("use_skill".into());
+
+        let decision = evaluate_tool_call(
+            &config,
+            "use_skill",
+            &serde_json::json!({"skill_id": "skill:demo"}),
+        );
+
         assert!(matches!(decision, ToolPolicyDecision::Deny { .. }));
     }
 }

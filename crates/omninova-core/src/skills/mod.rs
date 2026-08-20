@@ -7,6 +7,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+pub mod activation;
+pub mod catalog;
+pub mod commands;
+pub mod prompt;
+
+pub use activation::{
+    activate_skill, activation_system_message, apply_skill_runtime_prompt,
+    invocations_from_inbound_metadata, is_skill_working_context_system,
+    parse_skill_invocations, resolve_skill_from_store, sanitize_skill_working_context,
+    SkillInvocation, SkillRuntimePromptResult,
+};
+pub use catalog::{
+    estimate_prompt_tokens, is_safe_skill_locator, list_skill_catalog, normalize_skill_id,
+    source_badge_label, SkillCatalog, SkillCatalogEntry, SkillResource, MAX_ACTIVE_SKILLS,
+};
+pub use commands::{
+    command_token_at, filter_command_palette, list_command_palette, parse_slash_command,
+    CommandPalette, CommandPaletteItem, ParsedSlashCommand,
+};
+pub use prompt::{
+    parse_skill_prompt, SkillPrompt, SkillPromptIdentity, SkillPromptValidation,
+    ACTIVE_SKILL_INSTRUCTION_BUDGET_CHARS,
+};
+
 static SKILLS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,15 +204,10 @@ pub fn load_enabled_skills(config: &Config) -> Vec<Skill> {
     load_skills_from_dir(&resolve_configured_skills_dir(config)).unwrap_or_default()
 }
 
+/// Inject catalog metadata (not full SKILL.md). Explicit activations are applied
+/// separately via [`apply_skill_runtime_prompt`].
 pub fn inject_enabled_skills_prompt(system_prompt: &mut Option<String>, config: &Config) -> usize {
-    let skills = load_enabled_skills(config);
-    let prompt = format_skills_prompt(&skills);
-    if prompt.is_empty() {
-        return 0;
-    }
-    let current = system_prompt.take().unwrap_or_default();
-    *system_prompt = Some(format!("{current}\n{prompt}"));
-    skills.len()
+    apply_skill_runtime_prompt(system_prompt, config, &[]).catalog_count
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,7 +268,7 @@ pub fn skills_store_identity(config: &Config) -> String {
     )
 }
 
-fn discover_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     discover_skill_files_inner(root, &mut files)?;
     files.sort();
@@ -838,3 +857,5 @@ mod skillhub_tests {
 
 #[cfg(test)]
 mod runtime_s1;
+#[cfg(test)]
+mod runtime_s2;

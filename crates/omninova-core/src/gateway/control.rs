@@ -11,8 +11,8 @@ use crate::cron::{
 use crate::gateway::{AgentJobExecutor, GatewayRuntime};
 use crate::knowledge::{KnowledgeStore, KnowledgeUpsert};
 use crate::skills::{
-    import_skills_from_dir, load_skills_from_dir, skill_runtime_snapshot, skillhub_categories,
-    skillhub_install, skillhub_list, skillhub_rollback,
+    import_skills_from_dir, list_command_palette, list_skill_catalog, load_skills_from_dir,
+    skill_runtime_snapshot, skillhub_categories, skillhub_install, skillhub_list, skillhub_rollback,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -24,6 +24,7 @@ use base64::Engine;
 use futures_util::stream::unfold;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -328,6 +329,16 @@ async fn dispatch(runtime: &GatewayRuntime, command: &str, args: Value) -> Resul
             Ok(Value::Null)
         }
         "skills_package_summary" => skills_summary(runtime).await,
+        "list_skill_catalog" => {
+            let cfg = runtime.get_config().await;
+            serde_json::to_value(list_skill_catalog(&cfg)).map_err(|e| e.to_string())
+        }
+        "list_command_palette" => {
+            let cfg = runtime.get_config().await;
+            let query = args_opt_string(&args, &["query", "q"]).unwrap_or_default();
+            let palette = crate::skills::filter_command_palette(&list_command_palette(&cfg), &query);
+            serde_json::to_value(palette).map_err(|e| e.to_string())
+        }
         "import_skills" => {
             let from = args_string(&args, &["from", "source"])?;
             let cfg = runtime.get_config().await;
@@ -706,6 +717,19 @@ fn tags_from_value(value: &Value) -> Vec<String> {
 
 fn inbound_from_args(args: &Value) -> Result<InboundMessage, String> {
     let payload = args.get("payload").unwrap_or(args);
+    let mut metadata: HashMap<String, Value> = payload
+        .get("metadata")
+        .and_then(Value::as_object)
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    if let Some(invocations) = payload
+        .get("skillInvocations")
+        .or_else(|| payload.get("skill_invocations"))
+    {
+        metadata
+            .entry("skill_invocations".to_string())
+            .or_insert(invocations.clone());
+    }
     Ok(InboundMessage {
         channel: payload
             .get("channel")
@@ -727,11 +751,7 @@ fn inbound_from_args(args: &Value) -> Result<InboundMessage, String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        metadata: payload
-            .get("metadata")
-            .and_then(Value::as_object)
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default(),
+        metadata,
     })
 }
 

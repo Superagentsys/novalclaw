@@ -171,6 +171,20 @@ impl EventBus {
         step_id
     }
 
+    pub fn skill_activated(
+        &self,
+        skill_id: String,
+        display_name: String,
+        source: String,
+    ) {
+        self.emit(AgentRunEvent::skill_activated {
+            run_id: self.inner.run_id.clone(),
+            skill_id,
+            display_name,
+            source,
+        });
+    }
+
     fn tool_step_id(&self, tool_call_id: &str) -> String {
         let mut tool_steps = self.inner.tool_steps.lock().unwrap();
         tool_steps
@@ -431,6 +445,7 @@ impl EventBus {
             AgentRunEvent::patch_applied { result_summary, .. } => result_summary.clone(),
             AgentRunEvent::patch_failed { error, .. } => error.clone(),
             AgentRunEvent::tool_completed { result_summary, .. } => result_summary.clone(),
+            AgentRunEvent::skill_activated { display_name, .. } => display_name.clone(),
             AgentRunEvent::run_completed { reply_preview, .. } => reply_preview.clone(),
             AgentRunEvent::run_failed { error, .. } => error.clone(),
             AgentRunEvent::run_cancelled { reason, .. } => reason.clone(),
@@ -473,6 +488,7 @@ fn event_type_name(event: &AgentRunEvent) -> &'static str {
         AgentRunEvent::patch_applied { .. } => "patch_applied",
         AgentRunEvent::patch_failed { .. } => "patch_failed",
         AgentRunEvent::tool_completed { .. } => "tool_completed",
+        AgentRunEvent::skill_activated { .. } => "skill_activated",
         AgentRunEvent::run_completed { .. } => "run_completed",
         AgentRunEvent::run_failed { .. } => "run_failed",
         AgentRunEvent::run_cancelled { .. } => "run_cancelled",
@@ -513,6 +529,7 @@ impl EventBusDrainHandle {
                     AgentRunEvent::patch_applied { .. } => "patch_applied",
                     AgentRunEvent::patch_failed { .. } => "patch_failed",
                     AgentRunEvent::tool_completed { .. } => "tool_completed",
+                    AgentRunEvent::skill_activated { .. } => "skill_activated",
                     AgentRunEvent::run_completed { .. } => "run_completed",
                     AgentRunEvent::run_failed { .. } => "run_failed",
                     AgentRunEvent::run_cancelled { .. } => "run_cancelled",

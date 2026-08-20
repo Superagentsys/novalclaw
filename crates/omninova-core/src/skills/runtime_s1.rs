@@ -231,7 +231,10 @@ fn enabled_true_injects_installed_skill() {
     let mut prompt = Some("base".to_string());
     assert_eq!(inject_enabled_skills_prompt(&mut prompt, &config), 1);
     assert!(prompt.as_ref().unwrap().contains("visible"));
-    assert!(prompt.as_ref().unwrap().contains("inject me"));
+    assert!(
+        !prompt.as_ref().unwrap().contains("inject me"),
+        "S2 catalog injection must not dump full SKILL.md bodies"
+    );
 }
 
 #[test]
@@ -263,7 +266,11 @@ fn long_lived_runtime_sees_refreshed_skills_after_generation_change() {
     let mut prompt = Some(String::new());
     inject_enabled_skills_prompt(&mut prompt, &config);
     let seen = skills_generation();
-    assert!(prompt.as_ref().unwrap().contains("first body"));
+    assert!(prompt.as_ref().unwrap().contains("first"));
+    assert!(
+        !prompt.as_ref().unwrap().contains("first body"),
+        "catalog-only injection must omit full skill bodies"
+    );
     assert!(!prompt.as_ref().unwrap().contains("second body"));
 
     write_skill(&workspace.0.join("skills"), "second", "second", "second body");
@@ -271,8 +278,10 @@ fn long_lived_runtime_sees_refreshed_skills_after_generation_change() {
     assert!(skills_generation() > seen);
     let mut refreshed = Some(String::new());
     inject_enabled_skills_prompt(&mut refreshed, &config);
-    assert!(refreshed.as_ref().unwrap().contains("first body"));
-    assert!(refreshed.as_ref().unwrap().contains("second body"));
+    assert!(refreshed.as_ref().unwrap().contains("first"));
+    assert!(refreshed.as_ref().unwrap().contains("second"));
+    assert!(!refreshed.as_ref().unwrap().contains("first body"));
+    assert!(!refreshed.as_ref().unwrap().contains("second body"));
 }
 
 #[test]

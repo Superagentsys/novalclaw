@@ -3,6 +3,7 @@ use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::event_bus::EventBus;
 use crate::agent::history::{
     apply_compaction, plan_compaction, render_for_summary, truncate_history_preserving_system,
+    SUMMARY_MARKER,
 };
 use crate::agent::planner::{self, Reflection};
 use crate::agent::prompt::bootstrap_system_messages;
@@ -83,9 +84,7 @@ impl Agent {
         message: &str,
         images: &[String],
     ) -> Result<String> {
-        if self.messages.is_empty() {
-            self.messages.extend(bootstrap_system_messages(&self.config));
-        }
+        self.apply_request_system_prompt();
 
         let _ = self
             .memory
@@ -131,9 +130,7 @@ impl Agent {
         &mut self,
         message: &str,
     ) -> Result<(String, Vec<ToolExecutionEvent>)> {
-        if self.messages.is_empty() {
-            self.messages.extend(bootstrap_system_messages(&self.config));
-        }
+        self.apply_request_system_prompt();
 
         let _ = self
             .memory
@@ -181,9 +178,7 @@ impl Agent {
         external_session_id: Option<String>,
         cancel_token: AgentCancellationToken,
     ) -> Result<(String, Vec<AgentRunEvent>)> {
-        if self.messages.is_empty() {
-            self.messages.extend(bootstrap_system_messages(&self.config));
-        }
+        self.apply_request_system_prompt();
 
         let _ = self
             .memory
@@ -280,9 +275,7 @@ impl Agent {
         message: &str,
         events: &tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
     ) -> Result<String> {
-        if self.messages.is_empty() {
-            self.messages.extend(bootstrap_system_messages(&self.config));
-        }
+        self.apply_request_system_prompt();
 
         let _ = self
             .memory
@@ -530,6 +523,25 @@ impl Agent {
     pub fn export_messages(&self) -> Vec<ChatMessage> {
         self.messages.clone()
     }
+
+    /// Skill instructions are request-scoped working context. Rebuild the
+    /// bootstrap system prompt from this request's config and drop leftover
+    /// full SKILL.md payloads before the next model turn.
+    fn apply_request_system_prompt(&mut self) {
+        self.messages =
+            crate::skills::sanitize_skill_working_context(std::mem::take(&mut self.messages));
+        let bootstrap = bootstrap_system_messages(&self.config);
+        if bootstrap.is_empty() {
+            return;
+        }
+        if let Some(first) = self.messages.first() {
+            if first.role == "system" && !first.content.starts_with(SUMMARY_MARKER) {
+                self.messages[0] = bootstrap.into_iter().next().unwrap();
+                return;
+            }
+        }
+        self.messages.splice(0..0, bootstrap);
+    }
 }
 
 fn render_transcript(executed: &[(String, String)]) -> String {
@@ -563,7 +575,108 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::providers::MockProvider;
+    use crate::providers::{ChatResponse, MockProvider, TokenUsage, ToolCall};
+    use crate::tools::ToolResult;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct SequenceProvider {
+        responses: Mutex<VecDeque<ChatResponse>>,
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for SequenceProvider {
+        fn name(&self) -> &str {
+            "sequence"
+        }
+
+        async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request.messages.to_vec());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no queued provider response"))
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct AlreadyActiveUseSkillTool;
+
+    #[async_trait]
+    impl Tool for AlreadyActiveUseSkillTool {
+        fn name(&self) -> &str {
+            "use_skill"
+        }
+
+        fn description(&self) -> &str {
+            "Test already-active skill"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": { "skill_id": { "type": "string" } },
+                "required": ["skill_id"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "ok": true,
+                    "already_active": true,
+                    "skill_id": "skill:test",
+                    "display_name": "Test"
+                })
+                .to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn response(text: Option<&str>, tool_calls: Vec<ToolCall>, finish_reason: &str) -> ChatResponse {
+        ChatResponse {
+            text: text.map(ToString::to_string),
+            tool_calls,
+            usage: Some(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(text.map(|value| value.chars().count() as u64).unwrap_or(0)),
+            }),
+            reasoning_content: None,
+            finish_reason: Some(finish_reason.to_string()),
+        }
+    }
+
+    fn agent_with_provider(
+        provider: Box<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        config: AgentConfig,
+    ) -> Agent {
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+        let security = SecurityContext::from_config(&Config::default());
+        Agent::new(provider, tools, memory, config, security)
+    }
 
     fn mock_agent(agent_cfg: AgentConfig) -> Agent {
         let provider = Box::new(MockProvider::new("mock"));
@@ -577,6 +690,174 @@ mod tests {
         let mut agent = mock_agent(AgentConfig::default());
         let reply = agent.process_message("hello").await.expect("reply");
         assert_eq!(reply, "Mock response from provider");
+    }
+
+    #[tokio::test]
+    async fn explicit_skill_stream_request_keeps_active_prompt_and_user_message() {
+        let (provider, requests) = SequenceProvider::new(vec![response(
+            Some("visible skill reply"),
+            Vec::new(),
+            "stop",
+        )]);
+        let mut config = AgentConfig::default();
+        config.system_prompt = Some(
+            "base\n\n## Active Skill\n\nSkill `skill:test` is already active.".to_string(),
+        );
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), config);
+        let events = Arc::new(Mutex::new(Vec::<AgentRunEvent>::new()));
+        let event_sink = events.clone();
+
+        let (reply, _) = agent
+            .process_message_with_events_streaming(
+                "请按照技能规则介绍能力。",
+                Box::new(move |event| event_sink.lock().unwrap().push(event)),
+                Some("run-explicit-message".to_string()),
+                Some("session-explicit-message".to_string()),
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect("explicit skill request should complete");
+
+        assert_eq!(reply, "visible skill reply");
+        let captured = requests.lock().unwrap();
+        let first = captured.first().expect("provider request");
+        assert!(first.iter().any(|message| {
+            message.role == "system"
+                && crate::skills::is_skill_working_context_system(&message.content)
+        }));
+        assert!(first.iter().any(|message| {
+            message.role == "user" && message.content == "请按照技能规则介绍能力。"
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_model_output_surfaces_run_failed_instead_of_run_completed() {
+        let (provider, _) = SequenceProvider::new(vec![response(None, Vec::new(), "stop")]);
+        let mut config = AgentConfig::default();
+        config.system_prompt = Some("## Active Skill\n\nSkill is active.".to_string());
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), config);
+        let events = Arc::new(Mutex::new(Vec::<AgentRunEvent>::new()));
+        let event_sink = events.clone();
+
+        let error = agent
+            .process_message_with_events_streaming(
+                "task",
+                Box::new(move |event| event_sink.lock().unwrap().push(event)),
+                Some("run-empty-output".to_string()),
+                None,
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect_err("empty output must fail visibly");
+        assert!(error
+            .to_string()
+            .contains("模型本次未返回可显示的内容"));
+        tokio::task::yield_now().await;
+        let captured = events.lock().unwrap();
+        assert!(captured
+            .iter()
+            .any(|event| matches!(event, AgentRunEvent::run_failed { .. })));
+        assert!(!captured
+            .iter()
+            .any(|event| matches!(event, AgentRunEvent::run_completed { .. })));
+    }
+
+    #[tokio::test]
+    async fn skill_content_filter_surfaces_specific_provider_incompatibility() {
+        let (provider, _) =
+            SequenceProvider::new(vec![response(None, Vec::new(), "content_filter")]);
+        let mut config = AgentConfig::default();
+        config.system_prompt = Some("## Active Skill\n\nSkill is active.".to_string());
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), config);
+        let events = Arc::new(Mutex::new(Vec::<AgentRunEvent>::new()));
+        let event_sink = events.clone();
+
+        let error = agent
+            .process_message_with_events_streaming(
+                "harmless task",
+                Box::new(move |event| event_sink.lock().unwrap().push(event)),
+                Some("run-content-filter".to_string()),
+                None,
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect_err("provider content filter must fail without fallback");
+        assert_eq!(
+            error.to_string(),
+            "当前模型服务拒绝了该技能的提示内容。技能已成功加载，但与当前模型/服务的安全策略不兼容。请更换技能或模型。"
+        );
+        tokio::task::yield_now().await;
+        let captured = events.lock().unwrap();
+        assert!(captured
+            .iter()
+            .any(|event| matches!(event, AgentRunEvent::run_failed { .. })));
+        assert!(!captured
+            .iter()
+            .any(|event| matches!(event, AgentRunEvent::run_completed { .. })));
+    }
+
+    #[tokio::test]
+    async fn already_active_use_skill_tool_call_continues_to_followup_text() {
+        let tool_call = ToolCall {
+            id: "call-use-skill".to_string(),
+            name: "use_skill".to_string(),
+            arguments: json!({ "skill_id": "skill:test" }).to_string(),
+        };
+        let (provider, requests) = SequenceProvider::new(vec![
+            response(None, vec![tool_call], "tool_calls"),
+            response(Some("continued after already-active tool"), Vec::new(), "stop"),
+        ]);
+        let mut config = AgentConfig::default();
+        config.system_prompt = Some("## Active Skill\n\nSkill is active.".to_string());
+        let mut agent = agent_with_provider(
+            Box::new(provider),
+            vec![Box::new(AlreadyActiveUseSkillTool)],
+            config,
+        );
+
+        let (reply, _) = agent
+            .process_message_with_events_streaming(
+                "task",
+                Box::new(|_| {}),
+                Some("run-tool-followup".to_string()),
+                None,
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect("tool call should continue to a second model iteration");
+
+        assert_eq!(reply, "continued after already-active tool");
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[1]
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("already_active")));
+    }
+
+    #[tokio::test]
+    async fn normal_streaming_request_still_returns_visible_text() {
+        let (provider, _) = SequenceProvider::new(vec![response(
+            Some("normal visible reply"),
+            Vec::new(),
+            "stop",
+        )]);
+        let mut agent = agent_with_provider(
+            Box::new(provider),
+            Vec::new(),
+            AgentConfig::default(),
+        );
+
+        let (reply, _) = agent
+            .process_message_with_events_streaming(
+                "hello",
+                Box::new(|_| {}),
+                Some("run-normal-stream".to_string()),
+                None,
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect("normal request should complete");
+        assert_eq!(reply, "normal visible reply");
     }
 
     #[tokio::test]

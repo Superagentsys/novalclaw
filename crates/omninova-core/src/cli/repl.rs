@@ -4,7 +4,7 @@ use crate::channels::adapters::cli::inbound_from_cli;
 use crate::config::Config;
 use crate::cron::CronStore;
 use crate::gateway::GatewayRuntime;
-use crate::skills::load_skills_from_dir;
+use crate::skills::{list_command_palette, parse_slash_command, ParsedSlashCommand};
 use anyhow::Result;
 use serde_json::Value;
 use std::io::{self, IsTerminal, Read, Write};
@@ -19,7 +19,8 @@ OmniNova CLI  (Claude Code style)
     /help       Show this help
     /exit       Quit  (also /quit or Ctrl-D)
     /sessions   List stored sessions
-    /skills     List loaded skills
+    /skills     List installed skill catalog
+    /skill <slug> [prompt]  Activate one skill and optionally chat
     /cron       List automation jobs
     /kb         List knowledge-base documents
     /models     List configured providers
@@ -45,6 +46,30 @@ pub async fn run_repl(config: Config, session_id: Option<String>) -> Result<Stri
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if let Some(crate::skills::ParsedSlashCommand::Skill { id, rest }) =
+            crate::skills::parse_slash_command(trimmed)
+        {
+            if !matches!(
+                trimmed.split_whitespace().next().unwrap_or(""),
+                "/exit" | "/quit" | "/q" | "/help" | "/?" | "/clear" | "/tui" | "/config"
+                    | "/sessions" | "/skills" | "/cron" | "/kb" | "/knowledge" | "/models"
+            ) {
+                if rest.is_empty() {
+                    let palette = crate::skills::list_command_palette(&config);
+                    if let Some(item) = palette.skills.iter().find(|item| item.id == id) {
+                        println!(
+                            "skill {} ready. Send a prompt with /skill {} <text>",
+                            item.display_name, item.command_alias
+                        );
+                    } else {
+                        println!("skill unavailable: {id}");
+                    }
+                    continue;
+                }
+                stream_prompt_with_skill(&runtime, &rest, Some(session.clone()), &id).await?;
+                continue;
+            }
         }
         if let Some(output) = handle_slash(&runtime, &config, trimmed).await? {
             if output == "__exit__" {
@@ -90,7 +115,25 @@ async fn stream_prompt(
     prompt: &str,
     session_id: Option<String>,
 ) -> Result<String> {
-    let inbound = inbound_from_cli(prompt.to_string(), session_id, None);
+    stream_prompt_with_skill(runtime, prompt, session_id, "").await
+}
+
+async fn stream_prompt_with_skill(
+    runtime: &GatewayRuntime,
+    prompt: &str,
+    session_id: Option<String>,
+    skill_id: &str,
+) -> Result<String> {
+    let mut inbound = inbound_from_cli(prompt.to_string(), session_id, None);
+    if !skill_id.trim().is_empty() {
+        inbound.metadata.insert(
+            "skill_invocations".to_string(),
+            serde_json::json!([{
+                "skillId": skill_id,
+                "source": "slash_command"
+            }]),
+        );
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let printer = tokio::spawn(async move {
         let mut printed_delta = false;
@@ -180,14 +223,28 @@ async fn handle_slash(
             Ok(Some(serde_json::to_string_pretty(&snapshot)?))
         }
         "/skills" => {
-            let dir = crate::config::resolve_configured_skills_dir(config);
-            let skills = load_skills_from_dir(&dir).unwrap_or_default();
-            let names: Vec<_> = skills.iter().map(|s| s.metadata.name.clone()).collect();
+            let palette = crate::skills::list_command_palette(config);
             Ok(Some(serde_json::to_string_pretty(&serde_json::json!({
-                "dir": dir,
-                "count": names.len(),
-                "skills": names,
+                "generation": palette.generation,
+                "openSkillsEnabled": palette.open_skills_enabled,
+                "skills": palette.skills,
+                "empty": palette.skills_empty_reason,
             }))?))
+        }
+        "/skill" => {
+            let parsed = parse_slash_command(line);
+            match parsed {
+                Some(ParsedSlashCommand::Skill { id, rest }) if rest.is_empty() => {
+                    let palette = list_command_palette(config);
+                    let found = palette.skills.iter().find(|item| item.id == id);
+                    Ok(Some(serde_json::to_string_pretty(&serde_json::json!({
+                        "skillId": id,
+                        "available": found.is_some(),
+                        "item": found,
+                    }))?))
+                }
+                _ => Ok(Some("usage: /skill <slug> [prompt]".into())),
+            }
         }
         "/cron" => {
             let store = CronStore::open(config.workspace_dir.join("cron.json")).await?;

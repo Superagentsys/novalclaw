@@ -79,13 +79,16 @@ use crate::security::{
     is_tool_globally_allowed, resolve_shell_allowlist, ApprovalController, EstopController,
     EstopState, PendingApproval, SecurityContext,
 };
-use crate::skills::{inject_enabled_skills_prompt, skills_store_identity};
+use crate::skills::{
+    apply_skill_runtime_prompt, invocations_from_inbound_metadata, skills_store_identity,
+    SkillInvocation,
+};
 use crate::knowledge::append_knowledge_prompt;
 use crate::tools::{
     AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
     FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
-    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, Tool, WebFetchTool,
-    WebSearchTool,
+    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool,
+    ShellTool, SkillActivationGate, Tool, UseSkillTool, WebFetchTool, WebSearchTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
@@ -1738,7 +1741,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg);
+        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
@@ -1780,7 +1783,7 @@ impl GatewayRuntime {
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
 
-        inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg);
+        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
@@ -1945,8 +1948,39 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg) > 0 {
-            steps.push(ExecutionStep::done("加载技能提示", "已注入已安装技能"));
+        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
+        let skill_runtime = apply_skills_for_request(
+            &cfg,
+            &skill_invocations,
+            &mut tools,
+            &mut agent_cfg.system_prompt,
+        );
+        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
+            let reason = skill_runtime
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "所选技能当前不可用".to_string());
+            println!(
+                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
+                skill_invocations.len(),
+                reason.chars().count()
+            );
+            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
+            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
+        }
+        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
+            steps.push(ExecutionStep::done(
+                "加载技能提示",
+                if skill_runtime.activated.is_empty() {
+                    "已注入技能目录（按需 use_skill）".to_string()
+                } else {
+                    format!(
+                        "已激活技能 {}",
+                        skill_runtime.activated[0].skill_id
+                    )
+                },
+            ));
         }
 
         append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
@@ -2241,10 +2275,35 @@ impl GatewayRuntime {
             agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
         }
 
-        if inject_enabled_skills_prompt(&mut agent_cfg.system_prompt, &cfg) > 0 {
+        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
+        let skill_runtime = apply_skills_for_request(
+            &cfg,
+            &skill_invocations,
+            &mut tools,
+            &mut agent_cfg.system_prompt,
+        );
+        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
+            let reason = skill_runtime
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "所选技能当前不可用".to_string());
+            println!(
+                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
+                skill_invocations.len(),
+                reason.chars().count()
+            );
+            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
+            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
+        }
+        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
             steps.push(ExecutionStep::done(
                 "加载技能提示",
-                "已注入已安装技能",
+                if skill_runtime.activated.is_empty() {
+                    "已注入技能目录（按需 use_skill）".to_string()
+                } else {
+                    format!("已激活技能 {}", skill_runtime.activated[0].skill_id)
+                },
             ));
         }
 
@@ -9020,6 +9079,7 @@ async fn save_session_history(
 ) -> anyhow::Result<()> {
     // Backstop for the in-agent summarizer: keeps the bootstrap prompt and any
     // compaction summary instead of blindly slicing off the oldest messages.
+    messages = crate::skills::sanitize_skill_working_context(messages);
     messages = truncate_history_preserving_system(messages, max_history_messages);
     messages = sanitize_messages_for_provider(messages);
 
@@ -9823,6 +9883,23 @@ fn memory_identity(config: &Config) -> (String, String, String, String, String, 
         embedding.model.clone().unwrap_or_default(),
         embedding.base_url.clone().unwrap_or_default(),
     )
+}
+
+fn apply_skills_for_request(
+    config: &Config,
+    invocations: &[SkillInvocation],
+    tools: &mut Vec<Box<dyn Tool>>,
+    system_prompt: &mut Option<String>,
+) -> crate::skills::SkillRuntimePromptResult {
+    let result = apply_skill_runtime_prompt(system_prompt, config, invocations);
+    if config.skills.open_skills_enabled {
+        let explicit = result.activated.first().map(|item| item.skill_id.clone());
+        tools.push(Box::new(UseSkillTool::new(
+            config.clone(),
+            Arc::new(SkillActivationGate::with_explicit(explicit)),
+        )));
+    }
+    result
 }
 
 fn create_tools_for_route(

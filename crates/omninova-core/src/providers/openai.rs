@@ -44,6 +44,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,6 +136,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,7 +333,10 @@ impl OpenAiProvider {
             .collect()
     }
 
-    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(
+        message: NativeResponseMessage,
+        finish_reason: Option<String>,
+    ) -> ProviderChatResponse {
         let text = message.effective_content();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
@@ -348,6 +355,7 @@ impl OpenAiProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            finish_reason,
         }
     }
 }
@@ -374,6 +382,7 @@ impl Provider for MockProvider {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            finish_reason: Some("stop".to_string()),
         })
     }
 
@@ -430,13 +439,12 @@ impl Provider for OpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        let mut result = Self::parse_native_response(message);
+        let mut result = Self::parse_native_response(choice.message, choice.finish_reason);
         result.usage = usage;
         Ok(result)
     }
@@ -477,6 +485,7 @@ impl Provider for OpenAiProvider {
         // (id, name, arguments) accumulated per tool-call index.
         let mut tool_accum: Vec<(String, String, String)> = Vec::new();
         let mut usage: Option<TokenUsage> = None;
+        let mut finish_reason: Option<String> = None;
         let mut done = false;
 
         while let Some(item) = stream.next().await {
@@ -504,6 +513,9 @@ impl Provider for OpenAiProvider {
                     });
                 }
                 if let Some(choice) = chunk.choices.into_iter().next() {
+                    if let Some(reason) = choice.finish_reason {
+                        finish_reason = Some(reason);
+                    }
                     if let Some(c) = choice.delta.content {
                         if !c.is_empty() {
                             text.push_str(&c);
@@ -575,6 +587,7 @@ impl Provider for OpenAiProvider {
             } else {
                 Some(reasoning)
             },
+            finish_reason,
         })
     }
 

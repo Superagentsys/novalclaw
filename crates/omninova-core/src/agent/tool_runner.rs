@@ -508,6 +508,32 @@ impl<'a> ToolRunner<'a> {
                                 deletions: ds.deletions,
                             }),
                     );
+                    if tool_call.name == "use_skill" && is_success {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output) {
+                            let skill_id = value
+                                .get("skill_id")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            let display_name = value
+                                .get("display_name")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or(skill_id)
+                                .trim();
+                            let source = value
+                                .get("selection_source")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or("auto_use_skill")
+                                .trim();
+                            if !skill_id.is_empty() {
+                                bus.skill_activated(
+                                    skill_id.to_string(),
+                                    display_name.to_string(),
+                                    source.to_string(),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 Ok((

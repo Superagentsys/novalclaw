@@ -52,6 +52,7 @@ export type AgentRunEvent =
   | AgentRunEventToolCallCreated
   | AgentRunEventToolStarted
   | AgentRunEventToolCompleted
+  | AgentRunEventSkillActivated
   | AgentRunEventApprovalRequired
   | AgentRunEventCommandOutput
   | AgentRunEventFileChanged
@@ -118,6 +119,14 @@ export interface AgentRunEventToolCompleted {
   duration_ms: number;
   result_summary: string;
   diff_stats: RunDiffStats | null;
+}
+
+export interface AgentRunEventSkillActivated {
+  type: "skill_activated";
+  run_id: string;
+  skill_id: string;
+  display_name: string;
+  source: string;
 }
 
 export interface AgentRunEventApprovalRequired {
@@ -275,6 +284,7 @@ export function getEventStatusLabel(
     case "model_started":
     case "model_delta":
     case "tool_call_created":
+    case "skill_activated":
     case "tool_started":
     case "command_output":
     case "patch_started":
