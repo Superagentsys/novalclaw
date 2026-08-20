@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde::Deserializer;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Top-level Config
@@ -42,6 +43,8 @@ pub struct Config {
 
     #[serde(default)]
     pub provider: ProviderBehaviorConfig,
+    #[serde(default)]
+    pub provider_runtime: ProviderRuntimeConfig,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -193,6 +196,7 @@ impl Default for Config {
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             provider: ProviderBehaviorConfig::default(),
+            provider_runtime: ProviderRuntimeConfig::default(),
             agent: AgentConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -329,6 +333,80 @@ impl Default for ProviderBehaviorConfig {
             reasoning_level: default_reasoning_level(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Provider runtime timeouts
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+/// Bounded timeouts for provider network calls, configurable under
+/// `[provider_runtime]` in config.toml. Missing fields deserialize to 0 and
+/// fall back to the defaults; zero and out-of-range values are sanitized to
+/// safe bounds at access time so old config files stay valid and a mis-typed
+/// value can never produce an unbounded or instant timeout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRuntimeConfig {
+    /// Maximum time allowed to establish the provider connection.
+    /// Default 30s. Zero → default; clamped to 1..=120.
+    #[serde(default)]
+    pub connect_timeout_secs: u64,
+    /// Maximum continuous period without valid stream activity. The timer is
+    /// reset whenever stream data arrives. Default 300s. Zero → default;
+    /// clamped to 10..=3600.
+    #[serde(default)]
+    pub stream_idle_timeout_secs: u64,
+    /// Maximum wall-clock duration for one complete model request.
+    /// Default 900s. Zero → default; clamped to 60..=86400.
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ProviderRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            stream_idle_timeout_secs: DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl ProviderRuntimeConfig {
+    pub fn connect_timeout(&self) -> Duration {
+        clamp_timeout_secs(
+            self.connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+            1,
+            120,
+        )
+    }
+
+    pub fn stream_idle_timeout(&self) -> Duration {
+        clamp_timeout_secs(
+            self.stream_idle_timeout_secs,
+            DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            10,
+            3600,
+        )
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        clamp_timeout_secs(
+            self.request_timeout_secs,
+            DEFAULT_REQUEST_TIMEOUT_SECS,
+            60,
+            86_400,
+        )
+    }
+}
+
+fn clamp_timeout_secs(value: u64, default: u64, min: u64, max: u64) -> Duration {
+    let effective = if value == 0 { default } else { value.clamp(min, max) };
+    Duration::from_secs(effective)
 }
 
 // ---------------------------------------------------------------------------
@@ -2539,6 +2617,57 @@ pub struct SubagentsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_runtime_defaults_apply_when_fields_absent() {
+        // Old config files have no [provider_runtime] table: serde defaults
+        // fill 0s and the accessors fall back to the safe defaults.
+        let cfg = ProviderRuntimeConfig::default();
+        assert_eq!(cfg.connect_timeout(), Duration::from_secs(30));
+        assert_eq!(cfg.stream_idle_timeout(), Duration::from_secs(300));
+        assert_eq!(cfg.request_timeout(), Duration::from_secs(900));
+
+        let zeroed = ProviderRuntimeConfig {
+            connect_timeout_secs: 0,
+            stream_idle_timeout_secs: 0,
+            request_timeout_secs: 0,
+        };
+        assert_eq!(zeroed.connect_timeout(), Duration::from_secs(30));
+        assert_eq!(zeroed.stream_idle_timeout(), Duration::from_secs(300));
+        assert_eq!(zeroed.request_timeout(), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn provider_runtime_loads_custom_values_from_partial_toml() {
+        let loaded: Config = toml::from_str(
+            r#"
+[provider_runtime]
+connect_timeout_secs = 12
+stream_idle_timeout_secs = 240
+request_timeout_secs = 1800
+"#,
+        )
+        .expect("partial config with provider_runtime must load");
+        assert_eq!(loaded.provider_runtime.connect_timeout(), Duration::from_secs(12));
+        assert_eq!(
+            loaded.provider_runtime.stream_idle_timeout(),
+            Duration::from_secs(240)
+        );
+        assert_eq!(loaded.provider_runtime.request_timeout(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn provider_runtime_clamps_out_of_range_values() {
+        let extreme = ProviderRuntimeConfig {
+            connect_timeout_secs: 9_999_999,
+            stream_idle_timeout_secs: 9_999_999,
+            request_timeout_secs: 1,
+        };
+        assert_eq!(extreme.connect_timeout(), Duration::from_secs(120));
+        assert_eq!(extreme.stream_idle_timeout(), Duration::from_secs(3600));
+        // request min bound is 60s.
+        assert_eq!(extreme.request_timeout(), Duration::from_secs(60));
+    }
 
     #[test]
     fn resolve_effective_workspace_dir_session_wins() {

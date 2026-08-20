@@ -87,6 +87,7 @@ pub fn build_provider_with_selection(
             }
         });
     let temp = config.default_temperature;
+    let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
 
     let dispatch = resolve_dispatch_kind(&provider_name, &kind, base_url.is_some());
     match dispatch.as_str() {
@@ -96,6 +97,7 @@ pub fn build_provider_with_selection(
             model,
             temp,
             None,
+            timeouts,
         )),
         "gemini" => Box::new(GeminiProvider::new(
             base_url.as_deref(),
@@ -103,6 +105,7 @@ pub fn build_provider_with_selection(
             model,
             temp,
             None,
+            timeouts,
         )),
         "mock" => Box::new(MockProvider::new("mock-provider")),
         "openai-compat" => {
@@ -116,6 +119,7 @@ pub fn build_provider_with_selection(
                 model,
                 temp,
                 None,
+                timeouts,
             ))
         }
         _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(OpenAiProvider::new(
@@ -124,6 +128,7 @@ pub fn build_provider_with_selection(
             model,
             temp,
             None,
+            timeouts,
         )),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
     }

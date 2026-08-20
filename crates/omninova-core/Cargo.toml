@@ -61,3 +61,8 @@ qrcode.workspace = true
 ratatui = "0.29"
 aes = "0.8"
 zip = { version = "2", features = ["deflate"] }
+
+[dev-dependencies]
+# `test-util` is not part of tokio's `full` feature; it provides the paused
+# clock used by the provider timeout tests.
+tokio = { workspace = true, features = ["test-util"] }

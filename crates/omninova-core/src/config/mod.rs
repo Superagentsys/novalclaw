@@ -13,7 +13,7 @@ pub use schema::{
     HeartbeatConfig, HooksConfig, HttpRequestConfig,
     IdentityConfig, MemoryConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, OtpConfig, PeripheralsConfig, ProviderApiMode, ProviderBehaviorConfig,
-    ProviderConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
+    ProviderConfig, ProviderRuntimeConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     RobotConfig, RpiGpioConfig, RuntimeConfig, SafetyConfig, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SensorsConfig, SkillsConfig, Stm32Config,
     StorageConfig, StorageProviderConfig, StorageProviderInner, SyscallAnomalyConfig,
@@ -23,7 +23,8 @@ pub use schema::{
 
 pub use schema::{
     resolve_configured_skills_dir, resolve_effective_workspace_dir,
-    resolve_effective_workspace_skills_dir, DEFAULT_OPEN_SKILLS_ENABLED,
+    resolve_effective_workspace_skills_dir, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_OPEN_SKILLS_ENABLED,
+    DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
 };
 pub use loader::resolve_config_path;
 pub use validation::ValidationReport;

@@ -1,4 +1,4 @@
-use crate::providers::{ChatRequest, ChatResponse, OpenAiProvider, Provider};
+use crate::providers::{ChatRequest, ChatResponse, OpenAiProvider, Provider, ProviderTimeouts};
 use async_trait::async_trait;
 
 /// Gemini provider adapter over OpenAI-compatible gateways.
@@ -13,9 +13,10 @@ impl GeminiProvider {
         model: impl Into<String>,
         temperature: f64,
         max_tokens: Option<u32>,
+        timeouts: ProviderTimeouts,
     ) -> Self {
         Self {
-            inner: OpenAiProvider::new(base_url, api_key, model, temperature, max_tokens),
+            inner: OpenAiProvider::new(base_url, api_key, model, temperature, max_tokens, timeouts),
         }
     }
 }
