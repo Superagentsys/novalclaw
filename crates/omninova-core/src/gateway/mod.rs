@@ -2496,7 +2496,9 @@ impl GatewayRuntime {
         tracing::debug!(target: "e2e", "[e2e-debug-spawn] program=cmd.exe arg0=/C command={} cwd={} exists={}",
             preview_cmd, cwd.display(), cwd.exists());
 
-        let mut child = tokio::process::Command::new("cmd.exe")
+        let mut command_process = tokio::process::Command::new("cmd.exe");
+        crate::tools::configure_background_command(&mut command_process);
+        let mut child = command_process
             .arg("/C")
             .arg(&command)
             .current_dir(&cwd)

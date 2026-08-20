@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::agent::AgentCancellationToken;
 use crate::security::sandbox::{ensure_sandbox_home, normalize_workspace_path, sandbox_env, sandbox_enabled};
+use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -256,6 +257,7 @@ impl Tool for ShellTool {
             c.arg("-lc").arg(command);
             c
         };
+        configure_background_command(&mut child);
         child
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -426,6 +428,7 @@ impl ShellTool {
             c.arg("-lc").arg(&command);
             c
         };
+        configure_background_command(&mut child);
         child
             .current_dir(cwd)
             .stdin(Stdio::null())

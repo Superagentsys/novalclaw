@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
+import { writeClipboardText } from "../../utils/clipboard";
 import { listenAgentRunEvents } from "../../utils/events";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -404,6 +405,9 @@ export function Chat({
     Record<string, { elapsedSec: number; steps: ExecutionStep[]; runId: string; longRunning?: boolean }>
   >({});
   const [error, setError] = useState<string | null>(null);
+  const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const [copyNotice, setCopyNotice] = useState<string | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
   const [gatewayStarting, setGatewayStarting] = useState(false);
@@ -421,6 +425,7 @@ export function Chat({
   const cancelledRef = useRef<Record<string, boolean>>({});
   const elapsedTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const safetyTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const commandFallbackTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const runAvatarIdsRef = useRef<Record<string, string>>({});
   const contractReviewRunAvatarIdsRef = useRef<Record<string, string>>({});
   const activeRunIdRef = useRef<string | null>(null);
@@ -551,11 +556,12 @@ export function Chat({
 
   // Grow the composer with its content up to the CSS max-height, then scroll.
   useEffect(() => {
+    if (!isActive) return;
     const node = composerInputRef.current;
     if (!node) return;
     node.style.height = "auto";
     node.style.height = `${node.scrollHeight}px`;
-  }, [input, activeAvatarId]);
+  }, [input, activeAvatarId, isActive]);
 
   const openInspector = useCallback((tab: InspectorTab = "process") => {
     setInspectorTab(tab);
@@ -604,6 +610,11 @@ export function Chat({
       if (safetyTimer) {
         clearTimeout(safetyTimer);
         delete safetyTimersRef.current[runId];
+      }
+      const commandFallbackTimer = commandFallbackTimersRef.current[runId];
+      if (commandFallbackTimer) {
+        clearTimeout(commandFallbackTimer);
+        delete commandFallbackTimersRef.current[runId];
       }
 
       if (avatarId) {
@@ -989,6 +1000,97 @@ export function Chat({
     []
   );
 
+  const settleRunFromCommand = useCallback(
+    (
+      runId: string,
+      avatarId: string,
+      outcome: { reply: string } | { error: string }
+    ) => {
+      const previous = commandFallbackTimersRef.current[runId];
+      if (previous) clearTimeout(previous);
+
+      // Tauri normally emits a terminal event before resolving the command.
+      // Keep a short grace period for that event, then settle from the command
+      // result so a dropped event cannot leave the UI spinning indefinitely.
+      commandFallbackTimersRef.current[runId] = setTimeout(() => {
+        delete commandFallbackTimersRef.current[runId];
+        if (
+          terminalRunIdsRef.current.has(runId) ||
+          completedRunIdsRef.current.has(runId) ||
+          runsRef.current[avatarId]?.runId !== runId
+        ) {
+          return;
+        }
+
+        terminalRunIdsRef.current.add(runId);
+        completedRunIdsRef.current.add(runId);
+        const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
+
+        if (cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, "任务已取消。", avatarId);
+          appendTaskActivity(runId, "任务已取消（由命令结果确认）", "warning");
+          finalizeTask(runId, "cancelled");
+          if (contractAvatarId) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [contractAvatarId]: { stage: "cancelled" },
+            }));
+          }
+        } else if ("reply" in outcome) {
+          const reply = outcome.reply.trim();
+          if (reply) {
+            appendAssistantMessageOnce(runId, reply, avatarId);
+            appendTaskActivity(runId, "任务已完成（终态事件兜底）", "success");
+            finalizeTask(runId, "completed", reply);
+            if (contractAvatarId) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [contractAvatarId]: { stage: "completed" },
+              }));
+            }
+          } else {
+            const message = "模型请求已结束，但没有返回可显示的内容。";
+            setError(message);
+            appendAssistantMessageOnce(runId, `任务失败：${message}`, avatarId);
+            appendTaskActivity(runId, message, "error");
+            finalizeTask(runId, "failed", message);
+            if (contractAvatarId) {
+              setContractReviewUiByAvatar((prev) => ({
+                ...prev,
+                [contractAvatarId]: { stage: "failed", error: message },
+              }));
+            }
+          }
+        } else {
+          const displayError = contractAvatarId
+            ? friendlyContractReviewError(outcome.error)
+            : outcome.error;
+          setError(displayError);
+          appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
+          appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+          finalizeTask(runId, "failed", displayError);
+          if (contractAvatarId) {
+            setContractReviewUiByAvatar((prev) => ({
+              ...prev,
+              [contractAvatarId]: { stage: "failed", error: displayError },
+            }));
+          }
+        }
+
+        delete contractReviewRunAvatarIdsRef.current[runId];
+        void refreshTaskArtifacts(runId);
+        finishRun(runId);
+      }, 600);
+    },
+    [
+      appendAssistantMessageOnce,
+      appendTaskActivity,
+      finalizeTask,
+      finishRun,
+      refreshTaskArtifacts,
+    ]
+  );
+
   const handleClearTaskHistory = useCallback(() => {
     setTaskHistory((prev) =>
       prev.filter(
@@ -1113,12 +1215,13 @@ export function Chat({
   }, []);
 
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
+    if (!isActive || !stickToBottomRef.current) return;
     scrollMessagesToEnd("auto");
-  }, [messages, sending, activeSteps, elapsedSec, scrollMessagesToEnd]);
+  }, [messages, sending, activeSteps, elapsedSec, isActive, scrollMessagesToEnd]);
 
   // 窗口缩放导致消息重新换行时，保持视口顶部正在浏览的消息位置不变。
   useEffect(() => {
+    if (!isActive) return;
     const container = messagesScrollRef.current;
     if (!container) return;
 
@@ -1191,14 +1294,16 @@ export function Chat({
       ro.disconnect();
       container.removeEventListener("scroll", handleScroll);
     };
-  }, []);
+  }, [isActive]);
 
   useEffect(() => {
     const timers = elapsedTimersRef.current;
     const safetyTimers = safetyTimersRef.current;
+    const commandFallbackTimers = commandFallbackTimersRef.current;
     return () => {
       Object.values(timers).forEach((timer) => clearInterval(timer));
       Object.values(safetyTimers).forEach((timer) => clearTimeout(timer));
+      Object.values(commandFallbackTimers).forEach((timer) => clearTimeout(timer));
     };
   }, []);
 
@@ -2184,31 +2289,14 @@ export function Chat({
             console.log("[handleSend] resolved run_id=" + runId + " reply_len=" + (result?.reply?.length ?? -1));
           }
 
-          // Normal completion is driven only by terminal agent-run-event payloads:
-          // run_completed / run_failed / run_cancelled. The invoke Promise may
-          // resolve late or never resolve, so it must not mutate chat completion state.
+          settleRunFromCommand(runId, avatarId, { reply: result?.reply ?? "" });
         })
         .catch((e) => {
-          if (import.meta.env.DEV) {
-            console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
-          }
           const message = e instanceof Error ? e.message : String(e);
-          const displayError = opts?.contractEngineName
-            ? friendlyContractReviewError(message)
-            : `任务启动失败：${message}`;
-          setError(displayError);
-          if (opts?.contractEngineName) {
-            setContractReviewUiByAvatar((prev) => ({
-              ...prev,
-              [avatarId]: { stage: "failed", error: displayError },
-            }));
-            delete contractReviewRunAvatarIdsRef.current[runId];
+          if (import.meta.env.DEV) {
+            console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + message);
           }
-          appendTaskActivity(runId, displayError, "error");
-          finalizeTask(runId, "failed", displayError);
-          // If the invoke itself failed, no terminal event can arrive from the
-          // backend. Clean up locally so the composer never remains locked.
-          finishRun(runId);
+          settleRunFromCommand(runId, avatarId, { error: message });
         });
     } catch (e) {
       if (import.meta.env.DEV) {
@@ -2953,6 +3041,21 @@ export function Chat({
                       msg.content
                     )}
                   </div>
+                  <div className="chat-bubble-actions">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCopyError(null);
+                        setCopyNotice(null);
+                        void writeClipboardText(msg.content).then(() => {
+                          setCopiedMessageIndex(i);
+                          window.setTimeout(() => setCopiedMessageIndex((current) => current === i ? null : current), 1600);
+                        }).catch((reason) => setCopyError(String(reason)));
+                      }}
+                    >
+                      {copiedMessageIndex === i ? "已复制" : "复制"}
+                    </button>
+                  </div>
                   {msg.agent && (
                     <div className="chat-bubble-meta">Agent: {msg.agent}</div>
                   )}
@@ -2991,7 +3094,21 @@ export function Chat({
 
           {error && (
             <div className="chat-error" role="alert">
-              {error}
+              <span>{error}</span>
+              <button
+                type="button"
+                className="chat-error-copy"
+                onClick={() => {
+                  setCopyError(null);
+                  setCopyNotice(null);
+                  void writeClipboardText(error).then(() => {
+                    setCopyNotice("错误信息已复制");
+                    window.setTimeout(() => setCopyNotice(null), 1600);
+                  }).catch((reason) => setCopyError(String(reason)));
+                }}
+              >
+                复制错误
+              </button>
               <button
                 type="button"
                 className="chat-error-dismiss"
@@ -3002,6 +3119,8 @@ export function Chat({
               </button>
             </div>
           )}
+          {copyError ? <div className="chat-copy-error" role="alert">复制失败：{copyError}</div> : null}
+          {copyNotice ? <div className="chat-copy-notice" role="status">{copyNotice}</div> : null}
 
           <div className="chat-composer-wrap">
             <input
@@ -3374,6 +3493,7 @@ export function Chat({
             task={activeTask}
             liveSessionId={activeRunId}
             activeSteps={activeSteps}
+            onAddArtifactToChat={(path) => void mergePathsIntoInput([path])}
           />
         </main>
       </div>

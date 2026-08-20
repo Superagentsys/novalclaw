@@ -20,6 +20,7 @@ import omninovalLogo from "../../assets/omninoval-logo.png";
 import { open } from "@tauri-apps/plugin-dialog";
 import { UiIcon, type UiIconName } from "../UiIcon";
 import { notifySetupConfigUpdated } from "../../utils/appEvents";
+import { writeClipboardText } from "../../utils/clipboard";
 
 /** Sensitive field names that should be redacted in JSON preview */
 const SENSITIVE_KEYS = new Set([
@@ -968,8 +969,10 @@ export function Setup({
       setActionMessage(`${label}尚未生成。`);
       return;
     }
-    void navigator.clipboard.writeText(url);
-    setActionMessage(`${label}已复制。`);
+    void writeClipboardText(url).then(
+      () => setActionMessage(`${label}已复制。`),
+      () => setActionMessage(`${label}复制失败，请手动复制。`),
+    );
   };
 
   const handlePickWorkspaceDir = async () => {
@@ -1633,7 +1636,10 @@ export function Setup({
                 }
               }}
               onCopyWebhookUrl={(url) => {
-                void navigator.clipboard.writeText(url);
+                void writeClipboardText(url).then(
+                  () => setActionMessage("Webhook 地址已复制。"),
+                  () => setActionMessage("Webhook 地址复制失败，请手动复制。"),
+                );
               }}
             />
             {activeChannelId === "feishu" ? (
@@ -1970,8 +1976,10 @@ export function Setup({
               type="button"
               className="setup-preview-copy"
               onClick={() => {
-                void navigator.clipboard.writeText(jsonPreview);
-                setActionMessage("配置已复制到剪贴板。");
+                void writeClipboardText(jsonPreview).then(
+                  () => setActionMessage("配置已复制到剪贴板。"),
+                  () => setActionMessage("配置复制失败，请手动复制。"),
+                );
               }}
             >
               复制

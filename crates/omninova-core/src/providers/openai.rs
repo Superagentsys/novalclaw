@@ -6,6 +6,10 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const NETWORK_ERROR_SOURCE_LIMIT: usize = 4;
 const NETWORK_ERROR_FRAGMENT_LIMIT: usize = 240;
@@ -168,6 +172,12 @@ struct StreamFuncDelta {
     arguments: Option<String>,
 }
 
+fn has_started_tool_call(tool_accum: &[(String, String, String)]) -> bool {
+    tool_accum
+        .iter()
+        .any(|(id, name, arguments)| !id.is_empty() || !name.is_empty() || !arguments.is_empty())
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -270,6 +280,9 @@ impl OpenAiProvider {
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         let client = Client::builder()
+            // A broken proxy or unreachable provider should fail quickly instead
+            // of leaving the desktop UI in an endless "running" state.
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("failed to build reqwest client");
 
@@ -627,8 +640,38 @@ impl Provider for OpenAiProvider {
         let mut finish_reason: Option<String> = None;
         let mut done = false;
 
-        while let Some(item) = stream.next().await {
-            let bytes = item.map_err(|error| self.request_error("流式读取失败", error))?;
+        loop {
+            let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+                Ok(next) => next,
+                Err(_)
+                    if (!text.is_empty() || !reasoning.is_empty())
+                        && !has_started_tool_call(&tool_accum) =>
+                {
+                    // Some OpenAI-compatible services omit [DONE] or keep the
+                    // connection open after the final text. Preserve the answer
+                    // that has already arrived rather than spinning forever.
+                    break;
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "流式响应超过 {} 秒没有新数据，请检查模型服务或网络连接",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+            let Some(item) = next else { break };
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(_)
+                    if (!text.is_empty() || !reasoning.is_empty())
+                        && !has_started_tool_call(&tool_accum) =>
+                {
+                    // If a transport closes after a complete text answer, return
+                    // the received answer. Incomplete tool calls remain errors.
+                    break;
+                }
+                Err(error) => return Err(self.request_error("流式读取失败", error)),
+            };
             buf.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(pos) = buf.find('\n') {

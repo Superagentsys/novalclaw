@@ -22,7 +22,9 @@ mod tests {
         let chunks = chunk_text(&text);
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("Intro"));
-        assert!(chunks.iter().any(|c| c.heading.as_deref() == Some("Details")));
+        assert!(chunks
+            .iter()
+            .any(|c| c.heading.as_deref() == Some("Details")));
     }
 
     #[tokio::test]
@@ -61,6 +63,77 @@ mod tests {
         assert_eq!(listed.len(), 1);
         store.remove(&doc.id).await.expect("remove");
         assert!(store.list(None).await.is_empty());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn recovers_legacy_and_missing_document_bodies() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-kb-recovery-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("tempdir");
+        let store = KnowledgeStore::open_in(&dir).await.expect("open");
+        let content = format!(
+            "# Guide\n\n{}\n\nTHE-END",
+            "important instructions ".repeat(180)
+        );
+        let doc = store
+            .upsert(KnowledgeUpsert {
+                id: None,
+                title: "Legacy Guide".into(),
+                collection: "ops".into(),
+                source: "note".into(),
+                source_path: None,
+                kind: "md".into(),
+                tags: Vec::new(),
+                content: content.clone(),
+                enabled: true,
+            })
+            .await
+            .expect("upsert");
+
+        let canonical = dir
+            .join("knowledge")
+            .join("docs")
+            .join(format!("{}.md", doc.id));
+        let legacy = dir.join("knowledge").join("docs").join("Legacy Guide.md");
+        tokio::fs::rename(&canonical, &legacy)
+            .await
+            .expect("move to legacy title path");
+        let (_, legacy_content) = store
+            .get(&doc.id)
+            .await
+            .expect("get legacy")
+            .expect("legacy document");
+        assert_eq!(legacy_content, content.trim());
+        assert!(
+            canonical.exists(),
+            "legacy read should repair the canonical body"
+        );
+
+        tokio::fs::remove_file(&canonical)
+            .await
+            .expect("remove canonical");
+        tokio::fs::remove_file(&legacy)
+            .await
+            .expect("remove legacy");
+        let (_, reconstructed) = store
+            .get(&doc.id)
+            .await
+            .expect("get reconstructed")
+            .expect("reconstructed document");
+        assert!(reconstructed.starts_with("# Guide"));
+        assert!(reconstructed.ends_with("THE-END"));
+        assert!(
+            canonical.exists(),
+            "chunk recovery should repair the canonical body"
+        );
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

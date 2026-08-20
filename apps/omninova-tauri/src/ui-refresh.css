@@ -1973,6 +1973,83 @@
   overflow: visible;
 }
 
+/* Semantic feedback and clipboard controls shared by every theme. */
+.chat-bubble-actions {
+  display: flex;
+  min-height: 20px;
+  justify-content: flex-end;
+  margin-top: 5px;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.chat-bubble:hover .chat-bubble-actions,
+.chat-bubble:focus-within .chat-bubble-actions { opacity: 1; }
+
+.chat-bubble-actions button,
+.chat-error-copy {
+  min-height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--ui-border);
+  border-radius: 6px;
+  background: var(--ui-surface-2);
+  color: var(--ui-text-secondary);
+  font-size: 9px;
+}
+
+.chat-bubble-user .chat-bubble-actions button {
+  border-color: color-mix(in srgb, var(--ui-text-on-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--ui-text-on-accent) 12%, transparent);
+  color: var(--ui-text-on-accent);
+}
+
+.chat-error-copy {
+  margin-left: auto;
+  border-color: color-mix(in srgb, var(--ui-danger) 38%, var(--ui-border));
+  background: transparent;
+  color: var(--ui-danger);
+}
+
+.chat-copy-error {
+  margin: 0 20px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: var(--ui-warning-soft);
+  color: var(--ui-warning);
+  font-size: 10px;
+}
+
+.chat-copy-notice {
+  margin: 0 20px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: var(--ui-success-soft);
+  color: var(--ui-success);
+  font-size: 10px;
+}
+
+/* Native select popups and disabled controls otherwise inherit OS colors in dark WebViews. */
+:root:is([data-theme="midnight"], [data-theme="graphite"]) select,
+:root:is([data-theme="midnight"], [data-theme="graphite"]) select option {
+  background: var(--ui-surface-2);
+  color: var(--ui-text);
+}
+
+:root:is([data-theme="midnight"], [data-theme="graphite"]) :is(input, textarea, select)::placeholder {
+  color: var(--ui-text-muted);
+  opacity: 1;
+}
+
+:root:is([data-theme="midnight"], [data-theme="graphite"]) :is(button, input, textarea, select):disabled {
+  color: var(--ui-text-muted);
+  opacity: 0.66;
+}
+
+:root:is([data-theme="midnight"], [data-theme="graphite"]) :is(.chat-error, .chat-bubble-error, .knowledge-error) {
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
+}
+
 .chat-composer-model-shell {
   min-width: 0;
 }

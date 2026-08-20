@@ -1,10 +1,8 @@
 .agent-diff-panel {
   margin: 8px 8px 10px 18px;
-  border: 1px solid rgba(78, 86, 120, 0.14);
+  border: 1px solid var(--ui-border);
   border-radius: 12px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.48), rgba(255, 255, 255, 0.28)),
-    rgba(246, 243, 236, 0.52);
+  background: var(--ui-surface-1);
   overflow: hidden;
 }
 
@@ -20,7 +18,7 @@
   justify-content: space-between;
   gap: 10px;
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(78, 86, 120, 0.1);
+  border-bottom: 1px solid var(--ui-border);
 }
 
 .agent-diff-summary-main {
@@ -30,7 +28,7 @@
 }
 
 .agent-diff-summary-kicker {
-  color: #858ba0;
+  color: var(--ui-text-muted);
   font-size: 10px;
   font-weight: 750;
   letter-spacing: 0.08em;
@@ -38,7 +36,7 @@
 }
 
 .agent-diff-summary-title {
-  color: #373c52;
+  color: var(--ui-text);
   font-size: 12px;
   font-weight: 700;
 }
@@ -49,7 +47,7 @@
   justify-content: flex-end;
   gap: 7px;
   flex-wrap: wrap;
-  color: #73798e;
+  color: var(--ui-text-secondary);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -71,17 +69,17 @@
   gap: 6px;
   flex-wrap: wrap;
   padding: 6px 8px;
-  border-bottom: 1px solid rgba(78, 86, 120, 0.1);
-  background: rgba(255, 255, 255, 0.24);
+  border-bottom: 1px solid var(--ui-border);
+  background: var(--ui-surface-2);
 }
 
 .agent-diff-toolbar button {
   min-height: 26px;
   padding: 3px 8px;
-  border: 1px solid rgba(78, 86, 120, 0.13);
+  border: 1px solid var(--ui-border);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.44);
-  color: #5e657a;
+  background: var(--ui-surface-1);
+  color: var(--ui-text-secondary);
   font: inherit;
   font-size: 10.5px;
   font-weight: 650;
@@ -90,30 +88,30 @@
 
 .agent-diff-toolbar button:hover,
 .agent-diff-toolbar button.active {
-  border-color: rgba(65, 105, 168, 0.24);
-  background: rgba(65, 105, 168, 0.08);
-  color: #365f9d;
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
 }
 
 .agent-changed-file {
   overflow: hidden;
-  border: 1px solid rgba(78, 86, 120, 0.11);
+  border: 1px solid var(--ui-border);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.4);
+  background: var(--ui-surface-2);
 }
 
 .agent-changed-file.active {
-  border-color: rgba(59, 130, 246, 0.22);
-  background: rgba(239, 246, 255, 0.46);
+  border-color: var(--ui-accent);
+  background: var(--ui-accent-soft);
 }
 
 .agent-changed-file.completed {
-  border-color: rgba(34, 160, 107, 0.16);
+  border-color: color-mix(in srgb, var(--ui-success) 45%, var(--ui-border));
 }
 
 .agent-changed-file.failed,
 .agent-changed-file.interrupted {
-  border-color: rgba(220, 80, 80, 0.18);
+  border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border));
 }
 
 .agent-changed-file-header {
@@ -126,36 +124,36 @@
   padding: 7px 9px;
   border: 0;
   background: transparent;
-  color: #464b61;
+  color: var(--ui-text-secondary);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
 
 .agent-changed-file-header:hover {
-  background: rgba(80, 92, 140, 0.045);
+  background: var(--ui-surface-hover);
 }
 
 .agent-changed-file-status {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #9aa0b3;
+  background: var(--ui-text-muted);
 }
 
 .agent-changed-file-status--active {
-  background: #3b82f6;
-  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.11);
+  background: var(--ui-accent);
+  box-shadow: 0 0 0 4px var(--ui-accent-soft);
   animation: agent-diff-pulse 1.15s ease-in-out infinite;
 }
 
 .agent-changed-file-status--completed {
-  background: #22a06b;
+  background: var(--ui-success);
 }
 
 .agent-changed-file-status--failed,
 .agent-changed-file-status--interrupted {
-  background: #d45050;
+  background: var(--ui-danger);
 }
 
 .agent-changed-file-name-wrap {
@@ -167,7 +165,7 @@
 .agent-changed-file-name {
   min-width: 0;
   overflow: hidden;
-  color: #31364c;
+  color: var(--ui-text);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 11.5px;
   font-weight: 650;
@@ -178,7 +176,7 @@
 .agent-changed-file-directory {
   min-width: 0;
   overflow: hidden;
-  color: #8a90a4;
+  color: var(--ui-text-muted);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 10px;
   font-weight: 500;
@@ -189,13 +187,13 @@
 .agent-changed-file-kind,
 .agent-changed-file-state,
 .agent-changed-file-toggle {
-  color: #7a8094;
+  color: var(--ui-text-muted);
   font-size: 10.5px;
   white-space: nowrap;
 }
 
 .agent-changed-file-toggle {
-  color: #4169a8;
+  color: var(--ui-accent-strong);
   font-weight: 650;
 }
 
@@ -219,13 +217,13 @@
 }
 
 .agent-diff-stat-add {
-  background: rgba(34, 160, 107, 0.1);
-  color: #1d7c55;
+  background: var(--ui-success-soft);
+  color: var(--ui-success);
 }
 
 .agent-diff-stat-remove {
-  background: rgba(220, 80, 80, 0.09);
-  color: #ad3f3f;
+  background: var(--ui-danger-soft);
+  color: var(--ui-danger);
 }
 
 .agent-diff-stat-bump {
@@ -236,19 +234,19 @@
 .diff-hunk-empty,
 .diff-hunk-note {
   padding: 8px;
-  border: 1px dashed rgba(78, 86, 120, 0.16);
+  border: 1px dashed var(--ui-border-strong);
   border-radius: 9px;
-  background: rgba(27, 31, 45, 0.035);
-  color: #70778c;
+  background: var(--ui-surface-2);
+  color: var(--ui-text-secondary);
   font-size: 11px;
   line-height: 1.45;
 }
 
 .diff-hunk {
   overflow: hidden;
-  border: 1px solid rgba(78, 86, 120, 0.11);
+  border: 1px solid var(--ui-border);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.36);
+  background: var(--ui-surface-1);
 }
 
 .diff-hunk-header {
@@ -257,14 +255,14 @@
   gap: 7px;
   min-height: 30px;
   padding: 6px 8px;
-  border-bottom: 1px solid rgba(78, 86, 120, 0.08);
+  border-bottom: 1px solid var(--ui-border);
 }
 
 .diff-hunk-summary {
   min-width: 0;
   flex: 1;
   overflow: hidden;
-  color: #444a60;
+  color: var(--ui-text);
   font-size: 11.5px;
   font-weight: 650;
   text-overflow: ellipsis;
@@ -272,7 +270,7 @@
 }
 
 .diff-hunk-location {
-  color: #8990a3;
+  color: var(--ui-text-muted);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
@@ -280,7 +278,7 @@
 .diff-lines {
   max-height: 360px;
   overflow: auto;
-  background: rgba(27, 31, 45, 0.035);
+  background: var(--ui-code-bg);
 }
 
 .diff-line {
@@ -289,45 +287,45 @@
   align-items: baseline;
   min-width: 100%;
   min-height: 20px;
-  border-top: 1px solid rgba(78, 86, 120, 0.045);
-  color: #4e556a;
+  border-top: 1px solid color-mix(in srgb, var(--ui-border) 70%, transparent);
+  color: var(--ui-code-text);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 11px;
   line-height: 1.55;
 }
 
 .diff-line.add {
-  background: rgba(34, 160, 107, 0.08);
+  background: color-mix(in srgb, var(--ui-success) 14%, var(--ui-code-bg));
 }
 
 .diff-line.remove {
-  background: rgba(220, 80, 80, 0.075);
+  background: color-mix(in srgb, var(--ui-danger) 14%, var(--ui-code-bg));
 }
 
 .diff-line.context {
-  background: rgba(255, 255, 255, 0.24);
+  background: var(--ui-code-bg);
 }
 
 .diff-line-no {
   padding: 0 6px;
-  color: #969caf;
+  color: var(--ui-text-muted);
   text-align: right;
   user-select: none;
 }
 
 .diff-line-marker {
-  color: #7d8498;
+  color: var(--ui-text-muted);
   font-weight: 800;
   text-align: center;
   user-select: none;
 }
 
 .diff-line.add .diff-line-marker {
-  color: #1d7c55;
+  color: var(--ui-success);
 }
 
 .diff-line.remove .diff-line-marker {
-  color: #ad3f3f;
+  color: var(--ui-danger);
 }
 
 .diff-line-code {
@@ -340,9 +338,9 @@
   width: 100%;
   padding: 6px 8px;
   border: 0;
-  border-top: 1px solid rgba(78, 86, 120, 0.08);
-  background: rgba(80, 92, 140, 0.055);
-  color: #4169a8;
+  border-top: 1px solid var(--ui-border);
+  background: var(--ui-surface-2);
+  color: var(--ui-accent-strong);
   font: inherit;
   font-size: 11px;
   font-weight: 650;
@@ -350,7 +348,7 @@
 }
 
 .diff-hunk-expand:hover {
-  background: rgba(80, 92, 140, 0.08);
+  background: var(--ui-surface-hover);
 }
 
 .diff-hunk-empty,

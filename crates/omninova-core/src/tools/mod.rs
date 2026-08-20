@@ -39,3 +39,13 @@ pub use use_skill::{SkillActivationGate, UseSkillTool};
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
+
+/// Prevent background tool processes from flashing a console window on Windows.
+/// Keep this in one place so every Tokio child-process tool applies the same flag.
+pub(crate) fn configure_background_command(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}

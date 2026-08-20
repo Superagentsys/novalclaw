@@ -2986,16 +2986,16 @@
   align-self: flex-end;
   background: var(--accent-gradient);
   border: 1px solid transparent;
-  color: #fff;
+  color: var(--ui-text-on-accent);
   border-bottom-right-radius: 5px;
-  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.22);
+  box-shadow: var(--shadow-accent);
 }
 
 .chat-bubble-assistant {
   align-self: flex-start;
-  background: rgba(255, 255, 255, 0.94);
-  border: 1px solid var(--border-soft);
-  color: #2a2a3e;
+  background: var(--ui-surface-1);
+  border: 1px solid var(--ui-border);
+  color: var(--ui-text);
   border-bottom-left-radius: 5px;
   box-shadow: var(--shadow-sm);
 }
@@ -3003,11 +3003,11 @@
 .chat-bubble-meta {
   margin-top: 6px;
   font-size: 10px;
-  color: #8888aa;
+  color: var(--ui-text-muted);
 }
 
 .chat-bubble-user .chat-bubble-meta {
-  color: rgba(255, 255, 255, 0.75);
+  color: color-mix(in srgb, var(--ui-text-on-accent) 78%, transparent);
 }
 
 .chat-bubble-typing {
@@ -3028,7 +3028,7 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #aaaacc;
+  background: var(--ui-accent);
   animation: typing-bounce 0.6s ease-in-out infinite;
 }
 
@@ -3049,9 +3049,9 @@
   padding: 8px 14px;
   margin: 0 20px;
   border-radius: 8px;
-  background: rgba(232, 112, 112, 0.08);
-  border: 1px solid rgba(192, 64, 64, 0.22);
-  color: #c04040;
+  background: var(--ui-danger-soft);
+  border: 1px solid color-mix(in srgb, var(--ui-danger) 38%, var(--ui-border));
+  color: var(--ui-danger);
   font-size: 12px;
   flex-shrink: 0;
   display: flex;
@@ -3065,31 +3065,31 @@
   border: none;
   border-radius: 4px;
   background: transparent;
-  color: #e87070;
+  color: var(--ui-danger);
   cursor: pointer;
   font-size: 14px;
   flex-shrink: 0;
 }
 
 .chat-error-dismiss:hover {
-  background: rgba(232, 112, 112, 0.12);
+  background: color-mix(in srgb, var(--ui-danger) 14%, transparent);
 }
 
 .chat-bubble-error {
   align-self: flex-start;
-  background: rgba(232, 112, 112, 0.06);
-  border: 1px solid #3a2222;
-  color: #e87070;
+  background: var(--ui-danger-soft);
+  border: 1px solid color-mix(in srgb, var(--ui-danger) 42%, var(--ui-border));
+  color: var(--ui-danger);
   border-bottom-left-radius: 4px;
 }
 
 .chat-warn-text {
-  color: #e87070;
+  color: var(--ui-danger);
 }
 
 .typing-elapsed {
   font-size: 11px;
-  color: #5a524a;
+  color: var(--ui-text-muted);
   margin-left: 6px;
 }
 

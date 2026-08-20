@@ -8,6 +8,7 @@ import {
   type ChannelField,
 } from "../../types/config";
 import { UiIcon } from "../UiIcon";
+import { writeClipboardText } from "../../utils/clipboard";
 
 interface ChannelConfigFormProps {
   value: ChannelsConfig;
@@ -214,22 +215,27 @@ export function ChannelConfigForm({
   };
 
   /** Handle copy webhook URL */
-  const handleCopyWebhookUrl = () => {
+  const handleCopyWebhookUrl = async () => {
     if (!fullWebhookUrl) return;
-    if (onCopyWebhookUrl) {
-      onCopyWebhookUrl(fullWebhookUrl);
-    } else {
-      void navigator.clipboard.writeText(fullWebhookUrl);
+    try {
+      if (onCopyWebhookUrl) onCopyWebhookUrl(fullWebhookUrl);
+      else await writeClipboardText(fullWebhookUrl);
+      setCopyStatus("已复制");
+    } catch {
+      setCopyStatus("复制失败，请手动复制");
     }
-    setCopyStatus("已复制");
     setTimeout(() => setCopyStatus(""), 2000);
   };
 
   /** Handle copy card callback URL */
-  const handleCopyCardCallbackUrl = () => {
+  const handleCopyCardCallbackUrl = async () => {
     if (!fullCardCallbackUrl) return;
-    void navigator.clipboard.writeText(fullCardCallbackUrl);
-    setCopyCardStatus("已复制");
+    try {
+      await writeClipboardText(fullCardCallbackUrl);
+      setCopyCardStatus("已复制");
+    } catch {
+      setCopyCardStatus("复制失败，请手动复制");
+    }
     setTimeout(() => setCopyCardStatus(""), 2000);
   };
 
