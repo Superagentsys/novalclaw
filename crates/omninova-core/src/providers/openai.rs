@@ -7,6 +7,98 @@ use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 
+const NETWORK_ERROR_SOURCE_LIMIT: usize = 4;
+const NETWORK_ERROR_FRAGMENT_LIMIT: usize = 240;
+
+#[derive(Debug, PartialEq, Eq)]
+struct NetworkErrorDiagnostics {
+    host: String,
+    is_connect: bool,
+    is_timeout: bool,
+    is_request: bool,
+    is_body: bool,
+    is_decode: bool,
+    source_chain: Vec<String>,
+}
+
+impl NetworkErrorDiagnostics {
+    fn from_reqwest(base_url: &str, error: &reqwest::Error) -> Self {
+        let host = reqwest::Url::parse(base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToString::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut source_chain = Vec::new();
+        let mut source = std::error::Error::source(error);
+        while let Some(current) = source {
+            source_chain.push(sanitize_network_error_fragment(&current.to_string()));
+            if source_chain.len() >= NETWORK_ERROR_SOURCE_LIMIT {
+                break;
+            }
+            source = current.source();
+        }
+
+        Self {
+            host,
+            is_connect: error.is_connect(),
+            is_timeout: error.is_timeout(),
+            is_request: error.is_request(),
+            is_body: error.is_body(),
+            is_decode: error.is_decode(),
+            source_chain,
+        }
+    }
+}
+
+fn sanitize_network_error_fragment(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    if [
+        "authorization",
+        "bearer ",
+        "api_key",
+        "api-key",
+        "access_token",
+        "app_secret",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return "<redacted-sensitive-error-source>".to_string();
+    }
+
+    let mut sanitized = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let http = rest.find("http://");
+        let https = rest.find("https://");
+        let next = match (http, https) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(index), None) | (None, Some(index)) => Some(index),
+            (None, None) => None,
+        };
+        let Some(index) = next else {
+            sanitized.push_str(rest);
+            break;
+        };
+        sanitized.push_str(&rest[..index]);
+        sanitized.push_str("<url-redacted>");
+        let url_tail = &rest[index..];
+        let end = url_tail
+            .find(char::is_whitespace)
+            .unwrap_or(url_tail.len());
+        rest = &url_tail[end..];
+    }
+
+    let mut chars = sanitized.chars();
+    let mut truncated = chars
+        .by_ref()
+        .take(NETWORK_ERROR_FRAGMENT_LIMIT)
+        .collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
@@ -194,7 +286,7 @@ impl OpenAiProvider {
     /// 构建 POST 请求。本地推理服务（如 Ollama / LM Studio）通常无需 API Key，
     /// 因此仅在存在 credential 时附加 `Authorization` 头，否则不带鉴权直接请求。
     fn authorized_post(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self.client.post(format!("{}{}", self.base_url, path));
+        let req = self.client.post(self.endpoint_url(path));
         match self.credential.as_ref() {
             Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
             None => req,
@@ -203,11 +295,72 @@ impl OpenAiProvider {
 
     /// 构建 GET 请求，鉴权头处理同 [`authorized_post`]。
     fn authorized_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self.client.get(format!("{}{}", self.base_url, path));
+        let req = self.client.get(self.endpoint_url(path));
         match self.credential.as_ref() {
             Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
             None => req,
         }
+    }
+
+    fn endpoint_url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn request_error(&self, operation: &str, error: reqwest::Error) -> anyhow::Error {
+        let diagnostics = NetworkErrorDiagnostics::from_reqwest(&self.base_url, &error);
+        let source_0 = diagnostics
+            .source_chain
+            .first()
+            .map(String::as_str)
+            .unwrap_or("none");
+        let source_1 = diagnostics
+            .source_chain
+            .get(1)
+            .map(String::as_str)
+            .unwrap_or("none");
+        let source_2 = diagnostics
+            .source_chain
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("none");
+        let source_3 = diagnostics
+            .source_chain
+            .get(3)
+            .map(String::as_str)
+            .unwrap_or("none");
+        tracing::error!(
+            target: "omninova_core::providers::network",
+            provider = "openai-compatible",
+            host = %diagnostics.host,
+            is_connect = diagnostics.is_connect,
+            is_timeout = diagnostics.is_timeout,
+            is_request = diagnostics.is_request,
+            is_body = diagnostics.is_body,
+            is_decode = diagnostics.is_decode,
+            source_0 = %source_0,
+            source_1 = %source_1,
+            source_2 = %source_2,
+            source_3 = %source_3,
+            "[provider-network-error]"
+        );
+
+        let category = if diagnostics.is_timeout {
+            "请求超时"
+        } else if diagnostics.is_connect {
+            "连接失败"
+        } else if diagnostics.is_body {
+            "响应流读取失败"
+        } else if diagnostics.is_decode {
+            "响应解码失败"
+        } else if diagnostics.is_request {
+            "请求构建或发送失败"
+        } else {
+            "网络请求失败"
+        };
+        anyhow::anyhow!(
+            "{operation}：{category}（provider=openai-compatible, host={}）；详情见 provider-network-error 日志",
+            diagnostics.host
+        )
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -414,21 +567,7 @@ impl Provider for OpenAiProvider {
             .json(&native_request)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    anyhow::anyhow!(
-                        "请求超时：调用 {} 超时，请检查网络连通性或 API 服务可用性",
-                        self.base_url
-                    )
-                } else if e.is_connect() {
-                    anyhow::anyhow!(
-                        "连接失败：无法连接到 {}，请检查 Base URL 配置和网络连通性",
-                        self.base_url
-                    )
-                } else {
-                    anyhow::anyhow!("网络请求失败：{}", e)
-                }
-            })?;
+            .map_err(|error| self.request_error("请求失败", error))?;
 
         if !response.status().is_success() {
             return Err(api_error("OpenAI", response).await);
@@ -472,7 +611,7 @@ impl Provider for OpenAiProvider {
             .json(&native_request)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("流式请求失败：{e}"))?;
+            .map_err(|error| self.request_error("流式请求失败", error))?;
 
         if !response.status().is_success() {
             return Err(api_error("OpenAI", response).await);
@@ -489,7 +628,7 @@ impl Provider for OpenAiProvider {
         let mut done = false;
 
         while let Some(item) = stream.next().await {
-            let bytes = item.map_err(|e| anyhow::anyhow!("流式读取失败：{e}"))?;
+            let bytes = item.map_err(|error| self.request_error("流式读取失败", error))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(pos) = buf.find('\n') {
@@ -599,5 +738,51 @@ impl Provider for OpenAiProvider {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_completions_url_is_normalized_without_duplicate_slashes() {
+        for base_url in ["https://wetoken.pro/v1", "https://wetoken.pro/v1/"] {
+            let provider = OpenAiProvider::new(
+                Some(base_url),
+                None,
+                "deepseek-v4-flash",
+                0.7,
+                None,
+            );
+            assert_eq!(
+                provider.endpoint_url("/chat/completions"),
+                "https://wetoken.pro/v1/chat/completions"
+            );
+        }
+    }
+
+    #[test]
+    fn network_error_source_sanitizer_redacts_urls_and_credentials() {
+        let sanitized = sanitize_network_error_fragment(
+            "connect to https://user:password@example.test/v1 failed",
+        );
+        assert_eq!(sanitized, "connect to <url-redacted> failed");
+
+        let sensitive = sanitize_network_error_fragment(
+            "Authorization: Bearer never-log-this-secret",
+        );
+        assert_eq!(sensitive, "<redacted-sensitive-error-source>");
+    }
+
+    #[test]
+    fn network_error_source_sanitizer_truncates_on_char_boundaries() {
+        let input = "连接失败".repeat(NETWORK_ERROR_FRAGMENT_LIMIT);
+        let sanitized = sanitize_network_error_fragment(&input);
+        assert!(sanitized.ends_with("..."));
+        assert_eq!(
+            sanitized.trim_end_matches("...").chars().count(),
+            NETWORK_ERROR_FRAGMENT_LIMIT
+        );
     }
 }
