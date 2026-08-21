@@ -2398,6 +2398,41 @@ impl GatewayRuntime {
         tracing::debug!(target: "e2e", "[e2e-gateway-agent-return] timestamp={} run_id={}", now_ts(), run_id);
         run_guard.finish().await;
 
+        // The streaming desktop path must persist the same conversation state
+        // as the non-streaming path. Previously it only loaded history, so a
+        // successful request disappeared from the next turn and short follow-up
+        // messages such as "继续" or "按刚才的要求执行" used stale context.
+        if result.is_ok() && !is_stateless {
+            if let Some(session_id) = inbound.session_id.as_deref() {
+                let _guard = self.session_store_guard.lock().await;
+                let history_messages = agent
+                    .export_messages()
+                    .into_iter()
+                    .map(ChatMessage::strip_images_for_history)
+                    .collect();
+                if let Err(e) = save_session_history(
+                    &cfg,
+                    &inbound.channel,
+                    session_id,
+                    history_messages,
+                    agent_cfg.max_history_messages,
+                    lineage.parent_session_key.clone(),
+                    lineage.parent_agent_id.clone(),
+                    route.agent_name.clone(),
+                    lineage.spawn_depth,
+                )
+                .await
+                {
+                    steps.push(ExecutionStep::error("保存会话历史", e.to_string()));
+                    warn!("failed to save streaming session history for {}: {}", session_id, e);
+                } else {
+                    let count = agent.export_messages().len();
+                    security.audit_session_persisted(session_id, count).await;
+                    steps.push(ExecutionStep::done("保存会话历史", session_id.to_string()));
+                }
+            }
+        }
+
         let reply_text = match &result {
             Ok((reply, _)) => {
                 security

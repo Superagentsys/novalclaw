@@ -16,11 +16,11 @@ use crate::agent::event_bus::{
 use crate::agent::AgentCancellationToken;
 use crate::agent::{FileDiffStats, ToolExecutionEvent};
 use crate::providers::ToolCall;
-use crate::security::{SecurityContext, ToolExecutionGate};
+use crate::security::{ApprovalStatus, SecurityContext, ToolExecutionGate};
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::time::Instant;
+use tokio::time::{sleep, Duration, Instant};
 
 fn now_ts() -> String {
     use std::time::SystemTime;
@@ -41,6 +41,31 @@ fn preview(s: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+fn approval_arguments_for_display(arguments: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = arguments.as_object() else {
+        return arguments.clone();
+    };
+    serde_json::Value::Object(
+        object
+            .iter()
+            .map(|(key, value)| {
+                let lowered = key.to_ascii_lowercase();
+                let safe_value = if ["secret", "token", "password", "api_key", "apikey"]
+                    .iter()
+                    .any(|needle| lowered.contains(needle))
+                {
+                    serde_json::Value::String("[已隐藏敏感值]".to_string())
+                } else if let Some(text) = value.as_str() {
+                    serde_json::Value::String(preview(text, 2000))
+                } else {
+                    value.clone()
+                };
+                (key.clone(), safe_value)
+            })
+            .collect(),
+    )
 }
 
 fn tool_path_arg(args: &serde_json::Value) -> String {
@@ -211,27 +236,62 @@ impl<'a> ToolRunner<'a> {
                     }),
                 ));
             }
-            Ok(ToolExecutionGate::ApprovalRequired { .. }) => {
-                let msg = "tool execution requires user approval";
+            Ok(ToolExecutionGate::ApprovalRequired { pending }) => {
                 if let Some(ref bus) = self.event_bus {
                     bus.approval_required(
                         step_id.clone(),
                         tool_call.id.clone(),
+                        pending.id.clone(),
                         tool_call.name.clone(),
                         title,
-                        msg.to_string(),
-                    );
-                    bus.tool_completed(
-                        step_id.clone(),
-                        tool_call.id.clone(),
-                        tool_call.name.clone(),
-                        false,
-                        0,
-                        msg.to_string(),
-                        None,
+                        pending.reason.clone(),
+                        approval_arguments_for_display(&pending.arguments),
                     );
                 }
-                return Err(anyhow::anyhow!(msg));
+
+                // Keep this exact tool call alive while the desktop displays
+                // its approval card. Approving resumes here with the original
+                // arguments; no second model request or vague "retry" prompt is
+                // needed, so conversational context and the intended operation
+                // cannot drift.
+                let wait_started = Instant::now();
+                loop {
+                    if let Some(token) = &self.cancel_token {
+                        token.check()?;
+                    }
+                    if wait_started.elapsed() > Duration::from_secs(15 * 60) {
+                        return Err(anyhow::anyhow!("tool approval timed out"));
+                    }
+
+                    match self.security.tool_approval(&pending.id).await? {
+                        Some(item) if item.status == ApprovalStatus::Approved => {
+                            match self
+                                .security
+                                .gate_tool_execution(&tool_call.name, args)
+                                .await?
+                            {
+                                ToolExecutionGate::Proceed { .. } => break,
+                                _ => {
+                                    return Err(anyhow::anyhow!(
+                                        "approved tool request could not be consumed"
+                                    ));
+                                }
+                            }
+                        }
+                        Some(item) if item.status == ApprovalStatus::Rejected => {
+                            let detail = item
+                                .reject_reason
+                                .unwrap_or_else(|| "用户拒绝了本次操作".to_string());
+                            return Err(anyhow::anyhow!("tool execution rejected: {detail}"));
+                        }
+                        Some(_) => sleep(Duration::from_millis(180)).await,
+                        // The small JSON approval store is rewritten when the
+                        // UI decides. A read may briefly observe the rewrite;
+                        // keep waiting instead of turning that harmless race
+                        // into a failed agent run.
+                        None => sleep(Duration::from_millis(180)).await,
+                    }
+                }
             }
             Ok(ToolExecutionGate::Proceed { .. }) | Err(_) => {}
         }

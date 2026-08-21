@@ -58,6 +58,14 @@ impl ApprovalController {
         })
     }
 
+    /// Returns one approval request by id. This is used by an in-flight tool
+    /// execution to wait for the desktop user's decision without terminating
+    /// and recreating the whole agent run.
+    pub async fn get(&self, id: &str) -> Result<Option<PendingApproval>> {
+        let store = self.load().await?;
+        Ok(store.items.into_iter().find(|item| item.id == id))
+    }
+
     pub async fn create(
         &self,
         tool_name: &str,
@@ -191,5 +199,38 @@ mod tests {
         let a = hash_tool_args("shell", &args);
         let b = hash_tool_args("shell", &args);
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn approval_can_be_observed_and_consumed_by_an_inflight_tool() {
+        let workspace = std::env::temp_dir().join(format!("omninova-approval-test-{}", Uuid::new_v4()));
+        let controller = ApprovalController::from_workspace(&workspace);
+        let arguments = serde_json::json!({"command": "cargo test"});
+        let pending = controller
+            .create("shell", arguments.clone(), "test approval")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            controller.get(&pending.id).await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+        controller
+            .approve(&pending.id, Some("desktop-user".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.get(&pending.id).await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+        let consumed = controller
+            .consume_matching_grant("shell", &arguments)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.id, pending.id);
+        assert_eq!(consumed.status, ApprovalStatus::Consumed);
+
+        let _ = tokio::fs::remove_dir_all(workspace).await;
     }
 }

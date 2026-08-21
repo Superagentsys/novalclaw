@@ -319,6 +319,11 @@ impl SecurityContext {
         }
     }
 
+    /// Reads the current decision for a pending tool approval.
+    pub async fn tool_approval(&self, id: &str) -> Result<Option<PendingApproval>> {
+        self.approvals.get(id).await
+    }
+
     pub async fn audit_tool_call(
         &self,
         tool_name: &str,

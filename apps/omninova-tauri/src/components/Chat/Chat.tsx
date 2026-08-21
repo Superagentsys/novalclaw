@@ -116,6 +116,96 @@ const COMPOSER_MAX_HEIGHT = 240;
 const COMPOSER_HELP_TEXT =
   "可用命令：\n/help — 显示帮助\n/skills — 打开技能设置\n输入 / 打开命令面板，选择已安装技能后再发送任务。";
 
+type ApprovalProfile = "request_approval" | "risk_based";
+
+interface ApprovalProfilePayload {
+  profile: ApprovalProfile;
+  label: string;
+  description: string;
+}
+
+interface PendingToolApproval {
+  approvalId: string;
+  runId: string;
+  toolName: string;
+  title: string;
+  reason: string;
+  arguments: Record<string, unknown>;
+  decision: "pending" | "approving" | "rejecting";
+}
+
+const DEFAULT_APPROVAL_PROFILE: ApprovalProfilePayload = {
+  profile: "request_approval",
+  label: "请求批准",
+  description: "编辑文件、运行命令和使用互联网前始终请求确认。",
+};
+
+function friendlyToolApprovalError(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("tool execution rejected")) {
+    return "你已拒绝本次工具操作，任务已停止，未执行该命令或文件修改。";
+  }
+  if (normalized.includes("tool approval timed out")) {
+    return "工具操作等待确认超时，任务已停止。请重新发送请求后及时确认。";
+  }
+  if (normalized.includes("tool execution requires user approval")) {
+    return "工具操作正在等待你的确认，请在输入框上方的确认卡中查看具体命令或路径，并选择“允许本次”或“拒绝”。";
+  }
+  return message;
+}
+
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  shell: "运行命令",
+  file_write: "新建或写入文件",
+  file_edit: "编辑文件",
+  file_patch: "修改文件",
+  git_operations: "执行 Git 操作",
+  browser: "使用浏览器",
+  http_request: "访问互联网",
+};
+
+function approvalToolLabel(toolName: string): string {
+  return TOOL_DISPLAY_NAMES[toolName] ?? toolName;
+}
+
+function approvalArgumentRows(argumentsValue: Record<string, unknown>): Array<[string, string]> {
+  const preferredKeys = [
+    "command",
+    "path",
+    "file_path",
+    "working_directory",
+    "url",
+    "query",
+    "operation",
+  ];
+  const labels: Record<string, string> = {
+    command: "命令",
+    path: "目标路径",
+    file_path: "目标文件",
+    working_directory: "工作目录",
+    url: "网址",
+    query: "检索内容",
+    operation: "操作",
+  };
+  const rows: Array<[string, string]> = [];
+  for (const key of preferredKeys) {
+    const value = argumentsValue[key];
+    if (typeof value === "string" && value.trim()) {
+      rows.push([labels[key] ?? key, value.trim()]);
+    }
+  }
+  if (!rows.length) {
+    for (const [key, value] of Object.entries(argumentsValue).slice(0, 4)) {
+      if (typeof value === "string" && value.trim()) {
+        rows.push([key, value.trim()]);
+      } else if (typeof value === "number" || typeof value === "boolean") {
+        rows.push([key, String(value)]);
+      }
+    }
+  }
+  return rows;
+}
+
 const TEXT_FILE_EXTENSIONS = new Set([
   "txt",
   "md",
@@ -463,6 +553,15 @@ export function Chat({
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  const [approvalProfile, setApprovalProfile] = useState<ApprovalProfilePayload>(
+    DEFAULT_APPROVAL_PROFILE
+  );
+  const [approvalMenuOpen, setApprovalMenuOpen] = useState(false);
+  const [approvalSaving, setApprovalSaving] = useState(false);
+  const [pendingToolApprovals, setPendingToolApprovals] = useState<
+    Record<string, PendingToolApproval>
+  >({});
+  const approvalMenuRef = useRef<HTMLDivElement>(null);
   /**
    * Session-level temporary workspace. Set by the chat-page Workspace button
    * without modifying the agent's default workspace. This takes the highest
@@ -532,6 +631,7 @@ export function Chat({
   const elapsedSec = activeRun?.elapsedSec ?? 0;
   const activeSteps = useMemo(() => activeRun?.steps ?? [], [activeRun?.steps]);
   const activeRunId = activeRun?.runId ?? null;
+  const activeToolApproval = activeRunId ? pendingToolApprovals[activeRunId] : undefined;
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
   const selectedSkill = selectedSkills[activeAvatarId];
@@ -644,6 +744,12 @@ export function Chat({
       if (avatarId) {
         cancelledRef.current[avatarId] = false;
       }
+      setPendingToolApprovals((prev) => {
+        if (!prev[runId]) return prev;
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
       delete runAvatarIdsRef.current[runId];
     },
     [findAvatarIdByRunId]
@@ -1062,9 +1168,10 @@ export function Chat({
             }
           }
         } else {
+          const approvalAwareError = friendlyToolApprovalError(outcome.error);
           const displayError = contractAvatarId
-            ? friendlyContractReviewError(outcome.error)
-            : outcome.error;
+            ? friendlyContractReviewError(approvalAwareError)
+            : approvalAwareError;
           setError(displayError);
           appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
           appendTaskActivity(runId, `任务失败：${displayError}`, "error");
@@ -1138,6 +1245,26 @@ export function Chat({
     };
   }, [workspaceMenuOpen]);
 
+  useEffect(() => {
+    if (!approvalMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && approvalMenuRef.current?.contains(target)) return;
+      setApprovalMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setApprovalMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [approvalMenuOpen]);
+
   const refreshSetupConfig = useCallback(() => {
     return invokeTauri<Config>("get_setup_config")
       .then((cfg) => {
@@ -1188,9 +1315,17 @@ export function Chat({
       .catch(() => {});
   }, []);
 
+  const refreshApprovalProfile = useCallback(() => {
+    return invokeTauri<ApprovalProfilePayload>("get_approval_profile")
+      .then((profile) => setApprovalProfile(profile))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
-    if (isActive) void refreshSetupConfig();
-  }, [isActive, refreshSetupConfig]);
+    if (!isActive) return;
+    void refreshSetupConfig();
+    void refreshApprovalProfile();
+  }, [isActive, refreshApprovalProfile, refreshSetupConfig]);
 
   useEffect(() => {
     const handleSetupConfigUpdated = () => void refreshSetupConfig();
@@ -1199,6 +1334,110 @@ export function Chat({
       window.removeEventListener(SETUP_CONFIG_UPDATED_EVENT, handleSetupConfigUpdated);
     };
   }, [refreshSetupConfig]);
+
+  const handleApprovalProfileChange = useCallback(
+    async (profile: ApprovalProfile) => {
+      if (approvalSaving || profile === approvalProfile.profile) {
+        setApprovalMenuOpen(false);
+        return;
+      }
+      setApprovalSaving(true);
+      setError(null);
+      try {
+        const saved = await invokeTauri<ApprovalProfilePayload>("set_approval_profile", {
+          profile,
+        });
+        setApprovalProfile(saved);
+        setApprovalMenuOpen(false);
+        setCopyNotice(`权限模式已切换为“${saved.label}”，新任务立即生效。`);
+        window.setTimeout(() => setCopyNotice(null), 2400);
+      } catch (reason) {
+        setError(`权限模式保存失败：${reason instanceof Error ? reason.message : String(reason)}`);
+      } finally {
+        setApprovalSaving(false);
+      }
+    },
+    [approvalProfile.profile, approvalSaving]
+  );
+
+  const handleApproveToolRequest = useCallback(
+    async (approval: PendingToolApproval) => {
+      setError(null);
+      setPendingToolApprovals((prev) => ({
+        ...prev,
+        [approval.runId]: { ...approval, decision: "approving" },
+      }));
+      try {
+        await invokeTauri("approve_tool_request", {
+          approvalId: approval.approvalId,
+        });
+        setPendingToolApprovals((prev) => {
+          if (!prev[approval.runId]) return prev;
+          const next = { ...prev };
+          delete next[approval.runId];
+          return next;
+        });
+        patchTaskProgress(approval.runId, {
+          status: "running",
+          attentionReason: undefined,
+          approvalTool: undefined,
+          nextAction: undefined,
+        });
+        appendTaskActivity(
+          approval.runId,
+          `已允许本次操作：${approvalToolLabel(approval.toolName)}`,
+          "success",
+          {
+            kind: "approval",
+            status: "completed",
+            toolName: approval.toolName,
+            detail: "仅批准当前显示的这一项工具操作，Agent 已继续执行。",
+          }
+        );
+      } catch (reason) {
+        setPendingToolApprovals((prev) => ({
+          ...prev,
+          [approval.runId]: { ...approval, decision: "pending" },
+        }));
+        setError(`批准操作失败：${reason instanceof Error ? reason.message : String(reason)}`);
+      }
+    },
+    [appendTaskActivity, patchTaskProgress]
+  );
+
+  const handleRejectToolRequest = useCallback(
+    async (approval: PendingToolApproval) => {
+      setError(null);
+      setPendingToolApprovals((prev) => ({
+        ...prev,
+        [approval.runId]: { ...approval, decision: "rejecting" },
+      }));
+      try {
+        await invokeTauri("reject_tool_request", {
+          approvalId: approval.approvalId,
+          reason: "用户在桌面端拒绝了本次工具操作",
+        });
+        appendTaskActivity(
+          approval.runId,
+          `已拒绝本次操作：${approvalToolLabel(approval.toolName)}`,
+          "warning",
+          {
+            kind: "approval",
+            status: "failed",
+            toolName: approval.toolName,
+            detail: "Agent 将停止当前工具调用，不会执行所显示的命令或文件操作。",
+          }
+        );
+      } catch (reason) {
+        setPendingToolApprovals((prev) => ({
+          ...prev,
+          [approval.runId]: { ...approval, decision: "pending" },
+        }));
+        setError(`拒绝操作失败：${reason instanceof Error ? reason.message : String(reason)}`);
+      }
+    },
+    [appendTaskActivity]
+  );
 
   const scrollMessagesToEnd = useCallback((behavior: ScrollBehavior = "auto") => {
     const container = messagesScrollRef.current;
@@ -1354,17 +1593,37 @@ export function Chat({
       };
 
       if (eventType === "approval_required" || eventType === "approvalRequired") {
-        const reason = typeof rawPayload.reason === "string"
-          ? rawPayload.reason
-          : "该工具需要人工确认后才能继续。";
+        const reason = typeof rawPayload.reason === "string" && rawPayload.reason.trim()
+          ? rawPayload.reason.trim()
+          : "当前权限策略要求你确认本次工具操作。";
         const toolName = typeof rawPayload.tool_name === "string"
           ? rawPayload.tool_name
           : "受限工具";
+        const approvalId = stringValue("approval_id", "approvalId");
+        const title = stringValue("title") || approvalToolLabel(toolName);
+        const args = rawPayload.arguments;
+        const argumentsValue = args && typeof args === "object" && !Array.isArray(args)
+          ? args as Record<string, unknown>
+          : {};
+        if (approvalId) {
+          setPendingToolApprovals((prev) => ({
+            ...prev,
+            [runId]: {
+              approvalId,
+              runId,
+              toolName,
+              title,
+              reason,
+              arguments: argumentsValue,
+              decision: "pending",
+            },
+          }));
+        }
         patchTaskProgress(runId, {
           status: "needs_approval",
           attentionReason: reason.slice(0, 260),
           approvalTool: toolName,
-          nextAction: "在任务检查器中核对工具与原因，再调整授权策略或重新执行。",
+          nextAction: "核对即将执行的命令或目标路径，然后允许本次操作或拒绝。",
         });
         appendTaskActivity(runId, `需要授权：${toolName} · ${reason}`, "warning", {
           kind: "approval",
@@ -1593,7 +1852,9 @@ export function Chat({
 
       if (!completedRunIdsRef.current.has(runId)) {
         completedRunIdsRef.current.add(runId);
-        const rawError = payload.error || payload.message || "Agent run failed";
+        const rawError = friendlyToolApprovalError(
+          payload.error || payload.message || "Agent run failed"
+        );
         const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
         const displayError = contractAvatarId ? friendlyContractReviewError(rawError) : rawError;
         setError(displayError);
@@ -2292,7 +2553,7 @@ export function Chat({
           settleRunFromCommand(runId, avatarId, { reply: result?.reply ?? "" });
         })
         .catch((e) => {
-          const message = e instanceof Error ? e.message : String(e);
+          const message = friendlyToolApprovalError(e instanceof Error ? e.message : String(e));
           if (import.meta.env.DEV) {
             console.error("[handleSend] process_inbound_message_streaming error run_id=" + runId + " error=" + message);
           }
@@ -2302,7 +2563,7 @@ export function Chat({
       if (import.meta.env.DEV) {
         console.error("[handleSend] outer-error run_id=" + runId + " error=" + (e instanceof Error ? e.message : String(e)));
       }
-      const message = e instanceof Error ? e.message : String(e);
+      const message = friendlyToolApprovalError(e instanceof Error ? e.message : String(e));
       const displayError = opts?.contractEngineName
         ? friendlyContractReviewError(message)
         : `任务启动失败：${message}`;
@@ -3095,6 +3356,15 @@ export function Chat({
           {error && (
             <div className="chat-error" role="alert">
               <span>{error}</span>
+              {error.includes("权限模式要求先确认") ? (
+                <button
+                  type="button"
+                  className="chat-error-permission"
+                  onClick={() => setApprovalMenuOpen(true)}
+                >
+                  调整权限
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="chat-error-copy"
@@ -3190,6 +3460,56 @@ export function Chat({
                 onInstructionsChange={setContractExtraInstructions}
                 onStart={() => void handleStartContractReview()}
               />
+            ) : null}
+            {activeToolApproval ? (
+              <section className="chat-tool-approval" role="alertdialog" aria-labelledby="tool-approval-title">
+                <div className="chat-tool-approval-icon" aria-hidden>
+                  <UiIcon name="safety" size={18} />
+                </div>
+                <div className="chat-tool-approval-body">
+                  <div className="chat-tool-approval-heading">
+                    <div>
+                      <span className="chat-tool-approval-eyebrow">等待你的确认</span>
+                      <h3 id="tool-approval-title">
+                        {approvalToolLabel(activeToolApproval.toolName)}
+                      </h3>
+                    </div>
+                    <code>{activeToolApproval.toolName}</code>
+                  </div>
+                  <p>{activeToolApproval.reason}</p>
+                  <div className="chat-tool-approval-arguments">
+                    {approvalArgumentRows(activeToolApproval.arguments).map(([label, value]) => (
+                      <div key={`${label}-${value.slice(0, 32)}`}>
+                        <span>{label}</span>
+                        <code>{value}</code>
+                      </div>
+                    ))}
+                  </div>
+                  <details className="chat-tool-approval-details">
+                    <summary>查看完整工具参数</summary>
+                    <pre>{JSON.stringify(activeToolApproval.arguments, null, 2)}</pre>
+                  </details>
+                  <div className="chat-tool-approval-actions">
+                    <span>批准仅对本次显示的操作有效，后续受限操作仍会再次询问。</span>
+                    <button
+                      type="button"
+                      className="chat-tool-approval-reject"
+                      disabled={activeToolApproval.decision !== "pending"}
+                      onClick={() => void handleRejectToolRequest(activeToolApproval)}
+                    >
+                      {activeToolApproval.decision === "rejecting" ? "正在拒绝…" : "拒绝"}
+                    </button>
+                    <button
+                      type="button"
+                      className="chat-tool-approval-allow"
+                      disabled={activeToolApproval.decision !== "pending"}
+                      onClick={() => void handleApproveToolRequest(activeToolApproval)}
+                    >
+                      {activeToolApproval.decision === "approving" ? "正在继续…" : "允许本次"}
+                    </button>
+                  </div>
+                </div>
+              </section>
             ) : null}
             <div className="chat-composer-card">
               <div
@@ -3405,15 +3725,56 @@ export function Chat({
                       配置模型
                     </button>
                   ) : null}
-                  <button
-                    type="button"
-                    className="chat-composer-permission"
-                    title="工具授权规则由本地安全设置统一管理"
-                    onClick={() => onOpenSettings?.("general")}
-                  >
-                    <UiIcon name="safety" size={14} />
-                    <span>默认权限</span>
-                  </button>
+                  <div ref={approvalMenuRef} className="chat-approval-actions">
+                    <button
+                      type="button"
+                      className={`chat-composer-permission${approvalMenuOpen ? " is-open" : ""}`}
+                      title={approvalProfile.description}
+                      aria-haspopup="menu"
+                      aria-expanded={approvalMenuOpen}
+                      onClick={() => setApprovalMenuOpen((open) => !open)}
+                      disabled={approvalSaving}
+                    >
+                      <UiIcon name="safety" size={14} />
+                      <span>{approvalSaving ? "保存中…" : approvalProfile.label}</span>
+                      <span className="chat-permission-chevron" aria-hidden />
+                    </button>
+                    {approvalMenuOpen ? (
+                      <div className="chat-permission-menu" role="menu" aria-label="工具权限模式">
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={approvalProfile.profile === "request_approval"}
+                          className={approvalProfile.profile === "request_approval" ? "is-selected" : ""}
+                          onClick={() => void handleApprovalProfileChange("request_approval")}
+                          disabled={approvalSaving}
+                        >
+                          <span className="chat-permission-option-icon"><UiIcon name="safety" size={16} /></span>
+                          <span className="chat-permission-option-copy">
+                            <strong>请求批准</strong>
+                            <small>编辑文件、运行命令和使用互联网时始终询问</small>
+                          </span>
+                          {approvalProfile.profile === "request_approval" ? <UiIcon name="check" size={14} /> : null}
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={approvalProfile.profile === "risk_based"}
+                          className={approvalProfile.profile === "risk_based" ? "is-selected" : ""}
+                          onClick={() => void handleApprovalProfileChange("risk_based")}
+                          disabled={approvalSaving}
+                        >
+                          <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
+                          <span className="chat-permission-option-copy">
+                            <strong>帮我批准</strong>
+                            <small>自动执行常规操作，仅对检测到的风险操作进行限制</small>
+                          </span>
+                          {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
+                        </button>
+                        <p>危险命令和禁止路径仍会被安全策略拦截。</p>
+                      </div>
+                    ) : null}
+                  </div>
                   <div
                     ref={workspaceMenuRef}
                     className={`chat-workspace-actions${sessionWorkspaceDir ? " chat-workspace-actions--temporary" : ""}`}

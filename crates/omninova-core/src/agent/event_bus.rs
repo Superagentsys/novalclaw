@@ -361,17 +361,21 @@ impl EventBus {
         &self,
         step_id: String,
         tool_call_id: String,
+        approval_id: String,
         tool_name: String,
         title: String,
         reason: String,
+        arguments: serde_json::Value,
     ) {
         self.emit(AgentRunEvent::approval_required {
             run_id: self.inner.run_id.clone(),
             step_id,
             tool_call_id,
+            approval_id,
             tool_name,
             title,
             reason,
+            arguments,
         });
     }
 
