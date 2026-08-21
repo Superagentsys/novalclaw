@@ -507,6 +507,157 @@ struct SetupWorkspaceStatus {
     message: String,
 }
 
+const APPROVAL_PROFILE_REQUEST: &str = "request_approval";
+const APPROVAL_PROFILE_RISK_BASED: &str = "risk_based";
+
+/// Tools whose normal use can mutate the workspace or contact an external
+/// service. Both legacy `[autonomy]` and the newer `[approvals]` table must
+/// agree on these entries, otherwise runtimes can make opposite decisions.
+const APPROVAL_CONTROLLED_TOOLS: &[&str] = &[
+    "shell",
+    "file_write",
+    "file_edit",
+    "file_patch",
+    "apply_patch",
+    "git_operations",
+    "browser",
+    "http_request",
+];
+
+const APPROVAL_SAFE_TOOLS: &[&str] = &[
+    "file_read",
+    "file_list",
+    "memory_recall",
+    "memory_store",
+    "knowledge_search",
+    "use_skill",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApprovalProfilePayload {
+    profile: String,
+    label: String,
+    description: String,
+}
+
+fn approval_profile_payload(profile: &str) -> ApprovalProfilePayload {
+    if profile == APPROVAL_PROFILE_RISK_BASED {
+        ApprovalProfilePayload {
+            profile: APPROVAL_PROFILE_RISK_BASED.to_string(),
+            label: "帮我批准".to_string(),
+            description: "自动执行常规操作，仅由安全策略拦截检测到的风险操作。".to_string(),
+        }
+    } else {
+        ApprovalProfilePayload {
+            profile: APPROVAL_PROFILE_REQUEST.to_string(),
+            label: "请求批准".to_string(),
+            description: "编辑文件、运行命令和使用互联网前始终请求确认。".to_string(),
+        }
+    }
+}
+
+fn tool_list_contains(list: &[String], tool: &str) -> bool {
+    list.iter().any(|item| item.eq_ignore_ascii_case(tool))
+}
+
+fn remove_controlled_tools(list: &mut Vec<String>) {
+    list.retain(|item| {
+        !APPROVAL_CONTROLLED_TOOLS
+            .iter()
+            .any(|tool| item.eq_ignore_ascii_case(tool))
+    });
+}
+
+fn ensure_tool_entries(list: &mut Vec<String>, tools: &[&str]) {
+    for tool in tools {
+        if !tool_list_contains(list, tool) {
+            list.push((*tool).to_string());
+        }
+    }
+}
+
+/// Infer the user's intended profile from older configurations. The desktop
+/// previously added broad auto-approval entries only to `[autonomy]`; when
+/// those tools still appeared under `[approvals].require_approval`, the file
+/// was contradictory. Treat that legacy shape as the risk-based profile so an
+/// upgrade does not unexpectedly block edits meant to run automatically.
+fn configured_approval_profile(config: &Config) -> &'static str {
+    if config.approvals.mode.as_deref() == Some(APPROVAL_PROFILE_RISK_BASED) {
+        return APPROVAL_PROFILE_RISK_BASED;
+    }
+
+    let legacy_conflict = APPROVAL_CONTROLLED_TOOLS.iter().any(|tool| {
+        tool_list_contains(&config.autonomy.auto_approve, tool)
+            && tool_list_contains(&config.approvals.require_approval, tool)
+    });
+    let approvals_auto_runs_tools = APPROVAL_CONTROLLED_TOOLS
+        .iter()
+        .any(|tool| tool_list_contains(&config.approvals.auto_approve, tool));
+
+    if legacy_conflict || approvals_auto_runs_tools {
+        APPROVAL_PROFILE_RISK_BASED
+    } else {
+        APPROVAL_PROFILE_REQUEST
+    }
+}
+
+fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, String> {
+    if profile != APPROVAL_PROFILE_REQUEST && profile != APPROVAL_PROFILE_RISK_BASED {
+        return Err("未知的权限策略。".to_string());
+    }
+
+    let before = (
+        config.autonomy.level.clone(),
+        config.autonomy.require_approval_for_medium_risk,
+        config.autonomy.auto_approve.clone(),
+        config.approvals.enabled,
+        config.approvals.mode.clone(),
+        config.approvals.auto_approve.clone(),
+        config.approvals.require_approval.clone(),
+    );
+
+    config.autonomy.level = "supervised".to_string();
+    // Shell commands still pass through the explicit allowlist and dangerous
+    // command deny list. Keep medium-risk commands available so the approval
+    // layer can decide instead of silently denying them before prompting.
+    config.autonomy.require_approval_for_medium_risk = false;
+    config.approvals.enabled = true;
+    remove_controlled_tools(&mut config.autonomy.auto_approve);
+    remove_controlled_tools(&mut config.approvals.auto_approve);
+    remove_controlled_tools(&mut config.approvals.require_approval);
+    ensure_tool_entries(&mut config.autonomy.auto_approve, APPROVAL_SAFE_TOOLS);
+    ensure_tool_entries(&mut config.approvals.auto_approve, APPROVAL_SAFE_TOOLS);
+
+    if profile == APPROVAL_PROFILE_RISK_BASED {
+        config.approvals.mode = Some(APPROVAL_PROFILE_RISK_BASED.to_string());
+        ensure_tool_entries(
+            &mut config.autonomy.auto_approve,
+            APPROVAL_CONTROLLED_TOOLS,
+        );
+        ensure_tool_entries(
+            &mut config.approvals.auto_approve,
+            APPROVAL_CONTROLLED_TOOLS,
+        );
+    } else {
+        config.approvals.mode = Some("supervised".to_string());
+        ensure_tool_entries(
+            &mut config.approvals.require_approval,
+            APPROVAL_CONTROLLED_TOOLS,
+        );
+    }
+
+    let after = (
+        config.autonomy.level.clone(),
+        config.autonomy.require_approval_for_medium_risk,
+        config.autonomy.auto_approve.clone(),
+        config.approvals.enabled,
+        config.approvals.mode.clone(),
+        config.approvals.auto_approve.clone(),
+        config.approvals.require_approval.clone(),
+    );
+    Ok(before != after)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SetupAppConfig {
     api_key: Option<String>,
@@ -777,6 +928,46 @@ async fn get_setup_config(
 
     let cfg = runtime.get_config().await;
     Ok(setup_config_from_core(&cfg))
+}
+
+#[tauri::command]
+async fn get_approval_profile(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ApprovalProfilePayload, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let mut config = runtime.get_config().await;
+    let profile = configured_approval_profile(&config);
+    let payload = approval_profile_payload(profile);
+
+    // Older desktop releases could write the same tool into both
+    // `autonomy.auto_approve` and `approvals.require_approval`. Normalize that
+    // legacy shape as soon as the composer reads the selected profile, so the
+    // label shown to the user always matches the persisted/runtime policy.
+    if apply_approval_profile(&mut config, profile)? {
+        save_config_with_fallback(&mut config)?;
+        runtime.set_config(config).await.map_err(|e| e.to_string())?;
+    }
+
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn set_approval_profile(
+    profile: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ApprovalProfilePayload, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let mut config = runtime.get_config().await;
+    apply_approval_profile(&mut config, &profile)?;
+    save_config_with_fallback(&mut config)?;
+    runtime.set_config(config).await.map_err(|e| e.to_string())?;
+    Ok(approval_profile_payload(&profile))
 }
 
 #[tauri::command]
@@ -1111,6 +1302,39 @@ async fn cancel_agent_run(
     };
     runtime
         .cancel_agent_run(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Approve the exact tool call currently waiting in an active desktop run.
+#[tauri::command]
+async fn approve_tool_request(
+    approval_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::security::PendingApproval, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .approve_request(&approval_id, Some("desktop-user".to_string()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reject the exact tool call currently waiting in an active desktop run.
+#[tauri::command]
+async fn reject_tool_request(
+    approval_id: String,
+    reason: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::security::PendingApproval, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .reject_request(&approval_id, reason)
         .await
         .map_err(|e| e.to_string())
 }
@@ -3230,25 +3454,12 @@ fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
         changed = true;
     }
 
-    let auto_approved_tools = [
-        "browser",
-        "shell",
-        "file_read",
-        "file_write",
-        "file_edit",
-        "file_list",
-        "git_operations",
-    ];
-    for tool in auto_approved_tools {
-        if !config
-            .autonomy
-            .auto_approve
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(tool))
-        {
-            config.autonomy.auto_approve.push(tool.to_string());
-            changed = true;
-        }
+    // Keep the legacy autonomy list and the dedicated approvals module in
+    // lock-step. This also migrates the historical conflicting shape where
+    // desktop auto-approved a tool while approvals still required confirmation.
+    let profile = configured_approval_profile(config);
+    if apply_approval_profile(config, profile).unwrap_or(false) {
+        changed = true;
     }
 
     // Make sure common read-only / workspace-safe Git operations are in
@@ -4129,6 +4340,8 @@ pub fn run() {
             save_config,
             reload_config,
             get_setup_config,
+            get_approval_profile,
+            set_approval_profile,
             open_workspace_dir,
             save_setup_config,
             gateway_status,
@@ -4138,6 +4351,8 @@ pub fn run() {
             process_inbound_message,
             process_inbound_message_streaming,
             cancel_agent_run,
+            approve_tool_request,
+            reject_tool_request,
             automation_list_jobs,
             automation_upsert_job,
             automation_delete_job,
@@ -4442,6 +4657,56 @@ mod gateway_lifecycle_tests {
             PathBuf::from(r"D:\123\"),
             PathBuf::from("D:/123")
         ));
+    }
+}
+
+#[cfg(test)]
+mod approval_profile_tests {
+    use super::*;
+
+    fn has(list: &[String], tool: &str) -> bool {
+        list.iter().any(|item| item == tool)
+    }
+
+    #[test]
+    fn legacy_conflict_migrates_to_risk_based_without_overlap() {
+        let mut config = Config::default();
+        config.autonomy.auto_approve.push("file_write".into());
+        assert!(has(&config.approvals.require_approval, "file_write"));
+        assert_eq!(
+            configured_approval_profile(&config),
+            APPROVAL_PROFILE_RISK_BASED
+        );
+
+        apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap();
+        assert!(has(&config.autonomy.auto_approve, "file_write"));
+        assert!(has(&config.approvals.auto_approve, "file_write"));
+        assert!(!has(&config.approvals.require_approval, "file_write"));
+        assert_eq!(
+            config.approvals.mode.as_deref(),
+            Some(APPROVAL_PROFILE_RISK_BASED)
+        );
+    }
+
+    #[test]
+    fn request_profile_requires_mutating_and_network_tools() {
+        let mut config = Config::default();
+        apply_approval_profile(&mut config, APPROVAL_PROFILE_REQUEST).unwrap();
+
+        for tool in ["shell", "file_write", "file_edit", "git_operations", "browser"] {
+            assert!(!has(&config.autonomy.auto_approve, tool));
+            assert!(!has(&config.approvals.auto_approve, tool));
+            assert!(has(&config.approvals.require_approval, tool));
+        }
+        assert!(has(&config.approvals.auto_approve, "file_read"));
+        assert_eq!(config.approvals.mode.as_deref(), Some("supervised"));
+    }
+
+    #[test]
+    fn applying_a_profile_is_idempotent() {
+        let mut config = Config::default();
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
+        assert!(!apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
     }
 }
 

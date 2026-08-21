@@ -134,9 +134,11 @@ export interface AgentRunEventApprovalRequired {
   run_id: string;
   step_id: string;
   tool_call_id: string;
+  approval_id: string;
   tool_name: string;
   title: string;
   reason: string;
+  arguments: Record<string, unknown>;
 }
 
 export interface AgentRunEventCommandOutput {

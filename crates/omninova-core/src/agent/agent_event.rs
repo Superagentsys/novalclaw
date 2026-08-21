@@ -210,10 +210,15 @@ pub enum AgentRunEvent {
         run_id: String,
         step_id: String,
         tool_call_id: String,
+        /// Stable approval request id used by the UI to approve or reject.
+        approval_id: String,
         tool_name: String,
         title: String,
         /// Human-readable reason for the approval requirement.
         reason: String,
+        /// Exact tool arguments. They stay local to the desktop app and let the
+        /// user review the command, path or URL before making a decision.
+        arguments: serde_json::Value,
     },
 
     /// Run has completed successfully.
