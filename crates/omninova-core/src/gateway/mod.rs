@@ -3898,6 +3898,13 @@ pub async fn check_gateway_public_health(config: &Config) -> GatewayPublicHealth
         }
     };
 
+    probe_gateway_public_health(base_url, &client).await
+}
+
+async fn probe_gateway_public_health(
+    base_url: String,
+    client: &reqwest::Client,
+) -> GatewayPublicHealthStatus {
     let mut last_status = None;
     for suffix in ["/health", "/api/health"] {
         let checked_url = format!("{base_url}{suffix}");
@@ -9981,10 +9988,10 @@ mod tests {
         create_tools_for_route, dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
         feishu_public_callback_urls, http_dingtalk_card_callback_post,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
-        normalize_public_webhook_base_url, recover_session_store, resolve_agent_max_tool_iterations,
-        resolve_public_webhook_base_url, session_expired, split_session_key, DedupCache,
-        GatewayRuntime, GatewayRuntimeStatus, GatewaySessionTreeQuery, MonitorFlightGuard,
-        SessionLineageMeta,
+        normalize_public_webhook_base_url, probe_gateway_public_health, recover_session_store,
+        resolve_agent_max_tool_iterations, resolve_public_webhook_base_url, session_expired,
+        split_session_key, DedupCache, GatewayRuntime, GatewayRuntimeStatus,
+        GatewaySessionTreeQuery, MonitorFlightGuard, SessionLineageMeta,
     };
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::{
@@ -13434,7 +13441,12 @@ mod tests {
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
             Some(format!("http://{closed_addr}"));
-        let status = check_gateway_public_health(&config).await;
+        let base_url = resolve_public_webhook_base_url(&config).expect("configured base URL");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build direct test client");
+        let status = probe_gateway_public_health(base_url, &client).await;
 
         assert!(status.configured);
         assert!(!status.ok);
@@ -13454,8 +13466,13 @@ mod tests {
         let mut config = Config::default();
         config.gateway_public.public_webhook_base_url =
             Some(format!("http://{closed_addr}"));
-        let status1 = check_gateway_public_health(&config).await;
-        let status2 = check_gateway_public_health(&config).await;
+        let base_url = resolve_public_webhook_base_url(&config).expect("configured base URL");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build direct test client");
+        let status1 = probe_gateway_public_health(base_url.clone(), &client).await;
+        let status2 = probe_gateway_public_health(base_url, &client).await;
 
         assert!(!status1.ok);
         assert!(!status2.ok);

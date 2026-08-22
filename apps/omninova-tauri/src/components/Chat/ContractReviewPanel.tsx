@@ -25,6 +25,9 @@ interface Props {
   onEngineChange: (id: string) => void;
   onInstructionsChange: (value: string) => void;
   onStart: () => void;
+  skillStatus?: "NotInstalled" | "Installing" | "Ready" | "Incomplete" | "Failed";
+  skillMissing?: string[];
+  onInstallSkill?: () => void;
 }
 
 interface ReportProps {
@@ -64,6 +67,14 @@ function primaryActionLabel(stage: ContractReviewStage, fileCount: number): stri
   if (stage === "generating") return "正在生成报告...";
   if (stage === "completed") return fileCount > 1 ? "重新比对" : "重新审核";
   return fileCount > 1 ? "开始版本比对" : "开始审核";
+}
+
+function collapseStatusLabel(stage: ContractReviewStage, busy: boolean): string {
+  if (busy) return "审核中";
+  if (stage === "completed") return "已完成";
+  if (stage === "failed") return "审核失败";
+  if (stage === "cancelled") return "已取消";
+  return "待审核";
 }
 
 function ProgressIcon({ state }: { state: "done" | "active" | "waiting" | "skipped" }) {
@@ -111,25 +122,78 @@ function ReviewProgress({ stage, comparison }: { stage: ContractReviewStage; com
 }
 
 export function ContractReviewPanel(props: Props) {
+  const [collapsed, setCollapsed] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const busy = BUSY_STAGES.has(props.stage);
   const comparison = props.attachments.length > 1;
   const status = fileStatus(props.stage, props.documentsPrepared);
+  const collapseStatus = collapseStatusLabel(props.stage, busy);
 
   return (
-    <section className="contract-review-panel" aria-label="合同智能审核面板">
+    <section
+      className={`contract-review-panel${collapsed ? " is-collapsed" : ""}`}
+      aria-label="合同智能审核面板"
+    >
       <header className="contract-review-header">
         <div>
           <div className="contract-review-title-row">
             <UiIcon name="safety" size={18} />
             <h2>合同智能审核</h2>
+            {collapsed ? <span className="contract-review-collapse-status">{collapseStatus}</span> : null}
             <span className="contract-review-badge">系统工具</span>
           </div>
-          <p>关键条款审查 · 风险识别 · 缺漏检查 · 版本比对</p>
+          {collapsed ? null : <p>关键条款审查 · 风险识别 · 缺漏检查 · 版本比对</p>}
         </div>
+        <button
+          type="button"
+          className="contract-review-collapse"
+          onClick={() => setCollapsed((value) => !value)}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? "展开合同智能审核" : "收起合同智能审核"}
+          title={collapsed ? "展开合同智能审核" : "收起合同智能审核"}
+        >
+          <UiIcon name={collapsed ? "chevronDown" : "chevronUp"} size={13} />
+          {collapsed ? "展开" : "收起"}
+        </button>
       </header>
 
-      <div className="contract-review-setup-grid">
+      {collapsed ? null : (
+        <>
+          {props.skillStatus && props.skillStatus !== "Ready" ? (
+            <div
+              className={`contract-review-skill-banner is-${props.skillStatus.toLowerCase()}`}
+            >
+              <div>
+                <strong>
+                  {props.skillStatus === "Installing"
+                    ? "正在安装合同审核能力..."
+                    : props.skillStatus === "Failed"
+                      ? "合同审核能力安装失败"
+                      : "合同审核能力尚未安装完整"}
+                </strong>
+                {props.skillMissing?.length ? (
+                  <span>缺少：{props.skillMissing.join("、")}</span>
+                ) : null}
+              </div>
+              {props.onInstallSkill ? (
+                <button
+                  type="button"
+                  className="contract-review-skill-install"
+                  onClick={props.onInstallSkill}
+                  disabled={props.skillStatus === "Installing"}
+                >
+                  {props.skillStatus === "Installing" ? "正在安装..." : "下载并安装"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {props.skillStatus === "Ready" ? (
+            <div className="contract-review-skill-ready">
+              <UiIcon name="check" size={14} />
+              <span>合同审核能力已就绪</span>
+            </div>
+          ) : null}
+          <div className="contract-review-setup-grid">
         <section className="contract-review-section contract-review-files-section">
           <div className="contract-review-section-heading">
             <span className="contract-review-step-number">1</span>
@@ -257,7 +321,9 @@ export function ContractReviewPanel(props: Props) {
           {busy ? <span className="contract-review-elapsed">{props.elapsedSec}s</span> : null}
         </button>
         <p>审核结果用于风控初审辅助，不构成正式法律意见。</p>
-      </div>
+        </div>
+        </>
+      )}
     </section>
   );
 }

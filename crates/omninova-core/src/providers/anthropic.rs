@@ -1,4 +1,4 @@
-use crate::providers::{ChatRequest, ChatResponse, OpenAiProvider, Provider};
+use crate::providers::{ChatRequest, ChatResponse, OpenAiProvider, Provider, ProviderTimeouts};
 use async_trait::async_trait;
 
 /// Anthropic provider adapter.
@@ -18,10 +18,17 @@ impl AnthropicProvider {
         model: impl Into<String>,
         temperature: f64,
         max_tokens: Option<u32>,
+        timeouts: ProviderTimeouts,
     ) -> Self {
         Self {
-            inner: OpenAiProvider::new(base_url, api_key, model, temperature, max_tokens),
+            inner: OpenAiProvider::new(base_url, api_key, model, temperature, max_tokens, timeouts),
         }
+    }
+
+    /// Applies a per-provider HTTP transport mode to the underlying client.
+    pub fn with_transport_mode(mut self, mode: crate::config::TransportMode) -> Self {
+        self.inner = self.inner.with_transport_mode(mode);
+        self
     }
 }
 

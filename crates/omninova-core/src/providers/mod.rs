@@ -12,4 +12,4 @@ pub use traits::{
     ToolResultMessage,
 };
 
-pub use openai::{MockProvider, OpenAiProvider};
+pub use openai::{MockProvider, OpenAiProvider, ProviderTimeoutKind, ProviderTimeouts};

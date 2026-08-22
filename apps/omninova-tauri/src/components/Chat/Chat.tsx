@@ -74,6 +74,7 @@ import type {
 } from "./contractReviewModel";
 import {
   DEFAULT_CONTRACT_REVIEW_ENGINES,
+  detectContractModificationRequested,
   friendlyContractReviewError,
 } from "./contractReviewModel";
 import {
@@ -460,6 +461,28 @@ interface CollectedTaskArtifact {
   extension: string;
 }
 
+interface DocxValidationResult {
+  valid: boolean;
+  reason?: string | null;
+  path?: string | null;
+  size: number;
+  hasContentTypes: boolean;
+  hasDocumentXml: boolean;
+}
+
+interface DocxReplacement {
+  originalText: string;
+  newText: string;
+}
+
+interface ModifyDocxResult {
+  outputPath: string;
+  replacedCount: number;
+  totalReplacements: number;
+  successful: number;
+  failed: string[];
+}
+
 export function Chat({
   initialSidebarTab = "avatars",
   isActive = true,
@@ -518,6 +541,7 @@ export function Chat({
   const commandFallbackTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const runAvatarIdsRef = useRef<Record<string, string>>({});
   const contractReviewRunAvatarIdsRef = useRef<Record<string, string>>({});
+  const contractModificationRequestedRef = useRef<Record<string, boolean>>({});
   const activeRunIdRef = useRef<string | null>(null);
   const terminalRunIdsRef = useRef<Set<string>>(new Set());
   const completedRunIdsRef = useRef<Set<string>>(new Set());
@@ -534,6 +558,10 @@ export function Chat({
     Record<string, ContractReviewUiState>
   >({});
   const [lastRiskExport, setLastRiskExport] = useState<unknown>(null);
+  const [contractReviewSkillStatus, setContractReviewSkillStatus] = useState<
+    "NotInstalled" | "Installing" | "Ready" | "Incomplete" | "Failed"
+  >("NotInstalled");
+  const [contractReviewSkillMissing, setContractReviewSkillMissing] = useState<string[]>([]);
   const [commandPalette, setCommandPalette] = useState<CommandPalette>(() => emptyCommandPalette());
   const [composerCursor, setComposerCursor] = useState(0);
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -589,6 +617,23 @@ export function Chat({
       // localStorage 不可用时忽略
     }
   }, [sessionWorkspaceDirs]);
+
+  useEffect(() => {
+    let active = true;
+    invokeTauri<{ status: string; missing: string[] }>("contract_review_skill_status_command")
+      .then((result) => {
+        if (!active) return;
+        setContractReviewSkillStatus(normalizeSkillStatus(result.status));
+        setContractReviewSkillMissing(result.missing ?? []);
+      })
+      .catch(() => {
+        if (!active) return;
+        setContractReviewSkillStatus("Failed");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const activeSession = avatars.find((a) => a.id === activeAvatarId);
   const sessionId = activeSession?.sessionId ?? "omninova-chat-session";
@@ -1035,6 +1080,129 @@ export function Chat({
     }
   }, []);
 
+  const collectTaskArtifacts = useCallback(async (runId: string) => {
+    const target = taskHistoryRef.current.find((task) => task.runId === runId);
+    if (!target?.workspacePath) return [] as CollectedTaskArtifact[];
+    try {
+      return await invokeTauri<CollectedTaskArtifact[]>("collect_task_artifacts", {
+        workspacePath: target.workspacePath,
+        startedAt: target.startedAt,
+      });
+    } catch (reason) {
+      if (import.meta.env.DEV) {
+        console.debug("[contract-review][collect_task_artifacts]", reason);
+      }
+      return [] as CollectedTaskArtifact[];
+    }
+  }, []);
+
+  const validateDocxArtifact = useCallback(
+    async (artifact: CollectedTaskArtifact, workspacePath: string) => {
+      try {
+        const result = await invokeTauri<DocxValidationResult>("validate_docx_artifact", {
+          path: artifact.path,
+          workspacePath,
+        });
+        return result;
+      } catch (reason) {
+        if (import.meta.env.DEV) {
+          console.debug("[contract-review][validate_docx_artifact]", reason);
+        }
+        return {
+          valid: false,
+          reason: reason instanceof Error ? reason.message : String(reason),
+          path: artifact.path,
+          size: artifact.size,
+          hasContentTypes: false,
+          hasDocumentXml: false,
+        } satisfies DocxValidationResult;
+      }
+    },
+    []
+  );
+
+  const ensureDocxForModification = useCallback(
+    async (runId: string) => {
+      const target = taskHistoryRef.current.find((task) => task.runId === runId);
+      if (!target?.workspacePath) {
+        return { ok: false as const, reason: "任务没有 Workspace，无法定位 DOCX 产物。" };
+      }
+      const detected = await collectTaskArtifacts(runId);
+      for (const artifact of detected) {
+        if (artifact.extension !== "docx" || artifact.size <= 0) continue;
+        const validation = await validateDocxArtifact(artifact, target.workspacePath);
+        if (validation.valid) {
+          return { ok: true as const, generatedPath: artifact.path };
+        }
+      }
+
+      // 原生 DOCX 引擎桥接：如果技能在无 Python 环境写入了修改请求 JSON，
+      // 桌面端在此处调用内置 Rust 引擎生成真实 DOCX。
+      const requestFile = detected.find((artifact) =>
+        /(?:^|\/)(?:docx_modification_request|modification_request)\.json$/i.test(artifact.path)
+      );
+      if (requestFile) {
+        try {
+          const preview = await invokeTauri<{
+            path: string;
+            name: string;
+            kind: string;
+            extension: string;
+            size: number;
+            dataUrl?: string | null;
+            textPreview?: string | null;
+          }>("task_artifact_preview", {
+            path: requestFile.path,
+            workspacePath: target.workspacePath,
+          });
+          const request = JSON.parse(preview.textPreview ?? "{}") as {
+            input?: string;
+            output?: string;
+            replacements?: DocxReplacement[];
+            trackChanges?: boolean;
+          };
+          if (!request.input || !request.output || !Array.isArray(request.replacements) || !request.replacements.length) {
+            return { ok: false as const, reason: "检测到 DOCX 修改请求，但缺少 input/output/replacements 字段。" };
+          }
+          const result = await invokeTauri<ModifyDocxResult>("modify_contract_docx", {
+            inputPath: request.input,
+            outputPath: request.output,
+            replacements: request.replacements,
+            workspacePath: target.workspacePath,
+            trackChanges: request.trackChanges === true,
+          });
+          if (result.failed.length > 0) {
+            return {
+              ok: false as const,
+              reason: `原生 DOCX 引擎有未生效的替换：${result.failed[0]}`,
+            };
+          }
+          await refreshTaskArtifacts(runId);
+          const validation = await validateDocxArtifact(
+            { path: result.outputPath, size: 0, modifiedAt: 0, extension: "docx" },
+            target.workspacePath
+          );
+          if (validation.valid) {
+            return { ok: true as const, generatedPath: result.outputPath };
+          }
+          return {
+            ok: false as const,
+            reason: `原生 DOCX 引擎生成后校验失败：${validation.reason ?? "未知错误"}`,
+          };
+        } catch (reason) {
+          const detail = reason instanceof Error ? reason.message : String(reason);
+          return { ok: false as const, reason: `原生 DOCX 引擎执行失败：${detail}` };
+        }
+      }
+
+      return {
+        ok: false as const,
+        reason: "未找到有效 .docx 产物；仅有文字/建议不视为合同修改完成。",
+      };
+    },
+    [collectTaskArtifacts, refreshTaskArtifacts, validateDocxArtifact]
+  );
+
   // 记录一次新任务（发送消息即视为一次任务）。
   const recordTaskStart = useCallback((entry: TaskHistoryEntry) => {
     setTaskHistory((prev) => {
@@ -1106,6 +1274,62 @@ export function Chat({
     []
   );
 
+  const settleModificationCompletion = useCallback(
+    async (
+      runId: string,
+      avatarId: string,
+      contractAvatarId: string | undefined,
+      reply: string
+    ) => {
+      const check = await ensureDocxForModification(runId);
+      if (check.ok) {
+        if (!cancelledRef.current[avatarId]) {
+          appendAssistantMessageOnce(runId, reply, avatarId);
+        }
+        if (check.generatedPath) {
+          appendTaskActivity(
+            runId,
+            `已通过内置 DOCX 引擎生成修订文件：${check.generatedPath}`,
+            "success",
+            { kind: "file", status: "completed", path: check.generatedPath }
+          );
+        }
+        appendTaskActivity(runId, "任务已完成", "success");
+        finalizeTask(runId, "completed", reply);
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "completed" },
+          }));
+        }
+      } else {
+        const message = `合同修改未完成：${check.reason}`;
+        setError(message);
+        appendAssistantMessageOnce(runId, `任务失败：${message}`, avatarId);
+        appendTaskActivity(runId, message, "error");
+        finalizeTask(runId, "failed", message);
+        if (contractAvatarId) {
+          setContractReviewUiByAvatar((prev) => ({
+            ...prev,
+            [contractAvatarId]: { stage: "failed", error: message },
+          }));
+        }
+      }
+      await refreshTaskArtifacts(runId);
+      delete contractReviewRunAvatarIdsRef.current[runId];
+      delete contractModificationRequestedRef.current[runId];
+      finishRun(runId);
+    },
+    [
+      appendAssistantMessageOnce,
+      appendTaskActivity,
+      ensureDocxForModification,
+      finalizeTask,
+      finishRun,
+      refreshTaskArtifacts,
+    ]
+  );
+
   const settleRunFromCommand = useCallback(
     (
       runId: string,
@@ -1145,6 +1369,10 @@ export function Chat({
         } else if ("reply" in outcome) {
           const reply = outcome.reply.trim();
           if (reply) {
+            if (contractModificationRequestedRef.current[runId]) {
+              void settleModificationCompletion(runId, avatarId, contractAvatarId, reply);
+              return;
+            }
             appendAssistantMessageOnce(runId, reply, avatarId);
             appendTaskActivity(runId, "任务已完成（终态事件兜底）", "success");
             finalizeTask(runId, "completed", reply);
@@ -1185,6 +1413,7 @@ export function Chat({
         }
 
         delete contractReviewRunAvatarIdsRef.current[runId];
+        delete contractModificationRequestedRef.current[runId];
         void refreshTaskArtifacts(runId);
         finishRun(runId);
       }, 600);
@@ -1195,6 +1424,7 @@ export function Chat({
       finalizeTask,
       finishRun,
       refreshTaskArtifacts,
+      settleModificationCompletion,
     ]
   );
 
@@ -1809,6 +2039,15 @@ export function Chat({
             appendTaskActivity(runId, `任务失败：${emptyOutputError}`, "error");
             finalizeTask(runId, "failed", emptyOutputError);
           } else {
+            if (contractModificationRequestedRef.current[runId]) {
+              void settleModificationCompletion(
+                runId,
+                avatarId,
+                contractReviewRunAvatarIdsRef.current[runId],
+                finalReply
+              );
+              return;
+            }
             if (!cancelledRef.current[avatarId]) {
               appendAssistantMessageOnce(runId, finalReply, avatarId);
             }
@@ -1827,6 +2066,7 @@ export function Chat({
           console.log("[finishRun] run_id=" + runId);
         }
         delete contractReviewRunAvatarIdsRef.current[runId];
+        delete contractModificationRequestedRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1846,6 +2086,7 @@ export function Chat({
           void refreshTaskArtifacts(runId);
         }
         delete contractReviewRunAvatarIdsRef.current[runId];
+        delete contractModificationRequestedRef.current[runId];
         finishRun(runId);
         return;
       }
@@ -1875,6 +2116,7 @@ export function Chat({
         void refreshTaskArtifacts(runId);
       }
       delete contractReviewRunAvatarIdsRef.current[runId];
+      delete contractModificationRequestedRef.current[runId];
       finishRun(runId);
     }).then((fn) => {
       if (disposed) {
@@ -1896,6 +2138,7 @@ export function Chat({
     finalizeTask,
     patchTaskProgress,
     refreshTaskArtifacts,
+    settleModificationCompletion,
   ]);
 
   const refreshGatewayStatus = async () => {
@@ -2112,6 +2355,42 @@ export function Chat({
     URL.revokeObjectURL(url);
   }, [lastRiskExport]);
 
+  const normalizeSkillStatus = (value: string): "NotInstalled" | "Installing" | "Ready" | "Incomplete" | "Failed" => {
+    if (value === "Ready" || value === "Incomplete" || value === "Failed" || value === "Installing") {
+      return value;
+    }
+    return "NotInstalled";
+  };
+
+  const refreshContractReviewSkillStatus = async () => {
+    try {
+      const result = await invokeTauri<{ status: string; missing: string[] }>(
+        "contract_review_skill_status_command"
+      );
+      setContractReviewSkillStatus(normalizeSkillStatus(result.status));
+      setContractReviewSkillMissing(result.missing ?? []);
+    } catch {
+      setContractReviewSkillStatus("Failed");
+    }
+  };
+
+  const handleInstallContractReviewSkill = async () => {
+    setContractReviewSkillStatus("Installing");
+    try {
+      const result = await invokeTauri<{ status: string; installed: number }>(
+        "install_contract_review_skill_pack"
+      );
+      setContractReviewSkillStatus(normalizeSkillStatus(result.status));
+      if (result.status === "Ready") {
+        setContractReviewSkillMissing([]);
+      } else {
+        await refreshContractReviewSkillStatus();
+      }
+    } catch {
+      setContractReviewSkillStatus("Failed");
+    }
+  };
+
   const handleStartContractReview = async () => {
     if (!modelReady) {
       setError("请先配置 AI 模型服务。");
@@ -2149,11 +2428,13 @@ export function Chat({
         ...prev,
         [activeAvatarId]: { stage: "reviewing" },
       }));
+      const modificationRequested = detectContractModificationRequested(contractExtraInstructions);
       await handleSend({
         text: prepared.prompt,
         displayText: `合同智能审核：${pending.map((item) => item.name).join("、")}`,
         includeAttachments: false,
         contractEngineName: prepared.engine.name,
+        contractModificationRequested: modificationRequested,
       });
     } catch (reason) {
       const displayError = friendlyContractReviewError(reason);
@@ -2173,6 +2454,7 @@ export function Chat({
     displayText?: string;
     includeAttachments?: boolean;
     contractEngineName?: string;
+    contractModificationRequested?: boolean;
   }) {
     // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
     // 即使用户中途切换到其它会话也互不影响。
@@ -2342,6 +2624,9 @@ export function Chat({
     };
     if (opts?.contractEngineName) {
       contractReviewRunAvatarIdsRef.current[runId] = avatarId;
+      if (opts.contractModificationRequested) {
+        contractModificationRequestedRef.current[runId] = true;
+      }
     }
     setActiveInput("");
     setSelectedSkills((prev) => {
@@ -2452,7 +2737,13 @@ export function Chat({
         run_id: runId,
         ...(skillInvocations.length ? { skill_invocations: skillInvocations } : {}),
         ...(opts?.contractEngineName
-          ? { system_tool: "tool:contract-review", contract_review_engine: opts.contractEngineName }
+          ? {
+              system_tool: "tool:contract-review",
+              contract_review_engine: opts.contractEngineName,
+              ...(opts.contractModificationRequested
+                ? { contract_modification_requested: true, required_artifact_type: "docx" }
+                : {}),
+            }
           : {}),
       };
       if (import.meta.env.DEV) {
@@ -2574,6 +2865,7 @@ export function Chat({
           [avatarId]: { stage: "failed", error: displayError },
         }));
         delete contractReviewRunAvatarIdsRef.current[runId];
+        delete contractModificationRequestedRef.current[runId];
       }
       appendTaskActivity(runId, displayError, "error");
       finalizeTask(runId, "failed", displayError);
@@ -3459,6 +3751,9 @@ export function Chat({
                 onEngineChange={setSelectedContractEngine}
                 onInstructionsChange={setContractExtraInstructions}
                 onStart={() => void handleStartContractReview()}
+                skillStatus={contractReviewSkillStatus}
+                skillMissing={contractReviewSkillMissing}
+                onInstallSkill={() => void handleInstallContractReviewSkill()}
               />
             ) : null}
             {activeToolApproval ? (

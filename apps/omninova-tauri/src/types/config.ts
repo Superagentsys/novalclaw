@@ -47,6 +47,12 @@ export interface SafetyConfig {
   bump_sensor_pins: number[];
 }
 
+export type ProviderTransportMode = "auto" | "http1" | "http2";
+
+export interface ProviderTransportConfig {
+  mode: ProviderTransportMode;
+}
+
 export interface ProviderConfig {
   id: string;
   name: string;
@@ -55,6 +61,7 @@ export interface ProviderConfig {
   base_url?: string;
   models: string[];
   enabled: boolean;
+  transport?: ProviderTransportConfig;
 }
 
 export interface ProviderPreset extends ProviderConfig {
