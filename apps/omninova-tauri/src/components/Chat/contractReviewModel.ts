@@ -207,3 +207,16 @@ export function friendlyContractReviewError(reason: unknown): string {
   }
   return "审核未能完成，请检查合同文件后重试。详细技术信息已保留在日志中。";
 }
+
+const MODIFICATION_REQUEST_PATTERN =
+  /(?:修改|修订|完善|重写|改写|调整|替换条款).{0,12}(?:合同|条款|文件|文档|docx|协议)|(?:合同|条款|文件|文档|docx|协议).{0,6}(?:修改|修订|完善|重写|改写|调整)|生成(?:修改版|修订版)|(?:revise|modify|amend|rewrite)/i;
+
+/**
+ * 判断合同审核请求是否明确要求“生成修改后的 DOCX”。
+ * 只匹配明确指向合同/条款/文件本身的修改意图，避免把“修改建议”误判为需要 DOCX。
+ */
+export function detectContractModificationRequested(instructions: string): boolean {
+  const value = instructions.trim();
+  if (!value) return false;
+  return MODIFICATION_REQUEST_PATTERN.test(value);
+}

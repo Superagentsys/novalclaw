@@ -25,6 +25,9 @@ interface Props {
   onEngineChange: (id: string) => void;
   onInstructionsChange: (value: string) => void;
   onStart: () => void;
+  skillStatus?: "NotInstalled" | "Installing" | "Ready" | "Incomplete" | "Failed";
+  skillMissing?: string[];
+  onInstallSkill?: () => void;
 }
 
 interface ReportProps {
@@ -156,7 +159,41 @@ export function ContractReviewPanel(props: Props) {
 
       {collapsed ? null : (
         <>
-      <div className="contract-review-setup-grid">
+          {props.skillStatus && props.skillStatus !== "Ready" ? (
+            <div
+              className={`contract-review-skill-banner is-${props.skillStatus.toLowerCase()}`}
+            >
+              <div>
+                <strong>
+                  {props.skillStatus === "Installing"
+                    ? "正在安装合同审核能力..."
+                    : props.skillStatus === "Failed"
+                      ? "合同审核能力安装失败"
+                      : "合同审核能力尚未安装完整"}
+                </strong>
+                {props.skillMissing?.length ? (
+                  <span>缺少：{props.skillMissing.join("、")}</span>
+                ) : null}
+              </div>
+              {props.onInstallSkill ? (
+                <button
+                  type="button"
+                  className="contract-review-skill-install"
+                  onClick={props.onInstallSkill}
+                  disabled={props.skillStatus === "Installing"}
+                >
+                  {props.skillStatus === "Installing" ? "正在安装..." : "下载并安装"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {props.skillStatus === "Ready" ? (
+            <div className="contract-review-skill-ready">
+              <UiIcon name="check" size={14} />
+              <span>合同审核能力已就绪</span>
+            </div>
+          ) : null}
+          <div className="contract-review-setup-grid">
         <section className="contract-review-section contract-review-files-section">
           <div className="contract-review-section-heading">
             <span className="contract-review-step-number">1</span>

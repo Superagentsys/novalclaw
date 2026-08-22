@@ -86,6 +86,70 @@
   white-space: nowrap;
 }
 
+.contract-review-skill-banner,
+.contract-review-skill-ready {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-2);
+}
+
+.contract-review-skill-banner.is-incomplete,
+.contract-review-skill-banner.is-notinstalled {
+  border-color: color-mix(in srgb, var(--ui-warning) 35%, var(--ui-border));
+  background: var(--ui-warning-soft);
+}
+
+.contract-review-skill-banner.is-failed {
+  border-color: color-mix(in srgb, var(--ui-danger) 35%, var(--ui-border));
+  background: var(--ui-danger-soft);
+}
+
+.contract-review-skill-banner > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.contract-review-skill-banner strong {
+  font-size: 12px;
+}
+
+.contract-review-skill-banner span {
+  color: var(--ui-text-muted);
+  font-size: 11px;
+}
+
+.contract-review-skill-install {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.contract-review-skill-install:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.contract-review-skill-ready {
+  color: var(--ui-success);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .contract-review-badge,
 .contract-review-recommended {
   display: inline-flex;
