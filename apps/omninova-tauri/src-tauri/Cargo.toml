@@ -18,6 +18,7 @@ serde_json = "1.0"
 omninova-core = { path = "../../../crates/omninova-core" }
 tokio = { version = "1.43.0", features = ["full"] }
 zip = { version = "2", features = ["deflate"] }
+sha2 = "0.10"
 
 [features]
 default = ["custom-protocol"]

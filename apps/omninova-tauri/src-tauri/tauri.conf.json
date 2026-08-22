@@ -39,6 +39,7 @@
       "resources/agent-browser/linux",
       "resources/agent-browser/windows",
       "resources/cli",
+      "resources/contract-review-pack",
       "resources/THIRD_PARTY_NOTICES.md"
     ],
     "macOS": {

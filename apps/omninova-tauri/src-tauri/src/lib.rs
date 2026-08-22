@@ -26,13 +26,15 @@ use omninova_core::gateway::{
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
-    import_skills_from_dir, skill_runtime_snapshot, skillhub_categories, skillhub_install,
-    skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory, SkillHubItem,
+    import_skills_from_dir, load_skills_from_dir, skill_runtime_snapshot, skillhub_categories,
+    skillhub_install, skillhub_list, skillhub_remove, skillhub_rollback, SkillHubCategory,
+    SkillHubItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +47,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+use zip::write::SimpleFileOptions;
+use zip::{ZipArchive, ZipWriter};
 
 /// E2E debug: formats current wall-clock time as HH:MM:SS.mmm UTC.
 fn now_ts() -> String {
@@ -2620,6 +2624,181 @@ async fn list_command_palette(
     ))
 }
 
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn resolve_contract_review_pack_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    [
+        resource_dir.join("resources/contract-review-pack"),
+        resource_dir.join("contract-review-pack"),
+    ]
+    .into_iter()
+    .find(|path| path.join("manifest.json").exists())
+}
+
+fn contract_review_required_skills() -> [&'static str; 3] {
+    [
+        "legal-contract-review",
+        "baichen-legal",
+        "ai-contract-risk-officer",
+    ]
+}
+
+fn contract_review_skill_status(config: &Config) -> serde_json::Value {
+    let skills_dir = resolve_configured_skills_dir(config);
+    let loaded = load_skills_from_dir(&skills_dir).unwrap_or_default();
+    let names = loaded
+        .iter()
+        .map(|skill| skill.metadata.name.clone())
+        .collect::<Vec<_>>();
+    let required = contract_review_required_skills();
+    let missing = required
+        .iter()
+        .filter(|required_name| !names.iter().any(|name| name == *required_name))
+        .copied()
+        .collect::<Vec<_>>();
+    let any_installed = required
+        .iter()
+        .any(|required_name| names.iter().any(|name| name == *required_name));
+    let status = if missing.is_empty() {
+        "Ready"
+    } else if any_installed {
+        "Incomplete"
+    } else {
+        "NotInstalled"
+    };
+    serde_json::json!({
+        "status": status,
+        "missing": missing,
+        "installed": names,
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn contract_review_skill_status_command(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let config = {
+        let app_state = state.lock().await;
+        app_state.runtime.get_config().await
+    };
+    Ok(contract_review_skill_status(&config))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn install_contract_review_skill_pack(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let config = {
+        let app_state = state.lock().await;
+        app_state.runtime.get_config().await
+    };
+    eprintln!("[contract-review-pack] install_started");
+    let pack_dir = match resolve_contract_review_pack_dir(&app) {
+        Some(pack_dir) => {
+            eprintln!("[contract-review-pack] resource_found=true");
+            pack_dir
+        }
+        None => {
+            eprintln!("[contract-review-pack] install_failed stage=resolve_pack reason=not_found");
+            return Err("未找到内置 Contract Review Skill Pack 资源。".into());
+        }
+    };
+    let manifest_path = pack_dir.join("manifest.json");
+    let raw_bytes = std::fs::read(&manifest_path).map_err(|e| {
+        eprintln!("[contract-review-pack] install_failed stage=read_manifest reason={e}");
+        e.to_string()
+    })?;
+    let bom = raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    eprintln!("[contract-review-pack] manifest_read bytes={}", raw_bytes.len());
+    eprintln!("[contract-review-pack] manifest_bom={}", bom);
+    let manifest_text = String::from_utf8_lossy(&raw_bytes)
+        .trim_start_matches('\u{feff}')
+        .to_string();
+    let manifest: serde_json::Value = match serde_json::from_str(&manifest_text) {
+        Ok(value) => {
+            eprintln!("[contract-review-pack] manifest_parsed");
+            value
+        }
+        Err(error) => {
+            eprintln!(
+                "[contract-review-pack] install_failed stage=parse_manifest reason={error}"
+            );
+            return Err(error.to_string());
+        }
+    };
+    let files = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "manifest.json 缺少 files 列表。".to_string())?;
+    let checksums = manifest
+        .get("checksums")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for file_value in files {
+        let Some(file) = file_value.as_str() else {
+            return Err("manifest.json files 含非字符串条目。".into());
+        };
+        let path = pack_dir.join(file.replace('/', std::path::MAIN_SEPARATOR_STR));
+        eprintln!("[contract-review-pack] verify_file path={file}");
+        if !path.exists() {
+            eprintln!("[contract-review-pack] verify_failed path={file} reason=missing");
+            return Err(format!("内置 Pack 缺少文件：{file}"));
+        }
+        if let Some(expected_value) = checksums.get(file) {
+            let expected = expected_value.as_str().unwrap_or_default();
+            let actual = sha256_file(&path)?;
+            if actual != expected {
+                eprintln!("[contract-review-pack] verify_failed path={file} reason=sha256");
+                return Err(format!("内置 Pack 校验失败：{file}"));
+            }
+        }
+    }
+    let skills_source = pack_dir.join("skills");
+    if !skills_source.exists() {
+        eprintln!("[contract-review-pack] install_failed stage=verify_manifest reason=missing_skills");
+        return Err("内置 Pack 缺少 skills 目录。".into());
+    }
+    let target = resolve_configured_skills_dir(&config);
+    let count = import_skills_from_dir(&skills_source, &target, true).map_err(|e| {
+        eprintln!("[contract-review-pack] install_failed stage=copy_skills reason={e}");
+        e.to_string()
+    })?;
+    eprintln!("[contract-review-pack] copy_completed count={count}");
+    let status = contract_review_skill_status(&config);
+    if let Some(missing) = status.get("missing").and_then(serde_json::Value::as_array) {
+        let names = missing
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("[contract-review-pack] runtime_skills missing={names}");
+    }
+    Ok(serde_json::json!({
+        "installed": count,
+        "status": status.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "missing": status.get("missing").cloned().unwrap_or_else(|| serde_json::json!([])),
+    }))
+}
+
 #[tauri::command]
 fn list_contract_review_engines(
 ) -> Vec<omninova_core::contract_review::ContractReviewEngineProfile> {
@@ -3886,6 +4065,34 @@ struct CollectedTaskArtifact {
     extension: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocxValidationResult {
+    valid: bool,
+    reason: Option<String>,
+    path: Option<String>,
+    size: u64,
+    has_content_types: bool,
+    has_document_xml: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocxReplacement {
+    original_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModifyDocxResult {
+    output_path: String,
+    replaced_count: usize,
+    total_replacements: usize,
+    successful: usize,
+    failed: Vec<String>,
+}
+
 fn should_skip_artifact_dir(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -4021,6 +4228,438 @@ fn artifact_extension(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase()
+}
+
+fn resolve_docx_modify_path(
+    raw: &str,
+    workspace_path: Option<&str>,
+    must_exist: bool,
+) -> Result<PathBuf, String> {
+    let requested = expand_tilde_path(raw.trim());
+    let joined = if requested.is_absolute() {
+        requested
+    } else {
+        let workspace = workspace_path
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "缺少 Workspace，无法解析相对 DOCX 路径。".to_string())?;
+        expand_tilde_path(workspace).join(requested)
+    };
+
+    let workspace = workspace_path
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| expand_tilde_path(value).canonicalize())
+        .transpose()
+        .map_err(|error| format!("Workspace 无法访问：{error}"))?;
+    if let Some(workspace) = workspace.as_deref() {
+        let parent_for_check = if must_exist {
+            joined.clone()
+        } else {
+            joined.parent().unwrap_or(&joined).to_path_buf()
+        };
+        let canonical_parent = parent_for_check
+            .canonicalize()
+            .map_err(|error| format!("路径无法访问：{}（{error}）", joined.display()))?;
+        if !canonical_parent.starts_with(workspace) {
+            return Err("为保护本机文件，DOCX 修改只能访问当前任务 Workspace 内的路径。".to_string());
+        }
+    }
+
+    if must_exist {
+        let canonical = joined
+            .canonicalize()
+            .map_err(|error| format!("文件不存在或无法访问：{}（{error}）", joined.display()))?;
+        if !canonical.is_file() {
+            return Err(format!("该路径不是文件：{}", canonical.display()));
+        }
+        Ok(canonical)
+    } else {
+        Ok(joined)
+    }
+}
+
+fn unique_docx_output_path(output: PathBuf, overwrite: bool) -> PathBuf {
+    if overwrite || !output.exists() {
+        return output;
+    }
+    let parent = output.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output")
+        .to_string();
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    for index in 2..10_000 {
+        let candidate = parent.join(format!("{stem}_{index}{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    output
+}
+
+fn xml_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn apply_cross_run_replacement(
+    xml: &str,
+    original_escaped: &str,
+    new_escaped: &str,
+) -> (String, bool) {
+    let mut result = xml.to_string();
+    let mut matched = false;
+    let mut search_from = 0usize;
+
+    while let Some(paragraph_start_rel) = result[search_from..].find("<w:p") {
+        let paragraph_start = search_from + paragraph_start_rel;
+        let Some(paragraph_end_rel) = result[paragraph_start..].find("</w:p>") else {
+            break;
+        };
+        let paragraph_end = paragraph_start + paragraph_end_rel + "</w:p>".len();
+        let paragraph = &result[paragraph_start..paragraph_end];
+
+        // Collect every <w:t ...>text</w:t> span inside this paragraph.
+        let mut spans: Vec<(usize, usize, String)> = Vec::new();
+        let mut pos = 0usize;
+        while let Some(tag_start_rel) = paragraph[pos..].find("<w:t") {
+            let tag_start = pos + tag_start_rel;
+            let Some(tag_end_rel) = paragraph[tag_start..].find('>') else {
+                break;
+            };
+            let tag_end = tag_start + tag_end_rel + 1;
+            let Some(close_rel) = paragraph[tag_end..].find("</w:t>") else {
+                break;
+            };
+            let close = tag_end + close_rel;
+            spans.push((tag_end, close, paragraph[tag_end..close].to_string()));
+            pos = close + "</w:t>".len();
+        }
+        if spans.is_empty() {
+            search_from = paragraph_end;
+            continue;
+        }
+
+        let mut starts = Vec::with_capacity(spans.len());
+        let mut full_len = 0usize;
+        for span in &spans {
+            starts.push(full_len);
+            full_len += span.2.len();
+        }
+        let full_text = spans.iter().map(|span| span.2.as_str()).collect::<String>();
+        if !full_text.contains(original_escaped) {
+            search_from = paragraph_end;
+            continue;
+        }
+
+        let start_byte = full_text.find(original_escaped).expect("contains checked");
+        let end_byte = start_byte + original_escaped.len();
+        let mut new_paragraph = paragraph.to_string();
+
+        // Replace from the last affected run backwards so earlier byte offsets stay valid.
+        for index in (0..spans.len()).rev() {
+            let (content_start, content_end, text) = &spans[index];
+            let span_start = starts[index];
+            let span_end = span_start + text.len();
+            if span_end <= start_byte || span_start >= end_byte {
+                continue;
+            }
+            let prefix = if span_start < start_byte {
+                &text[..(start_byte - span_start)]
+            } else {
+                ""
+            };
+            let suffix = if span_end > end_byte {
+                &text[(end_byte - span_start)..]
+            } else {
+                ""
+            };
+            let replacement = format!("{prefix}{new_escaped}{suffix}");
+            new_paragraph.replace_range(*content_start..*content_end, &replacement);
+        }
+
+        result.replace_range(paragraph_start..paragraph_end, &new_paragraph);
+        matched = true;
+        search_from = paragraph_start + new_paragraph.len();
+    }
+
+    (result, matched)
+}
+
+fn apply_docx_replacements(
+    xml_bytes: &[u8],
+    replacements: &[DocxReplacement],
+) -> (Vec<u8>, usize, Vec<bool>) {
+    let mut xml = String::from_utf8_lossy(xml_bytes).into_owned();
+    let mut total_replacements = 0usize;
+    let mut matched_flags = vec![false; replacements.len()];
+
+    for (index, replacement) in replacements.iter().enumerate() {
+        let original = replacement.original_text.trim();
+        let new_text = replacement.new_text.trim();
+        if original.is_empty() || new_text.is_empty() {
+            continue;
+        }
+        let original_escaped = xml_escape_text(original);
+        let new_escaped = xml_escape_text(new_text);
+        let mut matched = 0usize;
+        let mut search_from = 0usize;
+        while let Some(start) = xml[search_from..].find("<w:t") {
+            let tag_start = search_from + start;
+            let tag_end_rel = xml[tag_start..].find('>').unwrap_or(0);
+            let tag_end = tag_start + tag_end_rel + 1;
+            let close_tag = "</w:t>";
+            let Some(close_rel) = xml[tag_end..].find(close_tag) else {
+                break;
+            };
+            let close = tag_end + close_rel;
+            let inner_start = tag_end;
+            let inner_end = close;
+            let inner = &xml[inner_start..inner_end];
+            if inner.contains(&original_escaped) {
+                let replaced = inner.replace(&original_escaped, &new_escaped);
+                xml.replace_range(inner_start..inner_end, &replaced);
+                matched += 1;
+                search_from = inner_start + replaced.len() + close_tag.len();
+            } else {
+                search_from = close + close_tag.len();
+            }
+        }
+        if matched == 0 {
+            let (updated, cross_matched) =
+                apply_cross_run_replacement(&xml, &original_escaped, &new_escaped);
+            if cross_matched {
+                xml = updated;
+                matched = 1;
+            }
+        }
+        if matched > 0 {
+            matched_flags[index] = true;
+            total_replacements += matched;
+        }
+    }
+
+    (xml.into_bytes(), total_replacements, matched_flags)
+}
+
+#[tauri::command]
+fn validate_docx_artifact(
+    path: String,
+    workspace_path: Option<String>,
+) -> Result<DocxValidationResult, String> {
+    let resolved = match resolve_task_workspace_path(&path, workspace_path.as_deref()) {
+        Ok(value) => value,
+        Err(reason) => {
+            return Ok(DocxValidationResult {
+                valid: false,
+                reason: Some(reason),
+                path: None,
+                size: 0,
+                has_content_types: false,
+                has_document_xml: false,
+            });
+        }
+    };
+    if !resolved.is_file() {
+        return Ok(DocxValidationResult {
+            valid: false,
+            reason: Some("DOCX 路径不是文件。".to_string()),
+            path: Some(resolved.to_string_lossy().to_string()),
+            size: 0,
+            has_content_types: false,
+            has_document_xml: false,
+        });
+    }
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(DocxValidationResult {
+                valid: false,
+                reason: Some(format!("无法读取 DOCX 元数据：{error}")),
+                path: Some(resolved.to_string_lossy().to_string()),
+                size: 0,
+                has_content_types: false,
+                has_document_xml: false,
+            });
+        }
+    };
+    let size = metadata.len();
+    if size == 0 {
+        return Ok(DocxValidationResult {
+            valid: false,
+            reason: Some("DOCX 文件为空（0 字节）。".to_string()),
+            path: Some(resolved.to_string_lossy().to_string()),
+            size,
+            has_content_types: false,
+            has_document_xml: false,
+        });
+    }
+
+    let file = match std::fs::File::open(&resolved) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(DocxValidationResult {
+                valid: false,
+                reason: Some(format!("无法打开 DOCX：{error}")),
+                path: Some(resolved.to_string_lossy().to_string()),
+                size,
+                has_content_types: false,
+                has_document_xml: false,
+            });
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(DocxValidationResult {
+                valid: false,
+                reason: Some(format!("DOCX 不是有效的 ZIP 结构：{error}")),
+                path: Some(resolved.to_string_lossy().to_string()),
+                size,
+                has_content_types: false,
+                has_document_xml: false,
+            });
+        }
+    };
+    let mut has_content_types = false;
+    let mut has_document_xml = false;
+    for index in 0..archive.len().min(10_000) {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        let name = entry.name().replace('\\', "/");
+        if name == "[Content_Types].xml" {
+            has_content_types = true;
+        }
+        if name == "word/document.xml" {
+            has_document_xml = true;
+        }
+        if has_content_types && has_document_xml {
+            break;
+        }
+    }
+    let valid = has_content_types && has_document_xml;
+    Ok(DocxValidationResult {
+        valid,
+        reason: if valid {
+            None
+        } else {
+            Some(if !has_content_types {
+                "DOCX 缺少 [Content_Types].xml。".to_string()
+            } else {
+                "DOCX 缺少 word/document.xml。".to_string()
+            })
+        },
+        path: Some(resolved.to_string_lossy().to_string()),
+        size,
+        has_content_types,
+        has_document_xml,
+    })
+}
+
+#[tauri::command]
+fn modify_contract_docx(
+    input_path: String,
+    output_path: String,
+    replacements: Vec<DocxReplacement>,
+    workspace_path: Option<String>,
+    track_changes: Option<bool>,
+    overwrite: Option<bool>,
+) -> Result<ModifyDocxResult, String> {
+    let _ = track_changes;
+    if replacements.is_empty() {
+        return Err("replacements 不能为空。".to_string());
+    }
+    let input = resolve_docx_modify_path(&input_path, workspace_path.as_deref(), true)?;
+    let mut output = resolve_docx_modify_path(&output_path, workspace_path.as_deref(), false)?;
+    if artifact_extension(&output).as_str() != "docx" {
+        return Err("输出文件必须是 .docx 后缀。".to_string());
+    }
+    output = unique_docx_output_path(output, overwrite.unwrap_or(false));
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建输出目录：{error}"))?;
+    }
+
+    let input_file = std::fs::File::open(&input).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(input_file).map_err(|error| error.to_string())?;
+    let output_file = std::fs::File::create(&output).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(output_file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    let mut total_replacements = 0usize;
+    let mut matched_any = vec![false; replacements.len()];
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("读取 DOCX 条目失败：{error}"))?;
+        let name = entry.name().replace('\\', "/");
+        let mut bytes = Vec::new();
+        entry
+            .by_ref()
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("读取 DOCX 条目 {name} 失败：{error}"))?;
+
+        let is_doc_xml = name == "word/document.xml"
+            || name.starts_with("word/header")
+            || name.starts_with("word/footer");
+        if is_doc_xml {
+            let (updated, replaced, matched_flags) = apply_docx_replacements(&bytes, &replacements);
+            total_replacements += replaced;
+            for (index, matched) in matched_flags.into_iter().enumerate() {
+                if matched {
+                    matched_any[index] = true;
+                }
+            }
+            bytes = updated;
+        }
+
+        writer
+            .start_file(&name, options)
+            .map_err(|error| format!("写入 DOCX 条目 {name} 失败：{error}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|error| format!("写入 DOCX 条目 {name} 失败：{error}"))?;
+    }
+
+    writer
+        .finish()
+        .map_err(|error| format!("完成 DOCX 写入失败：{error}"))?;
+
+    let validation = validate_docx_artifact(
+        output.to_string_lossy().to_string(),
+        workspace_path,
+    )?;
+    if !validation.valid {
+        return Err(format!(
+            "生成的 DOCX 校验失败：{}",
+            validation.reason.unwrap_or_else(|| "未知错误".to_string())
+        ));
+    }
+
+    let successful = matched_any.iter().filter(|matched| **matched).count();
+    let failed_count = replacements.len().saturating_sub(successful);
+    let failed = if failed_count > 0 {
+        vec![format!("有 {failed_count} 项替换文本未在 DOCX 中找到匹配内容。")]
+    } else {
+        Vec::new()
+    };
+
+    Ok(ModifyDocxResult {
+        output_path: output.to_string_lossy().to_string(),
+        replaced_count: total_replacements,
+        total_replacements: replacements.len(),
+        successful,
+        failed,
+    })
 }
 
 #[tauri::command]
@@ -4389,6 +5028,8 @@ pub fn run() {
             list_skill_catalog,
             list_command_palette,
             list_contract_review_engines,
+            contract_review_skill_status_command,
+            install_contract_review_skill_pack,
             prepare_contract_review,
             skillhub_browse,
             skillhub_category_list,
@@ -4399,6 +5040,8 @@ pub fn run() {
             open_task_artifact,
             save_task_artifact_as,
             collect_task_artifacts,
+            validate_docx_artifact,
+            modify_contract_docx,
             composer_attachments::read_composer_attachments,
             composer_attachments::prepare_composer_attachments,
             desktop_capture::capture_desktop_screenshot,
@@ -6274,4 +6917,162 @@ fn validate_persisted_channels_for_save(
 fn validate_persisted_feishu_like_channels(channels: &ChannelsConfig) -> Result<(), String> {
     validate_persisted_channel(channels, "feishu")?;
     validate_persisted_channel(channels, "lark")
+}
+
+#[cfg(test)]
+mod docx_engine_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-docx-engine-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_minimal_docx(path: &Path, document_xml: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        writer.start_file("[Content_Types].xml", options).unwrap();
+        writer.write_all(b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        writer.start_file("word/document.xml", options).unwrap();
+        writer.write_all(document_xml.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn validate_docx_accepts_real_zip_and_rejects_empty() {
+        let dir = temp_dir("validate");
+        let valid_path = dir.join("valid.docx");
+        write_minimal_docx(
+            &valid_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>合同</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+
+        let valid = validate_docx_artifact(
+            valid_path.to_string_lossy().to_string(),
+            Some(dir.to_string_lossy().to_string()),
+        )
+        .expect("validate valid docx");
+        assert!(valid.valid);
+        assert!(valid.has_content_types);
+        assert!(valid.has_document_xml);
+
+        let empty_path = dir.join("empty.docx");
+        std::fs::write(&empty_path, b"").unwrap();
+        let empty = validate_docx_artifact(
+            empty_path.to_string_lossy().to_string(),
+            Some(dir.to_string_lossy().to_string()),
+        )
+        .expect("validate empty docx");
+        assert!(!empty.valid);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modify_contract_docx_generates_valid_output_without_python() {
+        let dir = temp_dir("modify");
+        let input = dir.join("input.docx");
+        let output = dir.join("output.docx");
+        write_minimal_docx(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>旧条款</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+
+        let result = modify_contract_docx(
+            input.to_string_lossy().to_string(),
+            output.to_string_lossy().to_string(),
+            vec![DocxReplacement {
+                original_text: "旧条款".to_string(),
+                new_text: "新条款".to_string(),
+            }],
+            Some(dir.to_string_lossy().to_string()),
+            None,
+            None,
+        )
+        .expect("modify contract docx");
+
+        assert!(output.exists());
+        assert!(result.replaced_count >= 1);
+        assert_eq!(result.successful, 1);
+
+        let validation = validate_docx_artifact(
+            result.output_path.clone(),
+            Some(dir.to_string_lossy().to_string()),
+        )
+        .expect("validate generated docx");
+        assert!(validation.valid);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modify_contract_docx_supports_cross_run_replacement() {
+        let dir = temp_dir("cross-run");
+        let input = dir.join("input.docx");
+        let output = dir.join("output.docx");
+        write_minimal_docx(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>旧条</w:t></w:r><w:r><w:t>款</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+
+        let result = modify_contract_docx(
+            input.to_string_lossy().to_string(),
+            output.to_string_lossy().to_string(),
+            vec![DocxReplacement {
+                original_text: "旧条款".to_string(),
+                new_text: "新条款".to_string(),
+            }],
+            Some(dir.to_string_lossy().to_string()),
+            None,
+            None,
+        )
+        .expect("modify cross-run docx");
+
+        assert_eq!(result.successful, 1);
+        assert!(result.failed.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modify_contract_docx_auto_uniquifies_existing_output() {
+        let dir = temp_dir("uniquify");
+        let input = dir.join("input.docx");
+        let output = dir.join("output.docx");
+        write_minimal_docx(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        write_minimal_docx(
+            &output,
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>已有</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+
+        let result = modify_contract_docx(
+            input.to_string_lossy().to_string(),
+            output.to_string_lossy().to_string(),
+            vec![DocxReplacement {
+                original_text: "甲".to_string(),
+                new_text: "乙".to_string(),
+            }],
+            Some(dir.to_string_lossy().to_string()),
+            None,
+            None,
+        )
+        .expect("modify contract docx with existing output");
+
+        let generated = PathBuf::from(&result.output_path);
+        assert_ne!(generated, output);
+        assert!(generated.exists());
+        assert!(generated.file_name().unwrap().to_string_lossy().contains("_2"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
