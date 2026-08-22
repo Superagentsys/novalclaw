@@ -6,7 +6,8 @@ use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
     resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
-    GatewayPublicMode, ModelProviderConfig, ProviderConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
+    GatewayPublicMode, ModelProviderConfig, ProviderConfig, ProviderTransportConfig, RobotConfig,
+    DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -470,6 +471,8 @@ struct SetupProviderConfig {
     models: Vec<String>,
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2920,6 +2923,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 base_url: provider.base_url.clone(),
                 models: with_default_model(provider.models.clone(), provider.default_model.clone()),
                 enabled: provider.enabled,
+                transport: provider.transport,
             })
             .collect::<Vec<_>>()
     } else {
@@ -2934,6 +2938,7 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 base_url: provider.base_url.clone(),
                 models: provider.models.clone(),
                 enabled: provider.enabled,
+                transport: ProviderTransportConfig::default(),
             })
             .collect::<Vec<_>>()
     };
@@ -3237,6 +3242,7 @@ fn setup_config_to_core(
                     models: provider.models.clone(),
                     enabled: provider.enabled,
                     timeout_secs: None,
+                    transport: provider.transport,
                 },
             )
         })

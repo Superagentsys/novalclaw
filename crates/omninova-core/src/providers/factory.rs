@@ -88,48 +88,61 @@ pub fn build_provider_with_selection(
         });
     let temp = config.default_temperature;
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
+    let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
 
     let dispatch = resolve_dispatch_kind(&provider_name, &kind, base_url.is_some());
     match dispatch.as_str() {
-        "anthropic" => Box::new(AnthropicProvider::new(
-            base_url.as_deref(),
-            api_key.as_deref(),
-            model,
-            temp,
-            None,
-            timeouts,
-        )),
-        "gemini" => Box::new(GeminiProvider::new(
-            base_url.as_deref(),
-            api_key.as_deref(),
-            model,
-            temp,
-            None,
-            timeouts,
-        )),
+        "anthropic" => Box::new(
+            AnthropicProvider::new(
+                base_url.as_deref(),
+                api_key.as_deref(),
+                model,
+                temp,
+                None,
+                timeouts,
+            )
+            .with_transport_mode(transport_mode),
+        ),
+        "gemini" => Box::new(
+            GeminiProvider::new(
+                base_url.as_deref(),
+                api_key.as_deref(),
+                model,
+                temp,
+                None,
+                timeouts,
+            )
+            .with_transport_mode(transport_mode),
+        ),
         "mock" => Box::new(MockProvider::new("mock-provider")),
         "openai-compat" => {
             let custom_url = provider_name
                 .strip_prefix("custom:")
                 .map(str::to_string)
                 .or(base_url);
-            Box::new(OpenAiProvider::new(
-                custom_url.as_deref(),
+            Box::new(
+                OpenAiProvider::new(
+                    custom_url.as_deref(),
+                    api_key.as_deref(),
+                    model,
+                    temp,
+                    None,
+                    timeouts,
+                )
+                .with_transport_mode(transport_mode),
+            )
+        }
+        _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(
+            OpenAiProvider::new(
+                base_url.as_deref(),
                 api_key.as_deref(),
                 model,
                 temp,
                 None,
                 timeouts,
-            ))
-        }
-        _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(OpenAiProvider::new(
-            base_url.as_deref(),
-            api_key.as_deref(),
-            model,
-            temp,
-            None,
-            timeouts,
-        )),
+            )
+            .with_transport_mode(transport_mode),
+        ),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
     }
 }

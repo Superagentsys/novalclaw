@@ -1022,6 +1022,13 @@
   height: 1rem;
 }
 
+.provider-transport-field small {
+  color: var(--ui-text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
 .setup-grid label,
 .setup-group label,
 .provider-picker {

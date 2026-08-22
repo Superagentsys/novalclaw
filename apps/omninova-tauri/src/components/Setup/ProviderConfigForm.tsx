@@ -3,6 +3,7 @@ import {
   cloneProviderPreset,
   PROVIDER_PRESETS,
   type ProviderConfig,
+  type ProviderTransportMode,
 } from "../../types/config";
 
 type Props = {
@@ -18,6 +19,12 @@ const parseStringList = (value: string) =>
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+
+const PROVIDER_TRANSPORT_OPTIONS: { value: ProviderTransportMode; label: string }[] = [
+  { value: "auto", label: "自动协商（推荐）" },
+  { value: "http1", label: "HTTP/1.1" },
+  { value: "http2", label: "HTTP/2" },
+];
 
 function isLocalProvider(provider: ProviderConfig): boolean {
   const preset = PROVIDER_PRESETS.find((item) => item.id === provider.id);
@@ -384,6 +391,24 @@ export function ProviderConfigForm({
                         }
                         placeholder={local ? "http://localhost:11434" : "https://api.example.com/v1"}
                       />
+                    </label>
+                    <label className="provider-transport-field">
+                      HTTP 协议
+                      <select
+                        value={provider.transport?.mode ?? "auto"}
+                        onChange={(event) =>
+                          updateProvider(index, "transport", {
+                            mode: event.target.value as ProviderTransportMode,
+                          })
+                        }
+                      >
+                        {PROVIDER_TRANSPORT_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      <small>自动协商适合大多数服务；仅在第三方 API 出现连接兼容问题时尝试 HTTP/1.1 或 HTTP/2。</small>
                     </label>
                   </div>
                 ) : null}

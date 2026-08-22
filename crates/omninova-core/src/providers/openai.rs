@@ -1,3 +1,4 @@
+use crate::config::TransportMode;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
     TokenUsage, ToolCall as ProviderToolCall,
@@ -75,6 +76,42 @@ fn timeout_error_message(kind: ProviderTimeoutKind, secs: u64) -> String {
         }
         ProviderTimeoutKind::Request => {
             format!("provider request timeout ({}s): the model service did not finish in time", secs)
+        }
+    }
+}
+
+/// Application-level stream completion state used to decide whether a
+/// transport failure may be replayed safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseCompletionState {
+    NoOutput,
+    Partial,
+    Complete,
+}
+
+impl ResponseCompletionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoOutput => "no_output",
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+/// Whether a retry should use the persistent provider client or a brand-new
+/// client (and therefore a fresh connection pool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportProfile {
+    Persistent,
+    Fresh,
+}
+
+impl TransportProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Fresh => "fresh",
         }
     }
 }
@@ -206,8 +243,27 @@ fn final_provider_error(failure: AttemptError, attempts: u32) -> anyhow::Error {
     failure.error
 }
 
+/// Safe per-attempt transport telemetry: category-level metadata only.
+fn log_provider_transport(model: &str, transport_mode: &str, attempt: u32, connection: &str) {
+    tracing::debug!(
+        target: "omninova_core::providers::timeout",
+        model = %model,
+        transport_mode = %transport_mode,
+        attempt = %attempt,
+        connection = %connection,
+        "[provider-transport]"
+    );
+}
+
 /// Safe retry telemetry: category-level metadata only.
-fn log_provider_retry(model: &str, attempt: u32, reason: &str, backoff_ms: u64) {
+fn log_provider_retry(
+    model: &str,
+    attempt: u32,
+    reason: &str,
+    backoff_ms: u64,
+    transport_mode: &str,
+    connection: &str,
+) {
     tracing::warn!(
         target: "omninova_core::providers::timeout",
         model = %model,
@@ -215,19 +271,29 @@ fn log_provider_retry(model: &str, attempt: u32, reason: &str, backoff_ms: u64) 
         max_attempts = %MAX_PROVIDER_ATTEMPTS,
         reason = %reason,
         backoff_ms = %backoff_ms,
+        transport_mode = %transport_mode,
+        connection = %connection,
         // Retrying is only ever reached when nothing was emitted yet.
-        output_started = false,
+        completion_state = "no_output",
         "[provider-retry]"
     );
 }
 
 /// Safe structured success metrics for streaming responses (debug level).
-fn log_provider_stream_ok(model: &str, first_delta_ms: u64, total_elapsed_ms: u64) {
+fn log_provider_stream_ok(
+    model: &str,
+    first_delta_ms: u64,
+    total_elapsed_ms: u64,
+    completion_state: &str,
+    finish_reason: Option<&str>,
+) {
     tracing::debug!(
         target: "omninova_core::providers::timeout",
         model = %model,
         first_delta_ms = %first_delta_ms,
         total_elapsed_ms = %total_elapsed_ms,
+        completion_state = %completion_state,
+        finish_reason = %finish_reason.unwrap_or("-"),
         "[provider-stream]"
     );
 }
@@ -340,6 +406,7 @@ pub struct OpenAiProvider {
     max_tokens: Option<u32>,
     timeouts: ProviderTimeouts,
     retry_backoff: Duration,
+    transport_mode: TransportMode,
     client: Client,
 }
 
@@ -349,6 +416,7 @@ struct ConsumeOutcome {
     tool_accum: Vec<(String, String, String)>,
     usage: Option<TokenUsage>,
     finish_reason: Option<String>,
+    completion_state: ResponseCompletionState,
 }
 
 #[derive(Debug)]
@@ -356,13 +424,18 @@ enum StreamConsumeError<E> {
     Idle {
         secs: u64,
     },
+    /// The stream ended without a protocol-complete response (for example a
+    /// clean EOF before `[DONE]`/finish_reason, or an incomplete tool call).
+    Incomplete {
+        completion_state: ResponseCompletionState,
+    },
     /// The stream's own error, passed through unchanged so the caller keeps
-    /// full `reqwest::Error` classification. `output_started` records whether
+    /// full `reqwest::Error` classification. `completion_state` records whether
     /// anything had already been accumulated or forwarded, which decides
     /// whether replaying the request is safe.
     Transport {
         error: E,
-        output_started: bool,
+        completion_state: ResponseCompletionState,
     },
 }
 
@@ -407,9 +480,10 @@ impl AttemptError {
         self
     }
 
-    /// Drops the retry permission once output has reached the user.
-    fn block_retry_if_output_started(mut self, output_started: bool) -> Self {
-        if output_started {
+    /// Drops the retry permission unless the failed attempt had no output at
+    /// all. Complete and partial responses are never replayed.
+    fn block_retry_unless_no_output(mut self, state: ResponseCompletionState) -> Self {
+        if state != ResponseCompletionState::NoOutput {
             self.retry_reason = None;
         }
         self
@@ -452,16 +526,17 @@ where
     loop {
         let next = match tokio::time::timeout(idle_timeout, stream.next()).await {
             Ok(next) => next,
-            Err(_)
-                if (!text.is_empty() || !reasoning.is_empty())
-                    && !has_started_tool_call(&tool_accum) =>
-            {
-                // Some OpenAI-compatible services omit [DONE] or keep the
-                // connection open after the final text. Preserve the answer
-                // that has already arrived rather than spinning forever.
-                break;
-            }
             Err(_) => {
+                let state = completion_state(
+                    &text,
+                    &reasoning,
+                    &tool_accum,
+                    finish_reason.as_deref(),
+                    done,
+                );
+                if state == ResponseCompletionState::Complete {
+                    break;
+                }
                 return Err(StreamConsumeError::Idle {
                     secs: idle_timeout.as_secs(),
                 });
@@ -470,21 +545,24 @@ where
         let Some(item) = next else { break };
         let bytes = match item {
             Ok(bytes) => bytes,
-            Err(_)
-                if (!text.is_empty() || !reasoning.is_empty())
-                    && !has_started_tool_call(&tool_accum) =>
-            {
-                // If a transport closes after a complete text answer, return
-                // the received answer. Incomplete tool calls remain errors.
-                break;
-            }
             Err(error) => {
+                let state = completion_state(
+                    &text,
+                    &reasoning,
+                    &tool_accum,
+                    finish_reason.as_deref(),
+                    done,
+                );
+                // A trailing transport error after a strictly complete
+                // response is accepted; it must not turn the run into a
+                // failure.
+                if state == ResponseCompletionState::Complete {
+                    break;
+                }
                 return Err(StreamConsumeError::Transport {
                     error,
-                    output_started: !text.is_empty()
-                        || !reasoning.is_empty()
-                        || has_started_tool_call(&tool_accum),
-                })
+                    completion_state: state,
+                });
             }
         };
         buf.push_str(&String::from_utf8_lossy(bytes.as_ref()));
@@ -557,13 +635,27 @@ where
         }
     }
 
-    Ok(ConsumeOutcome {
-        text,
-        reasoning,
-        tool_accum,
-        usage,
-        finish_reason,
-    })
+    let state = completion_state(
+        &text,
+        &reasoning,
+        &tool_accum,
+        finish_reason.as_deref(),
+        done,
+    );
+    if state == ResponseCompletionState::Complete {
+        Ok(ConsumeOutcome {
+            text,
+            reasoning,
+            tool_accum,
+            usage,
+            finish_reason,
+            completion_state: state,
+        })
+    } else {
+        Err(StreamConsumeError::Incomplete {
+            completion_state: state,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -630,6 +722,45 @@ fn has_started_tool_call(tool_accum: &[(String, String, String)]) -> bool {
     tool_accum
         .iter()
         .any(|(id, name, arguments)| !id.is_empty() || !name.is_empty() || !arguments.is_empty())
+}
+
+fn has_any_output(text: &str, reasoning: &str, tool_accum: &[(String, String, String)]) -> bool {
+    !text.is_empty() || !reasoning.is_empty() || has_started_tool_call(tool_accum)
+}
+
+fn tool_call_is_complete(slot: &(String, String, String)) -> bool {
+    let (id, name, arguments) = slot;
+    !id.is_empty()
+        && !name.is_empty()
+        && serde_json::from_str::<serde_json::Value>(arguments).is_ok()
+}
+
+fn tool_calls_are_complete(tool_accum: &[(String, String, String)]) -> bool {
+    tool_accum.iter().all(|slot| {
+        let started = !slot.0.is_empty() || !slot.1.is_empty() || !slot.2.is_empty();
+        if !started {
+            return true;
+        }
+        tool_call_is_complete(slot)
+    })
+}
+
+fn completion_state(
+    text: &str,
+    reasoning: &str,
+    tool_accum: &[(String, String, String)],
+    finish_reason: Option<&str>,
+    done: bool,
+) -> ResponseCompletionState {
+    let protocol_complete = done || finish_reason.is_some();
+    let tools_complete = !has_started_tool_call(tool_accum) || tool_calls_are_complete(tool_accum);
+    if protocol_complete && tools_complete {
+        ResponseCompletionState::Complete
+    } else if has_any_output(text, reasoning, tool_accum) {
+        ResponseCompletionState::Partial
+    } else {
+        ResponseCompletionState::NoOutput
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -715,16 +846,39 @@ impl NativeResponseMessage {
     }
 }
 
+fn semantic_provider_error_code(body: &str) -> Option<&'static str> {
+    const NON_RETRYABLE_CODES: &[&str] = &[
+        "model_not_found",
+        "context_length_exceeded",
+        "content_filter",
+        "invalid_request_error",
+        "malformed_request",
+    ];
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))
+        .or_else(|| error.get("message").and_then(serde_json::Value::as_str))?;
+    NON_RETRYABLE_CODES
+        .iter()
+        .find(|known| code.to_ascii_lowercase().contains(*known))
+        .copied()
+}
+
 async fn api_error(provider_name: &str, response: Response) -> AttemptError {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
+    let retry_reason = transient_http_reason(status.as_u16())
+        .filter(|_| semantic_provider_error_code(&text).is_none());
     AttemptError::permanent(
         anyhow::anyhow!("{provider_name} API error ({status}): {text}"),
         "request",
         "http_error",
     )
     .with_status(status.as_u16())
-    .retryable(transient_http_reason(status.as_u16()))
+    .retryable(retry_reason)
 }
 
 impl OpenAiProvider {
@@ -739,13 +893,8 @@ impl OpenAiProvider {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-
-        let client = Client::builder()
-            // A broken proxy or unreachable provider should fail quickly instead
-            // of leaving the desktop UI in an endless "running" state.
-            .connect_timeout(timeouts.connect)
-            .build()
-            .expect("failed to build reqwest client");
+        let transport_mode = TransportMode::default();
+        let client = Self::build_client(timeouts.connect, transport_mode);
 
         Self {
             base_url,
@@ -755,8 +904,36 @@ impl OpenAiProvider {
             max_tokens: max_tokens.filter(|v| *v > 0),
             timeouts,
             retry_backoff: PROVIDER_RETRY_BACKOFF,
+            transport_mode,
             client,
         }
+    }
+
+    /// Sets the per-provider HTTP transport mode. Default is `Auto`; the
+    /// client is rebuilt so the chosen mode takes effect from the next request.
+    pub fn with_transport_mode(mut self, mode: TransportMode) -> Self {
+        self.transport_mode = mode;
+        self.client = Self::build_client(self.timeouts.connect, mode);
+        self
+    }
+
+    fn build_client(connect_timeout: Duration, mode: TransportMode) -> Client {
+        let mut builder = Client::builder()
+            // A broken proxy or unreachable provider should fail quickly instead
+            // of leaving the desktop UI in an endless "running" state.
+            .connect_timeout(connect_timeout);
+        match mode {
+            TransportMode::Auto => {}
+            TransportMode::Http1 => {
+                builder = builder.http1_only();
+            }
+            TransportMode::Http2 => {
+                builder = builder.http2_prior_knowledge();
+            }
+        }
+        builder
+            .build()
+            .expect("failed to build reqwest client for configured transport mode")
     }
 
     /// Test seam that keeps the retry tests fast without exposing the backoff
@@ -769,8 +946,8 @@ impl OpenAiProvider {
 
     /// 构建 POST 请求。本地推理服务（如 Ollama / LM Studio）通常无需 API Key，
     /// 因此仅在存在 credential 时附加 `Authorization` 头，否则不带鉴权直接请求。
-    fn authorized_post(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self.client.post(self.endpoint_url(path));
+    fn authorized_post(&self, client: &Client, path: &str) -> reqwest::RequestBuilder {
+        let req = client.post(self.endpoint_url(path));
         match self.credential.as_ref() {
             Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
             None => req,
@@ -778,8 +955,8 @@ impl OpenAiProvider {
     }
 
     /// 构建 GET 请求，鉴权头处理同 [`authorized_post`]。
-    fn authorized_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let req = self.client.get(self.endpoint_url(path));
+    fn authorized_get(&self, client: &Client, path: &str) -> reqwest::RequestBuilder {
+        let req = client.get(self.endpoint_url(path));
         match self.credential.as_ref() {
             Some(credential) => req.header("Authorization", format!("Bearer {credential}")),
             None => req,
@@ -1072,7 +1249,9 @@ impl Provider for OpenAiProvider {
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
         let started = Instant::now();
         let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, || self.chat_inner(request));
+        let driver = self.run_with_transient_retry(started, &attempts, |client| {
+            self.chat_inner(request, client)
+        });
         match tokio::time::timeout(self.timeouts.request, driver).await {
             Ok(result) => result,
             Err(_) => Err(self.request_timeout_error(started, &attempts)),
@@ -1087,16 +1266,18 @@ impl Provider for OpenAiProvider {
         let started = Instant::now();
         let first_delta_ms = AtomicU64::new(0);
         let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, || {
-            self.chat_stream_inner(request, token_tx.clone(), &first_delta_ms, started)
+        let driver = self.run_with_transient_retry(started, &attempts, |client| {
+            self.chat_stream_inner(request, token_tx.clone(), &first_delta_ms, started, client)
         });
         match tokio::time::timeout(self.timeouts.request, driver).await {
             Ok(result) => {
-                if result.is_ok() {
+                if let Ok(response) = &result {
                     log_provider_stream_ok(
                         &self.model,
                         first_delta_ms.load(Ordering::Relaxed),
                         started.elapsed().as_millis() as u64,
+                        "complete",
+                        response.finish_reason.as_deref(),
                     );
                 }
                 result
@@ -1108,7 +1289,7 @@ impl Provider for OpenAiProvider {
     async fn health_check(&self) -> bool {
         // 无论是否配置 API Key 都真实探测 `/models`；本地服务（Ollama 等）
         // 未启动时应如实返回不健康，而非因缺少 Key 而假报健康。
-        self.authorized_get("/models")
+        self.authorized_get(&self.client, "/models")
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -1132,12 +1313,31 @@ impl OpenAiProvider {
         mut attempt: F,
     ) -> anyhow::Result<ProviderChatResponse>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Client) -> Fut,
         Fut: std::future::Future<Output = Result<ProviderChatResponse, AttemptError>>,
     {
         loop {
             let attempt_number = attempts.fetch_add(1, Ordering::Relaxed) + 1;
-            let failure = match attempt().await {
+            let profile = if attempt_number == 1 {
+                TransportProfile::Persistent
+            } else {
+                TransportProfile::Fresh
+            };
+            // The first attempt uses the provider's normal persistent client.
+            // Every retry builds a brand-new reqwest client, so it cannot reuse
+            // the failed connection-pool entry.
+            let client = if attempt_number == 1 {
+                self.client.clone()
+            } else {
+                Self::build_client(self.timeouts.connect, self.transport_mode)
+            };
+            log_provider_transport(
+                &self.model,
+                self.transport_mode.as_str(),
+                attempt_number,
+                profile.as_str(),
+            );
+            let failure = match attempt(client).await {
                 Ok(response) => return Ok(response),
                 Err(failure) => failure,
             };
@@ -1148,6 +1348,8 @@ impl OpenAiProvider {
                         attempt_number,
                         reason,
                         self.retry_backoff.as_millis() as u64,
+                        self.transport_mode.as_str(),
+                        TransportProfile::Fresh.as_str(),
                     );
                     tokio::time::sleep(self.retry_backoff).await;
                 }
@@ -1186,6 +1388,7 @@ impl OpenAiProvider {
     async fn chat_inner(
         &self,
         request: ProviderChatRequest<'_>,
+        client: Client,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -1199,7 +1402,7 @@ impl OpenAiProvider {
         };
 
         let response = self
-            .authorized_post("/chat/completions")
+            .authorized_post(&client, "/chat/completions")
             .json(&native_request)
             .send()
             .await
@@ -1237,6 +1440,7 @@ impl OpenAiProvider {
         token_tx: tokio::sync::mpsc::UnboundedSender<String>,
         first_delta_ms: &AtomicU64,
         started: Instant,
+        client: Client,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -1250,7 +1454,7 @@ impl OpenAiProvider {
         };
 
         let response = self
-            .authorized_post("/chat/completions")
+            .authorized_post(&client, "/chat/completions")
             .json(&native_request)
             .send()
             .await
@@ -1276,6 +1480,7 @@ impl OpenAiProvider {
             tool_accum,
             usage,
             finish_reason,
+            ..
         } = match outcome {
             Ok(outcome) => outcome,
             // A stream idle timeout is a timeout, never a transient
@@ -1288,13 +1493,39 @@ impl OpenAiProvider {
                 )
                 .with_timeout_ms(self.timeouts.stream_idle.as_millis() as u64));
             }
+            Err(StreamConsumeError::Incomplete { completion_state }) => {
+                return Err(AttemptError::permanent(
+                    anyhow::anyhow!(
+                        "模型响应不完整（completion_state={}），已保留已生成的部分输出",
+                        completion_state.as_str()
+                    ),
+                    "stream",
+                    "incomplete_response",
+                )
+                .block_retry_unless_no_output(completion_state));
+            }
             Err(StreamConsumeError::Transport {
                 error,
-                output_started,
+                completion_state,
             }) => {
+                // Once any model/tool output has started, a transport failure
+                // is an explicit incomplete response: never replay it and do
+                // not hide the partial-output state behind a generic network
+                // error.
+                if completion_state == ResponseCompletionState::Partial {
+                    return Err(AttemptError::permanent(
+                        anyhow::anyhow!(
+                            "模型响应不完整（completion_state={}），已保留已生成的部分输出",
+                            completion_state.as_str()
+                        ),
+                        "stream",
+                        "incomplete_response",
+                    )
+                    .block_retry_unless_no_output(completion_state));
+                }
                 return Err(self
                     .request_error("流式读取失败", &error)
-                    .block_retry_if_output_started(output_started));
+                    .block_retry_unless_no_output(completion_state));
             }
         };
 
@@ -1517,11 +1748,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_timeout_after_text_preserves_received_answer() {
-        // Services that omit [DONE] and keep the connection open must not
-        // lose the answer that already arrived: idle after text -> success.
+    async fn idle_timeout_after_finish_reason_preserves_received_answer() {
+        // Services that signal finish_reason but omit [DONE] and keep the
+        // connection open must not lose the answer already arrived: idle after
+        // a strict completion signal -> success.
+        let complete_chunk = sse_line(
+            r#"{"id":"t1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}]}"#,
+        );
         let mut stream = Box::pin(
-            stream::iter(vec![Ok(delta_chunk("完成"))])
+            stream::iter(vec![Ok(complete_chunk)])
                 .chain(stream::pending::<Result<Vec<u8>, TestStreamError>>()),
         );
         let (token_tx, _token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1540,6 +1775,7 @@ mod tests {
         .expect("grace path must return before the guard")
         .expect("grace path preserves the answer");
         assert_eq!(outcome.text, "完成");
+        assert_eq!(outcome.completion_state, ResponseCompletionState::Complete);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1856,17 +2092,21 @@ mod tests {
     }
 
     #[test]
-    fn output_already_started_revokes_retry_permission() {
+    fn partial_or_complete_output_revokes_retry_permission() {
         let retryable = || {
             AttemptError::permanent(anyhow::anyhow!("boom"), "stream", "network_error")
                 .retryable(Some("transport_disconnect"))
         };
         assert!(retryable()
-            .block_retry_if_output_started(false)
+            .block_retry_unless_no_output(ResponseCompletionState::NoOutput)
             .retry_reason
             .is_some());
         assert!(retryable()
-            .block_retry_if_output_started(true)
+            .block_retry_unless_no_output(ResponseCompletionState::Partial)
+            .retry_reason
+            .is_none());
+        assert!(retryable()
+            .block_retry_unless_no_output(ResponseCompletionState::Complete)
             .retry_reason
             .is_none());
     }
@@ -1900,8 +2140,8 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// Runs `consume_sse_stream` over chunks that end in a transport error and
-    /// reports whether it considered output to have started.
-    async fn output_started_after_error(chunks: Vec<Vec<u8>>) -> bool {
+    /// reports the application-level completion state at the failure point.
+    async fn completion_state_after_error(chunks: Vec<Vec<u8>>) -> ResponseCompletionState {
         let mut stream = Box::pin(
             stream::iter(chunks.into_iter().map(Ok))
                 .chain(stream::iter(vec![Err(TestStreamError)])),
@@ -1917,7 +2157,12 @@ mod tests {
         )
         .await;
         match outcome {
-            Err(StreamConsumeError::Transport { output_started, .. }) => output_started,
+            Err(StreamConsumeError::Transport {
+                completion_state, ..
+            }) => completion_state,
+            Err(StreamConsumeError::Incomplete {
+                completion_state, ..
+            }) => completion_state,
             Err(StreamConsumeError::Idle { secs }) => {
                 panic!("expected a transport error, got an idle timeout after {secs}s")
             }
@@ -1931,18 +2176,38 @@ mod tests {
         )
     }
 
+    fn finish_chunk(reason: &str) -> Vec<u8> {
+        sse_line(&format!(
+            r#"{{"id":"t1","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}]}}"#
+        ))
+    }
+
+    fn full_tool_call_chunk() -> Vec<u8> {
+        sse_line(
+            r#"{"id":"t1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/tmp/a\"}"}}]},"finish_reason":null}]}"#,
+        )
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stream_error_before_any_output_allows_a_retry() {
-        assert!(!output_started_after_error(vec![]).await);
+        assert_eq!(
+            completion_state_after_error(vec![]).await,
+            ResponseCompletionState::NoOutput
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn stream_error_after_a_started_tool_call_blocks_retry() {
-        // Text alone takes the grace path and returns Ok, so a partially
-        // accumulated tool call is the case that must reach the error arm and
-        // veto a replay: replaying could run the tool twice.
-        assert!(output_started_after_error(vec![tool_call_chunk()]).await);
-        assert!(output_started_after_error(vec![delta_chunk("已生成"), tool_call_chunk()]).await);
+        // A partially accumulated tool call must be Partial: replaying could
+        // run the tool twice, so retry permission must be revoked.
+        assert_eq!(
+            completion_state_after_error(vec![tool_call_chunk()]).await,
+            ResponseCompletionState::Partial
+        );
+        assert_eq!(
+            completion_state_after_error(vec![delta_chunk("已生成"), tool_call_chunk()]).await,
+            ResponseCompletionState::Partial
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2315,7 +2580,7 @@ mod tests {
         // setup is untouched.
         for _ in 0..5 {
             tracing::callsite::rebuild_interest_cache();
-            log_provider_retry("warm-up", 0, "warm-up", 0);
+            log_provider_retry("warm-up", 0, "warm-up", 0, "auto", "persistent");
             log_provider_error("warm-up", "warm-up", "warm-up", 0, None, None, None);
             if events.lock().unwrap().len() >= 2 {
                 break;
@@ -2366,9 +2631,18 @@ mod tests {
         assert_eq!(retry.field("model"), Some("retry-model"));
         assert_eq!(retry.field("attempt"), Some("1"));
         assert_eq!(retry.field("max_attempts"), Some("2"));
-        assert_eq!(retry.field("reason"), Some("transport_disconnect"));
+        assert!(
+            matches!(
+                retry.field("reason"),
+                Some("transport_disconnect" | "http_502")
+            ),
+            "unexpected retry reason: {:?}",
+            retry.field("reason")
+        );
         assert_eq!(retry.field("backoff_ms"), Some("1"));
-        assert_eq!(retry.field("output_started"), Some("false"));
+        assert_eq!(retry.field("completion_state"), Some("no_output"));
+        assert_eq!(retry.field("transport_mode"), Some("auto"));
+        assert_eq!(retry.field("connection"), Some("fresh"));
 
         let errors: Vec<_> = captured
             .iter()
@@ -2472,5 +2746,153 @@ mod tests {
         assert_ne!(connect, idle);
         assert_ne!(idle, request);
         assert_ne!(request, connect);
+    }
+
+    #[tokio::test]
+    async fn complete_response_with_trailing_eof_is_accepted_without_retry() {
+        let (result, deltas, attempts) = stream_against_script(
+            vec![Scripted::SseTruncated(vec![
+                delta_chunk("He"),
+                delta_chunk("llo"),
+                finish_chunk("stop"),
+                sse_line("[DONE]"),
+            ])],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let response = result.expect("complete response must be accepted");
+        assert_eq!(response.text.as_deref(), Some("Hello"));
+        assert_eq!(deltas, vec!["He", "llo"]);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_text_with_eof_is_explicit_incomplete_and_not_retried() {
+        let (result, deltas, attempts) = stream_against_script(
+            vec![Scripted::SseTruncated(vec![delta_chunk("部分")]), ok_sse()],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let message = result
+            .expect_err("partial text must fail explicitly")
+            .to_string();
+        assert_eq!(deltas, vec!["部分"]);
+        assert_eq!(attempts, 1);
+        assert!(
+            message.contains("响应不完整") || message.contains("incomplete"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_output_transient_failure_retries_on_fresh_connection_and_succeeds() {
+        let (result, deltas, attempts) = stream_against_script(
+            vec![Scripted::DropBeforeResponse, ok_sse()],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let response = result.expect("fresh retry must succeed");
+        assert_eq!(response.text.as_deref(), Some("Hello"));
+        assert_eq!(deltas, vec!["He", "llo"]);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn partial_tool_call_is_not_replayed_and_not_executed() {
+        let (result, _deltas, attempts) = stream_against_script(
+            vec![Scripted::SseTruncated(vec![tool_call_chunk()]), ok_sse()],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "partial tool call must not produce a response"
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn complete_tool_call_preserves_normal_behavior() {
+        let (result, _deltas, attempts) = stream_against_script(
+            vec![Scripted::Sse(vec![
+                full_tool_call_chunk(),
+                finish_chunk("tool_calls"),
+                sse_line("[DONE]"),
+            ])],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let response = result.expect("complete tool call must succeed");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&response.tool_calls[0].arguments).is_ok(),
+            "tool call arguments must be valid JSON"
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transport_modes_build_clients_for_auto_http1_http2() {
+        for mode in [
+            TransportMode::Auto,
+            TransportMode::Http1,
+            TransportMode::Http2,
+        ] {
+            let provider = OpenAiProvider::new(
+                Some("https://example.invalid/v1"),
+                None,
+                "mode-test",
+                0.0,
+                None,
+                ProviderTimeouts::default(),
+            )
+            .with_transport_mode(mode);
+            assert_eq!(provider.transport_mode, mode);
+            assert_eq!(mode.as_str(), provider.transport_mode.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_regression_status_matrix() {
+        for status in [400u16, 401, 403, 404, 422, 429, 500] {
+            let (result, _deltas, attempts) = stream_against_script(
+                vec![Scripted::Status(status, "{\"error\":{}}"), ok_sse()],
+                ProviderTimeouts::default(),
+            )
+            .await;
+            assert!(result.is_err(), "HTTP {status} must fail");
+            assert_eq!(attempts, 1, "HTTP {status} must not retry");
+        }
+
+        for status in [502u16, 503, 504] {
+            let (result, _deltas, attempts) = stream_against_script(
+                vec![Scripted::Status(status, "{\"error\":{}}"), ok_sse()],
+                ProviderTimeouts::default(),
+            )
+            .await;
+            assert!(result.is_ok(), "HTTP {status} replay must succeed");
+            assert_eq!(attempts, 2, "HTTP {status} must retry once");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_503_with_model_not_found_is_not_retried() {
+        let (result, _deltas, attempts) = stream_against_script(
+            vec![
+                Scripted::Status(
+                    503,
+                    "{\"error\":{\"code\":\"model_not_found\",\"message\":\"missing\"}}",
+                ),
+                ok_sse(),
+            ],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        assert!(result.is_err(), "semantic model_not_found must fail");
+        assert_eq!(
+            attempts, 1,
+            "semantic provider error must override HTTP retry"
+        );
     }
 }

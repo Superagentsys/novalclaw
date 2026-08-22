@@ -293,6 +293,40 @@ pub struct ModelProviderConfig {
     pub enabled: bool,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub transport: ProviderTransportConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Provider HTTP transport profile
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    Http1,
+    Http2,
+}
+
+impl TransportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
+}
+
+/// Per-provider HTTP transport settings. The default is `Auto`, so existing
+/// config files without a `[model_providers.*.transport]` table keep the
+/// normal reqwest negotiation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProviderTransportConfig {
+    #[serde(default)]
+    pub mode: TransportMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -2799,6 +2833,59 @@ outbound_mode = "session_webhook"
             toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert_eq!(restored.transport_mode, DingtalkTransportMode::Http);
         assert_eq!(restored.card_template_id, "template-id");
+    }
+
+    #[test]
+    fn provider_transport_defaults_to_auto_when_absent() {
+        let cfg: Config = toml::from_str(
+            r#"
+[model_providers.custom_compatible]
+base_url = "https://api.example.com/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_providers["custom_compatible"].transport.mode,
+            TransportMode::Auto
+        );
+    }
+
+    #[test]
+    fn provider_transport_parses_explicit_modes() {
+        for (mode, expected) in [
+            ("auto", TransportMode::Auto),
+            ("http1", TransportMode::Http1),
+            ("http2", TransportMode::Http2),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"
+[model_providers.custom_compatible]
+base_url = "https://api.example.com/v1"
+
+[model_providers.custom_compatible.transport]
+mode = "{mode}"
+"#
+            ))
+            .unwrap();
+            assert_eq!(
+                cfg.model_providers["custom_compatible"].transport.mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn provider_transport_invalid_mode_is_a_config_error() {
+        let result = toml::from_str::<Config>(
+            r#"
+[model_providers.custom_compatible]
+base_url = "https://api.example.com/v1"
+
+[model_providers.custom_compatible.transport]
+mode = "http10"
+"#,
+        );
+        assert!(result.is_err(), "invalid transport mode must fail config loading");
     }
 }
 

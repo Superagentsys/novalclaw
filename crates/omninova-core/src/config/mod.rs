@@ -13,11 +13,11 @@ pub use schema::{
     HeartbeatConfig, HooksConfig, HttpRequestConfig,
     IdentityConfig, MemoryConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, OtpConfig, PeripheralsConfig, ProviderApiMode, ProviderBehaviorConfig,
-    ProviderConfig, ProviderRuntimeConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
+    ProviderConfig, ProviderRuntimeConfig, ProviderTransportConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     RobotConfig, RpiGpioConfig, RuntimeConfig, SafetyConfig, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SensorsConfig, SkillsConfig, Stm32Config,
     StorageConfig, StorageProviderConfig, StorageProviderInner, SyscallAnomalyConfig,
-    TranscriptionConfig, TunnelConfig, WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig,
+    TranscriptionConfig, TransportMode, TunnelConfig, WasmRuntimeConfig, WasmSecurityConfig, WebFetchConfig,
     WebSearchConfig, WecomTransportMode,
 };
 
