@@ -46,6 +46,46 @@
   font-size: 12px;
 }
 
+.contract-review-panel.is-collapsed {
+  max-height: none;
+  overflow: visible;
+}
+
+.contract-review-collapse {
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  transition: border-color var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+}
+
+.contract-review-collapse:hover {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.contract-review-collapse:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 2px;
+}
+
+.contract-review-collapse-status {
+  color: var(--ui-accent-strong);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
 .contract-review-badge,
 .contract-review-recommended {
   display: inline-flex;

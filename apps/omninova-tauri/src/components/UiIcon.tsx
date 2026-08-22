@@ -15,6 +15,8 @@ import DatabaseOutlined from "@ant-design/icons/DatabaseOutlined";
 import DeleteOutlined from "@ant-design/icons/DeleteOutlined";
 import DesktopOutlined from "@ant-design/icons/DesktopOutlined";
 import DollarOutlined from "@ant-design/icons/DollarOutlined";
+import DownOutlined from "@ant-design/icons/DownOutlined";
+import UpOutlined from "@ant-design/icons/UpOutlined";
 import EditOutlined from "@ant-design/icons/EditOutlined";
 import ExperimentOutlined from "@ant-design/icons/ExperimentOutlined";
 import FileImageOutlined from "@ant-design/icons/FileImageOutlined";
@@ -66,6 +68,8 @@ const ICONS = {
   database: DatabaseOutlined,
   delete: DeleteOutlined,
   desktop: DesktopOutlined,
+  chevronDown: DownOutlined,
+  chevronUp: UpOutlined,
   edit: EditOutlined,
   experiment: ExperimentOutlined,
   file: FileOutlined,
