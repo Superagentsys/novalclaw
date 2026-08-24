@@ -4157,6 +4157,9 @@ export function Chat({
             liveSessionId={activeRunId}
             activeSteps={activeSteps}
             onAddArtifactToChat={(path) => void mergePathsIntoInput([path])}
+            approval={activeToolApproval}
+            onApproveApproval={(approval) => void handleApproveToolRequest(approval)}
+            onRejectApproval={(approval) => void handleRejectToolRequest(approval)}
           />
         </main>
       </div>

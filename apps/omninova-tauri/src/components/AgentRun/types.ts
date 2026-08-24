@@ -54,6 +54,9 @@ export type AgentRunEvent =
   | AgentRunEventToolCompleted
   | AgentRunEventSkillActivated
   | AgentRunEventApprovalRequired
+  | AgentRunEventApprovalApproved
+  | AgentRunEventApprovalRejected
+  | AgentRunEventApprovalCancelled
   | AgentRunEventCommandOutput
   | AgentRunEventFileChanged
   | AgentRunEventPatchStarted
@@ -139,6 +142,34 @@ export interface AgentRunEventApprovalRequired {
   title: string;
   reason: string;
   arguments: Record<string, unknown>;
+}
+
+export interface AgentRunEventApprovalApproved {
+  type: "approval_approved";
+  run_id: string;
+  step_id: string;
+  approval_id: string;
+  tool_call_id: string;
+  tool_name: string;
+}
+
+export interface AgentRunEventApprovalRejected {
+  type: "approval_rejected";
+  run_id: string;
+  step_id: string;
+  approval_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  reason: string;
+}
+
+export interface AgentRunEventApprovalCancelled {
+  type: "approval_cancelled";
+  run_id: string;
+  step_id: string;
+  approval_id: string;
+  tool_call_id: string;
+  tool_name: string;
 }
 
 export interface AgentRunEventCommandOutput {
@@ -295,6 +326,11 @@ export function getEventStatusLabel(
     case "commandOutput":
       return "running";
     case "approval_required":
+      return "warning";
+    case "approval_approved":
+      return "success";
+    case "approval_rejected":
+    case "approval_cancelled":
       return "warning";
     case "run_completed":
     case "model_completed":

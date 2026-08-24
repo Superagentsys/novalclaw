@@ -221,6 +221,34 @@ pub enum AgentRunEvent {
         arguments: serde_json::Value,
     },
 
+    /// An approval request was approved and its tool call may now execute.
+    approval_approved {
+        run_id: String,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+    },
+
+    /// An approval request was rejected by the user; the tool call must not execute.
+    approval_rejected {
+        run_id: String,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        reason: String,
+    },
+
+    /// An approval request was cancelled, usually because its run/task stopped.
+    approval_cancelled {
+        run_id: String,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+    },
+
     /// Run has completed successfully.
     run_completed {
         run_id: String,
@@ -272,6 +300,9 @@ impl AgentRunEvent {
             Self::tool_completed { run_id, .. } => run_id,
             Self::skill_activated { run_id, .. } => run_id,
             Self::approval_required { run_id, .. } => run_id,
+            Self::approval_approved { run_id, .. } => run_id,
+            Self::approval_rejected { run_id, .. } => run_id,
+            Self::approval_cancelled { run_id, .. } => run_id,
             Self::run_completed { run_id, .. } => run_id,
             Self::run_failed { run_id, .. } => run_id,
             Self::run_cancelled { run_id, .. } => run_id,
@@ -297,6 +328,9 @@ impl AgentRunEvent {
             Self::tool_completed { step_id, .. } => Some(step_id),
             Self::skill_activated { .. } => None,
             Self::approval_required { step_id, .. } => Some(step_id),
+            Self::approval_approved { step_id, .. } => Some(step_id),
+            Self::approval_rejected { step_id, .. } => Some(step_id),
+            Self::approval_cancelled { step_id, .. } => Some(step_id),
             Self::run_completed { .. } => None,
             Self::run_failed { .. } => None,
             Self::run_cancelled { .. } => None,

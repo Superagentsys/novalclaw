@@ -197,6 +197,10 @@ pub fn evaluate_tool_call(
         }
     }
 
+    if tool_name == "git_operations" && git_operation_is_read_only(arguments) {
+        return ToolPolicyDecision::Allow;
+    }
+
     if is_tool_auto_approved(config, tool_name) {
         return ToolPolicyDecision::Allow;
     }
@@ -257,6 +261,13 @@ fn is_read_only_workspace_tool(tool_name: &str) -> bool {
     READ_ONLY_WORKSPACE_TOOLS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+}
+
+fn git_operation_is_read_only(arguments: &serde_json::Value) -> bool {
+    matches!(
+        arguments.get("operation").and_then(|value| value.as_str()),
+        Some("status" | "diff" | "log")
+    )
 }
 
 fn pattern_looks_outside_workspace(pattern: &str) -> bool {
@@ -335,5 +346,55 @@ mod tests {
         );
 
         assert!(matches!(decision, ToolPolicyDecision::Deny { .. }));
+    }
+#[test]
+    fn read_only_git_operations_are_allowed_without_approval() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        for operation in ["status", "diff", "log"] {
+            let decision = evaluate_tool_call(
+                &config,
+                "git_operations",
+                &serde_json::json!({"operation": operation}),
+            );
+            assert_eq!(
+                decision,
+                ToolPolicyDecision::Allow,
+                "git {operation} should be read-only and allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_git_operations_require_approval_under_supervised() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "git_operations",
+            &serde_json::json!({"operation": "commit", "args": ["-m", "x"]}),
+        );
+        assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
+    fn unknown_tool_defaults_to_approval_under_supervised() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "some_unknown_tool",
+            &serde_json::json!({"value": 1}),
+        );
+        assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
     }
 }

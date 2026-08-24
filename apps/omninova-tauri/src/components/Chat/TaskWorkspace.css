@@ -487,6 +487,76 @@
   display: none;
 }
 
+.task-inspector-approval-card {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid var(--ui-warning);
+  border-radius: 8px;
+  background: var(--ui-warning-soft, rgba(255, 180, 0, 0.08));
+}
+
+.task-inspector-approval-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ui-warning-strong, #9a6b00);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.task-inspector-approval-action,
+.task-inspector-approval-row,
+.task-inspector-approval-risk {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.task-inspector-approval-action span,
+.task-inspector-approval-row span,
+.task-inspector-approval-risk span {
+  color: var(--ui-text-muted);
+}
+
+.task-inspector-approval-row code {
+  overflow-wrap: anywhere;
+  color: var(--ui-text);
+}
+
+.task-inspector-approval-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.task-inspector-approval-actions button {
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.task-inspector-approval-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.task-inspector-approval-reject {
+  background: rgba(160, 60, 60, 0.12);
+  color: #a23b3b;
+}
+
+.task-inspector-approval-allow {
+  background: rgba(40, 100, 200, 0.12);
+  color: #285ba8;
+}
+
 .task-inspector-empty {
   display: grid;
   min-height: 210px;

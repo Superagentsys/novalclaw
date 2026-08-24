@@ -77,6 +77,9 @@ function eventKey(event: RawEvent): string {
   if (type === "run_completed" || type === "run_failed" || type === "run_cancelled" || type === "error") {
     return `${type}:${runId}`;
   }
+  if (type === "approval_required" || type === "approval_approved" || type === "approval_rejected" || type === "approval_cancelled") {
+    return `${type}:${runId}:${stringField(event, "approval_id")}`;
+  }
   if (type === "model_started" || type === "model_completed") {
     return `${type}:${runId}:${stringField(event, "step_id")}:${hashText(stringField(event, "title"))}`;
   }
@@ -348,14 +351,36 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
     if (type === "approval_required") {
       const id = stepIdFor(event, index);
       const reason = stringField(event, "reason") || "该工具需要人工确认后才能继续。";
-      const step = ensureStep(
-        id,
-        toolName,
-        stringField(event, "title") || `需要授权：${toolName || "受限工具"}`
-      );
+      const step = ensureStep(id, toolName, `等待审批：${getToolRunningLabel(toolName)}`);
       step.status = "warning";
-      step.title = stringField(event, "title") || `需要授权：${toolName || "受限工具"}`;
+      step.title = `等待审批：${getToolRunningLabel(toolName)}`;
       step.result_summary = reason;
+      return;
+    }
+
+    if (type === "approval_approved") {
+      const id = stepIdFor(event, index);
+      const step = ensureStep(id, toolName, `用户已批准：${getToolRunningLabel(toolName)}`);
+      step.status = "success";
+      step.title = `用户已批准：${getToolRunningLabel(toolName)}`;
+      return;
+    }
+
+    if (type === "approval_rejected") {
+      const id = stepIdFor(event, index);
+      const step = ensureStep(id, toolName, `用户已拒绝：${getToolRunningLabel(toolName)}`);
+      step.status = "warning";
+      step.title = `用户已拒绝：${getToolRunningLabel(toolName)}`;
+      step.result_summary = stringField(event, "reason") || "用户拒绝执行该操作";
+      return;
+    }
+
+    if (type === "approval_cancelled") {
+      const id = stepIdFor(event, index);
+      const step = ensureStep(id, toolName, `审批已取消：${getToolRunningLabel(toolName)}`);
+      step.status = "warning";
+      step.title = `审批已取消：${getToolRunningLabel(toolName)}`;
+      step.result_summary = stringField(event, "reason") || "任务已停止，审批已取消";
       return;
     }
   });

@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -10,15 +13,26 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Rejected,
+    Cancelled,
     Consumed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub id: String,
+    pub run_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub tool_name: String,
+    /// Raw tool arguments. Used for exact matching and never displayed directly
+    /// in approval UI when a separate safe_arguments value is available.
     pub arguments: serde_json::Value,
+    /// Sanitized/truncated arguments for user-facing approval cards.
+    #[serde(default = "default_safe_arguments")]
+    pub safe_arguments: serde_json::Value,
     pub args_hash: String,
+    pub action: Option<String>,
+    pub risk_level: Option<String>,
+    pub summary: Option<String>,
     pub reason: String,
     pub status: ApprovalStatus,
     pub created_at: String,
@@ -27,59 +41,109 @@ pub struct PendingApproval {
     pub reject_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_safe_arguments() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ApprovalStore {
     #[serde(default)]
     items: Vec<PendingApproval>,
+    #[serde(skip)]
+    loaded: bool,
+}
+
+type SharedApprovalStore = Arc<AsyncMutex<ApprovalStore>>;
+
+fn shared_store(path: &Path) -> SharedApprovalStore {
+    static MAP: OnceLock<StdMutex<HashMap<String, SharedApprovalStore>>> = OnceLock::new();
+    let mut map = MAP
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("approval store map lock poisoned");
+    let key = path.to_string_lossy().to_string();
+    map.entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(ApprovalStore::default())))
+        .clone()
 }
 
 #[derive(Debug, Clone)]
 pub struct ApprovalController {
     store_file: PathBuf,
+    store: SharedApprovalStore,
 }
 
 impl ApprovalController {
     pub fn from_workspace(workspace_dir: &PathBuf) -> Self {
-        Self {
-            store_file: workspace_dir.join(".omninova-approvals.json"),
-        }
+        let store_file = workspace_dir.join(".omninova-approvals.json");
+        let store = shared_store(&store_file);
+        Self { store_file, store }
     }
 
     pub async fn list(&self, pending_only: bool) -> Result<Vec<PendingApproval>> {
-        let store = self.load().await?;
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
         Ok(if pending_only {
             store
                 .items
-                .into_iter()
+                .iter()
                 .filter(|item| item.status == ApprovalStatus::Pending)
+                .cloned()
                 .collect()
         } else {
-            store.items
+            store.items.clone()
         })
     }
 
-    /// Returns one approval request by id. This is used by an in-flight tool
-    /// execution to wait for the desktop user's decision without terminating
-    /// and recreating the whole agent run.
     pub async fn get(&self, id: &str) -> Result<Option<PendingApproval>> {
-        let store = self.load().await?;
-        Ok(store.items.into_iter().find(|item| item.id == id))
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
+        Ok(store.items.iter().find(|item| item.id == id).cloned())
     }
 
     pub async fn create(
         &self,
+        run_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: serde_json::Value,
+        safe_arguments: serde_json::Value,
+        action: &str,
+        risk_level: &str,
+        summary: &str,
         reason: &str,
     ) -> Result<PendingApproval> {
-        let mut store = self.load().await?;
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
         let now = now_ts();
         let args_hash = hash_tool_args(tool_name, &arguments);
         let item = PendingApproval {
             id: format!("appr-{}", Uuid::new_v4()),
+            run_id: Some(run_id.to_string()),
+            tool_call_id: Some(tool_call_id.to_string()),
             tool_name: tool_name.to_string(),
-            arguments,
+            arguments: arguments.clone(),
+            safe_arguments: if safe_arguments.is_null() {
+                arguments.clone()
+            } else {
+                safe_arguments
+            },
             args_hash,
+            action: if action.is_empty() {
+                None
+            } else {
+                Some(action.to_string())
+            },
+            risk_level: if risk_level.is_empty() {
+                None
+            } else {
+                Some(risk_level.to_string())
+            },
+            summary: if summary.is_empty() {
+                None
+            } else {
+                Some(summary.to_string())
+            },
             reason: reason.to_string(),
             status: ApprovalStatus::Pending,
             created_at: now.clone(),
@@ -88,7 +152,7 @@ impl ApprovalController {
             reject_reason: None,
         };
         store.items.push(item.clone());
-        self.save(&store).await?;
+        self.save_locked(&store).await?;
         Ok(item)
     }
 
@@ -106,16 +170,42 @@ impl ApprovalController {
             .await
     }
 
-    /// If a matching approved (not yet consumed) request exists, mark consumed and return true.
+    /// Marks every Pending approval for a run as Cancelled. Returns the number
+    /// of approvals that transitioned from Pending to Cancelled.
+    pub async fn cancel_for_run(&self, run_id: &str) -> Result<usize> {
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
+        let now = now_ts();
+        let mut changed = 0usize;
+        for item in store.items.iter_mut() {
+            if item.run_id.as_deref() == Some(run_id) && item.status == ApprovalStatus::Pending {
+                item.status = ApprovalStatus::Cancelled;
+                item.updated_at = now.clone();
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.save_locked(&store).await?;
+        }
+        Ok(changed)
+    }
+
+    /// If an approved request exists for the exact run+tool_call identity, mark
+    /// it Consumed and return it. This is the exactly-once authorization gate.
     pub async fn consume_matching_grant(
         &self,
+        run_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<Option<PendingApproval>> {
         let hash = hash_tool_args(tool_name, arguments);
-        let mut store = self.load().await?;
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
         let idx = store.items.iter().position(|item| {
             item.status == ApprovalStatus::Approved
+                && item.run_id.as_deref() == Some(run_id)
+                && item.tool_call_id.as_deref() == Some(tool_call_id)
                 && item.tool_name == tool_name
                 && item.args_hash == hash
         });
@@ -126,7 +216,7 @@ impl ApprovalController {
         item.status = ApprovalStatus::Consumed;
         item.updated_at = now_ts();
         store.items[idx] = item.clone();
-        self.save(&store).await?;
+        self.save_locked(&store).await?;
         Ok(Some(item))
     }
 
@@ -137,7 +227,8 @@ impl ApprovalController {
         approved_by: Option<String>,
         reject_reason: Option<String>,
     ) -> Result<PendingApproval> {
-        let mut store = self.load().await?;
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
         let item = store
             .items
             .iter_mut()
@@ -151,24 +242,51 @@ impl ApprovalController {
         item.approved_by = approved_by;
         item.reject_reason = reject_reason;
         let out = item.clone();
-        self.save(&store).await?;
+        self.save_locked(&store).await?;
         Ok(out)
     }
 
-    async fn load(&self) -> Result<ApprovalStore> {
-        if !self.store_file.exists() {
-            return Ok(ApprovalStore::default());
+    async fn ensure_loaded(&self, store: &mut ApprovalStore) -> Result<()> {
+        if store.loaded {
+            return Ok(());
         }
-        let raw = tokio::fs::read_to_string(&self.store_file).await?;
-        Ok(serde_json::from_str(&raw).unwrap_or_default())
+        if self.store_file.exists() {
+            let raw = tokio::fs::read_to_string(&self.store_file).await?;
+            if let Ok(mut file_store) = serde_json::from_str::<ApprovalStore>(&raw) {
+                let mut had_pending = false;
+                let now = now_ts();
+                for item in file_store.items.iter_mut() {
+                    if item.status == ApprovalStatus::Pending {
+                        item.status = ApprovalStatus::Cancelled;
+                        item.updated_at = now.clone();
+                        had_pending = true;
+                    }
+                }
+                if had_pending {
+                    // Old pending approvals from a previous process must never
+                    // become executable after restart.
+                    *store = file_store;
+                    store.loaded = true;
+                    self.save_locked(store).await?;
+                    return Ok(());
+                }
+                *store = file_store;
+            }
+        }
+        store.loaded = true;
+        Ok(())
     }
 
-    async fn save(&self, store: &ApprovalStore) -> Result<()> {
+    async fn save_locked(&self, store: &ApprovalStore) -> Result<()> {
         if let Some(parent) = self.store_file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let raw = serde_json::to_string_pretty(store)?;
-        tokio::fs::write(&self.store_file, raw).await?;
+        let tmp = self
+            .store_file
+            .with_extension(format!("tmp-{}", Uuid::new_v4()));
+        tokio::fs::write(&tmp, raw).await?;
+        tokio::fs::rename(&tmp, &self.store_file).await?;
         Ok(())
     }
 }
@@ -193,6 +311,15 @@ fn now_ts() -> String {
 mod tests {
     use super::*;
 
+    fn temp_controller(label: &str) -> ApprovalController {
+        let dir = std::env::temp_dir().join(format!("omninova-approval-{label}-{}", Uuid::new_v4()));
+        let controller = ApprovalController::from_workspace(&dir);
+        clean_on_drop(dir);
+        controller
+    }
+
+    fn clean_on_drop(_dir: PathBuf) {}
+
     #[test]
     fn hash_is_stable() {
         let args = serde_json::json!({"command": "ls"});
@@ -202,35 +329,225 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_can_be_observed_and_consumed_by_an_inflight_tool() {
-        let workspace = std::env::temp_dir().join(format!("omninova-approval-test-{}", Uuid::new_v4()));
-        let controller = ApprovalController::from_workspace(&workspace);
-        let arguments = serde_json::json!({"command": "cargo test"});
+    async fn read_only_allow_is_not_created_by_controller() {
+        // Controller-level test only checks identity/consume semantics; policy
+        // Allow/Ask is decided in SecurityContext.
+        let controller = temp_controller("readonly");
         let pending = controller
-            .create("shell", arguments.clone(), "test approval")
+            .create(
+                "run-1",
+                "call-1",
+                "file_read",
+                serde_json::json!({"path": "README.md"}),
+                serde_json::json!({"path": "README.md"}),
+                "读取文件",
+                "low",
+                "读取文件",
+                "read-only",
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn create_binds_run_and_tool_call() {
+        let controller = temp_controller("identity");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.run_id.as_deref(), Some("run-a"));
+        assert_eq!(pending.tool_call_id.as_deref(), Some("call-a"));
+    }
+
+    #[tokio::test]
+    async fn approve_consumes_exactly_once_for_exact_identity() {
+        let controller = temp_controller("once");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
             .await
             .unwrap();
 
-        assert_eq!(
-            controller.get(&pending.id).await.unwrap().unwrap().status,
-            ApprovalStatus::Pending
-        );
-        controller
-            .approve(&pending.id, Some("desktop-user".to_string()))
+        controller.approve(&pending.id, Some("user".to_string())).await.unwrap();
+        let first = controller
+            .consume_matching_grant("run-a", "call-a", "write_file", &serde_json::json!({"path": "/tmp/a"}))
             .await
             .unwrap();
-        assert_eq!(
-            controller.get(&pending.id).await.unwrap().unwrap().status,
-            ApprovalStatus::Approved
-        );
+        assert!(first.is_some());
+        let second = controller
+            .consume_matching_grant("run-a", "call-a", "write_file", &serde_json::json!({"path": "/tmp/a"}))
+            .await
+            .unwrap();
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_approve_is_blocked() {
+        let controller = temp_controller("dup");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "shell",
+                serde_json::json!({"command": "ls"}),
+                serde_json::json!({"command": "ls"}),
+                "执行命令",
+                "medium",
+                "执行命令",
+                "shell",
+            )
+            .await
+            .unwrap();
+        controller.approve(&pending.id, None).await.unwrap();
+        let err = controller.approve(&pending.id, None).await;
+        assert!(err.is_err(), "second approve must fail");
+    }
+
+    #[tokio::test]
+    async fn reject_prevents_consumption() {
+        let controller = temp_controller("reject");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
+            .await
+            .unwrap();
+        controller.reject(&pending.id, Some("user_rejected".to_string())).await.unwrap();
         let consumed = controller
-            .consume_matching_grant("shell", &arguments)
+            .consume_matching_grant("run-a", "call-a", "write_file", &serde_json::json!({"path": "/tmp/a"}))
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(consumed.id, pending.id);
-        assert_eq!(consumed.status, ApprovalStatus::Consumed);
+        assert!(consumed.is_none());
+    }
 
-        let _ = tokio::fs::remove_dir_all(workspace).await;
+    #[tokio::test]
+    async fn cancel_for_run_cancels_pending_and_blocks_later_approve() {
+        let controller = temp_controller("cancel");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
+            .await
+            .unwrap();
+        let changed = controller.cancel_for_run("run-a").await.unwrap();
+        assert_eq!(changed, 1);
+        let stored = controller.get(&pending.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Cancelled);
+        let err = controller.approve(&pending.id, None).await;
+        assert!(err.is_err(), "approve after cancel must fail");
+    }
+
+    #[tokio::test]
+    async fn cross_run_consumption_is_rejected() {
+        let controller = temp_controller("cross");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
+            .await
+            .unwrap();
+        controller.approve(&pending.id, None).await.unwrap();
+        let consumed = controller
+            .consume_matching_grant("run-b", "call-a", "write_file", &serde_json::json!({"path": "/tmp/a"}))
+            .await
+            .unwrap();
+        assert!(consumed.is_none(), "run mismatch must not consume");
+    }
+
+    #[tokio::test]
+    async fn tool_call_id_mismatch_is_rejected() {
+        let controller = temp_controller("call-mismatch");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "write_file",
+                serde_json::json!({"path": "/tmp/a"}),
+                serde_json::json!({"path": "/tmp/a"}),
+                "写入文件",
+                "medium",
+                "写入文件",
+                "side effect",
+            )
+            .await
+            .unwrap();
+        controller.approve(&pending.id, None).await.unwrap();
+        let consumed = controller
+            .consume_matching_grant("run-a", "call-b", "write_file", &serde_json::json!({"path": "/tmp/a"}))
+            .await
+            .unwrap();
+        assert!(consumed.is_none(), "tool_call mismatch must not consume");
+    }
+
+    #[tokio::test]
+    async fn approve_reject_race_first_wins() {
+        let controller = temp_controller("race");
+        let pending = controller
+            .create(
+                "run-a",
+                "call-a",
+                "shell",
+                serde_json::json!({"command": "ls"}),
+                serde_json::json!({"command": "ls"}),
+                "执行命令",
+                "medium",
+                "执行命令",
+                "shell",
+            )
+            .await
+            .unwrap();
+
+        let approve = controller.approve(&pending.id, None);
+        let reject = controller.reject(&pending.id, Some("nope".to_string()));
+        let (a, r) = tokio::join!(approve, reject);
+        assert!(
+            a.is_ok() != r.is_ok(),
+            "exactly one terminal decision must win"
+        );
     }
 }

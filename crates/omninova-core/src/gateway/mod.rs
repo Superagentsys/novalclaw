@@ -1701,7 +1701,11 @@ impl GatewayRuntime {
     }
 
     pub async fn cancel_agent_run(&self, run_id: &str) -> anyhow::Result<()> {
-        self.run_registry.cancel_run(run_id).await
+        self.run_registry.cancel_run(run_id).await?;
+        let cfg = self.config.read().await.clone();
+        let controller = ApprovalController::from_workspace(&cfg.workspace_dir);
+        let _ = controller.cancel_for_run(run_id).await?;
+        Ok(())
     }
 
     pub async fn refresh_memory_from_config(&self) -> anyhow::Result<()> {
