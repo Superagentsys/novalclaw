@@ -49,6 +49,7 @@ import type {
 } from "../../types/config";
 import { UiIcon } from "../UiIcon";
 import { AgentRunTimeline } from "../AgentRun/AgentRunTimeline";
+import { getErrorPresentation } from "../AgentRun/executionPresentation";
 import { SETUP_CONFIG_UPDATED_EVENT } from "../../utils/appEvents";
 import {
   TaskDeliverable,
@@ -1397,12 +1398,15 @@ export function Chat({
           }
         } else {
           const approvalAwareError = friendlyToolApprovalError(outcome.error);
+          const presentation = getErrorPresentation(approvalAwareError, { type: "run_failed" });
           const displayError = contractAvatarId
             ? friendlyContractReviewError(approvalAwareError)
-            : approvalAwareError;
+            : presentation.title;
           setError(displayError);
           appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
-          appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+          appendTaskActivity(runId, `任务失败：${displayError}`, "error", {
+            detail: contractAvatarId ? undefined : presentation.detail || undefined,
+          });
           finalizeTask(runId, "failed", displayError);
           if (contractAvatarId) {
             setContractReviewUiByAvatar((prev) => ({
@@ -2097,7 +2101,8 @@ export function Chat({
           payload.error || payload.message || "Agent run failed"
         );
         const contractAvatarId = contractReviewRunAvatarIdsRef.current[runId];
-        const displayError = contractAvatarId ? friendlyContractReviewError(rawError) : rawError;
+        const presentation = getErrorPresentation(rawError, { type: "run_failed" });
+        const displayError = contractAvatarId ? friendlyContractReviewError(rawError) : presentation.title;
         setError(displayError);
         if (contractAvatarId) {
           setContractReviewUiByAvatar((prev) => ({
@@ -2111,7 +2116,9 @@ export function Chat({
         if (!cancelledRef.current[avatarId]) {
           appendAssistantMessageOnce(runId, `任务失败：${displayError}`, avatarId);
         }
-        appendTaskActivity(runId, `任务失败：${displayError}`, "error");
+        appendTaskActivity(runId, `任务失败：${displayError}`, "error", {
+          detail: contractAvatarId ? undefined : presentation.detail || undefined,
+        });
         finalizeTask(runId, "failed", displayError);
         void refreshTaskArtifacts(runId);
       }

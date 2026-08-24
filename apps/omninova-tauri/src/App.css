@@ -3339,6 +3339,14 @@
   color: #a23b3b;
 }
 
+.agent-run-step-error-detail {
+  margin-top: 4px;
+  color: #a23b3b;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .agent-run-step-meta {
   display: inline-flex;
   align-items: center;

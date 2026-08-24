@@ -1,5 +1,13 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listenAgentRunEvents } from "../../utils/events";
+import {
+  MODEL_COMPLETED_LABEL,
+  MODEL_STARTED_LABEL,
+  MODEL_STREAMING_LABEL,
+  getToolCompletedLabel,
+  getToolFailedLabel,
+  getToolRunningLabel,
+} from "./executionPresentation";
 import type { AgentRunChangedFile, AgentRunEvent, AgentRunStep, RunEvent } from "./types";
 import { AgentRunEventCard } from "./AgentRunEventCard";
 import { AgentDiffPanel } from "../AgentDiff/AgentDiffPanel";
@@ -126,42 +134,15 @@ function stepIdFor(event: RawEvent, fallbackIndex: number): string {
 }
 
 function cleanTitle(title: string, toolName: string): string {
-  if (!title.trim()) {
-    switch (toolName) {
-      case "file_list":
-      case "list_directory":
-        return "正在列出目录";
-      case "file_write":
-      case "write_file":
-        return "正在写入文件";
-      case "git_operations":
-      case "git":
-        return "正在执行 Git 操作";
-      case "shell":
-      case "bash":
-      case "run_command":
-      case "Command":
-        return "正在执行命令";
-      default:
-        return `正在执行工具：${toolName || "unknown"}`;
-    }
+  if (toolName === "model") {
+    return title.trim() ? title : MODEL_STARTED_LABEL;
   }
-  return title;
+  return getToolRunningLabel(toolName);
 }
 
-function completedTitle(startTitle: string, toolName: string, success: boolean, summary: string): string {
-  if (!success) return startTitle.replace(/^正在/, "") || summary;
-  return startTitle
-    .replace(/^正在列出目录/, "列出目录")
-    .replace(/^正在列出文件/, "列出文件")
-    .replace(/^正在读取文件/, "读取文件")
-    .replace(/^正在写入文件/, "写入文件")
-    .replace(/^正在编辑文件/, "编辑文件")
-    .replace(/^正在搜索文件/, "搜索文件")
-    .replace(/^正在搜索内容/, "搜索内容")
-    .replace(/^正在执行命令/, "执行命令")
-    .replace(/^正在执行 Git 操作/, "Git 操作")
-    .replace(/^正在执行工具/, toolName || "工具");
+function completedTitle(_startTitle: string, toolName: string, success: boolean, _summary: string): string {
+  if (success) return getToolCompletedLabel(toolName);
+  return getToolFailedLabel(toolName);
 }
 
 function upsertChangedFile(files: AgentRunChangedFile[], file: AgentRunChangedFile): AgentRunChangedFile[] {
@@ -230,14 +211,14 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
 
     if (type === "model_started") {
       const id = stepIdFor(event, index);
-      const step = ensureStep(id, "model", stringField(event, "title") || "正在分析请求");
+      const step = ensureStep(id, "model", stringField(event, "title") || MODEL_STARTED_LABEL);
       step.status = "running";
       return;
     }
 
     if (type === "model_delta") {
       const id = stepIdFor(event, index);
-      const step = ensureStep(id, "model", "正在生成回复");
+      const step = ensureStep(id, "model", MODEL_STREAMING_LABEL);
       const content = stringField(event, "content");
       if (content && !step.outputs.includes(content)) step.outputs.push(content);
       return;
@@ -245,17 +226,17 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
 
     if (type === "model_completed") {
       const id = stepIdFor(event, index);
-      const step = ensureStep(id, "model", stringField(event, "title") || "模型阶段完成");
+      const step = ensureStep(id, "model", stringField(event, "title") || MODEL_COMPLETED_LABEL);
       step.status = "success";
-      step.title = stringField(event, "title") || "模型阶段完成";
+      step.title = stringField(event, "title") || MODEL_COMPLETED_LABEL;
       return;
     }
 
     if (type === "tool_call_created") {
       const id = stepIdFor(event, index);
-      const step = ensureStep(id, toolName, stringField(event, "title") || `准备调用工具：${toolName || "unknown"}`);
+      const step = ensureStep(id, toolName, getToolRunningLabel(toolName));
       step.status = "running";
-      step.title = stringField(event, "title") || `准备调用工具：${toolName || "unknown"}`;
+      step.title = getToolRunningLabel(toolName);
       return;
     }
 
@@ -270,9 +251,9 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
     if (type === "patch_started") {
       const id = stepIdFor(event, index);
       const path = stringField(event, "path") || "文件";
-      const step = ensureStep(id, "file_patch", stringField(event, "title") || `准备修改 ${path}`);
+      const step = ensureStep(id, "file_patch", `正在修改文件：${path}`);
       step.status = "running";
-      step.title = stringField(event, "title") || `准备修改 ${path}`;
+      step.title = `正在修改文件：${path}`;
       lastFileStepId = id;
       return;
     }
