@@ -43,6 +43,7 @@ import SoundOutlined from "@ant-design/icons/SoundOutlined";
 import SunOutlined from "@ant-design/icons/SunOutlined";
 import SyncOutlined from "@ant-design/icons/SyncOutlined";
 import ClockCircleOutlined from "@ant-design/icons/ClockCircleOutlined";
+import CopyOutlined from "@ant-design/icons/CopyOutlined";
 import TeamOutlined from "@ant-design/icons/TeamOutlined";
 import ToolOutlined from "@ant-design/icons/ToolOutlined";
 import VideoCameraOutlined from "@ant-design/icons/VideoCameraOutlined";
@@ -61,6 +62,7 @@ const ICONS = {
   audio: AudioOutlined,
   chart: BarChartOutlined,
   check: CheckOutlined,
+  copy: CopyOutlined,
   close: CloseOutlined,
   cloud: CloudOutlined,
   code: CodeOutlined,

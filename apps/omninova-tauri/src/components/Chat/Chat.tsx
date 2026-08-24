@@ -68,6 +68,7 @@ import {
 } from "./ModelPicker";
 import { CommandPalette as CommandPaletteMenu } from "./CommandPalette";
 import { ContractReviewPanel, ContractReviewReport } from "./ContractReviewPanel";
+import { MessageActions } from "./MessageActions";
 import type {
   ContractReviewStage,
   ContractReviewEngineCard,
@@ -115,8 +116,16 @@ const SESSION_WORKSPACE_STORAGE_KEY = "omninova.chat.sessionWorkspaces.v1";
 const COMPOSER_HEIGHT_STORAGE_KEY = "omninova.chat.composerHeight.v1";
 const COMPOSER_MIN_HEIGHT = 54;
 const COMPOSER_MAX_HEIGHT = 240;
+const MESSAGE_EDIT_MAX_HEIGHT = 240;
 const COMPOSER_HELP_TEXT =
   "可用命令：\n/help — 显示帮助\n/skills — 打开技能设置\n输入 / 打开命令面板，选择已安装技能后再发送任务。";
+
+function resizeMessageEditor(textarea: HTMLTextAreaElement) {
+  textarea.style.height = "0px";
+  const nextHeight = Math.min(textarea.scrollHeight, MESSAGE_EDIT_MAX_HEIGHT);
+  textarea.style.height = `${nextHeight}px`;
+  textarea.style.overflowY = textarea.scrollHeight > MESSAGE_EDIT_MAX_HEIGHT ? "auto" : "hidden";
+}
 
 type ApprovalProfile = "request_approval" | "risk_based";
 
@@ -134,6 +143,18 @@ interface PendingToolApproval {
   reason: string;
   arguments: Record<string, unknown>;
   decision: "pending" | "approving" | "rejecting";
+}
+
+interface SelectedAskContext {
+  text: string;
+  messageId: number;
+}
+
+interface SelectionAskActionState {
+  top: number;
+  left: number;
+  text: string;
+  messageId: number;
 }
 
 const DEFAULT_APPROVAL_PROFILE: ApprovalProfilePayload = {
@@ -522,6 +543,10 @@ export function Chat({
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
   const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const [selectedAskContext, setSelectedAskContext] = useState<SelectedAskContext | null>(null);
+  const [selectionAskAction, setSelectionAskAction] = useState<SelectionAskActionState | null>(null);
+  const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
+  const [editingText, setEditingText] = useState("");
   const [gatewayStatus, setGatewayStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
   const [gatewayUrl, setGatewayUrl] = useState<string>("");
   const [gatewayStarting, setGatewayStarting] = useState(false);
@@ -533,6 +558,7 @@ export function Chat({
   const [defaultModelId, setDefaultModelId] = useState("");
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  const messageEditInputRef = useRef<HTMLTextAreaElement>(null);
   const stickToBottomRef = useRef(true);
   const historyLoadGenRef = useRef(0);
   // 每个会话独立的取消标志与计时器。
@@ -814,6 +840,7 @@ export function Chat({
           {
             role: "assistant",
             content: reply,
+            createdAt: Date.now(),
           },
         ],
       }));
@@ -959,6 +986,81 @@ export function Chat({
   useEffect(() => {
     setSidebarTab(initialSidebarTab);
   }, [initialSidebarTab]);
+
+  useEffect(() => {
+    const handleSelectionChange = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+        setSelectionAskAction(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      const startElement = range.startContainer.parentElement?.closest?.(
+        ".chat-bubble-assistant"
+      ) as HTMLElement | null;
+      const endElement = range.endContainer.parentElement?.closest?.(
+        ".chat-bubble-assistant"
+      ) as HTMLElement | null;
+      if (!startElement || startElement !== endElement) {
+        setSelectionAskAction(null);
+        return;
+      }
+      const messageIndex = Number(startElement.dataset.messageIndex ?? -1);
+      if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+        setSelectionAskAction(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        return;
+      }
+      const actionWidth = 128;
+      let left = rect.left + rect.width / 2 - actionWidth / 2;
+      left = Math.min(Math.max(8, left), window.innerWidth - actionWidth - 8);
+      let top = rect.top - 38;
+      if (top < 8) {
+        top = rect.bottom + 8;
+      }
+      setSelectionAskAction({
+        top,
+        left,
+        text: selection.toString().trim(),
+        messageId: messageIndex,
+      });
+    };
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (target?.closest?.(".selection-ask-action")) return;
+      setSelectionAskAction(null);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSelectionAskAction(null);
+      }
+    };
+
+    const handleScroll = () => setSelectionAskAction(null);
+
+    document.addEventListener("selectionchange", handleSelectionChange);
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("scroll", handleScroll, true);
+    return () => {
+      document.removeEventListener("selectionchange", handleSelectionChange);
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    setSelectedAskContext(null);
+    setSelectionAskAction(null);
+    setEditingMessageIndex(null);
+    setEditingText("");
+  }, [activeAvatarId, sessionId]);
 
   const loadSessionHistory = useCallback(
     async (
@@ -1673,6 +1775,78 @@ export function Chat({
     [appendTaskActivity]
   );
 
+  const handleAskSelection = useCallback(() => {
+    if (!selectionAskAction) return;
+    setSelectedAskContext({
+      text: selectionAskAction.text,
+      messageId: selectionAskAction.messageId,
+    });
+    setSelectionAskAction(null);
+    composerInputRef.current?.focus();
+    composerInputRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectionAskAction]);
+
+  const startEditUserMessage = useCallback(
+    (index: number) => {
+      const current = messagesBySession[activeAvatarId] ?? [];
+      const message = current[index];
+      if (message?.role !== "user" || sending) return;
+      setEditingMessageIndex(index);
+      setEditingText(message.content);
+    },
+    [activeAvatarId, messagesBySession, sending]
+  );
+
+  const cancelEditUserMessage = useCallback(() => {
+    setEditingMessageIndex(null);
+    setEditingText("");
+  }, []);
+
+  useEffect(() => {
+    if (editingMessageIndex === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      const textarea = messageEditInputRef.current;
+      if (!textarea) return;
+      resizeMessageEditor(textarea);
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [editingMessageIndex]);
+
+  const submitEditUserMessage = useCallback(
+    (index: number) => {
+      if (sending) return;
+      const text = editingText.trim();
+      if (!text) return;
+      setMessagesBySession((prev) => {
+        const list = prev[activeAvatarId] ?? [];
+        return { ...prev, [activeAvatarId]: list.slice(0, index) };
+      });
+      setEditingMessageIndex(null);
+      setEditingText("");
+      void handleSend({ text, displayText: text });
+    },
+    [activeAvatarId, editingText, sending, handleSend]
+  );
+
+  const retryAssistantMessage = useCallback(
+    (index: number) => {
+      if (sending) return;
+      const current = messagesBySession[activeAvatarId] ?? [];
+      if (current[index]?.role !== "assistant") return;
+      let userIndex = index - 1;
+      while (userIndex >= 0 && current[userIndex].role !== "user") userIndex -= 1;
+      if (userIndex < 0) return;
+      const userText = current[userIndex].content;
+      setMessagesBySession((prev) => {
+        const list = prev[activeAvatarId] ?? [];
+        return { ...prev, [activeAvatarId]: list.slice(0, index) };
+      });
+      void handleSend({ text: userText, displayText: userText, skipAppendUser: true });
+    },
+    [activeAvatarId, messagesBySession, sending, handleSend]
+  );
   const scrollMessagesToEnd = useCallback((behavior: ScrollBehavior = "auto") => {
     const container = messagesScrollRef.current;
     if (!container) return;
@@ -2462,6 +2636,7 @@ export function Chat({
     includeAttachments?: boolean;
     contractEngineName?: string;
     contractModificationRequested?: boolean;
+    skipAppendUser?: boolean;
   }) {
     // 绑定到「发送时」的会话，使后续状态更新只作用于该会话，
     // 即使用户中途切换到其它会话也互不影响。
@@ -2596,7 +2771,10 @@ export function Chat({
       .map((attachment) => attachment.content.trim())
       .filter(Boolean)
       .join("\n\n");
-    const outgoingText = [text, attachmentBlock].filter(Boolean).join("\n\n");
+    const selectionBlock = selectedAskContext
+      ? `[引用所选内容]\n${selectedAskContext.text}\n`
+      : "";
+    const outgoingText = [selectionBlock, text, attachmentBlock].filter(Boolean).join("\n\n");
     const displayText = opts?.displayText ?? (pendingAttachments.length
       ? `${text ? `${text}\n\n` : ""}附件：${pendingAttachments.map((attachment) => attachment.name).join("、")}`
       : text || (selectedForSend ? `使用技能 ${selectedForSend.displayName}` : text));
@@ -2636,6 +2814,7 @@ export function Chat({
       }
     }
     setActiveInput("");
+    setSelectedAskContext(null);
     setSelectedSkills((prev) => {
       if (!prev[avatarId]) return prev;
       const next = { ...prev };
@@ -2660,22 +2839,26 @@ export function Chat({
     });
 
     stickToBottomRef.current = true;
-    setMessagesBySession((prev) => ({
-      ...prev,
-      [avatarId]: [
-        ...(prev[avatarId] ?? []),
-        {
-          role: "user",
-          content: displayText,
-          ...(selectedForSend
-            ? { skillId: selectedForSend.id, skillName: selectedForSend.displayName }
-            : {}),
-          ...(opts?.contractEngineName
-            ? { toolId: "tool:contract-review", toolName: "合同智能审核", contractEngineName: opts.contractEngineName }
-            : {}),
-        },
-      ],
-    }));
+    setMessagesBySession((prev) => {
+      const current = prev[avatarId] ?? [];
+      const next = opts?.skipAppendUser
+        ? current
+        : [
+            ...current,
+            {
+              role: "user" as const,
+              content: displayText,
+              createdAt: Date.now(),
+              ...(selectedForSend
+                ? { skillId: selectedForSend.id, skillName: selectedForSend.displayName }
+                : {}),
+              ...(opts?.contractEngineName
+                ? { toolId: "tool:contract-review", toolName: "合同智能审核", contractEngineName: opts.contractEngineName }
+                : {}),
+            },
+          ];
+      return { ...prev, [avatarId]: next };
+    });
     setAvatars((prev) =>
       prev.map((a) =>
         a.id === avatarId ? { ...a, lastAt: formatTime(new Date()) } : a
@@ -2742,6 +2925,14 @@ export function Chat({
         ...(sessionWorkspaceDir ? { workspace_dir: sessionWorkspaceDir } : {}),
         // Run ID for real-time event correlation between frontend and backend.
         run_id: runId,
+        ...(selectedAskContext
+          ? {
+              selected_context: {
+                text: selectedAskContext.text,
+                message_id: selectedAskContext.messageId,
+              },
+            }
+          : {}),
         ...(skillInvocations.length ? { skill_invocations: skillInvocations } : {}),
         ...(opts?.contractEngineName
           ? {
@@ -3582,53 +3773,111 @@ export function Chat({
               messages.map((msg, i) => {
                 const isContractReport = contractReportMessageIndexes.has(i);
                 const contractRequest = isContractReport ? messages[i - 1] : undefined;
+                const isEditing = msg.role === "user" && editingMessageIndex === i;
                 return (
                 <div
                   key={i}
-                  className={`chat-bubble chat-bubble-${msg.role}${isContractReport ? " chat-bubble-contract-review" : ""}`}
+                  className={`message-wrapper message-wrapper-${msg.role}${isEditing ? " message-wrapper-editing" : ""}`}
                 >
-                  <div className="chat-bubble-content">
-                    {isContractReport ? (
-                      <ContractReviewReport
-                        content={msg.content}
-                        engineName={contractRequest?.contractEngineName}
-                        exportData={i === latestContractReportIndex ? lastRiskExport : undefined}
-                        onExport={i === latestContractReportIndex && lastRiskExport ? handleExportRiskJson : undefined}
+                  {isEditing ? (
+                    <div className="message-edit-card">
+                      <textarea
+                        ref={messageEditInputRef}
+                        className="message-edit-input"
+                        aria-label="编辑消息内容"
+                        value={editingText}
+                        rows={1}
+                        onChange={(event) => {
+                          setEditingText(event.currentTarget.value);
+                          resizeMessageEditor(event.currentTarget);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.nativeEvent.isComposing || event.key === "Process") return;
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelEditUserMessage();
+                            return;
+                          }
+                          if (event.key === "Enter" && event.ctrlKey) {
+                            event.preventDefault();
+                            submitEditUserMessage(i);
+                          }
+                        }}
                       />
-                    ) : msg.role === "assistant" ? (
-                      <MarkdownMessage content={msg.content} workspacePath={activeWorkspaceDir} />
-                    ) : (
-                      msg.content
-                    )}
-                  </div>
-                  <div className="chat-bubble-actions">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCopyError(null);
-                        setCopyNotice(null);
-                        void writeClipboardText(msg.content).then(() => {
-                          setCopiedMessageIndex(i);
-                          window.setTimeout(() => setCopiedMessageIndex((current) => current === i ? null : current), 1600);
-                        }).catch((reason) => setCopyError(String(reason)));
-                      }}
-                    >
-                      {copiedMessageIndex === i ? "已复制" : "复制"}
-                    </button>
-                  </div>
-                  {msg.agent && (
-                    <div className="chat-bubble-meta">Agent: {msg.agent}</div>
+                      <div className="message-edit-actions">
+                        <button
+                          type="button"
+                          className="message-edit-action message-edit-action--cancel"
+                          onClick={cancelEditUserMessage}
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          className="message-edit-action message-edit-action--submit"
+                          disabled={sending || !editingText.trim()}
+                          onClick={() => submitEditUserMessage(i)}
+                        >
+                          发送
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div
+                        data-message-index={msg.role === "assistant" ? i : undefined}
+                        className={`chat-bubble chat-bubble-${msg.role}${isContractReport ? " chat-bubble-contract-review" : ""}`}
+                      >
+                        <div className="chat-bubble-content">
+                          {isContractReport ? (
+                            <ContractReviewReport
+                              content={msg.content}
+                              engineName={contractRequest?.contractEngineName}
+                              exportData={i === latestContractReportIndex ? lastRiskExport : undefined}
+                              onExport={i === latestContractReportIndex && lastRiskExport ? handleExportRiskJson : undefined}
+                            />
+                          ) : msg.role === "assistant" ? (
+                            <MarkdownMessage content={msg.content} workspacePath={activeWorkspaceDir} />
+                          ) : (
+                            msg.content
+                          )}
+                        </div>
+                        {msg.agent && (
+                          <div className="chat-bubble-meta">Agent: {msg.agent}</div>
+                        )}
+                        {msg.skillName && (
+                          <div className="chat-bubble-meta">使用技能：{msg.skillName}</div>
+                        )}
+                        {msg.toolName && (
+                          <div className="chat-bubble-meta">使用工具：{msg.toolName}</div>
+                        )}
+                        {msg.contractEngineName && (
+                          <div className="chat-bubble-meta">审核引擎：{msg.contractEngineName}</div>
+                        )}
+                        {msg.steps?.length ? <ExecutionSteps steps={msg.steps} /> : null}
+                      </div>
+                      <div className="message-metadata">
+                        {typeof msg.createdAt === "number" ? (
+                          <span className="message-timestamp">{formatTime(new Date(msg.createdAt))}</span>
+                        ) : null}
+                        <MessageActions
+                          role={msg.role}
+                          copied={copiedMessageIndex === i}
+                          disabled={sending}
+                          onCopy={() => {
+                            setCopyError(null);
+                            setCopyNotice(null);
+                            void writeClipboardText(msg.content).then(() => {
+                              setCopiedMessageIndex(i);
+                              window.setTimeout(() => setCopiedMessageIndex((current) => current === i ? null : current), 1600);
+                            }).catch((reason) => setCopyError(String(reason)));
+                          }}
+                          onEdit={msg.role === "user" ? () => startEditUserMessage(i) : undefined}
+                          onRetry={msg.role === "assistant" ? () => retryAssistantMessage(i) : undefined}
+                        />
+                      </div>
+                    </>
                   )}
-                  {msg.skillName && (
-                    <div className="chat-bubble-meta">使用技能：{msg.skillName}</div>
-                  )}
-                  {msg.toolName && (
-                    <div className="chat-bubble-meta">使用工具：{msg.toolName}</div>
-                  )}
-                  {msg.contractEngineName && (
-                    <div className="chat-bubble-meta">审核引擎：{msg.contractEngineName}</div>
-                  )}
-                  {msg.steps?.length ? <ExecutionSteps steps={msg.steps} /> : null}
                 </div>
                 );
               })
@@ -3651,6 +3900,17 @@ export function Chat({
               </div>
             )}
           </div>
+
+          {selectionAskAction && (
+            <button
+              type="button"
+              className="selection-ask-action"
+              style={{ top: selectionAskAction.top, left: selectionAskAction.left }}
+              onClick={() => handleAskSelection()}
+            >
+              询问 OmniNova
+            </button>
+          )}
 
           {error && (
             <div className="chat-error" role="alert">
@@ -3829,6 +4089,23 @@ export function Chat({
               >
                 <span aria-hidden />
               </div>
+              {selectedAskContext ? (
+                <div className="chat-skill-chips" aria-label="已引用所选内容">
+                  <span className="chat-skill-chip">
+                    <UiIcon name="copy" size={13} />
+                    <span className="chat-skill-chip-name">已引用所选内容</span>
+                    <button
+                      type="button"
+                      className="chat-skill-chip-remove"
+                      aria-label="取消引用所选内容"
+                      onClick={() => setSelectedAskContext(null)}
+                      disabled={sending}
+                    >
+                      <UiIcon name="close" size={11} />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
               {selectedSkill ? (
                 <div className="chat-skill-chips" aria-label="已选择技能">
                   <span className="chat-skill-chip">
