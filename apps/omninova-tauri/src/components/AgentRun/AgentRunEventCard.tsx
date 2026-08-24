@@ -1,6 +1,6 @@
 import React, { memo, useMemo, useState } from "react";
+import { getErrorPresentation, sanitizeDisplayText } from "./executionPresentation";
 import type { AgentRunStep } from "./types";
-import { getToolLabel } from "./types";
 import { UiIcon } from "../UiIcon";
 
 interface AgentRunEventCardProps {
@@ -15,54 +15,13 @@ function hasLongOutput(text: string): boolean {
   return text.split(/\r?\n/).length > 20 || text.length > 1600;
 }
 
-function isCommandTool(toolName: string): boolean {
-  return ["shell", "bash", "run_command", "Command", "git_operations", "git"].includes(toolName);
-}
-
-function friendlyError(toolName: string, raw: string, title: string): string {
-  const lower = raw.toLowerCase();
-
-  if (
-    (toolName === "git_operations" || toolName === "git") &&
-    (lower.includes("not a git repository") ||
-      lower.includes("git diff exited with status 129") ||
-      (title.toLowerCase().includes("diff") && lower.includes("exited with status 129")))
-  ) {
-    return "当前 Workspace 不是 Git 仓库，无法执行 Git diff。";
-  }
-
-  if (
-    (toolName === "git_operations" || toolName === "git") &&
-    (lower.includes("git status exited with status 128") ||
-      (title.toLowerCase().includes("status") && lower.includes("exited with status 128")))
-  ) {
-    return "当前 Workspace 不是 Git 仓库，无法读取 Git 状态。";
-  }
-
-  if (lower.includes("absolute paths are not allowed")) {
-    return "当前安全策略不允许访问 Workspace 外的绝对路径。";
-  }
-
-  if (lower.includes("tool blocked by security policy")) {
-    return "工具被安全策略拦截。";
-  }
-
-  if (isCommandTool(toolName)) {
-    const status = raw.match(/(?:status|退出码|exit code)[:： ]+(-?\d+)/i)?.[1];
-    if (status) return `命令执行失败，退出码：${status}`;
-  }
-
-  return raw || `${getToolLabel(toolName)}执行失败`;
-}
-
 function successTitle(step: AgentRunStep): string {
-  if (step.status === "running") return step.title;
   if (step.status === "error") {
-    const message = friendlyError(step.tool_name, step.result_summary ?? "", step.title);
-    if (step.tool_name === "git_operations" || step.tool_name === "git") {
-      return `Git diff 失败：${message}`;
-    }
-    return `${getToolLabel(step.tool_name)}失败：${message}`;
+    const presentation = getErrorPresentation(step.result_summary ?? "", {
+      toolName: step.tool_name,
+      type: "tool",
+    });
+    return presentation.title;
   }
   return step.title;
 }
@@ -84,7 +43,7 @@ function StepIcon({ status }: { status: AgentRunStep["status"] }) {
 }
 
 function OutputBlock({ outputs, kind = "tool" }: { outputs: string[]; kind?: "tool" | "model" }) {
-  const output = outputs.filter(Boolean).join("\n");
+  const output = sanitizeDisplayText(outputs.filter(Boolean).join("\n"));
   const shouldCollapse = kind === "model" || hasLongOutput(output) || hasMojibake(output);
   const [expanded, setExpanded] = useState(false);
 
@@ -119,7 +78,11 @@ function OutputBlock({ outputs, kind = "tool" }: { outputs: string[]; kind?: "to
 export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function AgentRunEventCard({
   step,
 }) {
-  const title = successTitle(step);
+  const errorPresentation =
+    step.status === "error"
+      ? getErrorPresentation(step.result_summary ?? "", { toolName: step.tool_name, type: "tool" })
+      : null;
+  const title = errorPresentation?.title ?? successTitle(step);
   const fileCount = useMemo(() => parseFileListCount(step.result_summary), [step.result_summary]);
   const fileSummary =
     step.changed_files.length > 1
@@ -148,6 +111,9 @@ export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function
             ) : null}
           </div>
         </div>
+        {errorPresentation?.detail ? (
+          <div className="agent-run-step-error-detail">{errorPresentation.detail}</div>
+        ) : null}
         {step.changed_files.length > 1 ? (
           <div className="agent-run-files">
             {step.changed_files.slice(0, 4).map((file) => (

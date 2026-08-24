@@ -244,13 +244,43 @@ fn final_provider_error(failure: AttemptError, attempts: u32) -> anyhow::Error {
 }
 
 /// Safe per-attempt transport telemetry: category-level metadata only.
-fn log_provider_transport(model: &str, transport_mode: &str, attempt: u32, connection: &str) {
-    tracing::debug!(
+fn log_provider_transport(model: &str, configured_mode: &str, attempt: u32, connection: &str) {
+    tracing::info!(
         target: "omninova_core::providers::timeout",
         model = %model,
-        transport_mode = %transport_mode,
+        configured_mode = %configured_mode,
         attempt = %attempt,
         connection = %connection,
+        "[provider-transport]"
+    );
+}
+
+fn http_version_label(version: reqwest::Version) -> &'static str {
+    match version {
+        reqwest::Version::HTTP_09 => "HTTP/0.9",
+        reqwest::Version::HTTP_10 => "HTTP/1.0",
+        reqwest::Version::HTTP_11 => "HTTP/1.1",
+        reqwest::Version::HTTP_2 => "HTTP/2",
+        reqwest::Version::HTTP_3 => "HTTP/3",
+        _ => "other",
+    }
+}
+
+/// Logs the actual negotiated HTTP version after response headers are received.
+/// Never called when no `Response` exists.
+fn log_provider_transport_negotiated(
+    model: &str,
+    attempt: u32,
+    configured_mode: &str,
+    response: &Response,
+) {
+    tracing::info!(
+        target: "omninova_core::providers::timeout",
+        model = %model,
+        attempt = %attempt,
+        configured_mode = %configured_mode,
+        negotiated_http = %http_version_label(response.version()),
+        status = %response.status().as_u16(),
         "[provider-transport]"
     );
 }
@@ -1249,8 +1279,8 @@ impl Provider for OpenAiProvider {
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
         let started = Instant::now();
         let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, |client| {
-            self.chat_inner(request, client)
+        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
+            self.chat_inner(request, client, attempt)
         });
         match tokio::time::timeout(self.timeouts.request, driver).await {
             Ok(result) => result,
@@ -1266,8 +1296,15 @@ impl Provider for OpenAiProvider {
         let started = Instant::now();
         let first_delta_ms = AtomicU64::new(0);
         let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, |client| {
-            self.chat_stream_inner(request, token_tx.clone(), &first_delta_ms, started, client)
+        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
+            self.chat_stream_inner(
+                request,
+                token_tx.clone(),
+                &first_delta_ms,
+                started,
+                client,
+                attempt,
+            )
         });
         match tokio::time::timeout(self.timeouts.request, driver).await {
             Ok(result) => {
@@ -1313,7 +1350,7 @@ impl OpenAiProvider {
         mut attempt: F,
     ) -> anyhow::Result<ProviderChatResponse>
     where
-        F: FnMut(Client) -> Fut,
+        F: FnMut(Client, u32) -> Fut,
         Fut: std::future::Future<Output = Result<ProviderChatResponse, AttemptError>>,
     {
         loop {
@@ -1337,7 +1374,7 @@ impl OpenAiProvider {
                 attempt_number,
                 profile.as_str(),
             );
-            let failure = match attempt(client).await {
+            let failure = match attempt(client, attempt_number).await {
                 Ok(response) => return Ok(response),
                 Err(failure) => failure,
             };
@@ -1389,6 +1426,7 @@ impl OpenAiProvider {
         &self,
         request: ProviderChatRequest<'_>,
         client: Client,
+        attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -1407,6 +1445,12 @@ impl OpenAiProvider {
             .send()
             .await
             .map_err(|error| self.request_error("请求失败", &error))?;
+        log_provider_transport_negotiated(
+            &self.model,
+            attempt,
+            self.transport_mode.as_str(),
+            &response,
+        );
 
         if !response.status().is_success() {
             return Err(api_error("OpenAI", response).await);
@@ -1441,6 +1485,7 @@ impl OpenAiProvider {
         first_delta_ms: &AtomicU64,
         started: Instant,
         client: Client,
+        attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -1459,6 +1504,12 @@ impl OpenAiProvider {
             .send()
             .await
             .map_err(|error| self.request_error("流式请求失败", &error))?;
+        log_provider_transport_negotiated(
+            &self.model,
+            attempt,
+            self.transport_mode.as_str(),
+            &response,
+        );
 
         if !response.status().is_success() {
             return Err(api_error("OpenAI", response).await);
@@ -2851,6 +2902,20 @@ mod tests {
             assert_eq!(provider.transport_mode, mode);
             assert_eq!(mode.as_str(), provider.transport_mode.as_str());
         }
+    }
+
+    #[test]
+    fn configured_mode_labels_are_stable() {
+        assert_eq!(TransportMode::Auto.as_str(), "auto");
+        assert_eq!(TransportMode::Http1.as_str(), "http1");
+        assert_eq!(TransportMode::Http2.as_str(), "http2");
+    }
+
+    #[test]
+    fn http_version_labels_are_stable_for_observability() {
+        assert_eq!(http_version_label(reqwest::Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(http_version_label(reqwest::Version::HTTP_2), "HTTP/2");
+        assert_eq!(http_version_label(reqwest::Version::HTTP_3), "HTTP/3");
     }
 
     #[tokio::test]

@@ -13,6 +13,9 @@ export interface StoredAvatarSession {
 export interface StoredChatMessage {
   role: "user" | "assistant" | "error";
   content: string;
+  /** Epoch milliseconds when the message was created locally. Optional for
+   *  historical/imported messages that do not carry a timestamp. */
+  createdAt?: number;
   agent?: string;
   /** Request-scoped Skill shown in local conversation history. */
   skillId?: string;
@@ -130,6 +133,7 @@ export function areStoredMessagesEqual(
     if (
       left.role !== right.role ||
       left.content !== right.content ||
+      (left.createdAt ?? 0) !== (right.createdAt ?? 0) ||
       (left.agent ?? "") !== (right.agent ?? "")
       || (left.skillId ?? "") !== (right.skillId ?? "")
       || (left.skillName ?? "") !== (right.skillName ?? "")
@@ -163,6 +167,7 @@ export function mergeLocalMessageMetadata(
       ) {
         return {
           ...message,
+          ...(candidate.createdAt ? { createdAt: candidate.createdAt } : {}),
           ...(candidate.skillId ? { skillId: candidate.skillId } : {}),
           ...(candidate.skillName ? { skillName: candidate.skillName } : {}),
           ...(candidate.toolId ? { toolId: candidate.toolId } : {}),

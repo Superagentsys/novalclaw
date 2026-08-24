@@ -18,6 +18,16 @@ import "./TaskWorkspace.css";
 
 type InspectorTab = "process" | "changes" | "logs" | "results";
 
+interface TaskApprovalView {
+  approvalId: string;
+  runId: string;
+  toolName: string;
+  title: string;
+  reason: string;
+  arguments: Record<string, unknown>;
+  decision: "pending" | "approving" | "rejecting";
+}
+
 interface ArtifactPreview {
   path: string;
   name: string;
@@ -269,6 +279,78 @@ export function TaskDeliverable({
   );
 }
 
+function approvalDetailRows(approval: TaskApprovalView): Array<[string, string]> {
+  const preferredKeys = [
+    "command",
+    "path",
+    "file_path",
+    "working_directory",
+    "url",
+    "query",
+    "operation",
+  ];
+  const labels: Record<string, string> = {
+    command: "命令",
+    path: "目标路径",
+    file_path: "目标文件",
+    working_directory: "工作目录",
+    url: "网址",
+    query: "检索内容",
+    operation: "操作",
+  };
+  const rows: Array<[string, string]> = [];
+  for (const key of preferredKeys) {
+    const value = approval.arguments[key];
+    if (typeof value === "string" && value.trim()) {
+      rows.push([labels[key] ?? key, value.trim()]);
+    }
+  }
+  return rows;
+}
+
+function ApprovalGateCard({
+  approval,
+  onApprove,
+  onReject,
+}: {
+  approval: TaskApprovalView;
+  onApprove?: (approval: TaskApprovalView) => void;
+  onReject?: (approval: TaskApprovalView) => void;
+}) {
+  const busy = approval.decision !== "pending";
+  const rows = approvalDetailRows(approval);
+  return (
+    <div className="task-inspector-approval-card">
+      <div className="task-inspector-approval-title">
+        <UiIcon name="safety" size={14} />
+        <span>需要审批</span>
+      </div>
+      <div className="task-inspector-approval-action">
+        <span>操作</span>
+        <strong>{approval.title || approval.toolName}</strong>
+      </div>
+      {rows.map(([label, value]) => (
+        <div className="task-inspector-approval-row" key={label}>
+          <span>{label}</span>
+          <code>{value}</code>
+        </div>
+      ))}
+      <div className="task-inspector-approval-risk">
+        <span>风险</span>
+        <small>{approval.reason || "需要人工确认后才能执行"}</small>
+      </div>
+      <div className="task-inspector-approval-actions">
+        <button type="button" className="task-inspector-approval-reject" disabled={busy} onClick={() => onReject?.(approval)}>
+          拒绝
+        </button>
+        <button type="button" className="task-inspector-approval-allow" disabled={busy} onClick={() => onApprove?.(approval)}>
+          允许本次
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function TaskInspector({
   open,
   tab,
@@ -278,6 +360,9 @@ export function TaskInspector({
   liveSessionId,
   activeSteps,
   onAddArtifactToChat,
+  approval,
+  onApproveApproval,
+  onRejectApproval,
 }: {
   open: boolean;
   tab: InspectorTab;
@@ -287,6 +372,9 @@ export function TaskInspector({
   liveSessionId: string | null;
   activeSteps: ExecutionStep[];
   onAddArtifactToChat?: (path: string) => void;
+  approval?: TaskApprovalView | null;
+  onApproveApproval?: (approval: TaskApprovalView) => void;
+  onRejectApproval?: (approval: TaskApprovalView) => void;
 }) {
   const tabs: Array<{ id: InspectorTab; label: string; icon: UiIconName }> = [
     { id: "process", label: "过程", icon: "sync" },
@@ -436,8 +524,15 @@ export function TaskInspector({
         ))}
       </div>
       <div className="task-inspector-body">
-        {tab === "process" ? (
-          liveSessionId ? (
+        <div className="task-inspector-tabpane" hidden={tab !== "process"}>
+          {approval ? (
+            <ApprovalGateCard
+              approval={approval}
+              onApprove={onApproveApproval}
+              onReject={onRejectApproval}
+            />
+          ) : null}
+          {liveSessionId ? (
             <AgentRunTimeline events={[]} isRunning defaultCollapsed={false} liveSessionId={liveSessionId} />
           ) : processEntries.length ? (
             <ol className="task-inspector-process-list">
@@ -481,8 +576,8 @@ export function TaskInspector({
             </ol>
           ) : (
             <InspectorEmpty icon="sync" title="暂无执行过程" detail="任务启动后，工具调用与步骤会出现在这里。" />
-          )
-        ) : null}
+          )}
+        </div>
 
         {tab === "changes" ? (
           files.length ? (

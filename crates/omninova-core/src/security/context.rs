@@ -8,6 +8,39 @@ use crate::security::estop::EstopController;
 use crate::security::tool_policy::{evaluate_tool_call, ToolPolicyDecision};
 use anyhow::Result;
 
+fn safe_approval_arguments(arguments: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = arguments.as_object() else {
+        return arguments.clone();
+    };
+    serde_json::Value::Object(
+        object
+            .iter()
+            .map(|(key, value)| {
+                let lowered = key.to_ascii_lowercase();
+                let safe_value = if ["secret", "token", "password", "api_key", "apikey"]
+                    .iter()
+                    .any(|needle| lowered.contains(needle))
+                {
+                    serde_json::Value::String("[已隐藏敏感值]".to_string())
+                } else if let Some(text) = value.as_str() {
+                    serde_json::Value::String(text.chars().take(2000).collect())
+                } else {
+                    value.clone()
+                };
+                (key.clone(), safe_value)
+            })
+            .collect(),
+    )
+}
+
+fn risk_level_for_tool(tool_name: &str) -> &'static str {
+    match tool_name {
+        "file_delete" | "delete_file" | "git_clean" | "git_reset" | "git_restore" | "git_checkout" => "high",
+        "shell" | "bash" | "run_command" | "Command" => "medium",
+        _ => "medium",
+    }
+}
+
 /// Feishu chat-only system prompt - used when inbound.metadata.chat_only=true
 pub const FEISHU_CHAT_ONLY_SYSTEM_PROMPT: &str = r#"你是 OmniNova 飞书聊天助手。
 
@@ -283,12 +316,14 @@ impl SecurityContext {
 
     pub async fn gate_tool_execution(
         &self,
+        run_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<ToolExecutionGate> {
         if let Some(grant) = self
             .approvals
-            .consume_matching_grant(tool_name, arguments)
+            .consume_matching_grant(run_id, tool_call_id, tool_name, arguments)
             .await?
         {
             record_approval_event("consumed");
@@ -307,7 +342,17 @@ impl SecurityContext {
             ToolPolicyDecision::RequireApproval { reason } => {
                 let pending = self
                     .approvals
-                    .create(tool_name, arguments.clone(), &reason)
+                    .create(
+                        run_id,
+                        tool_call_id,
+                        tool_name,
+                        arguments.clone(),
+                        safe_approval_arguments(arguments),
+                        tool_name,
+                        risk_level_for_tool(tool_name),
+                        "需要审批",
+                        &reason,
+                    )
                     .await?;
                 record_approval_event("requested");
                 record_tool_call(tool_name, "approval_required");

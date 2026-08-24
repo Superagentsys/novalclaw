@@ -127,6 +127,7 @@ pub struct ToolRunner<'a> {
     /// Optional EventBus. When None, no structured events are emitted.
     event_bus: Option<EventBus>,
     cancel_token: Option<AgentCancellationToken>,
+    run_id: Option<String>,
 }
 
 impl<'a> Clone for ToolRunner<'a> {
@@ -136,6 +137,7 @@ impl<'a> Clone for ToolRunner<'a> {
             security: self.security,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
+            run_id: self.run_id.clone(),
         }
     }
 }
@@ -148,7 +150,15 @@ impl<'a> ToolRunner<'a> {
             security,
             event_bus: None,
             cancel_token: None,
+            run_id: None,
         }
+    }
+
+    /// Sets an explicit run id used for approval identity when no EventBus is
+    /// available (tests and non-streaming paths).
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
     }
 
     /// Injects the EventBus for structured event emission.
@@ -205,7 +215,19 @@ impl<'a> ToolRunner<'a> {
         };
 
         // ── Security gate ───────────────────────────────────────────────────
-        let gate = self.security.gate_tool_execution(tool_call.name.as_str(), args).await;
+        let run_id = self
+            .run_id
+            .clone()
+            .or_else(|| {
+                self.event_bus
+                    .as_ref()
+                    .map(|bus| bus.run_id().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let gate = self
+            .security
+            .gate_tool_execution(&run_id, &tool_call.id, &tool_call.name, args)
+            .await;
         if let Some(token) = &self.cancel_token {
             token.check()?;
         }
@@ -265,9 +287,17 @@ impl<'a> ToolRunner<'a> {
 
                     match self.security.tool_approval(&pending.id).await? {
                         Some(item) if item.status == ApprovalStatus::Approved => {
+                            if let Some(ref bus) = self.event_bus {
+                                bus.approval_approved(
+                                    step_id.clone(),
+                                    pending.id.clone(),
+                                    tool_call.id.clone(),
+                                    tool_call.name.clone(),
+                                );
+                            }
                             match self
                                 .security
-                                .gate_tool_execution(&tool_call.name, args)
+                                .gate_tool_execution(&run_id, &tool_call.id, &tool_call.name, args)
                                 .await?
                             {
                                 ToolExecutionGate::Proceed { .. } => break,
@@ -281,8 +311,55 @@ impl<'a> ToolRunner<'a> {
                         Some(item) if item.status == ApprovalStatus::Rejected => {
                             let detail = item
                                 .reject_reason
+                                .clone()
                                 .unwrap_or_else(|| "用户拒绝了本次操作".to_string());
-                            return Err(anyhow::anyhow!("tool execution rejected: {detail}"));
+                            if let Some(ref bus) = self.event_bus {
+                                bus.approval_rejected(
+                                    step_id.clone(),
+                                    pending.id.clone(),
+                                    tool_call.id.clone(),
+                                    tool_call.name.clone(),
+                                    detail.clone(),
+                                );
+                                bus.tool_completed(
+                                    step_id.clone(),
+                                    tool_call.id.clone(),
+                                    tool_call.name.clone(),
+                                    false,
+                                    0,
+                                    detail.clone(),
+                                    None,
+                                );
+                            }
+                            let rejection = serde_json::json!({
+                                "status": "rejected_by_user",
+                                "tool_call_id": tool_call.id.clone(),
+                                "reason": "user_rejected",
+                                "detail": detail.clone(),
+                            })
+                            .to_string();
+                            return Ok((
+                                rejection,
+                                Some(ToolExecutionEvent::Completed {
+                                    tool_call_id: tool_call.id.clone(),
+                                    tool_name: tool_call.name.clone(),
+                                    success: false,
+                                    duration_ms: 0,
+                                    result_summary: "用户已拒绝该操作".to_string(),
+                                    diff_stats: None,
+                                }),
+                            ));
+                        }
+                        Some(item) if item.status == ApprovalStatus::Cancelled => {
+                            if let Some(ref bus) = self.event_bus {
+                                bus.approval_cancelled(
+                                    step_id.clone(),
+                                    pending.id.clone(),
+                                    tool_call.id.clone(),
+                                    tool_call.name.clone(),
+                                );
+                            }
+                            return Err(anyhow::anyhow!("审批已取消"));
                         }
                         Some(_) => sleep(Duration::from_millis(180)).await,
                         // The small JSON approval store is rewritten when the
@@ -634,5 +711,215 @@ impl<'a> ToolRunner<'a> {
                 ))
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::providers::ToolCall;
+    use crate::security::{ApprovalStatus, SecurityContext};
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct FakeTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for FakeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake tool for approval gate tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn test_config(workspace: &Path) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+        config.approvals.auto_approve = vec!["test_read".into()];
+        config.approvals.require_approval = vec!["test_write".into()];
+        config
+    }
+
+    fn tool_call(name: &str, id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_executes_without_approval() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "test_read".to_string(),
+            calls: calls.clone(),
+        })];
+        let runner = ToolRunner::new(&tools, &security).with_run_id("run-a");
+        let result = runner
+            .run_tool(&tool_call("test_read", "call-1"), &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(result.0.contains("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(security.approvals().list(true).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn hard_security_deny_never_executes() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-deny-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config(&dir);
+        config.security.tool_policy.denied_tools.push("test_denied".into());
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "test_denied".to_string(),
+            calls: calls.clone(),
+        })];
+        let runner = ToolRunner::new(&tools, &security).with_run_id("run-a");
+        let _ = runner
+            .run_tool(&tool_call("test_denied", "call-1"), &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(security.approvals().list(true).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn write_tool_is_blocked_until_approval_and_executes_once_after_approve() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "test_write".to_string(),
+            calls: calls.clone(),
+        })];
+        let runner_security = security.clone();
+        let runner_tools = tools;
+        let handle = tokio::spawn(async move {
+            let runner = ToolRunner::new(&runner_tools, &runner_security).with_run_id("run-a");
+            runner
+                .run_tool(&tool_call("test_write", "call-1"), &serde_json::json!({}))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let pending_list = security.approvals().list(true).await.unwrap();
+        assert_eq!(pending_list.len(), 1);
+        let pending = &pending_list[0];
+        assert_eq!(pending.run_id.as_deref(), Some("run-a"));
+        assert_eq!(pending.tool_call_id.as_deref(), Some("call-1"));
+        security
+            .approvals()
+            .approve(&pending.id, Some("desktop-user".to_string()))
+            .await
+            .unwrap();
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.0.contains("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let err = security
+            .approvals()
+            .approve(&pending.id, Some("desktop-user".to_string()))
+            .await;
+        assert!(err.is_err(), "duplicate approve must be blocked");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reject_prevents_execution_and_returns_rejected_result() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-reject-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "test_write".to_string(),
+            calls: calls.clone(),
+        })];
+        let runner_security = security.clone();
+        let runner_tools = tools;
+        let handle = tokio::spawn(async move {
+            let runner = ToolRunner::new(&runner_tools, &runner_security).with_run_id("run-a");
+            runner
+                .run_tool(&tool_call("test_write", "call-reject"), &serde_json::json!({}))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let pending = security.approvals().list(true).await.unwrap().pop().unwrap();
+        security
+            .approvals()
+            .reject(&pending.id, Some("user_rejected".to_string()))
+            .await
+            .unwrap();
+        let (output, _) = handle.await.unwrap().unwrap();
+        assert!(output.contains("rejected_by_user"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stored = security.approvals().get(&pending.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Rejected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_while_pending_prevents_execution() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeTool {
+            name: "test_write".to_string(),
+            calls: calls.clone(),
+        })];
+        let runner_security = security.clone();
+        let runner_tools = tools;
+        let handle = tokio::spawn(async move {
+            let runner = ToolRunner::new(&runner_tools, &runner_security).with_run_id("run-a");
+            runner
+                .run_tool(&tool_call("test_write", "call-cancel"), &serde_json::json!({}))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let pending = security.approvals().list(true).await.unwrap().pop().unwrap();
+        security.approvals().cancel_for_run("run-a").await.unwrap();
+        assert!(handle.await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stored = security.approvals().get(&pending.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Cancelled);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

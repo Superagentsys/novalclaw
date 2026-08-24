@@ -379,6 +379,59 @@ impl EventBus {
         });
     }
 
+    /// Emits approval_approved.
+    pub fn approval_approved(
+        &self,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+    ) {
+        self.emit(AgentRunEvent::approval_approved {
+            run_id: self.inner.run_id.clone(),
+            step_id,
+            approval_id,
+            tool_call_id,
+            tool_name,
+        });
+    }
+
+    /// Emits approval_rejected.
+    pub fn approval_rejected(
+        &self,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        reason: String,
+    ) {
+        self.emit(AgentRunEvent::approval_rejected {
+            run_id: self.inner.run_id.clone(),
+            step_id,
+            approval_id,
+            tool_call_id,
+            tool_name,
+            reason,
+        });
+    }
+
+    /// Emits approval_cancelled.
+    pub fn approval_cancelled(
+        &self,
+        step_id: String,
+        approval_id: String,
+        tool_call_id: String,
+        tool_name: String,
+    ) {
+        self.emit(AgentRunEvent::approval_cancelled {
+            run_id: self.inner.run_id.clone(),
+            step_id,
+            approval_id,
+            tool_call_id,
+            tool_name,
+        });
+    }
+
     /// Emits run_completed.
     pub fn run_completed(&self, reply: String, reply_preview: String) {
         self.emit_terminal(AgentRunEvent::run_completed {
@@ -454,6 +507,9 @@ impl EventBus {
             AgentRunEvent::run_failed { error, .. } => error.clone(),
             AgentRunEvent::run_cancelled { reason, .. } => reason.clone(),
             AgentRunEvent::approval_required { reason, .. } => reason.clone(),
+            AgentRunEvent::approval_approved { tool_name, .. } => tool_name.clone(),
+            AgentRunEvent::approval_rejected { reason, .. } => reason.clone(),
+            AgentRunEvent::approval_cancelled { tool_name, .. } => tool_name.clone(),
         };
         tracing::debug!(target: "e2e", "[e2e-bus-emit] timestamp={} run_id={} type={} content=\"{}\"", now_ts(), self.inner.run_id, type_name, preview(&content_preview, 80));
 
@@ -497,6 +553,9 @@ fn event_type_name(event: &AgentRunEvent) -> &'static str {
         AgentRunEvent::run_failed { .. } => "run_failed",
         AgentRunEvent::run_cancelled { .. } => "run_cancelled",
         AgentRunEvent::approval_required { .. } => "approval_required",
+        AgentRunEvent::approval_approved { .. } => "approval_approved",
+        AgentRunEvent::approval_rejected { .. } => "approval_rejected",
+        AgentRunEvent::approval_cancelled { .. } => "approval_cancelled",
     }
 }
 
@@ -546,6 +605,9 @@ impl EventBusDrainHandle {
                     AgentRunEvent::run_failed { .. } => "run_failed",
                     AgentRunEvent::run_cancelled { .. } => "run_cancelled",
                     AgentRunEvent::approval_required { .. } => "approval_required",
+                    AgentRunEvent::approval_approved { .. } => "approval_approved",
+                    AgentRunEvent::approval_rejected { .. } => "approval_rejected",
+                    AgentRunEvent::approval_cancelled { .. } => "approval_cancelled",
                 };
                 tracing::debug!(target: "e2e", "[e2e-bus-drain] timestamp={} run_id={} type={}", now_ts(), run_id, type_name);
                 (self.emit_fn)(evt);
