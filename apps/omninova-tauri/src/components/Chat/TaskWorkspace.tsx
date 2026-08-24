@@ -436,8 +436,8 @@ export function TaskInspector({
         ))}
       </div>
       <div className="task-inspector-body">
-        {tab === "process" ? (
-          liveSessionId ? (
+        <div className="task-inspector-tabpane" hidden={tab !== "process"}>
+          {liveSessionId ? (
             <AgentRunTimeline events={[]} isRunning defaultCollapsed={false} liveSessionId={liveSessionId} />
           ) : processEntries.length ? (
             <ol className="task-inspector-process-list">
@@ -481,8 +481,8 @@ export function TaskInspector({
             </ol>
           ) : (
             <InspectorEmpty icon="sync" title="暂无执行过程" detail="任务启动后，工具调用与步骤会出现在这里。" />
-          )
-        ) : null}
+          )}
+        </div>
 
         {tab === "changes" ? (
           files.length ? (

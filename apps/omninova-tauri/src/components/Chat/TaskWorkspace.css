@@ -483,6 +483,10 @@
   padding: 12px;
 }
 
+.task-inspector-tabpane[hidden] {
+  display: none;
+}
+
 .task-inspector-empty {
   display: grid;
   min-height: 210px;
