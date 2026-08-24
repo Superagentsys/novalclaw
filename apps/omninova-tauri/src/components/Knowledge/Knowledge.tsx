@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import { UiIcon } from "../UiIcon";
 import { invokeTauri, isTauriEnvironment } from "../../utils/tauri";
 import "./Knowledge.css";
@@ -38,6 +41,11 @@ interface EditorState {
   enabled: boolean;
 }
 
+interface KnowledgeDocumentDetail {
+  document: KnowledgeDocument;
+  content: string;
+}
+
 function blankEditor(collection: string): EditorState {
   return {
     title: "",
@@ -62,7 +70,7 @@ export function Knowledge() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<KnowledgeHit[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ document: KnowledgeDocument; content: string } | null>(null);
+  const [detail, setDetail] = useState<KnowledgeDocumentDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailReloadKey, setDetailReloadKey] = useState(0);
@@ -74,6 +82,30 @@ export function Knowledge() {
   const [searchAttempted, setSearchAttempted] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorDirty = Boolean(editor && JSON.stringify(editor) !== editorBaseline);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Sorting state
+  const [sortBy, setSortBy] = useState<"updated" | "title" | "size">("updated");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+
+  // Batch selection state
+  const [batchMode, setBatchMode] = useState(false);
+  const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
+
+  // Sort documents
+  const sortedDocs = useMemo(() => {
+    return [...docs].sort((a, b) => {
+      let cmp = 0;
+      if (sortBy === "updated") {
+        cmp = a.updated_at.localeCompare(b.updated_at);
+      } else if (sortBy === "title") {
+        cmp = a.title.localeCompare(b.title);
+      } else if (sortBy === "size") {
+        cmp = a.char_count - b.char_count;
+      }
+      return sortOrder === "asc" ? cmp : -cmp;
+    });
+  }, [docs, sortBy, sortOrder]);
 
   const openEditor = useCallback((next: EditorState) => {
     setEditor(next);
@@ -142,7 +174,7 @@ export function Knowledge() {
     setDetail(null);
     setDetailError(null);
     setDetailLoading(true);
-    void invokeTauri<{ document: KnowledgeDocument; content: string }>("knowledge_get", {
+    void invokeTauri<KnowledgeDocumentDetail>("knowledge_get", {
       id: selectedId,
     })
       .then((next) => {
@@ -335,6 +367,160 @@ export function Knowledge() {
     [hits, query]
   );
 
+  // Keyboard shortcut: Ctrl/Cmd+K to focus search
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  // Highlight search query in text
+  const highlightMatch = (text: string, searchQuery: string) => {
+    if (!searchQuery.trim()) return text;
+    const parts = text.split(new RegExp(`(${searchQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"));
+    return parts.map((part, i) =>
+      part.toLowerCase() === searchQuery.toLowerCase() ? (
+        <mark key={i} style={{ background: "var(--ui-accent-soft)", color: "var(--ui-accent-strong)", padding: "0 2px", borderRadius: "2px" }}>{part}</mark>
+      ) : part
+    );
+  };
+
+  // Batch selection handlers
+  const toggleBatchMode = () => {
+    setBatchMode(!batchMode);
+    if (batchMode) {
+      setSelectedDocs(new Set());
+    }
+  };
+
+  const toggleDocSelection = (docId: string) => {
+    setSelectedDocs(prev => {
+      const next = new Set(prev);
+      if (next.has(docId)) {
+        next.delete(docId);
+      } else {
+        next.add(docId);
+      }
+      return next;
+    });
+  };
+
+  const deselectAllDocs = () => {
+    setSelectedDocs(new Set());
+  };
+
+  const moveDocumentsToCollection = async (
+    documents: KnowledgeDocument[],
+    targetCollection: string,
+  ) => {
+    // Read every canonical body before writing metadata. An empty content value
+    // would replace the stored body and remove all indexed chunks.
+    const details = await Promise.all(
+      documents.map((doc) =>
+        invokeTauri<KnowledgeDocumentDetail>("knowledge_get", { id: doc.id })
+      )
+    );
+    for (const { document, content } of details) {
+      await invokeTauri("knowledge_upsert", {
+        input: {
+          id: document.id,
+          title: document.title,
+          collection: targetCollection,
+          tags: document.tags,
+          content,
+          enabled: document.enabled,
+          source: document.source,
+          sourcePath: document.source_path,
+          kind: document.kind,
+        },
+      });
+    }
+  };
+
+  const deleteSelectedDocs = async () => {
+    if (selectedDocs.size === 0) return;
+    if (!window.confirm(`确定要删除选中的 ${selectedDocs.size} 篇文档吗？`)) return;
+    setBusy("batch-delete");
+    try {
+      for (const docId of selectedDocs) {
+        await invokeTauri("knowledge_delete", { id: docId });
+      }
+      setSelectedDocs(new Set());
+      setBatchMode(false);
+      if (selectedId && selectedDocs.has(selectedId)) {
+        setSelectedId(null);
+        setDetail(null);
+      }
+      await loadList();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const moveSelectedDocs = async (targetCollection: string) => {
+    if (selectedDocs.size === 0) return;
+    setBusy("batch-move");
+    try {
+      const documents = docs.filter((doc) => selectedDocs.has(doc.id));
+      await moveDocumentsToCollection(documents, targetCollection);
+      setSelectedDocs(new Set());
+      setBatchMode(false);
+      setDetailReloadKey((current) => current + 1);
+      await loadList();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Rename a collection (move all docs from old name to new name)
+  const renameCollection = async (oldName: string, newName: string) => {
+    setBusy(`rename:${oldName}`);
+    try {
+      const docsInCollection = await invokeTauri<KnowledgeDocument[]>("knowledge_list", {
+        collection: oldName,
+      });
+      await moveDocumentsToCollection(docsInCollection, newName);
+      if (collection === oldName) {
+        setCollection(newName);
+      }
+      setDetailReloadKey((current) => current + 1);
+      await loadList();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Delete a collection (move all docs to default)
+  const deleteCollection = async (name: string) => {
+    setBusy(`delete:${name}`);
+    try {
+      const docsInCollection = await invokeTauri<KnowledgeDocument[]>("knowledge_list", {
+        collection: name,
+      });
+      await moveDocumentsToCollection(docsInCollection, "default");
+      if (collection === name) {
+        setCollection("all");
+      }
+      setDetailReloadKey((current) => current + 1);
+      await loadList();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="knowledge-page">
       <header className="knowledge-hero">
@@ -364,6 +550,7 @@ export function Knowledge() {
         >
           <UiIcon name="search" />
           <input
+            ref={searchInputRef}
             value={query}
             onChange={(event) => {
               setQuery(event.target.value);
@@ -375,8 +562,20 @@ export function Knowledge() {
           <button type="submit" disabled={busy === "search"}>
             {busy === "search" ? "检索中…" : "检索"}
           </button>
+          <span className="knowledge-search-hint">
+            <kbd>Ctrl</kbd><kbd>K</kbd>
+          </span>
         </form>
         <div className="knowledge-toolbar-actions">
+          <button
+            type="button"
+            className={batchMode ? "is-active" : ""}
+            onClick={toggleBatchMode}
+            title="批量选择"
+          >
+            <UiIcon name="check" />
+            {batchMode ? "取消选择" : "批量操作"}
+          </button>
           <button type="button" className="knowledge-primary" onClick={() => openEditor(blankEditor(collection))}>
             <UiIcon name="plus" />
             新建笔记
@@ -404,15 +603,58 @@ export function Knowledge() {
           全部
         </button>
         {collections.map((name) => (
-          <button
-            key={name}
-            type="button"
-            className={collection === name ? "is-active" : ""}
-            onClick={() => setCollection(name)}
-          >
-            {name}
-          </button>
+          <div key={name} className="knowledge-tab-wrapper">
+            <button
+              type="button"
+              className={`knowledge-tab ${collection === name ? "is-active" : ""}`}
+              onClick={() => setCollection(name)}
+            >
+              {name}
+            </button>
+            <div className="knowledge-collection-actions">
+              <button
+                type="button"
+                className="knowledge-collection-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const newName = window.prompt("重命名分类：", name);
+                  if (newName?.trim() && newName !== name) {
+                    void renameCollection(name, newName.trim());
+                  }
+                }}
+                title="重命名"
+              >
+                <UiIcon name="edit" size={10} />
+              </button>
+              <button
+                type="button"
+                className="knowledge-collection-btn danger"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (window.confirm(`确定要删除分类「${name}」吗？该分类下的文档将移至 default。`)) {
+                    void deleteCollection(name);
+                  }
+                }}
+                title="删除"
+              >
+                <UiIcon name="delete" size={10} />
+              </button>
+            </div>
+          </div>
         ))}
+        <button
+          type="button"
+          className="knowledge-tab-add"
+          onClick={() => {
+            const name = window.prompt("输入新分类名称：");
+            if (name?.trim()) {
+              setCollection(name.trim());
+            }
+          }}
+          title="新建分类"
+        >
+          <UiIcon name="plus" size={14} />
+        </button>
       </div>
 
       {visibleHits.length > 0 ? (
@@ -426,12 +668,12 @@ export function Knowledge() {
               className="knowledge-hit"
               onClick={() => setSelectedId(hit.document_id)}
             >
-              <strong>{hit.title}</strong>
+              <strong>{highlightMatch(hit.title, query)}</strong>
               <span>
                 {hit.collection}
-                {hit.heading ? ` · ${hit.heading}` : ""}
+                {hit.heading ? <> · {highlightMatch(hit.heading, query)}</> : null}
               </span>
-              <p>{hit.snippet}</p>
+              <p>{highlightMatch(hit.snippet, query)}</p>
             </button>
           ))}
           </div>
@@ -448,28 +690,101 @@ export function Knowledge() {
             <p className="knowledge-muted">正在加载…</p>
           ) : docs.length === 0 ? (
             <div className="knowledge-empty">
+              <div className="knowledge-empty-icon">
+                <UiIcon name="knowledge" size={36} />
+              </div>
               <h2>还没有文档</h2>
               <p>新建一条笔记，或导入 Markdown / TXT / PDF。</p>
+              <button type="button" className="knowledge-primary" onClick={() => openEditor(blankEditor(collection))}>
+                <UiIcon name="plus" size={14} />
+                创建第一个文档
+              </button>
             </div>
           ) : (
-            docs.map((doc) => (
-              <article
-                key={doc.id}
-                className={`knowledge-card ${selectedId === doc.id ? "is-active" : ""} ${doc.enabled ? "" : "is-disabled"}`}
-                onClick={() => setSelectedId(doc.id)}
-              >
-                <div className="knowledge-card-head">
-                  <h2>{doc.title}</h2>
-                  <span>{doc.collection}</span>
+            <>
+              {batchMode && selectedDocs.size > 0 && (
+                <div className="knowledge-batch-bar">
+                  <div className="knowledge-batch-bar-left">
+                    <UiIcon name="check" size={14} />
+                    已选择 {selectedDocs.size} 篇文档
+                  </div>
+                  <div className="knowledge-batch-bar-actions">
+                    <button type="button" onClick={() => {
+                      const target = window.prompt("移动到分类：");
+                      if (target?.trim()) moveSelectedDocs(target.trim());
+                    }}>
+                      移动到
+                    </button>
+                    <button type="button" onClick={deleteSelectedDocs} className="is-danger">
+                      删除
+                    </button>
+                    <button type="button" onClick={deselectAllDocs}>
+                      取消选择
+                    </button>
+                  </div>
                 </div>
-                <p>{doc.preview || "空文档"}</p>
-                <div className="knowledge-card-meta">
-                  <span>{doc.chunk_count} 片段</span>
-                  <span>{doc.char_count} 字</span>
-                  <span>{doc.enabled ? "已启用" : "已停用"}</span>
+              )}
+              <div className="knowledge-sort-bar">
+                <div className="knowledge-sort-controls">
+                  <span>{sortedDocs.length} 篇文档</span>
                 </div>
-              </article>
-            ))
+                <div className="knowledge-sort-controls">
+                  <span>排序：</span>
+                  <select
+                    className="knowledge-sort-select"
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                  >
+                    <option value="updated">更新时间</option>
+                    <option value="title">标题</option>
+                    <option value="size">文档大小</option>
+                  </select>
+                  <button
+                    type="button"
+                    className="knowledge-sort-order-btn"
+                    onClick={() => setSortOrder(o => o === "asc" ? "desc" : "asc")}
+                    title={sortOrder === "asc" ? "升序" : "降序"}
+                  >
+                    <UiIcon name={sortOrder === "asc" ? "chevronDown" : "chevronUp"} size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className={batchMode ? "batch-mode" : ""}>
+                {sortedDocs.map((doc) => (
+                  <article
+                    key={doc.id}
+                    className={`knowledge-card ${selectedId === doc.id ? "is-active" : ""} ${doc.enabled ? "" : "is-disabled"} ${selectedDocs.has(doc.id) ? "is-selected" : ""}`}
+                    onClick={() => batchMode ? toggleDocSelection(doc.id) : setSelectedId(doc.id)}
+                  >
+                    {batchMode && (
+                      <div
+                        className={`knowledge-card-select ${selectedDocs.has(doc.id) ? "checked" : ""}`}
+                        onClick={(e) => { e.stopPropagation(); toggleDocSelection(doc.id); }}
+                      >
+                        {selectedDocs.has(doc.id) && <UiIcon name="check" size={12} />}
+                      </div>
+                    )}
+                    <div className="knowledge-card-head">
+                      <h2>{doc.title}</h2>
+                      <span>{doc.collection}</span>
+                    </div>
+                    <p>{doc.preview || "空文档"}</p>
+                    {doc.tags.length > 0 && (
+                      <div className="knowledge-card-tags">
+                        {doc.tags.map(tag => (
+                          <span key={tag} className="knowledge-tag">{tag}</span>
+                        ))}
+                      </div>
+                    )}
+                    <div className="knowledge-card-meta">
+                      <span>{doc.chunk_count} 片段</span>
+                      <span>{doc.char_count} 字</span>
+                      <span>{doc.enabled ? "已启用" : "已停用"}</span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
           )}
         </section>
 
@@ -489,28 +804,49 @@ export function Knowledge() {
             </div>
           ) : detail ? (
             <>
+              <div className="knowledge-breadcrumb">
+                <button onClick={() => setSelectedId(null)}>知识库</button>
+                <UiIcon name="chevronDown" size={10} className="knowledge-breadcrumb-separator" />
+                <span>{detail.document.collection}</span>
+                <UiIcon name="chevronDown" size={10} className="knowledge-breadcrumb-separator" />
+                <span>{detail.document.title}</span>
+              </div>
               <div className="knowledge-preview-head">
                 <div>
-                  <p className="knowledge-kicker">{detail.document.collection}</p>
                   <h2>{detail.document.title}</h2>
                   <p className="knowledge-muted">
                     更新于 {formatStamp(detail.document.updated_at)} · {detail.document.source}
-                    {detail.document.tags.length ? ` · ${detail.document.tags.join(" / ")}` : ""}
                   </p>
+                  {detail.document.tags.length > 0 && (
+                    <div className="knowledge-card-tags" style={{ marginTop: 8 }}>
+                      {detail.document.tags.map(tag => (
+                        <span key={tag} className="knowledge-tag">{tag}</span>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <div className="knowledge-preview-actions">
                   <button type="button" onClick={editSelected}>
+                    <UiIcon name="edit" size={14} />
                     编辑
                   </button>
                   <button type="button" onClick={() => void toggleEnabled(detail.document)} disabled={busy === detail.document.id}>
                     {detail.document.enabled ? "停用" : "启用"}
                   </button>
-                  <button type="button" onClick={() => void deleteDoc(detail.document)}>
+                  <button type="button" className="is-danger" onClick={() => void deleteDoc(detail.document)}>
+                    <UiIcon name="delete" size={14} />
                     删除
                   </button>
                 </div>
               </div>
-              <pre className="knowledge-body">{detail.content}</pre>
+              <div className="knowledge-body">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeHighlight]}
+                >
+                  {detail.content}
+                </ReactMarkdown>
+              </div>
             </>
           ) : (
             <div className="knowledge-empty">
@@ -532,6 +868,14 @@ export function Knowledge() {
           }}
         >
           <div className="knowledge-modal-card" aria-describedby={editorDirty ? "knowledge-unsaved-hint" : undefined}>
+            <button
+              type="button"
+              className="knowledge-modal-close"
+              onClick={closeEditor}
+              aria-label="关闭"
+            >
+              <UiIcon name="close" size={16} />
+            </button>
             <header>
               <h2 id="knowledge-editor-title">{editor.id ? "编辑笔记" : "新建笔记"}</h2>
               {editorDirty ? <span id="knowledge-unsaved-hint" className="knowledge-unsaved">有未保存修改</span> : null}
