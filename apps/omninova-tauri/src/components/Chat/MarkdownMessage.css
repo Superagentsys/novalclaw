@@ -85,6 +85,86 @@
   margin: 1em 0;
 }
 
+/* Generated and workspace images are first-class chat content. */
+.md-image {
+  display: grid;
+  width: min(100%, 720px);
+  gap: 6px;
+  margin: 12px 0;
+  overflow: hidden;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 10px;
+  background: var(--ui-surface-2);
+  box-shadow: var(--shadow-sm);
+}
+
+.md-image > a,
+.md-image-open {
+  display: grid;
+  min-height: 120px;
+  margin: 0;
+  padding: 0;
+  place-items: center;
+  overflow: hidden;
+  border: 0;
+  background:
+    linear-gradient(45deg, var(--ui-surface-2) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--ui-surface-2) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--ui-surface-2) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--ui-surface-2) 75%),
+    var(--ui-surface-3);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
+  cursor: zoom-in;
+}
+
+.md-image img {
+  display: block;
+  width: 100%;
+  max-height: min(520px, 60vh);
+  object-fit: contain;
+}
+
+.md-image-caption {
+  margin: 0;
+  padding: 0 10px 8px;
+  color: var(--ui-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.md-image-state {
+  display: flex;
+  min-height: 68px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  color: var(--ui-text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.md-image-state.is-error {
+  min-height: auto;
+  color: var(--ui-danger);
+}
+
+.md-image-state button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 6px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text);
+}
+
+.md-image-open:focus-visible,
+.md-image > a:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: -2px;
+}
+
 /* Inline code */
 .md-inline-code {
   font-family: var(--font-mono);

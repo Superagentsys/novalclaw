@@ -7,7 +7,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -130,15 +130,31 @@ function fileBasename(path: string): string {
 }
 
 function normalizeLocalHref(href: string): string | null {
-  if (href.startsWith("file://")) {
+  let value = href;
+  try {
+    value = decodeURIComponent(href);
+  } catch {
+    // Keep the original value when it contains a literal percent sign.
+  }
+  if (/^(?:https?|mailto|data|blob):/i.test(value)) return null;
+  if (value.startsWith("file://")) {
     try {
-      const decoded = decodeURIComponent(href.slice("file://".length));
+      const decoded = decodeURIComponent(value.slice("file://".length));
       return /^\/[A-Za-z]:\//.test(decoded) ? decoded.slice(1) : decoded;
     } catch {
       return null;
     }
   }
-  return looksLikeFilePath(href) ? href : null;
+  return looksLikeFilePath(value) ? value : null;
+}
+
+function markdownUrlTransform(url: string, key: string): string | null | undefined {
+  if (key === "src") {
+    if (normalizeLocalHref(url)) return url;
+    if (/^data:image\/(?:png|jpe?g|gif|webp|bmp);base64,/i.test(url)) return url;
+    if (/^blob:/i.test(url)) return url;
+  }
+  return defaultUrlTransform(url);
 }
 
 function InlineCode({
@@ -194,6 +210,100 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
     >
       {children}
     </button>
+  );
+}
+
+function MarkdownImage({
+  src,
+  alt,
+  title,
+}: {
+  src?: string;
+  alt?: string;
+  title?: string;
+}) {
+  const workspacePath = useContext(WorkspacePathContext);
+  const localPath = src ? normalizeLocalHref(src) : null;
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(localPath ? null : src ?? null);
+  const [loading, setLoading] = useState(Boolean(localPath));
+  const [failed, setFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFailed(null);
+    if (!src || !localPath) {
+      setResolvedSrc(src ?? null);
+      setLoading(false);
+      return () => { cancelled = true; };
+    }
+    setResolvedSrc(null);
+    setLoading(true);
+    void invokeTauri<{ dataUrl?: string | null }>("task_artifact_preview", {
+      path: localPath,
+      workspacePath: workspacePath || undefined,
+    }).then((preview) => {
+      if (cancelled) return;
+      if (preview.dataUrl) {
+        setResolvedSrc(preview.dataUrl);
+      } else {
+        setFailed("该图片过大或格式暂不支持内嵌预览");
+      }
+    }).catch((reason) => {
+      if (!cancelled) setFailed(String(reason));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [localPath, src, workspacePath]);
+
+  const openLocalImage = () => {
+    if (!localPath) return;
+    void invokeTauri("open_task_artifact", {
+      path: localPath,
+      workspacePath: workspacePath || undefined,
+      reveal: false,
+    }).catch(() => {});
+  };
+
+  if (!src) return null;
+  return (
+    <span
+      className={`md-image${failed ? " is-error" : ""}`}
+      role="figure"
+      aria-label={alt || (localPath ? fileBasename(localPath) : "生成图片")}
+    >
+      {loading ? <div className="md-image-state">正在加载图片预览…</div> : null}
+      {resolvedSrc ? (
+        localPath ? (
+          <button type="button" className="md-image-open" onClick={openLocalImage} title="使用系统默认程序打开图片">
+            <img
+              src={resolvedSrc}
+              alt={alt || fileBasename(localPath)}
+              title={title}
+              loading="lazy"
+              onError={() => setFailed("图片加载失败")}
+            />
+          </button>
+        ) : (
+          <a href={src} target="_blank" rel="noreferrer noopener" title="在新窗口打开图片">
+            <img
+              src={resolvedSrc}
+              alt={alt || "生成图片"}
+              title={title}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+              onError={() => setFailed("图片加载失败或远程地址不可访问")}
+            />
+          </a>
+        )
+      ) : null}
+      {failed ? (
+        <span className="md-image-state is-error">
+          <span>{failed}</span>
+          {localPath ? <button type="button" onClick={openLocalImage}>打开原文件</button> : null}
+        </span>
+      ) : alt ? <span className="md-image-caption">{alt}</span> : null}
+    </span>
   );
 }
 
@@ -386,6 +496,7 @@ const components: Components = {
   pre: PreBlock as Components["pre"],
   code: InlineCode as Components["code"],
   a: MarkdownLink as Components["a"],
+  img: MarkdownImage as Components["img"],
   table: ({ children }) => (
     <div className="md-table-wrap">
       <table>{children}</table>
@@ -415,6 +526,7 @@ export function MarkdownMessage({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           rehypePlugins={rehypePlugins as any}
           components={components}
+          urlTransform={markdownUrlTransform}
         >
           {content}
         </ReactMarkdown>

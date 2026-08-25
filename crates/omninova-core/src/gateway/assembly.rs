@@ -66,6 +66,7 @@ impl GatewayRuntime {
             request.session_id,
             request.channel,
             request.spawn_depth,
+            request.workspace,
             &mut tools,
         ) {
             steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));

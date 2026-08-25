@@ -1615,7 +1615,14 @@
 /* ---------- SkillHub trust, lifecycle and local audit ---------- */
 
 .market-card {
-  align-items: flex-start;
+  display: grid;
+  min-height: 194px;
+  grid-template-columns: 42px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 11px;
+  row-gap: 12px;
+  padding: 13px;
   background: var(--ui-surface-1);
   color: var(--ui-text);
 }
@@ -1625,14 +1632,107 @@
   border-color: var(--ui-accent);
 }
 
-.market-card-name { color: var(--ui-text); }
+.market-card-icon {
+  grid-column: 1;
+  grid-row: 1;
+  width: 42px;
+  height: 42px;
+}
+
+.market-card-body {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  gap: 7px;
+}
+
+.market-card-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.market-card-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--ui-text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .01em;
+}
 .market-card-desc { color: var(--ui-text-secondary); }
 
-.market-card-actions {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
+.market-card-meta {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(48px, .8fr) minmax(56px, .9fr) minmax(64px, 1.15fr);
+  align-items: stretch;
   gap: 5px;
+  margin-top: auto;
+}
+
+.market-card-meta-item,
+.market-card-category {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 25px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--ui-border);
+  border-radius: 7px;
+  background: var(--ui-surface-2);
+  color: var(--ui-text-secondary);
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.market-card-meta-item > span {
+  color: var(--ui-text-muted);
+}
+
+.market-card-meta-item > strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ui-text-secondary);
+  font-weight: 700;
+  text-overflow: ellipsis;
+}
+
+.market-card-category {
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--ui-accent) 22%, var(--ui-border));
+  background: var(--ui-accent-soft);
+  color: var(--ui-accent-strong);
+  font-weight: 650;
+  text-overflow: ellipsis;
+}
+
+.market-card-installed-tag {
+  max-width: 116px;
+  flex: 0 1 auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.market-card-actions {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  min-width: 0;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+  padding-top: 9px;
+  border-top: 1px solid var(--ui-border);
 }
 
 .market-card-btn,
@@ -1649,8 +1749,11 @@
   border-radius: 6px;
   background: var(--ui-surface-2);
   color: var(--ui-text-secondary);
-  font-size: 10px;
+  font-family: inherit;
+  font-size: 10.5px;
   font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .market-card-btn:hover:not(:disabled),
@@ -1703,6 +1806,11 @@
 }
 
 .market-card-details dd { margin: 0; }
+
+.market-grid {
+  grid-template-columns: repeat(auto-fill, minmax(292px, 1fr));
+  align-items: stretch;
+}
 
 .market-install-log {
   margin-top: 18px;
@@ -1778,6 +1886,11 @@
 
 @media (max-width: 820px) {
   .market-card.is-expanded { grid-column: auto; }
+}
+
+@media (max-width: 640px) {
+  .market-grid { grid-template-columns: minmax(0, 1fr); }
+  .market-card-meta { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 :root[data-theme="graphite"] .chat-new-chat-pill,

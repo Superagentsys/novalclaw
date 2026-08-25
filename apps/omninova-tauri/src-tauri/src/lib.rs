@@ -4239,6 +4239,36 @@ fn artifact_extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_raster_preview_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff"
+    )
+}
+
+fn safe_svg_preview_data_url(bytes: &[u8]) -> Result<String, String> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| "SVG 不是有效的 UTF-8 文本，无法安全预览。".to_string())?;
+    let normalized = source.to_ascii_lowercase();
+    let unsafe_markers = [
+        "<script",
+        "javascript:",
+        "<foreignobject",
+        " onload=",
+        " onclick=",
+        " onerror=",
+        "@import",
+        "url(http",
+        "href=\"http",
+        "href='http",
+    ];
+    if unsafe_markers.iter().any(|marker| normalized.contains(marker)) {
+        return Err("SVG 含有脚本、事件或外部资源，已阻止内嵌预览；仍可使用“打开”查看。".to_string());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:image/svg+xml;base64,{encoded}"))
+}
+
 fn resolve_docx_modify_path(
     raw: &str,
     workspace_path: Option<&str>,
@@ -4678,6 +4708,7 @@ fn task_artifact_preview(
 ) -> Result<TaskArtifactPreview, String> {
     const MAX_TEXT_BYTES: u64 = 160 * 1024;
     const MAX_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+    const MAX_SVG_BYTES: u64 = 4 * 1024 * 1024;
 
     let resolved = resolve_task_artifact_path(&path, workspace_path.as_deref())?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
@@ -4691,7 +4722,7 @@ fn task_artifact_preview(
     let mut text_preview = None;
     let kind;
 
-    if matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+    if is_raster_preview_extension(&extension) {
         kind = "image".to_string();
         if metadata.len() <= MAX_IMAGE_BYTES {
             let decoded = image::open(&resolved)
@@ -4703,6 +4734,12 @@ fn task_artifact_preview(
                 .map_err(|error| format!("图片缩略图生成失败：{error}"))?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
             data_url = Some(format!("data:image/png;base64,{encoded}"));
+        }
+    } else if extension == "svg" {
+        kind = "image".to_string();
+        if metadata.len() <= MAX_SVG_BYTES {
+            let bytes = std::fs::read(&resolved).map_err(|error| error.to_string())?;
+            data_url = Some(safe_svg_preview_data_url(&bytes)?);
         }
     } else if matches!(
         extension.as_str(),

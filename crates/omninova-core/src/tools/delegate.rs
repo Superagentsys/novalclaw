@@ -6,6 +6,7 @@
 use crate::channels::ChannelKind;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// A delegation request resolved by the runtime.
@@ -25,6 +26,9 @@ pub struct DelegateRequest {
     pub channel: ChannelKind,
     /// Spawn depth of the child (parent depth + 1).
     pub child_depth: u32,
+    /// Effective workspace of the parent. The child must inherit this instead
+    /// of falling back to the target agent's or global default workspace.
+    pub workspace_dir: PathBuf,
 }
 
 /// Runtime capable of executing a delegated subtask on another agent.
@@ -48,6 +52,7 @@ pub struct DelegateTool {
     parent_session_id: Option<String>,
     channel: ChannelKind,
     child_depth: u32,
+    workspace_dir: PathBuf,
 }
 
 impl DelegateTool {
@@ -59,6 +64,7 @@ impl DelegateTool {
         parent_session_id: Option<String>,
         channel: ChannelKind,
         child_depth: u32,
+        workspace_dir: PathBuf,
     ) -> Self {
         Self {
             invoker,
@@ -68,6 +74,7 @@ impl DelegateTool {
             parent_session_id,
             channel,
             child_depth,
+            workspace_dir,
         }
     }
 }
@@ -158,6 +165,7 @@ impl Tool for DelegateTool {
             parent_session_id: self.parent_session_id.clone(),
             channel: self.channel.clone(),
             child_depth: self.child_depth,
+            workspace_dir: self.workspace_dir.clone(),
         };
 
         match self.invoker.invoke_agent(request).await {
@@ -174,5 +182,49 @@ impl Tool for DelegateTool {
                 error: Some(format!("delegation to '{agent}' failed: {e}")),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    struct CapturingInvoker {
+        request: Mutex<Option<DelegateRequest>>,
+    }
+
+    #[async_trait]
+    impl AgentInvoker for CapturingInvoker {
+        async fn invoke_agent(&self, request: DelegateRequest) -> anyhow::Result<String> {
+            *self.request.lock() = Some(request);
+            Ok("done".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_request_inherits_parent_workspace() {
+        let invoker = Arc::new(CapturingInvoker {
+            request: Mutex::new(None),
+        });
+        let expected = PathBuf::from("G:/AI/z-world/zhennovel-engine");
+        let tool = DelegateTool::new(
+            invoker.clone(),
+            vec!["explore".to_string()],
+            "explore: read-only".to_string(),
+            "omninova".to_string(),
+            Some("parent-session".to_string()),
+            ChannelKind::Cli,
+            1,
+            expected.clone(),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({"agent": "explore", "task": "inspect"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let request = invoker.request.lock().clone().unwrap();
+        assert_eq!(request.workspace_dir, expected);
     }
 }
