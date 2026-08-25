@@ -83,6 +83,8 @@ pub fn sanitize_messages_for_provider(messages: Vec<ChatMessage>) -> Vec<ChatMes
 /// Prefix identifying a compaction summary, so repeated compactions fold the
 /// previous summary into the new one instead of stacking summaries forever.
 pub const SUMMARY_MARKER: &str = "[对话摘要]";
+pub const TASK_MARKER: &str = "[任务]";
+pub const CHECKPOINT_MARKER: &str = "[检查点]";
 
 /// Fraction of the history budget kept verbatim as the most recent turns.
 /// The rest is eligible for summarization.
@@ -121,13 +123,24 @@ pub fn plan_compaction(messages: &[ChatMessage], max_history: usize) -> Option<C
         return None;
     }
 
-    let summarize = messages[head_len..tail_start].to_vec();
+    let mut head = messages[..head_len].to_vec();
+    let mut summarize = messages[head_len..tail_start].to_vec();
+    let mut extra_pinned = Vec::new();
+    summarize.retain(|message| {
+        if is_pinned_system(message) {
+            extra_pinned.push(message.clone());
+            false
+        } else {
+            true
+        }
+    });
+    head.extend(extra_pinned);
     if summarize.iter().all(is_summary) {
         return None;
     }
 
     Some(CompactionPlan {
-        head: messages[..head_len].to_vec(),
+        head,
         summarize,
         tail: messages[tail_start..].to_vec(),
     })
@@ -135,6 +148,12 @@ pub fn plan_compaction(messages: &[ChatMessage], max_history: usize) -> Option<C
 
 fn is_summary(message: &ChatMessage) -> bool {
     message.role == "system" && message.content.starts_with(SUMMARY_MARKER)
+}
+
+pub fn is_pinned_system(message: &ChatMessage) -> bool {
+    message.role == "system"
+        && (message.content.starts_with(TASK_MARKER)
+            || message.content.starts_with(CHECKPOINT_MARKER))
 }
 
 /// Render the messages being dropped into a transcript for the summarizer.
@@ -167,19 +186,29 @@ pub fn truncate_history_preserving_system(
         return messages;
     }
 
-    let head_len = messages
-        .iter()
-        .take_while(|message| message.role == "system")
-        .count()
-        .min(max_history);
-    let tail_budget = max_history - head_len;
-
-    let mut out = messages[..head_len].to_vec();
-    if tail_budget > 0 {
-        let start = messages.len().saturating_sub(tail_budget).max(head_len);
-        out.extend_from_slice(&messages[start..]);
+    let mut protected = Vec::new();
+    let mut rest = Vec::new();
+    let mut in_prefix = true;
+    for message in messages {
+        if in_prefix && message.role == "system" {
+            protected.push(message);
+            continue;
+        }
+        in_prefix = false;
+        if is_pinned_system(&message) {
+            protected.push(message);
+        } else {
+            rest.push(message);
+        }
     }
-    out
+
+    let tail_budget = max_history.saturating_sub(protected.len());
+    if tail_budget == 0 {
+        return protected;
+    }
+    let start = rest.len().saturating_sub(tail_budget);
+    protected.extend(rest.drain(start..));
+    protected
 }
 
 #[cfg(test)]
@@ -311,5 +340,29 @@ mod tests {
         let messages = history(1, 2);
         let truncated = truncate_history_preserving_system(messages.clone(), 50);
         assert_eq!(truncated.len(), messages.len());
+    }
+
+    #[test]
+    fn pinned_task_stays_in_compaction_head() {
+        let mut messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::system(format!("{TASK_MARKER} 持续跟标书")),
+            ChatMessage::system(format!("{CHECKPOINT_MARKER} 已列提纲")),
+        ];
+        messages.extend(history(0, 20));
+
+        let plan = plan_compaction(&messages, 10).expect("plan");
+        assert!(plan
+            .head
+            .iter()
+            .any(|message| message.content.starts_with(TASK_MARKER)));
+        assert!(plan
+            .head
+            .iter()
+            .any(|message| message.content.starts_with(CHECKPOINT_MARKER)));
+        assert!(!plan
+            .summarize
+            .iter()
+            .any(|message| is_pinned_system(message)));
     }
 }

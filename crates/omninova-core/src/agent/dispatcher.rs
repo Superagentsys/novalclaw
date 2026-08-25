@@ -17,6 +17,20 @@ const SKILL_PROVIDER_CONTENT_FILTER_ERROR: &str =
 const PROVIDER_CONTENT_FILTER_ERROR: &str =
     "当前模型服务拒绝了本次请求内容。请调整请求或更换模型。";
 
+fn waiting_approval_reply(tool_result: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(tool_result).ok()?;
+    if value.get("status").and_then(|item| item.as_str()) != Some("waiting_approval") {
+        return None;
+    }
+    let id = value
+        .get("approval_id")
+        .and_then(|item| item.as_str())
+        .unwrap_or("-");
+    Some(format!(
+        "该操作需要你确认后才能继续（审批 ID：{id}）。批准后我会接着执行。"
+    ))
+}
+
 fn has_active_skill(messages: &[ChatMessage]) -> bool {
     messages.iter().any(|message| {
         message.role == "system"
@@ -343,6 +357,10 @@ impl<'a> AgentDispatcher<'a> {
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
+                if let Some(reply) = waiting_approval_reply(&tool_result) {
+                    messages.push(ChatMessage::assistant(&reply));
+                    return Ok(reply);
+                }
             }
         }
 
@@ -563,6 +581,10 @@ impl<'a> AgentDispatcher<'a> {
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
+                if let Some(reply) = waiting_approval_reply(&tool_result) {
+                    messages.push(ChatMessage::assistant(&reply));
+                    return Ok(reply);
+                }
             }
         }
 
@@ -685,6 +707,11 @@ impl<'a> AgentDispatcher<'a> {
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
+                if let Some(reply) = waiting_approval_reply(&tool_result) {
+                    messages.push(ChatMessage::assistant(&reply));
+                    let _ = events.send(AgentEvent::Done(reply.clone()));
+                    return Ok(reply);
+                }
             }
         }
 
@@ -789,6 +816,10 @@ impl<'a> AgentDispatcher<'a> {
                 .to_string();
                 messages.push(ChatMessage::tool(tool_payload));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
+                if let Some(reply) = waiting_approval_reply(&tool_result) {
+                    messages.push(ChatMessage::assistant(&reply));
+                    return Ok(reply);
+                }
             }
         }
 

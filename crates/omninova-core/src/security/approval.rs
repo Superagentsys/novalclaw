@@ -39,6 +39,14 @@ pub struct PendingApproval {
     pub updated_at: String,
     pub approved_by: Option<String>,
     pub reject_reason: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub resume_on_approve: bool,
 }
 
 fn default_safe_arguments() -> serde_json::Value {
@@ -150,6 +158,10 @@ impl ApprovalController {
             updated_at: now,
             approved_by: None,
             reject_reason: None,
+            session_id: None,
+            task_id: None,
+            channel: None,
+            resume_on_approve: false,
         };
         store.items.push(item.clone());
         self.save_locked(&store).await?;
@@ -188,6 +200,26 @@ impl ApprovalController {
             self.save_locked(&store).await?;
         }
         Ok(changed)
+    }
+
+    pub async fn attach_resume_context(
+        &self,
+        id: &str,
+        session_id: Option<String>,
+        task_id: Option<String>,
+        channel: Option<String>,
+    ) -> Result<()> {
+        let mut store = self.store.lock().await;
+        self.ensure_loaded(&mut store).await?;
+        if let Some(item) = store.items.iter_mut().find(|item| item.id == id) {
+            item.session_id = session_id;
+            item.task_id = task_id;
+            item.channel = channel;
+            item.resume_on_approve = true;
+            item.updated_at = now_ts();
+        }
+        self.save_locked(&store).await?;
+        Ok(())
     }
 
     /// If an approved request exists for the exact run+tool_call identity, mark

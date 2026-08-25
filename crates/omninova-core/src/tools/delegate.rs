@@ -41,6 +41,9 @@ pub struct DelegateTool {
     invoker: Arc<dyn AgentInvoker>,
     /// Agents that may be delegated to (excludes the current agent).
     targets: Vec<String>,
+    /// One line per target: `name: when to use it`. Shown in the tool schema
+    /// so the parent can pick the right subagent the way Cursor's Task tool does.
+    catalog: String,
     parent_agent: String,
     parent_session_id: Option<String>,
     channel: ChannelKind,
@@ -51,6 +54,7 @@ impl DelegateTool {
     pub fn new(
         invoker: Arc<dyn AgentInvoker>,
         targets: Vec<String>,
+        catalog: String,
         parent_agent: String,
         parent_session_id: Option<String>,
         channel: ChannelKind,
@@ -59,6 +63,7 @@ impl DelegateTool {
         Self {
             invoker,
             targets,
+            catalog,
             parent_agent,
             parent_session_id,
             channel,
@@ -74,9 +79,12 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a self-contained subtask to another specialized agent and get its final answer. \
-         Use this to split complex work across agents. The sub-agent has no access to this \
-         conversation, so include all necessary details in the task."
+        "Launch a specialized subagent for a bounded subtask. The subagent starts a \
+         fresh session and cannot see this conversation, so put every fact it needs \
+         in `task` (and optional `context`). Use `explore` for read-only codebase \
+         questions, `general-purpose` for multi-step implementation, `shell` for \
+         git/build/test commands. Custom agents from `.omninova/agents/*.md` also \
+         appear in `agent`."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -86,8 +94,8 @@ impl Tool for DelegateTool {
                 "agent": {
                     "type": "string",
                     "description": format!(
-                        "Target agent name. Available agents: {}",
-                        self.targets.join(", ")
+                        "Which subagent should run this task.\n{}",
+                        self.catalog
                     ),
                     "enum": self.targets,
                 },

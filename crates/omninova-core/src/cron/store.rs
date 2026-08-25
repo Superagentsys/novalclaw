@@ -44,6 +44,9 @@ pub struct CronJob {
     pub last_error: Option<String>,
     #[serde(default)]
     pub created_at: String,
+    /// When set, the scheduler runs this job as a long-horizon task wake.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 impl CronJob {

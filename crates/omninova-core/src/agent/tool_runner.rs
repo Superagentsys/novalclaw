@@ -271,6 +271,51 @@ impl<'a> ToolRunner<'a> {
                     );
                 }
 
+                if self.security.should_defer_approval() {
+                    let session_id = self.security.audit().context().session_id.clone();
+                    let task_id = self.security.inbound_task_id();
+                    let channel = Some(self.security.audit().context().channel.clone());
+                    let _ = self
+                        .security
+                        .approvals()
+                        .attach_resume_context(
+                            &pending.id,
+                            session_id,
+                            task_id,
+                            channel,
+                        )
+                        .await;
+                    let payload = serde_json::json!({
+                        "status": "waiting_approval",
+                        "approval_id": pending.id,
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                    })
+                    .to_string();
+                    if let Some(ref bus) = self.event_bus {
+                        bus.tool_completed(
+                            step_id.clone(),
+                            tool_call.id.clone(),
+                            tool_call.name.clone(),
+                            false,
+                            0,
+                            "等待审批".to_string(),
+                            None,
+                        );
+                    }
+                    return Ok((
+                        payload,
+                        Some(ToolExecutionEvent::Completed {
+                            tool_call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            success: false,
+                            duration_ms: 0,
+                            result_summary: "等待审批".to_string(),
+                            diff_stats: None,
+                        }),
+                    ));
+                }
+
                 // Keep this exact tool call alive while the desktop displays
                 // its approval card. Approving resumes here with the original
                 // arguments; no second model request or vague "retry" prompt is

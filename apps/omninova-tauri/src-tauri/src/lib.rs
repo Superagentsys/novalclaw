@@ -1470,6 +1470,7 @@ fn build_cron_job(input: AutomationJobInput, existing: Option<CronJob>) -> Resul
             .map(|job| job.created_at.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(now),
+        task_id: existing.as_ref().and_then(|job| job.task_id.clone()),
     })
 }
 

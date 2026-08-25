@@ -14,7 +14,10 @@ pub mod observability;
 pub mod providers;
 pub mod routing;
 pub mod security;
+pub mod session;
 pub mod skills;
+pub mod subagent;
+pub mod task;
 pub mod tools;
 pub mod util;
 

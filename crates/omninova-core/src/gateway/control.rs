@@ -538,6 +538,7 @@ async fn upsert_job(runtime: &GatewayRuntime, input: Value) -> Result<Value, Str
             .map(|job| job.created_at.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(now_timestamp),
+        task_id: existing.as_ref().and_then(|job| job.task_id.clone()),
     };
     store.upsert(job.clone()).await.map_err(|e| e.to_string())?;
     serde_json::to_value(job).map_err(|e| e.to_string())

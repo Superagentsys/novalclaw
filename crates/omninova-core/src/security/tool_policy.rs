@@ -1,38 +1,11 @@
 use crate::config::Config;
 use crate::security::dangerous_tools::is_dangerous_shell_command;
 use crate::security::sandbox::path_hits_forbidden;
+use crate::tools::registry::capabilities_or_unknown;
 use serde::{Deserialize, Serialize};
 
 const MEDIUM_RISK_COMMANDS: &[&str] = &[
     "git", "npm", "pnpm", "yarn", "cargo", "pip", "docker",
-];
-
-const HIGH_RISK_TOOLS: &[&str] = &[
-    "shell",
-    "file_write",
-    "file_edit",
-    "file_patch",
-    "git_operations",
-    "browser",
-    "http_request",
-];
-
-const READ_ONLY_WORKSPACE_TOOLS: &[&str] = &[
-    "file_read",
-    "read_file",
-    "file_list",
-    "list_directory",
-    "glob_search",
-    "glob",
-    "file_search",
-    "content_search",
-    "grep_search",
-    "grep",
-    "search",
-    "knowledge_search",
-    // Loads instructions from the already-discovered local skill catalog. It
-    // does not mutate the workspace or contact an external service.
-    "use_skill",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,9 +153,7 @@ pub fn evaluate_tool_call(
         }
     }
 
-    if matches!(tool_name, "file_read" | "file_write" | "file_edit" | "file_patch" | "apply_patch")
-        || is_read_only_workspace_tool(tool_name)
-    {
+    if capabilities_or_unknown(tool_name).touches_workspace_paths() {
         if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
             if let Some(reason) = path_hits_forbidden(config, path) {
                 return ToolPolicyDecision::Deny { reason };
@@ -252,15 +223,11 @@ fn is_medium_risk_command(cmd: &str) -> bool {
 }
 
 fn is_high_risk_tool(tool_name: &str) -> bool {
-    HIGH_RISK_TOOLS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+    capabilities_or_unknown(tool_name).is_high_risk()
 }
 
 fn is_read_only_workspace_tool(tool_name: &str) -> bool {
-    READ_ONLY_WORKSPACE_TOOLS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+    capabilities_or_unknown(tool_name).is_read_only_workspace()
 }
 
 fn git_operation_is_read_only(arguments: &serde_json::Value) -> bool {
