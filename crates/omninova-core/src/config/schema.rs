@@ -568,6 +568,10 @@ pub struct DelegateAgentConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// Tells the parent when to pick this agent. Shown in the `delegate` tool
+    /// catalog. Built-in and markdown subagents always set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub max_depth: Option<u32>,
     #[serde(default)]
     pub agentic: bool,
@@ -707,6 +711,7 @@ where
                         provider,
                         model,
                         system_prompt: None,
+                        description: None,
                         max_depth: None,
                         agentic: false,
                         allowed_tools: Vec::new(),
@@ -2483,6 +2488,9 @@ pub struct ApprovalsConfig {
     pub auto_approve: Vec<String>,
     #[serde(default = "default_require_approval_tools")]
     pub require_approval: Vec<String>,
+    /// `blocking` waits in-process (desktop). `deferred` ends the turn and resumes after approve.
+    /// When omitted, IM channels default to deferred and others to blocking.
+    pub wait_mode: Option<String>,
 }
 
 fn default_require_approval_tools() -> Vec<String> {
@@ -2503,6 +2511,7 @@ impl Default for ApprovalsConfig {
             mode: Some("supervised".into()),
             auto_approve: default_auto_approve(),
             require_approval: default_require_approval_tools(),
+            wait_mode: None,
         }
     }
 }
@@ -2646,6 +2655,10 @@ pub struct SubagentsConfig {
     pub thinking: Option<String>,
     pub run_timeout_seconds: Option<u32>,
     pub announce_timeout_ms: Option<u64>,
+    /// Directory of `*.md` subagent definitions. Defaults to
+    /// `{workspace}/.omninova/agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definitions_dir: Option<String>,
 }
 
 #[cfg(test)]

@@ -12,6 +12,10 @@ apps/omninova-tauri/src-tauri/resources/cli/omninova
 .omninova-memory.json
 .omninova-sessions.json
 .omninova-sessions.corrupt.*.json
+.omninova-tasks.db
+.omninova-tasks.db-wal
+.omninova-tasks.db-shm
+sessions/
 
 # Android
 apps/omninova-android/.gradle/
