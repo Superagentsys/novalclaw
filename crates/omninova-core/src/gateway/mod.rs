@@ -97,7 +97,7 @@ use axum::{Json, Router};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -9666,21 +9666,7 @@ impl AgentInvoker for GatewayRuntime {
         }
 
         let child_session_id = format!("subagent-{}", uuid::Uuid::new_v4());
-        let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
-        metadata.insert("agent".into(), serde_json::json!(request.agent));
-        metadata.insert("spawn_depth".into(), serde_json::json!(request.child_depth));
-        // Parent lineage requires a registered parent session; sessionless
-        // parents still propagate depth so spawn limits hold.
-        if let Some(parent_session_id) = &request.parent_session_id {
-            metadata.insert(
-                "parent_session_id".into(),
-                serde_json::json!(parent_session_id),
-            );
-            metadata.insert(
-                "parent_agent_id".into(),
-                serde_json::json!(request.parent_agent),
-            );
-        }
+        let metadata = delegate_metadata(&request);
 
         let text = match &request.context {
             Some(context) => format!(
@@ -9718,6 +9704,30 @@ impl AgentInvoker for GatewayRuntime {
     }
 }
 
+fn delegate_metadata(request: &DelegateRequest) -> HashMap<String, serde_json::Value> {
+    let mut metadata = HashMap::new();
+    metadata.insert("agent".into(), serde_json::json!(request.agent));
+    metadata.insert("spawn_depth".into(), serde_json::json!(request.child_depth));
+    metadata.insert(
+        "workspace_dir".into(),
+        serde_json::json!(request.workspace_dir.display().to_string()),
+    );
+    // Parent lineage requires a registered parent session; sessionless
+    // parents still propagate depth and workspace so spawn limits hold and
+    // delegated tools operate on the same project as the parent.
+    if let Some(parent_session_id) = &request.parent_session_id {
+        metadata.insert(
+            "parent_session_id".into(),
+            serde_json::json!(parent_session_id),
+        );
+        metadata.insert(
+            "parent_agent_id".into(),
+            serde_json::json!(request.parent_agent),
+        );
+    }
+    metadata
+}
+
 /// Fold built-in and workspace subagent definitions into a cloned config so
 /// routing and the `delegate` tool see them, without writing them back to
 /// `config.toml`.
@@ -9735,6 +9745,7 @@ fn attach_delegate_tool(
     parent_session_id: Option<&str>,
     channel: &ChannelKind,
     parent_depth: u32,
+    parent_workspace: &StdPath,
     tools: &mut Vec<Box<dyn Tool>>,
 ) -> bool {
     let listed = crate::subagent::available_targets(cfg, route_agent_name);
@@ -9780,6 +9791,7 @@ fn attach_delegate_tool(
         parent_session_id.map(ToString::to_string),
         channel.clone(),
         child_depth,
+        parent_workspace.to_path_buf(),
     )));
     true
 }
@@ -9847,7 +9859,7 @@ mod tests {
         acquire_inbound_slot, acquire_subagent_guard, attach_delegate_tool,
         check_dingtalk_public_route, check_gateway_public_health, classify_dingtalk_route_response,
         create_tools_for_route, dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
-        feishu_public_callback_urls, http_dingtalk_card_callback_post,
+        feishu_public_callback_urls, http_dingtalk_card_callback_post, delegate_metadata,
         normalize_gateway_public_config, normalize_named_tunnel_hostname,
         normalize_public_webhook_base_url, probe_gateway_public_health, recover_session_store,
         resolve_agent_max_tool_iterations, resolve_public_webhook_base_url, session_expired,
@@ -9858,6 +9870,7 @@ mod tests {
     use crate::config::{
         ChannelEntry, Config, DelegateAgentConfig, GatewayPublicConfig, GatewayPublicMode,
     };
+    use crate::tools::DelegateRequest;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
@@ -9986,6 +9999,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools
         ));
 
@@ -10000,6 +10014,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools
         ));
         assert_eq!(tools.last().map(|t| t.name()), Some("delegate"));
@@ -10013,8 +10028,28 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools2
         ));
+    }
+
+    #[test]
+    fn delegated_inbound_metadata_keeps_parent_workspace() {
+        let request = DelegateRequest {
+            agent: "explore".to_string(),
+            task: "inspect".to_string(),
+            context: None,
+            parent_agent: "omninova".to_string(),
+            parent_session_id: Some("parent".to_string()),
+            channel: ChannelKind::Cli,
+            child_depth: 1,
+            workspace_dir: PathBuf::from("G:/AI/z-world/zhennovel-engine"),
+        };
+        let metadata = delegate_metadata(&request);
+        assert_eq!(
+            metadata.get("workspace_dir").and_then(|value| value.as_str()),
+            Some("G:/AI/z-world/zhennovel-engine")
+        );
     }
 
     #[test]
@@ -10031,6 +10066,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools
         ));
         let spec = tools.last().unwrap().spec();
@@ -10069,6 +10105,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools
         ));
     }
@@ -10101,6 +10138,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             1,
+            std::path::Path::new("."),
             &mut tools
         ));
 
@@ -10112,6 +10150,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools
         ));
 
@@ -10124,6 +10163,7 @@ mod tests {
             None,
             &ChannelKind::Cli,
             0,
+            std::path::Path::new("."),
             &mut tools2
         ));
     }

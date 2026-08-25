@@ -43,6 +43,8 @@ home.workspace = true
 avif-serialize.workspace = true
 base64ct.workspace = true
 globset.workspace = true
+regex.workspace = true
+walkdir.workspace = true
 screenshots.workspace = true
 png.workspace = true
 rusqlite = { version = "0.31", features = ["bundled"] }
