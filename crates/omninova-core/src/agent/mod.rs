@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_event;
 pub mod budget;
+pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
 pub mod history;

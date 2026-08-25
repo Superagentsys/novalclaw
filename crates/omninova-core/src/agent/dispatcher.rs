@@ -1,5 +1,6 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::event_bus::EventBus;
+use crate::agent::context::maintain_context;
 use crate::agent::history::sanitize_messages_for_provider;
 use crate::agent::tool_runner::ToolRunner;
 use crate::agent::{build_tool_prepare_summary, build_tool_summary, AgentCancellationToken, AgentEvent, ToolExecutionEvent};
@@ -190,6 +191,8 @@ pub struct AgentDispatcher<'a> {
     max_tool_iterations: usize,
     security: &'a SecurityContext,
     budget: &'a BudgetTracker,
+    max_history_messages: usize,
+    compact_context: bool,
     /// Optional EventBus for real-time structured events.
     event_bus: Option<EventBus>,
     cancel_token: Option<AgentCancellationToken>,
@@ -204,6 +207,8 @@ impl<'a> Clone for AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
+            max_history_messages: self.max_history_messages,
+            compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
         }
@@ -218,6 +223,8 @@ impl<'a> AgentDispatcher<'a> {
         max_tool_iterations: usize,
         security: &'a SecurityContext,
         budget: &'a BudgetTracker,
+        max_history_messages: usize,
+        compact_context: bool,
     ) -> Self {
         Self {
             provider,
@@ -226,6 +233,8 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations,
             security,
             budget,
+            max_history_messages,
+            compact_context,
             event_bus: None,
             cancel_token: None,
         }
@@ -269,6 +278,15 @@ impl<'a> AgentDispatcher<'a> {
                 messages.push(ChatMessage::assistant(&text));
                 return Ok(text);
             }
+
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -414,6 +432,19 @@ impl<'a> AgentDispatcher<'a> {
                 }
                 return Err(anyhow::anyhow!(text));
             }
+
+            // Mid-turn unified context maintenance: same policy as the
+            // turn-boundary path. It prunes oversized historical tool results,
+            // then performs bounded structured compaction if pressure remains.
+            // The Provider's C1 hard preflight still guards the final request.
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -620,6 +651,15 @@ impl<'a> AgentDispatcher<'a> {
                 return Ok(text);
             }
 
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+            )
+            .await;
+
             let provider_name = self
                 .security
                 .audit()
@@ -743,6 +783,15 @@ impl<'a> AgentDispatcher<'a> {
                 return Ok(text);
             }
 
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+            )
+            .await;
+
             let provider_name = self
                 .security
                 .audit()
@@ -847,6 +896,8 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
+            max_history_messages: self.max_history_messages,
+            compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
         };

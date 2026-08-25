@@ -1,4 +1,5 @@
 use crate::config::TransportMode;
+use crate::providers::context_budget::{ContextBudget, TokenEstimator};
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
     TokenUsage, ToolCall as ProviderToolCall,
@@ -438,6 +439,7 @@ pub struct OpenAiProvider {
     retry_backoff: Duration,
     transport_mode: TransportMode,
     client: Client,
+    context_budget: Option<ContextBudget>,
 }
 
 struct ConsumeOutcome {
@@ -936,7 +938,14 @@ impl OpenAiProvider {
             retry_backoff: PROVIDER_RETRY_BACKOFF,
             transport_mode,
             client,
+            context_budget: None,
         }
+    }
+
+    /// Sets an optional authoritative context budget for final preflight.
+    pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
+        self.context_budget = budget;
+        self
     }
 
     /// Sets the per-provider HTTP transport mode. Default is `Auto`; the
@@ -945,6 +954,49 @@ impl OpenAiProvider {
         self.transport_mode = mode;
         self.client = Self::build_client(self.timeouts.connect, mode);
         self
+    }
+
+    fn preflight_context(&self, request_body: &str) -> anyhow::Result<()> {
+        let Some(budget) = self.context_budget else {
+            return Ok(());
+        };
+        let estimator = TokenEstimator::new();
+        let estimated_input_tokens = estimator.estimate_request(request_body);
+        if estimated_input_tokens <= budget.max_input_tokens {
+            tracing::info!(
+                target: "omninova_core::providers::context",
+                model = %self.model,
+                budget_source = %budget.source.as_str(),
+                context_window_tokens = %budget.context_window_tokens,
+                estimated_input_tokens = %estimated_input_tokens,
+                max_input_tokens = %budget.max_input_tokens,
+                output_reserve_tokens = %budget.output_reserve_tokens,
+                safety_reserve_tokens = %budget.safety_reserve_tokens,
+                result = "allow",
+                "context_preflight"
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "omninova_core::providers::context",
+            model = %self.model,
+            budget_source = %budget.source.as_str(),
+            context_window_tokens = %budget.context_window_tokens,
+            estimated_input_tokens = %estimated_input_tokens,
+            max_input_tokens = %budget.max_input_tokens,
+            output_reserve_tokens = %budget.output_reserve_tokens,
+            safety_reserve_tokens = %budget.safety_reserve_tokens,
+            result = "blocked",
+            "context_preflight"
+        );
+        Err(anyhow::anyhow!(
+            "ContextBudgetExceeded: estimated_input_tokens={estimated_input_tokens}, context_window_tokens={}, max_input_tokens={}, output_reserve_tokens={}, safety_reserve_tokens={}, model={}",
+            budget.context_window_tokens,
+            budget.max_input_tokens,
+            budget.output_reserve_tokens,
+            budget.safety_reserve_tokens,
+            self.model
+        ))
     }
 
     fn build_client(connect_timeout: Duration, mode: TransportMode) -> Client {
@@ -1332,6 +1384,10 @@ impl Provider for OpenAiProvider {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        self.context_budget
+    }
 }
 
 impl OpenAiProvider {
@@ -1439,6 +1495,17 @@ impl OpenAiProvider {
             stream: None,
         };
 
+        let request_body = serde_json::to_string(&native_request)
+            .map_err(|error| {
+                AttemptError::permanent(
+                    anyhow::anyhow!("序列化请求失败: {error}"),
+                    "request",
+                    "serialize_error",
+                )
+            })?;
+        self.preflight_context(&request_body)
+            .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
+
         let response = self
             .authorized_post(&client, "/chat/completions")
             .json(&native_request)
@@ -1497,6 +1564,17 @@ impl OpenAiProvider {
             tools,
             stream: Some(true),
         };
+
+        let request_body = serde_json::to_string(&native_request)
+            .map_err(|error| {
+                AttemptError::permanent(
+                    anyhow::anyhow!("序列化流式请求失败: {error}"),
+                    "request",
+                    "serialize_error",
+                )
+            })?;
+        self.preflight_context(&request_body)
+            .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
 
         let response = self
             .authorized_post(&client, "/chat/completions")
@@ -2959,5 +3037,63 @@ mod tests {
             attempts, 1,
             "semantic provider error must override HTTP retry"
         );
+    }
+#[test]
+    fn preflight_blocks_oversized_request_before_send() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "oversized-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_048_576,
+            Some(16_384),
+            crate::providers::context_budget::ContextBudgetSource::ExplicitConfig,
+        )));
+
+        let huge = "x".repeat(1_680_613);
+        let error = provider
+            .preflight_context(&huge)
+            .expect_err("oversized request must be blocked locally");
+        assert!(error.to_string().contains("ContextBudgetExceeded"));
+    }
+
+    #[test]
+    fn preflight_allows_under_budget_request() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "small-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_048_576,
+            Some(16_384),
+            crate::providers::context_budget::ContextBudgetSource::ExplicitConfig,
+        )));
+
+        provider
+            .preflight_context("hello")
+            .expect("small request must pass");
+    }
+
+    #[test]
+    fn unknown_budget_does_not_block() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "unknown-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        );
+        provider
+            .preflight_context(&"x".repeat(2_000_000))
+            .expect("unknown budget must not fabricate a hard limit");
     }
 }

@@ -1,4 +1,5 @@
 use crate::tools::ToolSpec;
+use crate::providers::context_budget::ContextBudget;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,11 @@ pub struct ChatMessage {
     /// OpenAI 兼容视觉输入：`data:image/...;base64,...` 或 https URL。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
+    /// When a tool result is pruned for the model-visible context, this holds
+    /// the full original tool output so durable session storage can preserve
+    /// it without sending it to the Provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tool_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -18,6 +24,7 @@ impl ChatMessage {
             role: "system".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -26,6 +33,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -39,6 +47,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             images,
+            original_tool_content: None,
         }
     }
 
@@ -47,6 +56,7 @@ impl ChatMessage {
             role: "assistant".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -55,6 +65,7 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -175,4 +186,9 @@ pub trait Provider: Send + Sync {
 
     /// Check if the provider is healthy
     async fn health_check(&self) -> bool;
+
+    /// Returns the authoritative context budget if one is known.
+    fn context_budget(&self) -> Option<ContextBudget> {
+        None
+    }
 }

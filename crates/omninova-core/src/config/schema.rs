@@ -295,6 +295,13 @@ pub struct ModelProviderConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+    /// Optional authoritative model context-window override.
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    /// Optional model max-output-token override. Also used as the output
+    /// reserve when known.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

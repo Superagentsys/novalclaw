@@ -1,16 +1,14 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::event_bus::EventBus;
-use crate::agent::history::{
-    apply_compaction, plan_compaction, render_for_summary, truncate_history_preserving_system,
-    SUMMARY_MARKER,
-};
+use crate::agent::context::maintain_context;
+use crate::agent::history::SUMMARY_MARKER;
 use crate::agent::planner::{self, Reflection};
 use crate::agent::prompt::bootstrap_system_messages;
 use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
-use crate::providers::{ChatMessage, ChatRequest, Provider};
+use crate::providers::{ChatMessage, Provider};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
@@ -114,13 +112,15 @@ impl Agent {
             self.run_plan_execute_reflect(message, &budget).await
         } else {
             let dispatcher = AgentDispatcher::new(
-                self.provider.as_ref(),
-                &self.tools,
-                &self.tool_specs,
-                self.config.max_tool_iterations,
-                &self.security,
-                &budget,
-            );
+                                 self.provider.as_ref(),
+                                 &self.tools,
+                                 &self.tool_specs,
+                                 self.config.max_tool_iterations,
+                                 &self.security,
+                                 &budget,
+                                 self.config.max_history_messages,
+                                 self.config.compact_context,
+                             );
             dispatcher.run(&mut self.messages).await
         }
     }
@@ -148,13 +148,15 @@ impl Agent {
 
         let budget = BudgetTracker::new(self.config.budget.clone());
         let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
-        );
+                             self.provider.as_ref(),
+                             &self.tools,
+                             &self.tool_specs,
+                             self.config.max_tool_iterations,
+                             &self.security,
+                             &budget,
+                             self.config.max_history_messages,
+                             self.config.compact_context,
+                         );
 
         let (reply, events) = dispatcher.run_with_events(&mut self.messages).await?;
 
@@ -218,13 +220,15 @@ impl Agent {
         bus.run_started(self.config.name.clone(), external_session_id, None);
 
         let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
-        )
+                             self.provider.as_ref(),
+                             &self.tools,
+                             &self.tool_specs,
+                             self.config.max_tool_iterations,
+                             &self.security,
+                             &budget,
+                             self.config.max_history_messages,
+                             self.config.compact_context,
+                         )
         .with_event_bus(Some(bus.clone()))
         .with_cancel_token(Some(cancel_token.clone()));
 
@@ -293,13 +297,15 @@ impl Agent {
 
         let budget = BudgetTracker::new(self.config.budget.clone());
         let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
-        );
+                             self.provider.as_ref(),
+                             &self.tools,
+                             &self.tool_specs,
+                             self.config.max_tool_iterations,
+                             &self.security,
+                             &budget,
+                             self.config.max_history_messages,
+                             self.config.compact_context,
+                         );
         dispatcher.run_streaming(&mut self.messages, events).await
     }
 
@@ -331,13 +337,15 @@ impl Agent {
                 // than failing the request.
                 warn!("planner failed, falling back to ReAct: {e}");
                 let dispatcher = AgentDispatcher::new(
-                    self.provider.as_ref(),
-                    &self.tools,
-                    &self.tool_specs,
-                    self.config.max_tool_iterations,
-                    &self.security,
-                    budget,
-                );
+                                     self.provider.as_ref(),
+                                     &self.tools,
+                                     &self.tool_specs,
+                                     self.config.max_tool_iterations,
+                                     &self.security,
+                                     budget,
+                                     self.config.max_history_messages,
+                                     self.config.compact_context,
+                                 );
                 return dispatcher.run(&mut self.messages).await;
             }
         };
@@ -361,13 +369,15 @@ impl Agent {
                     task
                 )));
                 let dispatcher = AgentDispatcher::new(
-                    self.provider.as_ref(),
-                    &self.tools,
-                    &self.tool_specs,
-                    self.config.max_tool_iterations,
-                    &self.security,
-                    budget,
-                );
+                                     self.provider.as_ref(),
+                                     &self.tools,
+                                     &self.tool_specs,
+                                     self.config.max_tool_iterations,
+                                     &self.security,
+                                     budget,
+                                     self.config.max_history_messages,
+                                     self.config.compact_context,
+                                 );
                 let step_result = dispatcher.run(&mut self.messages).await?;
                 executed.push((step.clone(), step_result));
 
@@ -427,13 +437,15 @@ impl Agent {
              final answer to the original task now. Original task: {task}"
         )));
         let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            budget,
-        );
+                             self.provider.as_ref(),
+                             &self.tools,
+                             &self.tool_specs,
+                             self.config.max_tool_iterations,
+                             &self.security,
+                             budget,
+                             self.config.max_history_messages,
+                             self.config.compact_context,
+                         );
         dispatcher.run(&mut self.messages).await
     }
 
@@ -469,35 +481,14 @@ impl Agent {
         if !self.config.compact_context {
             return;
         }
-        let max_history = self.config.max_history_messages;
-        let Some(plan) = plan_compaction(&self.messages, max_history) else {
-            return;
-        };
-
-        let request_messages = vec![
-            ChatMessage::system(SUMMARIZER_PROMPT),
-            ChatMessage::user(render_for_summary(&plan.summarize)),
-        ];
-        let summary = match self
-            .provider
-            .chat(ChatRequest {
-                messages: &request_messages,
-                tools: None,
-            })
-            .await
-        {
-            Ok(response) => response.text.unwrap_or_default(),
-            Err(error) => {
-                warn!("context compaction failed, truncating instead: {error}");
-                self.messages = truncate_history_preserving_system(
-                    std::mem::take(&mut self.messages),
-                    max_history,
-                );
-                return;
-            }
-        };
-
-        self.messages = apply_compaction(plan, &summary);
+        self.messages = maintain_context(
+            self.provider.as_ref(),
+            std::mem::take(&mut self.messages),
+            &self.tool_specs,
+            self.config.max_history_messages,
+            true,
+        )
+        .await;
     }
 
     pub fn export_non_system_messages(&self) -> Vec<ChatMessage> {
@@ -576,7 +567,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::providers::{ChatResponse, MockProvider, TokenUsage, ToolCall};
+    use crate::providers::{ChatRequest, ChatResponse, MockProvider, TokenUsage, ToolCall};
     use crate::tools::ToolResult;
     use async_trait::async_trait;
     use serde_json::json;

@@ -1,4 +1,5 @@
 use crate::config::{Config, ModelProviderConfig, ProviderConfig};
+use crate::providers::context_budget::resolve_context_budget;
 use crate::providers::{AnthropicProvider, GeminiProvider, MockProvider, OpenAiProvider, Provider};
 
 #[derive(Debug, Clone, Default)]
@@ -89,6 +90,7 @@ pub fn build_provider_with_selection(
     let temp = config.default_temperature;
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
     let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
+    let context_budget = resolve_context_budget(config, &model, profile);
 
     let dispatch = resolve_dispatch_kind(&provider_name, &kind, base_url.is_some());
     match dispatch.as_str() {
@@ -101,7 +103,8 @@ pub fn build_provider_with_selection(
                 None,
                 timeouts,
             )
-            .with_transport_mode(transport_mode),
+            .with_transport_mode(transport_mode)
+            .with_context_budget(context_budget),
         ),
         "gemini" => Box::new(
             GeminiProvider::new(
@@ -112,7 +115,8 @@ pub fn build_provider_with_selection(
                 None,
                 timeouts,
             )
-            .with_transport_mode(transport_mode),
+            .with_transport_mode(transport_mode)
+            .with_context_budget(context_budget),
         ),
         "mock" => Box::new(MockProvider::new("mock-provider")),
         "openai-compat" => {
@@ -129,7 +133,8 @@ pub fn build_provider_with_selection(
                     None,
                     timeouts,
                 )
-                .with_transport_mode(transport_mode),
+                .with_transport_mode(transport_mode)
+                    .with_context_budget(context_budget),
             )
         }
         _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(
@@ -141,7 +146,8 @@ pub fn build_provider_with_selection(
                 None,
                 timeouts,
             )
-            .with_transport_mode(transport_mode),
+            .with_transport_mode(transport_mode)
+            .with_context_budget(context_budget),
         ),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
     }

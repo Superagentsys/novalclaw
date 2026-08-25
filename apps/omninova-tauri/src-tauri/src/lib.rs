@@ -3423,6 +3423,14 @@ fn setup_config_to_core(
                     enabled: provider.enabled,
                     timeout_secs: None,
                     transport: provider.transport,
+                    context_window_tokens: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.context_window_tokens),
+                    max_output_tokens: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.max_output_tokens),
                 },
             )
         })

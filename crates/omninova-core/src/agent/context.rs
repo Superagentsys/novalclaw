@@ -1,0 +1,381 @@
+use crate::agent::history::{
+    apply_compaction, build_structured_checkpoint, normalize_transient_system_messages,
+    plan_compaction, plan_compaction_with_tail_tokens, prune_oversized_tool_results,
+    render_for_summary, truncate_history_preserving_system, SUMMARY_MARKER,
+};
+use crate::providers::context_budget::{
+    TokenEstimator, MAX_MAINTENANCE_PASSES, MAX_SUMMARY_SOURCE_CHARS,
+};
+use crate::providers::{ChatMessage, ChatRequest, Provider};
+use crate::tools::ToolSpec;
+
+const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对话浓缩成要点，必须保留：\
+用户的目标与偏好、已确认的事实与决定、未完成的任务与下一步、关键文件路径与命令、阻塞原因。\
+省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
+不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
+
+/// One authoritative context-maintenance path used by both turn-boundary
+/// compaction and mid-turn Provider-request preparation.
+///
+/// Flow:
+///   1. normalize transient system/skill/knowledge messages
+///   2. measure
+///   3. if pressure: prune oversized historical tool results
+///   4. remeasure
+///   5. if still above target and compaction is enabled: bounded structured
+///      compaction with a checkpoint + recent-tail preservation
+///   6. return the model-visible context (C1 preflight still runs afterwards
+///      inside the Provider)
+pub async fn maintain_context(
+    provider: &dyn Provider,
+    messages: Vec<ChatMessage>,
+    tool_specs: &[ToolSpec],
+    max_history_messages: usize,
+    compact_context: bool,
+) -> Vec<ChatMessage> {
+    let Some(budget) = provider.context_budget() else {
+        if !compact_context {
+            return messages;
+        }
+        // Unknown budget: keep the legacy count-based fallback.
+        let max_history = max_history_messages.max(1);
+        let Some(plan) = plan_compaction(&messages, max_history) else {
+            return messages;
+        };
+        let request_messages = vec![
+            ChatMessage::system(SUMMARIZER_PROMPT),
+            ChatMessage::user(render_for_summary(&plan.summarize)),
+        ];
+        let summary = match provider
+            .chat(ChatRequest {
+                messages: &request_messages,
+                tools: None,
+            })
+            .await
+        {
+            Ok(response) => response.text.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!("context compaction failed, truncating instead: {error}");
+                return truncate_history_preserving_system(messages, max_history);
+            }
+        };
+        return apply_compaction(plan, &summary);
+    };
+
+    let estimator = TokenEstimator::new();
+    let messages = normalize_transient_system_messages(messages);
+    let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
+    let pressure_threshold = budget.pressure_threshold();
+    if before <= pressure_threshold {
+        return messages;
+    }
+
+    tracing::info!(
+        target: "omninova_core::context",
+        estimated_before = %before,
+        pressure_threshold = %pressure_threshold,
+        max_input = %budget.max_input_tokens,
+        "context_pressure_detected"
+    );
+
+    // 1. Prune oversized historical tool results. Recent tail is preserved so
+    // the current tool turn remains usable.
+    let max_tool_result_tokens = budget.max_input_tokens.saturating_div(20).max(1);
+    let recent_tail_tokens = budget.recent_tail_budget();
+    let (mut current, pruned_count) =
+        prune_oversized_tool_results(messages, max_tool_result_tokens, recent_tail_tokens);
+    let after_tool_prune = estimator.estimate_messages_with_tools(&current, tool_specs);
+    if pruned_count > 0 {
+        tracing::info!(
+            target: "omninova_core::context",
+            tool_results_pruned = %pruned_count,
+            estimated_before = %before,
+            estimated_after = %after_tool_prune,
+            "tool_results_pruned"
+        );
+    }
+
+    if !compact_context {
+        return current;
+    }
+
+    // 2. If still above target, run bounded structured compaction.
+    if after_tool_prune > budget.target_after_compaction() {
+        let mut last_estimate = after_tool_prune;
+        for _pass in 0..MAX_MAINTENANCE_PASSES {
+            let max_history = max_history_messages.max(1);
+            let Some(plan) = plan_compaction_with_tail_tokens(
+                &current,
+                max_history,
+                Some(budget.recent_tail_budget()),
+            ) else {
+                break;
+            };
+            if plan.summarize.is_empty() {
+                break;
+            }
+            let render = render_for_summary(&plan.summarize);
+            let bounded_render: String = if render.chars().count() > MAX_SUMMARY_SOURCE_CHARS {
+                render.chars().take(MAX_SUMMARY_SOURCE_CHARS).collect()
+            } else {
+                render
+            };
+            let request_messages = vec![
+                ChatMessage::system(SUMMARIZER_PROMPT),
+                ChatMessage::user(bounded_render),
+            ];
+            let summary = match provider
+                .chat(ChatRequest {
+                    messages: &request_messages,
+                    tools: None,
+                })
+                .await
+            {
+                Ok(response) => response.text.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!("context compaction failed: {error}");
+                    break;
+                }
+            };
+            if summary.trim().is_empty() {
+                break;
+            }
+            let checkpoint = build_structured_checkpoint(&current, &summary);
+            let compacted = apply_compaction(plan, &summary)
+                .into_iter()
+                .map(|message| {
+                    if message.role == "system" && message.content.starts_with(SUMMARY_MARKER) {
+                        checkpoint.clone()
+                    } else {
+                        message
+                    }
+                })
+                .collect::<Vec<_>>();
+            let after_compact = estimator.estimate_messages_with_tools(&compacted, tool_specs);
+            if after_compact >= last_estimate {
+                tracing::warn!(
+                    target: "omninova_core::context",
+                    before = %last_estimate,
+                    after = %after_compact,
+                    "context_compaction_failed: non-shrinking"
+                );
+                break;
+            }
+            current = compacted;
+            last_estimate = after_compact;
+            tracing::info!(
+                target: "omninova_core::context",
+                estimated_before = %before,
+                estimated_after = %after_compact,
+                max_input = %budget.max_input_tokens,
+                "context_compaction_completed"
+            );
+            if after_compact <= budget.target_after_compaction() {
+                break;
+            }
+        }
+    }
+
+    current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::providers::context_budget::{ContextBudget, ContextBudgetSource};
+    use crate::providers::{ChatMessage, ChatResponse, TokenUsage};
+    use crate::security::SecurityContext;
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct BudgetProvider {
+        budget: ContextBudget,
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        compact_summaries: Arc<Mutex<Vec<String>>>,
+        tool_round: AtomicUsize,
+    }
+
+    impl BudgetProvider {
+        fn new(context_window: u64) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>, Arc<Mutex<Vec<String>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let compact_summaries = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    budget: ContextBudget::new(context_window, Some(16_384), ContextBudgetSource::BuiltIn),
+                    requests: requests.clone(),
+                    compact_summaries: compact_summaries.clone(),
+                    tool_round: AtomicUsize::new(0),
+                },
+                requests,
+                compact_summaries,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for BudgetProvider {
+        fn name(&self) -> &str {
+            "budget"
+        }
+
+        fn context_budget(&self) -> Option<ContextBudget> {
+            Some(self.budget)
+        }
+
+        async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request.messages.to_vec());
+            let is_summarizer = request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("你是对话摘要器"));
+            if is_summarizer {
+                self.compact_summaries.lock().unwrap().push("summarized context".to_string());
+                return Ok(ChatResponse {
+                    text: Some("summarized context".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    finish_reason: Some("stop".to_string()),
+                });
+            }
+            let round = self.tool_round.fetch_add(1, Ordering::SeqCst);
+            if round == 0 {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "big_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: Some(TokenUsage {
+                        input_tokens: Some(100),
+                        output_tokens: Some(10),
+                    }),
+                    reasoning_content: None,
+                    finish_reason: Some("tool_calls".to_string()),
+                });
+            }
+            Ok(ChatResponse {
+                text: Some("final answer".to_string()),
+                tool_calls: vec![],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                }),
+                reasoning_content: None,
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct BigTool;
+
+    #[async_trait]
+    impl Tool for BigTool {
+        fn name(&self) -> &str {
+            "big_tool"
+        }
+
+        fn description(&self) -> &str {
+            "big tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "T".repeat(120_000),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn long_run_mid_turn_compaction_preserves_continuity_and_stays_under_budget() {
+        let (provider, requests, summaries) = BudgetProvider::new(200_000);
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
+        let security = SecurityContext::from_config(&Config::default());
+        let mut config = crate::config::AgentConfig::default();
+        config.compact_context = true;
+        config.max_history_messages = 10;
+        config.system_prompt = Some("Primary goal: complete long task. Constraint: don't stop. Branch: feature/testnew-context-security-hardening".to_string());
+
+        let mut agent = crate::agent::Agent::new(
+            Box::new(provider),
+            vec![Box::new(BigTool)],
+            memory,
+            config,
+            security,
+        );
+        let (reply, _events) = agent
+            .process_message_with_events_streaming(
+                "Run the long task and keep all task state visible.",
+                Box::new(|_| {}),
+                Some("run-long".to_string()),
+                Some("session-long".to_string()),
+                crate::agent::AgentCancellationToken::new(),
+            )
+            .await
+            .expect("long run completes");
+        assert_eq!(reply, "final answer");
+
+        let captured = requests.lock().unwrap();
+        assert!(captured.len() >= 2, "expected at least two model calls");
+        let final_request = captured.last().unwrap();
+        let estimator = TokenEstimator::new();
+        let final_estimate = estimator.estimate_messages_with_tools(final_request, &[]);
+        let budget = ContextBudget::new(200_000, Some(16_384), ContextBudgetSource::BuiltIn);
+        assert!(
+            final_estimate <= budget.max_input_tokens,
+            "final request must stay under C1 budget"
+        );
+        let all_text: String = final_request
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("Primary goal"));
+        assert!(all_text.contains("feature/testnew-context-security-hardening"));
+        assert!(all_text.contains("summarized context") || all_text.contains("[检查点]"));
+        assert!(summaries.lock().unwrap().len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn maintain_context_prunes_before_structured_compaction() {
+        let (provider, _, summaries) = BudgetProvider::new(200_000);
+        let huge = "x".repeat(120_000);
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::user("goal"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"old","name":"big_tool","arguments":"{}"}]}"#),
+            ChatMessage::tool(format!(r#"{{"tool_call_id":"old","content":"{huge}"}}"#)),
+            ChatMessage::assistant("continue"),
+        ];
+        let out = maintain_context(
+            &provider,
+            messages,
+            &[],
+            10,
+            true,
+        ).await;
+        let pruned = out.iter().any(|m| m.content.contains("[Tool output pruned from model context]"));
+        let has_checkpoint = out.iter().any(|m| m.content.starts_with("[检查点]"));
+        assert!(pruned, "large tool output should be pruned");
+        if !has_checkpoint {
+            assert!(summaries.lock().unwrap().is_empty(), "summarizer ran but no checkpoint was inserted");
+        } else {
+            assert!(summaries.lock().unwrap().len() >= 1);
+        }
+    }
+}

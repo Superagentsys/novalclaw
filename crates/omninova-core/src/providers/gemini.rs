@@ -1,3 +1,4 @@
+use crate::providers::context_budget::ContextBudget;
 use crate::providers::{ChatRequest, ChatResponse, OpenAiProvider, Provider, ProviderTimeouts};
 use async_trait::async_trait;
 
@@ -25,6 +26,11 @@ impl GeminiProvider {
         self.inner = self.inner.with_transport_mode(mode);
         self
     }
+
+    pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
+        self.inner = self.inner.with_context_budget(budget);
+        self
+    }
 }
 
 #[async_trait]
@@ -39,5 +45,9 @@ impl Provider for GeminiProvider {
 
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
+    }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        self.inner.context_budget()
     }
 }

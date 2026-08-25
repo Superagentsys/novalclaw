@@ -106,6 +106,14 @@ pub struct CompactionPlan {
 /// Returns `None` when history still fits, or when there is nothing worth
 /// summarizing (which prevents a pointless LLM call).
 pub fn plan_compaction(messages: &[ChatMessage], max_history: usize) -> Option<CompactionPlan> {
+    plan_compaction_with_tail_tokens(messages, max_history, None)
+}
+
+pub fn plan_compaction_with_tail_tokens(
+    messages: &[ChatMessage],
+    max_history: usize,
+    recent_tail_tokens: Option<u64>,
+) -> Option<CompactionPlan> {
     if max_history == 0 || messages.len() <= max_history {
         return None;
     }
@@ -114,11 +122,33 @@ pub fn plan_compaction(messages: &[ChatMessage], max_history: usize) -> Option<C
         .iter()
         .take_while(|message| message.role == "system" && !is_summary(message))
         .count();
-    let keep_recent = (max_history / RECENT_KEEP_RATIO).max(1);
 
-    // Everything between the bootstrap prompt and the recent window is
-    // condensed; a previous summary sits in that range and gets folded in.
-    let tail_start = messages.len().saturating_sub(keep_recent).max(head_len);
+    let mut tail_start = if let Some(budget) = recent_tail_tokens {
+        let estimator = crate::providers::context_budget::TokenEstimator::new();
+        let mut consumed = 0u64;
+        let mut index = messages.len();
+        while index > head_len {
+            let idx = index - 1;
+            let tokens = estimator.estimate_text(&messages[idx].content);
+            if consumed.saturating_add(tokens) > budget {
+                break;
+            }
+            consumed = consumed.saturating_add(tokens);
+            index -= 1;
+        }
+        index
+    } else {
+        let keep_recent = (max_history / RECENT_KEEP_RATIO).max(1);
+        messages.len().saturating_sub(keep_recent).max(head_len)
+    };
+
+    // Never split an assistant tool_call from its tool results.
+    while tail_start > head_len
+        && tail_start < messages.len()
+        && messages[tail_start].role == "tool"
+    {
+        tail_start -= 1;
+    }
     if tail_start <= head_len {
         return None;
     }
@@ -209,6 +239,135 @@ pub fn truncate_history_preserving_system(
     let start = rest.len().saturating_sub(tail_budget);
     protected.extend(rest.drain(start..));
     protected
+}
+
+/// Keeps the first bootstrap system message and protected markers, drops
+/// transient runtime system/skill/knowledge messages that are re-injected
+/// fresh on every request.
+pub fn normalize_transient_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut first_system = true;
+    messages
+        .into_iter()
+        .filter(|message| {
+            if message.role != "system" {
+                return true;
+            }
+            if is_summary(message) || is_pinned_system(message) {
+                return true;
+            }
+            if first_system {
+                first_system = false;
+                return true;
+            }
+            false
+        })
+        .collect()
+}
+
+/// Replaces oversized historical tool results with a bounded pruning marker.
+/// Recent messages within `recent_tail_tokens` are left untouched so the Agent
+/// can continue the current operation.
+pub fn prune_oversized_tool_results(
+    messages: Vec<ChatMessage>,
+    max_tool_result_tokens: u64,
+    recent_tail_tokens: u64,
+) -> (Vec<ChatMessage>, usize) {
+    use crate::providers::context_budget::TokenEstimator;
+
+    let estimator = TokenEstimator::new();
+    let mut protected_from_end = 0usize;
+    let mut consumed = 0u64;
+    for message in messages.iter().rev() {
+        let tokens = estimator.estimate_text(&message.content);
+        if consumed.saturating_add(tokens) > recent_tail_tokens {
+            break;
+        }
+        consumed = consumed.saturating_add(tokens);
+        protected_from_end += 1;
+    }
+
+    let prune_start = messages.len().saturating_sub(protected_from_end);
+    let mut pruned = 0usize;
+    let mut out = Vec::with_capacity(messages.len());
+    for (index, mut message) in messages.into_iter().enumerate() {
+        if index >= prune_start || message.role != "tool" {
+            out.push(message);
+            continue;
+        }
+        let tokens = estimator.estimate_text(&message.content);
+        if tokens <= max_tool_result_tokens {
+            out.push(message);
+            continue;
+        }
+        if let Some(pruned_content) = prune_tool_content(&message.content) {
+            if message.original_tool_content.is_none() {
+                if let Some(original) = extract_tool_content(&message.content) {
+                    message.original_tool_content = Some(original);
+                }
+            }
+            message.content = pruned_content;
+            pruned += 1;
+        }
+        out.push(message);
+    }
+    (out, pruned)
+}
+
+fn extract_tool_content(content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    value
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn prune_tool_content(content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let original = value.get("content").and_then(|v| v.as_str())?;
+    let head: String = original.chars().take(600).collect();
+    let tail_start = original.len().saturating_sub(600);
+    let tail: String = original.chars().skip(tail_start).take(600).collect();
+    let marker = format!(
+        "[Tool output pruned from model context]\noriginal_size={}\nretained_head={}\nretained_tail={}\n\n{head}\n\n... omitted ...\n\n{tail}",
+        original.chars().count(),
+        head.chars().count(),
+        tail.chars().count(),
+    );
+    let mut pruned = value;
+    pruned["content"] = serde_json::Value::String(marker);
+    Some(serde_json::to_string(&pruned).ok()?)
+}
+
+/// Builds a structured checkpoint system message from available task pins and
+/// a compact summary. This is intentionally deterministic: it preserves what
+/// source history provides and does not invent missing fields.
+pub fn build_structured_checkpoint(messages: &[ChatMessage], summary: &str) -> ChatMessage {
+    let mut task_lines = Vec::new();
+    let mut checkpoint_lines = Vec::new();
+    for message in messages {
+        if message.content.starts_with(TASK_MARKER) {
+            task_lines.push(message.content.trim_start_matches(TASK_MARKER).trim().to_string());
+        } else if message.content.starts_with(CHECKPOINT_MARKER) {
+            checkpoint_lines.push(
+                message
+                    .content
+                    .trim_start_matches(CHECKPOINT_MARKER)
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+
+    let body = format!(
+        "## Primary Goal\n{}\n\n## Current Task State\n{}\n\n## Important Facts\n{}",
+        task_lines.join("\n"),
+        checkpoint_lines
+            .last()
+            .cloned()
+            .unwrap_or_else(|| summary.to_string()),
+        task_lines.join("\n"),
+    );
+    ChatMessage::system(format!("{CHECKPOINT_MARKER} structured checkpoint\n{body}"))
 }
 
 #[cfg(test)]
@@ -365,4 +524,81 @@ mod tests {
             .iter()
             .any(|message| is_pinned_system(message)));
     }
+    #[test]
+    fn normalize_keeps_first_system_and_markers_drops_transient() {
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::system("skill runtime instructions"),
+            ChatMessage::system(format!("{SUMMARY_MARKER} old summary")),
+            ChatMessage::system(format!("{TASK_MARKER} goal")),
+            ChatMessage::user("hi"),
+        ];
+        let out = normalize_transient_system_messages(messages);
+        let system_count = out.iter().filter(|m| m.role == "system").count();
+        assert_eq!(system_count, 3);
+        assert!(out.iter().any(|m| m.content.starts_with(SUMMARY_MARKER)));
+        assert!(out.iter().any(|m| m.content.starts_with(TASK_MARKER)));
+        assert!(!out.iter().any(|m| m.content.contains("skill runtime")));
+    }
+
+    #[test]
+    fn prune_prunes_old_large_tool_result_and_keeps_recent() {
+        use crate::providers::context_budget::TokenEstimator;
+        let estimator = TokenEstimator::new();
+        let huge = "x".repeat(200_000);
+        let old_tool = ChatMessage::tool(format!("{{\"tool_call_id\":\"call-old\",\"content\":\"{huge}\"}}"));
+        let recent_tool = ChatMessage::tool("{\"tool_call_id\":\"call-new\",\"content\":\"small\"}");
+        let messages = vec![
+            ChatMessage::assistant("{\"tool_calls\":[]}"),
+            old_tool,
+            ChatMessage::assistant("{\"tool_calls\":[]}"),
+            recent_tool,
+        ];
+        let (out, pruned) = prune_oversized_tool_results(messages, 1_000, 10_000);
+        assert_eq!(pruned, 1);
+        assert!(out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
+        assert!(out.iter().any(|m| m.content.contains("call-new")));
+        let after = estimator.estimate_messages_with_tools(&out, &[]);
+        let before = estimator.estimate_messages_with_tools(&out, &[]);
+        assert!(after <= before + 8);
+    }
+
+    #[test]
+    fn structured_checkpoint_preserves_task_and_checkpoint() {
+        let messages = vec![
+            ChatMessage::system(format!("{TASK_MARKER} keep goal")),
+            ChatMessage::system(format!("{CHECKPOINT_MARKER} keep state")),
+            ChatMessage::user("hello"),
+        ];
+        let checkpoint = build_structured_checkpoint(&messages, "fallback summary");
+        let body = checkpoint.content;
+        assert!(body.contains("Primary Goal"));
+        assert!(body.contains("keep goal"));
+        assert!(body.contains("keep state"));
+        assert!(body.starts_with(CHECKPOINT_MARKER));
+    }
+
+    #[test]
+    fn pruning_captures_original_tool_content_for_durable_recovery() {
+        let huge = "x".repeat(20_000);
+        let tool = ChatMessage::tool(format!(r#"{{"tool_call_id":"call-1","content":"{huge}"}}"#));
+        let messages = vec![
+            ChatMessage::assistant(r#"{"tool_calls":[]}"#),
+            tool,
+            ChatMessage::assistant("done"),
+        ];
+        let (pruned_messages, pruned) = prune_oversized_tool_results(messages, 100, 10_000);
+        assert_eq!(pruned, 1);
+        let pruned_tool = pruned_messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool remains");
+        assert!(pruned_tool.content.contains("[Tool output pruned from model context]"));
+        let original = pruned_tool
+            .original_tool_content
+            .as_deref()
+            .expect("original output captured");
+        assert_eq!(original, huge);
+    }
+
 }
