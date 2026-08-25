@@ -5,6 +5,8 @@ use serde_json::json;
 use std::path::PathBuf;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_LINE_LIMIT: usize = 400;
+const MAX_LINE_LIMIT: usize = 2_000;
 
 pub struct FileReadTool {
     workspace_dir: PathBuf,
@@ -33,8 +35,8 @@ impl Tool for FileReadTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative file path. Use \"index.html\", not D:\\\\workspace\\\\index.html." },
-                "offset": { "type": "integer" },
-                "limit": { "type": "integer" }
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based first line (default: 1)" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return (default: 400, maximum: 2000)" }
             },
             "required": ["path"]
         })
@@ -102,17 +104,21 @@ impl Tool for FileReadTool {
         let offset = args
             .get("offset")
             .and_then(|v| v.as_u64())
-            .map(|v| usize::try_from(v.max(1)).unwrap_or(usize::MAX).saturating_sub(1))
+            .map(|v| {
+                usize::try_from(v.max(1))
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(1)
+            })
             .unwrap_or(0);
         let start = offset.min(total);
 
-        let end = match args.get("limit").and_then(|v| v.as_u64()) {
-            Some(l) => {
-                let limit = usize::try_from(l).unwrap_or(usize::MAX);
-                (start.saturating_add(limit)).min(total)
-            }
-            None => total,
-        };
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(DEFAULT_LINE_LIMIT)
+            .clamp(1, MAX_LINE_LIMIT);
+        let end = start.saturating_add(limit).min(total);
 
         if start >= end {
             return Ok(ToolResult {
@@ -129,7 +135,14 @@ impl Tool for FileReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let summary = if start > 0 || end < total {
+        let summary = if end < total {
+            format!(
+                "\n[Lines {}-{} of {total}; continue with offset={} and limit={limit}]",
+                start + 1,
+                end,
+                end + 1
+            )
+        } else if start > 0 {
             format!("\n[Lines {}-{} of {total}]", start + 1, end)
         } else {
             format!("\n[{total} lines total]")
@@ -140,5 +153,32 @@ impl Tool for FileReadTool {
             output: format!("{numbered}{summary}"),
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_read_is_bounded_and_returns_continuation_offset() {
+        let root =
+            std::env::temp_dir().join(format!("omninova-file-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let body = (1..=450)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("large.txt"), body).unwrap();
+
+        let result = FileReadTool::new(&root)
+            .execute(json!({"path": "large.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("400: line 400"));
+        assert!(!result.output.contains("401: line 401"));
+        assert!(result.output.contains("continue with offset=401"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

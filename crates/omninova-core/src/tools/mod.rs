@@ -21,6 +21,7 @@ pub mod traits;
 pub mod use_skill;
 pub mod web_fetch;
 pub mod web_search;
+mod workspace_walk;
 
 pub use browser::BrowserTool;
 pub use content_search::ContentSearchTool;

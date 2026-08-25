@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::agent::AgentCancellationToken;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Result of a tool execution
@@ -8,6 +8,24 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+}
+
+impl ToolResult {
+    pub fn success(output: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+        }
+    }
+
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// Description of a tool for the LLM

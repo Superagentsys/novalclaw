@@ -3150,6 +3150,7 @@ dependencies = [
  "prometheus",
  "qrcode",
  "ratatui",
+ "regex",
  "reqwest 0.12.0",
  "rusqlite",
  "rustls 0.23.43",
@@ -3174,6 +3175,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "walkdir",
  "zip",
 ]
 
