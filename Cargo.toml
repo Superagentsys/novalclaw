@@ -32,7 +32,7 @@ toml_edit = "=0.22.8"
 directories = "6.0"
 urlencoding = "2.1"
 base64 = "0.22"
-image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png"] }
+image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "ico", "tiff"] }
 prometheus = "0.14"
 time = "=0.3.36"
 time-core = "=0.1.2"

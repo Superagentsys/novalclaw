@@ -112,6 +112,70 @@
   border-bottom: 1px solid var(--ui-border);
 }
 
+.task-image-gallery {
+  display: grid;
+  gap: 9px;
+  padding: 12px 0 2px;
+}
+
+.task-image-gallery > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-image-gallery > header > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.task-image-gallery > header > button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ui-accent-strong);
+  font-size: 10px;
+}
+
+.task-image-gallery > div {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+
+.task-image-gallery-item {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 6px;
+  overflow: hidden;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-surface-1);
+  color: var(--ui-text-secondary);
+  text-align: left;
+  transition: border-color var(--transition-fast), transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.task-image-gallery-item:hover {
+  border-color: var(--ui-accent);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+
+.task-image-gallery-item > span:last-child {
+  overflow: hidden;
+  padding: 0 2px;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .task-artifact-kicker {
   display: block;
   margin-bottom: 4px;
@@ -222,6 +286,15 @@
 
 .task-artifact-thumbnail.has-image { background: var(--ui-code-bg); }
 .task-artifact-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
+
+.task-artifact-thumbnail.is-large {
+  width: 100%;
+  height: 82px;
+  border-radius: 6px;
+  background: var(--ui-code-bg);
+}
+
+.task-artifact-thumbnail.is-large img { object-fit: contain; }
 
 .task-artifact-files li span {
   overflow: hidden;
@@ -739,6 +812,21 @@
 .task-inspector-artifact-grid > button.is-selected {
   border-color: var(--ui-accent);
   background: var(--ui-accent-soft);
+}
+
+.task-inspector-artifact-grid > button.is-image {
+  grid-template-columns: 68px minmax(0, 1fr);
+  min-height: 62px;
+}
+
+.task-inspector-artifact-grid > button.is-image .task-artifact-thumbnail {
+  width: 62px;
+  height: 48px;
+  background: var(--ui-code-bg);
+}
+
+.task-inspector-artifact-grid > button.is-image .task-artifact-thumbnail img {
+  object-fit: contain;
 }
 
 .task-inspector-artifact-grid .task-artifact-thumbnail { grid-row: 1 / 3; }
