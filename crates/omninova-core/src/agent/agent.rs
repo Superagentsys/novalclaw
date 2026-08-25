@@ -41,9 +41,10 @@ fn truncate_chars_with_ellipsis(input: &str, max_chars: usize) -> String {
 /// Cap on per-step result text quoted back into reflector prompts.
 const REFLECT_RESULT_SNIPPET_CHARS: usize = 2_000;
 
-const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对话浓缩成简洁要点，必须保留：\
-用户的目标与偏好、已确认的事实与决定、未完成的任务、关键文件路径与命令。\
-省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 300 字。";
+const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对话浓缩成要点，必须保留：\
+用户的目标与偏好、已确认的事实与决定、未完成的任务与下一步、关键文件路径与命令、阻塞原因。\
+省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
+不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
 
 pub struct Agent {
     provider: Box<dyn Provider>,

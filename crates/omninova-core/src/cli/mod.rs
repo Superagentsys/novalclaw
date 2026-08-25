@@ -1119,6 +1119,7 @@ async fn run_cron(cmd: &CronCommands, config: &Config) -> Result<String> {
                 next_run: parsed.next_run_iso(0),
                 last_error: None,
                 created_at: now_timestamp(),
+                task_id: None,
             };
             store.upsert(job.clone()).await?;
             Ok(serde_json::to_string_pretty(&job)?)

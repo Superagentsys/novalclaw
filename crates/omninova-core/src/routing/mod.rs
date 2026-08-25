@@ -52,6 +52,12 @@ fn apply_preferred_model_overrides(inbound: &InboundMessage, route: &mut RouteDe
     }
 }
 
+/// Route for a known agent name, for entry points that have no inbound message
+/// to match bindings against (one-shot `chat`, interactive terminal).
+pub fn route_for_agent(config: &Config, agent_name: &str) -> RouteDecision {
+    build_route_decision(config, agent_name)
+}
+
 fn build_route_decision(config: &Config, agent_name: &str) -> RouteDecision {
     let fallback_provider = config
         .agent_defaults_extended
@@ -204,7 +210,7 @@ fn metadata_str<'a>(inbound: &'a InboundMessage, keys: &[&str]) -> Option<&'a st
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_agent_route;
+    use super::{resolve_agent_route, route_for_agent};
     use crate::channels::{ChannelKind, InboundMessage};
     use crate::config::schema::{
         AgentDefaultsExtendedConfig, AgentModelConfig, BindingEntry, BindingMatchConfig, Config,
@@ -212,6 +218,33 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// Entry points without an inbound message (one-shot `chat`, terminal UI)
+    /// must land on the same provider/model as the inbound pipeline, otherwise
+    /// a per-agent model silently applies on one path and not the other.
+    #[test]
+    fn route_for_agent_honours_per_agent_provider_and_model() {
+        let mut config = Config::default();
+        config.default_provider = Some("global-provider".into());
+        config.default_model = Some("global-model".into());
+        config.agents.insert(
+            "alpha".into(),
+            DelegateAgentConfig {
+                provider: Some("p-alpha".into()),
+                model: Some("m-alpha".into()),
+                ..DelegateAgentConfig::default()
+            },
+        );
+
+        let route = route_for_agent(&config, "alpha");
+        assert_eq!(route.agent_name, "alpha");
+        assert_eq!(route.provider.as_deref(), Some("p-alpha"));
+        assert_eq!(route.model.as_deref(), Some("m-alpha"));
+
+        let fallback = route_for_agent(&config, "not-configured");
+        assert_eq!(fallback.provider.as_deref(), Some("global-provider"));
+        assert_eq!(fallback.model.as_deref(), Some("global-model"));
+    }
 
     #[test]
     fn explicit_agent_overrides_bindings() {

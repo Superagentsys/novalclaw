@@ -13,7 +13,10 @@ pub mod knowledge_search;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod pdf_read;
+pub mod registry;
 pub mod shell;
+pub mod task_checkpoint;
+pub mod todo_write;
 pub mod traits;
 pub mod use_skill;
 pub mod web_fetch;
@@ -34,7 +37,13 @@ pub use knowledge_search::KnowledgeSearchTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use pdf_read::PdfReadTool;
+pub use registry::{
+    build_tools, capabilities_for, capabilities_or_unknown, read_only_tool_names, ToolBuildContext,
+    ToolCapabilities, WriteScope,
+};
 pub use shell::ShellTool;
+pub use task_checkpoint::TaskCheckpointTool;
+pub use todo_write::TodoWriteTool;
 pub use use_skill::{SkillActivationGate, UseSkillTool};
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;

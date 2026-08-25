@@ -38,7 +38,9 @@ interface ArtifactPreview {
   textPreview?: string | null;
 }
 
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
+const IMAGE_EXTENSIONS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "svg",
+]);
 const TEXT_EXTENSIONS = new Set([
   "txt", "md", "markdown", "json", "jsonl", "yaml", "yml", "toml", "csv", "tsv",
   "log", "rs", "tsx", "ts", "jsx", "js", "css", "html", "xml", "py", "go", "java",
@@ -56,6 +58,10 @@ function artifactIcon(path: string): UiIconName {
   if (IMAGE_EXTENSIONS.has(extension)) return "fileImage";
   if (TEXT_EXTENSIONS.has(extension)) return "fileText";
   return "file";
+}
+
+function isImageArtifact(path: string): boolean {
+  return IMAGE_EXTENSIONS.has(extensionOf(path));
 }
 
 function artifactKindLabel(path: string): string {
@@ -100,10 +106,12 @@ function ArtifactThumbnail({
   file,
   workspacePath,
   eager = false,
+  large = false,
 }: {
   file: TaskChangedFile;
   workspacePath?: string;
   eager?: boolean;
+  large?: boolean;
 }) {
   const [thumbnail, setThumbnail] = useState<string | null>(null);
   const isImage = IMAGE_EXTENSIONS.has(extensionOf(file.path));
@@ -123,9 +131,57 @@ function ArtifactThumbnail({
   }, [eager, file.changeType, file.path, isImage, workspacePath]);
 
   return (
-    <span className={`task-artifact-thumbnail${thumbnail ? " has-image" : ""}`} aria-hidden>
+    <span className={`task-artifact-thumbnail${thumbnail ? " has-image" : ""}${large ? " is-large" : ""}`} aria-hidden>
       {thumbnail ? <img src={thumbnail} alt="" /> : <UiIcon name={artifactIcon(file.path)} size={16} />}
     </span>
+  );
+}
+
+function TaskImageGallery({
+  files,
+  workspacePath,
+  onOpenInspector,
+}: {
+  files: TaskChangedFile[];
+  workspacePath?: string;
+  onOpenInspector: (tab?: InspectorTab) => void;
+}) {
+  const images = files.filter((file) => file.changeType !== "deleted" && isImageArtifact(file.path));
+  if (!images.length) return null;
+
+  const openImage = async (file: TaskChangedFile) => {
+    try {
+      await invokeTauri("open_task_artifact", {
+        path: file.path,
+        workspacePath,
+        reveal: false,
+      });
+    } catch {
+      onOpenInspector("results");
+    }
+  };
+
+  return (
+    <section className="task-image-gallery" aria-label="生成图片">
+      <header>
+        <span><UiIcon name="fileImage" size={15} /> 生成图片</span>
+        <button type="button" onClick={() => onOpenInspector("results")}>查看全部 {images.length} 张</button>
+      </header>
+      <div>
+        {images.slice(0, 6).map((file) => (
+          <button
+            type="button"
+            key={file.path}
+            className="task-image-gallery-item"
+            onClick={() => void openImage(file)}
+            title={`${file.path}\n点击使用系统默认程序打开`}
+          >
+            <ArtifactThumbnail file={file} workspacePath={workspacePath} eager large />
+            <span>{file.path.split(/[\\/]/).pop()}</span>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -224,6 +280,8 @@ export function TaskDeliverable({
           <UiIcon name="menuUnfold" size={15} /> 打开任务检查器
         </button>
       </header>
+
+      <TaskImageGallery files={files} workspacePath={task.workspacePath} onOpenInspector={onOpenInspector} />
 
       <div className="task-artifact-grid">
         <article className="task-artifact-summary">
@@ -586,7 +644,7 @@ export function TaskInspector({
                 {files.map((file, index) => (
                   <li key={file.path} className={selectedArtifactPath === file.path ? "is-selected" : ""}>
                     <button type="button" onClick={() => setSelectedArtifactPath(file.path)} onContextMenu={(event) => showArtifactMenu(event, file)}>
-                      <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
+                      <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12 || isImageArtifact(file.path)} />
                       <span>
                         <strong title={file.path}>{file.path}</strong>
                         <small>{artifactMetadata(file)} · {changeTypeLabel(file.changeType)}</small>
@@ -628,12 +686,12 @@ export function TaskInspector({
                       <button
                         type="button"
                         key={file.path}
-                        className={selectedArtifactPath === file.path ? "is-selected" : ""}
+                        className={`${selectedArtifactPath === file.path ? "is-selected" : ""}${isImageArtifact(file.path) ? " is-image" : ""}`}
                         onClick={() => setSelectedArtifactPath(file.path)}
                         onContextMenu={(event) => showArtifactMenu(event, file)}
                         title={file.path}
                       >
-                        <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12} />
+                        <ArtifactThumbnail file={file} workspacePath={task?.workspacePath} eager={index < 12 || isImageArtifact(file.path)} />
                         <span>{file.path.split(/[\\/]/).pop()}</span>
                         <small>{artifactMetadata(file)}</small>
                       </button>

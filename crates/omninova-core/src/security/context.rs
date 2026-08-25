@@ -163,6 +163,27 @@ impl SecurityContext {
         &self.audit
     }
 
+    pub fn inbound_task_id(&self) -> Option<String> {
+        self.inbound_metadata
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    pub fn should_defer_approval(&self) -> bool {
+        match self.config.approvals.wait_mode.as_deref() {
+            Some("deferred") => true,
+            Some("blocking") => false,
+            _ => {
+                let channel = self.audit.context().channel.to_ascii_lowercase();
+                channel.contains("feishu")
+                    || channel.contains("lark")
+                    || channel.contains("wecom")
+                    || channel.contains("dingtalk")
+            }
+        }
+    }
+
     /// Check if chat-only mode is enabled for this inbound (e.g., Feishu without slash commands)
     pub fn is_chat_only(&self) -> bool {
         self.inbound_metadata

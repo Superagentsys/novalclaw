@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -538,6 +539,7 @@ async fn upsert_job(runtime: &GatewayRuntime, input: Value) -> Result<Value, Str
             .map(|job| job.created_at.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(now_timestamp),
+        task_id: existing.as_ref().and_then(|job| job.task_id.clone()),
     };
     store.upsert(job.clone()).await.map_err(|e| e.to_string())?;
     serde_json::to_value(job).map_err(|e| e.to_string())
@@ -564,7 +566,41 @@ async fn skills_summary(runtime: &GatewayRuntime) -> Result<Value, String> {
     }))
 }
 
+fn is_preview_image_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "svg"
+    )
+}
+
+fn safe_svg_preview_data_url(bytes: &[u8]) -> Result<String, String> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| "SVG is not valid UTF-8 and cannot be previewed safely".to_string())?;
+    let normalized = source.to_ascii_lowercase();
+    let unsafe_markers = [
+        "<script",
+        "javascript:",
+        "<foreignobject",
+        " onload=",
+        " onclick=",
+        " onerror=",
+        "@import",
+        "url(http",
+        "href=\"http",
+        "href='http",
+    ];
+    if unsafe_markers.iter().any(|marker| normalized.contains(marker)) {
+        return Err("SVG contains active or external content; inline preview was blocked".to_string());
+    }
+    Ok(format!(
+        "data:image/svg+xml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 async fn preview_artifact(runtime: &GatewayRuntime, args: &Value) -> Result<Value, String> {
+    const MAX_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+    const MAX_SVG_BYTES: u64 = 4 * 1024 * 1024;
     let path = args_string(args, &["path"])?;
     let cfg = runtime.get_config().await;
     let workspace = args_opt_string(args, &["workspacePath", "workspace_path"])
@@ -579,7 +615,7 @@ async fn preview_artifact(runtime: &GatewayRuntime, args: &Value) -> Result<Valu
     if !resolved.is_file() {
         return Err(format!("file not found: {}", resolved.display()));
     }
-    let bytes = tokio::fs::read(&resolved).await.map_err(|e| e.to_string())?;
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(|e| e.to_string())?;
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
@@ -590,25 +626,46 @@ async fn preview_artifact(runtime: &GatewayRuntime, args: &Value) -> Result<Valu
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") {
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "svg" => "image/svg+xml",
-            _ => "image/jpeg",
+    if is_preview_image_extension(&ext) {
+        let limit = if ext == "svg" { MAX_SVG_BYTES } else { MAX_IMAGE_BYTES };
+        if metadata.len() > limit {
+            return Ok(json!({
+                "path": resolved,
+                "name": name,
+                "kind": "image",
+                "extension": ext,
+                "size": metadata.len(),
+                "dataUrl": Value::Null,
+                "textPreview": Value::Null,
+            }));
+        }
+        let bytes = tokio::fs::read(&resolved).await.map_err(|e| e.to_string())?;
+        let data_url = if ext == "svg" {
+            safe_svg_preview_data_url(&bytes)?
+        } else {
+            let decoded = image::load_from_memory(&bytes)
+                .map_err(|error| format!("image preview failed: {error}"))?;
+            let thumbnail = decoded.thumbnail(640, 480);
+            let mut output = Cursor::new(Vec::new());
+            thumbnail
+                .write_to(&mut output, image::ImageFormat::Png)
+                .map_err(|error| format!("image thumbnail failed: {error}"))?;
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(output.into_inner())
+            )
         };
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         return Ok(json!({
             "path": resolved,
             "name": name,
             "kind": "image",
             "extension": ext,
-            "size": bytes.len(),
-            "dataUrl": format!("data:{mime};base64,{b64}"),
+            "size": metadata.len(),
+            "dataUrl": data_url,
             "textPreview": Value::Null,
         }));
     }
+    let bytes = tokio::fs::read(&resolved).await.map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
     let preview: String = text.chars().take(16_000).collect();
     Ok(json!({

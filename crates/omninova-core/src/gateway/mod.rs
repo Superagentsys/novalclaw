@@ -1,4 +1,5 @@
 pub mod agent_menu;
+mod assembly;
 pub mod dingtalk_card;
 pub mod dingtalk_card_stream;
 pub mod dingtalk_commands;
@@ -71,24 +72,20 @@ use crate::memory::{
     Memory,
 };
 use crate::providers::ChatMessage;
-use crate::providers::{
-    build_provider_from_config, build_provider_with_selection, ProviderSelection,
-};
-use crate::routing::{resolve_agent_route, RouteDecision};
+use crate::providers::build_provider_from_config;
+use crate::gateway::assembly::AgentAssemblyRequest;
+use crate::routing::{resolve_agent_route, route_for_agent, RouteDecision};
 use crate::security::{
-    is_tool_globally_allowed, resolve_shell_allowlist, ApprovalController, EstopController,
-    EstopState, PendingApproval, SecurityContext,
+    is_tool_globally_allowed, ApprovalController, EstopController, EstopState, PendingApproval,
+    SecurityContext,
 };
 use crate::skills::{
     apply_skill_runtime_prompt, invocations_from_inbound_metadata, skills_store_identity,
     SkillInvocation,
 };
-use crate::knowledge::append_knowledge_prompt;
 use crate::tools::{
-    AgentInvoker, BrowserTool, ContentSearchTool, DelegateRequest, DelegateTool, FileEditTool,
-    FileListTool, FilePatchTool, FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool,
-    HttpRequestTool, KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, PdfReadTool,
-    ShellTool, SkillActivationGate, Tool, UseSkillTool, WebFetchTool, WebSearchTool,
+    AgentInvoker, DelegateRequest, DelegateTool, SkillActivationGate, Tool, ToolBuildContext,
+    UseSkillTool,
 };
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
@@ -1717,39 +1714,7 @@ impl GatewayRuntime {
 
     pub async fn chat(&self, message: &str) -> anyhow::Result<String> {
         self.ensure_not_stopped().await?;
-        let cfg = self.config.read().await.clone();
-        let route_agent_name = cfg.agent.name.clone();
-        let provider = build_provider_from_config(&cfg);
-        let agent_delegate = cfg.agents.get(&route_agent_name);
-        let effective_workspace = resolve_effective_workspace_dir(
-            None,
-            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
-            &cfg.workspace_dir,
-        )
-        .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
-        let mut tools = create_tools_for_route(
-            &cfg,
-            &route_agent_name,
-            self.memory().await,
-            &effective_workspace,
-        );
-        attach_delegate_tool(
-            &cfg,
-            self,
-            &route_agent_name,
-            None,
-            &ChannelKind::Web,
-            0,
-            &mut tools,
-        );
-        let mut agent_cfg = cfg.agent.clone();
-        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
-
-        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
-        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
-
-        let security = SecurityContext::from_config(&cfg);
-        let mut agent = Agent::new(provider, tools, self.memory().await, agent_cfg, security);
+        let mut agent = self.build_interactive_agent().await?;
         agent.process_message(message).await
     }
 
@@ -1757,52 +1722,32 @@ impl GatewayRuntime {
     /// security), for interactive front-ends like the terminal UI that drive
     /// multi-turn streaming conversations and keep history in-memory.
     pub async fn build_interactive_agent(&self) -> anyhow::Result<Agent> {
-        let cfg = self.config.read().await.clone();
-        let route_agent_name = cfg.agent.name.clone();
-        let provider = build_provider_from_config(&cfg);
-        let agent_delegate = cfg.agents.get(&route_agent_name);
+        let cfg = config_with_subagents(self.config.read().await.clone());
+        let route = route_for_agent(&cfg, &cfg.agent.name);
         let effective_workspace = resolve_effective_workspace_dir(
             None,
-            agent_delegate.and_then(|d| d.workspace_dir.as_deref()),
+            cfg.agents
+                .get(&route.agent_name)
+                .and_then(|d| d.workspace_dir.as_deref()),
             &cfg.workspace_dir,
         )
         .ok_or_else(|| anyhow::anyhow!(WORKSPACE_REQUIRED_MESSAGE))?;
-        let mut tools = create_tools_for_route(
-            &cfg,
-            &route_agent_name,
-            self.memory().await,
-            &effective_workspace,
-        );
-        // Give the interactive agent the delegate tool so it can hand subtasks
-        // to other configured agents (multi-agent), matching `chat()`.
-        attach_delegate_tool(
-            &cfg,
-            self,
-            &route_agent_name,
-            None,
-            &ChannelKind::Web,
-            0,
-            &mut tools,
-        );
-        let mut agent_cfg = cfg.agent.clone();
-        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route_agent_name);
-
-        apply_skills_for_request(&cfg, &[], &mut tools, &mut agent_cfg.system_prompt);
-
-        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
 
         let security = SecurityContext::from_config(&cfg);
-        Ok(Agent::new(
-            provider,
-            tools,
-            self.memory().await,
-            agent_cfg,
-            security,
-        ))
+        let request = AgentAssemblyRequest {
+            route: &route,
+            channel: &ChannelKind::Web,
+            session_id: None,
+            workspace: &effective_workspace,
+            spawn_depth: 0,
+            skill_invocations: &[],
+            security: &security,
+        };
+        self.assemble_agent(&cfg, &request, &mut Vec::new()).await
     }
 
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
-        let cfg = self.config.read().await.clone();
+        let cfg = config_with_subagents(self.config.read().await.clone());
         resolve_agent_route(&cfg, inbound)
     }
 
@@ -1812,7 +1757,7 @@ impl GatewayRuntime {
     ) -> anyhow::Result<GatewayInboundResponse> {
         let started = std::time::Instant::now();
         self.ensure_not_stopped().await?;
-        let cfg = self.config.read().await.clone();
+        let cfg = config_with_subagents(self.config.read().await.clone());
         let route = resolve_agent_route(&cfg, inbound);
         let security = SecurityContext::for_inbound(&cfg, inbound, &route);
         let channel_label = security.audit().context().channel.clone();
@@ -1904,100 +1849,9 @@ impl GatewayRuntime {
                 );
             }
         }
-        let selection = ProviderSelection {
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-        };
-        let provider = build_provider_with_selection(&cfg, &selection);
-        let mut tools = create_tools_for_route(
-            &cfg,
-            &route.agent_name,
-            self.memory().await,
-            &effective_workspace,
-        );
-        if attach_delegate_tool(
-            &cfg,
-            self,
-            &route.agent_name,
-            inbound.session_id.as_deref(),
-            &inbound.channel,
-            lineage.spawn_depth,
-            &mut tools,
-        ) {
-            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
-        }
-        steps.push(ExecutionStep::done(
-            "加载工具",
-            format!("可用工具数：{}", tools.len()),
-        ));
-
-        let mut agent_cfg = cfg.agent.clone();
-        if let Some(delegate) = cfg.agents.get(&route.agent_name) {
-            if let Some(prompt) = &delegate.system_prompt {
-                agent_cfg.system_prompt = Some(prompt.clone());
-            }
-        }
-        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
-
-        // Always tell the agent where its workspace lives so it can answer
-        // "where am I working?" and so the LLM has a single source of truth
-        // for absolute paths. Path /home or /workspace style guesses should
-        // never be used to answer that question.
-        {
-            let workspace_note = format!(
-                "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
-                effective_workspace.display()
-            );
-            let current = agent_cfg.system_prompt.unwrap_or_default();
-            agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
-        }
-
-        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
-        let skill_runtime = apply_skills_for_request(
-            &cfg,
-            &skill_invocations,
-            &mut tools,
-            &mut agent_cfg.system_prompt,
-        );
-        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
-            let reason = skill_runtime
-                .errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "所选技能当前不可用".to_string());
-            println!(
-                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
-                skill_invocations.len(),
-                reason.chars().count()
-            );
-            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
-            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
-        }
-        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
-            steps.push(ExecutionStep::done(
-                "加载技能提示",
-                if skill_runtime.activated.is_empty() {
-                    "已注入技能目录（按需 use_skill）".to_string()
-                } else {
-                    format!(
-                        "已激活技能 {}",
-                        skill_runtime.activated[0].skill_id
-                    )
-                },
-            ));
-        }
-
-        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
-
-        // ==== FEISHU CHAT-ONLY MODE ====
-        // Inject chat-only system prompt when inbound is chat_only mode
-        // This must be done AFTER the workspace note but BEFORE agent creation
-        if let Some(chat_only_prompt) = security.chat_only_system_prompt() {
-            let current = agent_cfg.system_prompt.unwrap_or_default();
-            agent_cfg.system_prompt = Some(format!("{}\n\n{}", current, chat_only_prompt));
-            steps.push(ExecutionStep::done("飞书聊天模式", "已注入 chat_only 限制"));
-
-            // Detect tool intent in user message and short-circuit if needed
+        // Chat-only channels never run tools, so refuse before assembling an
+        // agent we would immediately throw away.
+        if security.chat_only_system_prompt().is_some() {
             if let Some(intent) = security.detect_tool_intent(&inbound.text) {
                 let blocked_response = security.tool_intent_blocked_response();
                 println!(
@@ -2005,7 +1859,6 @@ impl GatewayRuntime {
                     intent,
                     inbound.text.len()
                 );
-                // Return early with blocked response - no agent execution needed
                 return Ok(GatewayInboundResponse {
                     route,
                     reply: blocked_response,
@@ -2017,14 +1870,19 @@ impl GatewayRuntime {
             }
         }
 
-        let agent_security = security.clone();
-        let mut agent = Agent::new(
-            provider,
-            tools,
-            self.memory().await,
-            agent_cfg.clone(),
-            agent_security,
-        );
+        let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
+        let assembly_request = AgentAssemblyRequest {
+            route: &route,
+            channel: &inbound.channel,
+            session_id: inbound.session_id.as_deref(),
+            workspace: &effective_workspace,
+            spawn_depth: lineage.spawn_depth,
+            skill_invocations: &skill_invocations,
+            security: &security,
+        };
+        let mut agent = self
+            .assemble_agent(&cfg, &assembly_request, &mut steps)
+            .await?;
         // Check for stateless mode - skip session history loading
         let is_stateless = inbound.metadata.get("stateless")
             .and_then(|v| v.as_bool())
@@ -2101,7 +1959,7 @@ impl GatewayRuntime {
                 &inbound.channel,
                 session_id,
                 history_messages,
-                agent_cfg.max_history_messages,
+                cfg.agent.max_history_messages,
                 lineage.parent_session_key.clone(),
                 lineage.parent_agent_id.clone(),
                 route.agent_name.clone(),
@@ -2157,7 +2015,7 @@ impl GatewayRuntime {
         events_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     ) -> anyhow::Result<GatewayInboundResponse> {
         let started = std::time::Instant::now();
-        let cfg = self.config.read().await.clone();
+        let cfg = config_with_subagents(self.config.read().await.clone());
         let route = resolve_agent_route(&cfg, inbound);
         let security = SecurityContext::for_inbound(&cfg, inbound, &route);
         let channel_label = security.audit().context().channel.clone();
@@ -2239,88 +2097,19 @@ impl GatewayRuntime {
             .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
             .await?;
 
-        let mut tools = create_tools_for_route(
-            &cfg,
-            &route.agent_name,
-            self.memory().await,
-            &effective_workspace,
-        );
-
-        if attach_delegate_tool(
-            &cfg,
-            self,
-            &route.agent_name,
-            inbound.session_id.as_deref(),
-            &inbound.channel,
-            lineage.spawn_depth,
-            &mut tools,
-        ) {
-            steps.push(ExecutionStep::done("加载委托工具", "已启用 delegate 工具"));
-        }
-        steps.push(ExecutionStep::done(
-            "加载工具",
-            format!("可用工具数：{}", tools.len()),
-        ));
-
-        let mut agent_cfg = cfg.agent.clone();
-        if let Some(delegate) = cfg.agents.get(&route.agent_name) {
-            if let Some(prompt) = &delegate.system_prompt {
-                agent_cfg.system_prompt = Some(prompt.clone());
-            }
-        }
-        agent_cfg.max_tool_iterations = resolve_agent_max_tool_iterations(&cfg, &route.agent_name);
-
-        {
-            let workspace_note = format!(
-                "\n[环境信息] 当前 Workspace 目录是：{}。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
-                effective_workspace.display()
-            );
-            let current = agent_cfg.system_prompt.unwrap_or_default();
-            agent_cfg.system_prompt = Some(format!("{current}{workspace_note}"));
-        }
-
         let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
-        let skill_runtime = apply_skills_for_request(
-            &cfg,
-            &skill_invocations,
-            &mut tools,
-            &mut agent_cfg.system_prompt,
-        );
-        if !skill_invocations.is_empty() && skill_runtime.activated.is_empty() {
-            let reason = skill_runtime
-                .errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "所选技能当前不可用".to_string());
-            println!(
-                "[skill-runtime] explicit_activation_failed=true invocation_count={} reason_len={}",
-                skill_invocations.len(),
-                reason.chars().count()
-            );
-            steps.push(ExecutionStep::error("加载技能提示", "所选技能当前不可用，请重新选择。"));
-            return Err(anyhow::anyhow!("所选技能当前不可用：{reason}"));
-        }
-        if skill_runtime.catalog_count > 0 || !skill_runtime.activated.is_empty() {
-            steps.push(ExecutionStep::done(
-                "加载技能提示",
-                if skill_runtime.activated.is_empty() {
-                    "已注入技能目录（按需 use_skill）".to_string()
-                } else {
-                    format!("已激活技能 {}", skill_runtime.activated[0].skill_id)
-                },
-            ));
-        }
-
-        append_knowledge_prompt(&mut agent_cfg.system_prompt, &effective_workspace).await;
-
-        let agent_security = security.clone();
-        let mut agent = Agent::new(
-            build_provider_from_config(&cfg),
-            tools,
-            self.memory().await,
-            agent_cfg.clone(),
-            agent_security.clone(),
-        );
+        let assembly_request = AgentAssemblyRequest {
+            route: &route,
+            channel: &inbound.channel,
+            session_id: inbound.session_id.as_deref(),
+            workspace: &effective_workspace,
+            spawn_depth: lineage.spawn_depth,
+            skill_invocations: &skill_invocations,
+            security: &security,
+        };
+        let mut agent = self
+            .assemble_agent(&cfg, &assembly_request, &mut steps)
+            .await?;
 
         // Check for stateless mode - skip session history loading
         let is_stateless = inbound.metadata.get("stateless")
@@ -2402,11 +2191,9 @@ impl GatewayRuntime {
         tracing::debug!(target: "e2e", "[e2e-gateway-agent-return] timestamp={} run_id={}", now_ts(), run_id);
         run_guard.finish().await;
 
-        // The streaming desktop path must persist the same conversation state
-        // as the non-streaming path. Previously it only loaded history, so a
-        // successful request disappeared from the next turn and short follow-up
-        // messages such as "继续" or "按刚才的要求执行" used stale context.
-        if result.is_ok() && !is_stateless {
+        // Persist once, including failed turns so the next message still has
+        // the user utterance instead of looking like a brand-new conversation.
+        if !is_stateless {
             if let Some(session_id) = inbound.session_id.as_deref() {
                 let _guard = self.session_store_guard.lock().await;
                 let history_messages = agent
@@ -2419,7 +2206,7 @@ impl GatewayRuntime {
                     &inbound.channel,
                     session_id,
                     history_messages,
-                    agent_cfg.max_history_messages,
+                    cfg.agent.max_history_messages,
                     lineage.parent_session_key.clone(),
                     lineage.parent_agent_id.clone(),
                     route.agent_name.clone(),
@@ -2464,6 +2251,7 @@ impl GatewayRuntime {
         };
 
         tracing::debug!(target: "e2e", "[e2e-gateway-return] timestamp={} run_id={} reply_len={}", now_ts(), run_id, reply_text.len());
+
         Ok(GatewayInboundResponse {
             route,
             reply: reply_text,
@@ -2809,9 +2597,64 @@ impl GatewayRuntime {
     ) -> anyhow::Result<PendingApproval> {
         let cfg = self.config.read().await.clone();
         crate::observability::record_approval_event("approved");
-        ApprovalController::from_workspace(&cfg.workspace_dir)
+        let item = ApprovalController::from_workspace(&cfg.workspace_dir)
             .approve(id, approved_by)
-            .await
+            .await?;
+        if item.resume_on_approve {
+            if let Some(task_id) = item.task_id.as_deref() {
+                if let Ok(store) =
+                    crate::task::TaskStore::open(cfg.workspace_dir.join(".omninova-tasks.db"))
+                {
+                    if let Ok(Some(mut task)) = store.get(task_id) {
+                        task.status = crate::task::TaskStatus::Sleeping;
+                        task.lease_until = None;
+                        let _ = store.upsert(&task);
+                    }
+                }
+            }
+            let runtime = self.clone();
+            let resume = item.clone();
+            tokio::spawn(async move {
+                if let Err(error) = runtime.resume_after_approval(&resume).await {
+                    warn!("failed to resume after approval {}: {error}", resume.id);
+                }
+            });
+        }
+        Ok(item)
+    }
+
+    async fn resume_after_approval(&self, item: &PendingApproval) -> anyhow::Result<()> {
+        let Some(session_id) = item.session_id.clone() else {
+            return Ok(());
+        };
+        let channel = parse_resume_channel(item.channel.as_deref());
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "source".to_string(),
+            serde_json::Value::String("approval_resume".to_string()),
+        );
+        metadata.insert(
+            "approval_id".to_string(),
+            serde_json::Value::String(item.id.clone()),
+        );
+        if let Some(task_id) = &item.task_id {
+            metadata.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.clone()),
+            );
+        }
+        let inbound = InboundMessage {
+            channel,
+            user_id: Some("approval".to_string()),
+            session_id: Some(session_id),
+            text: format!(
+                "审批已通过（id={}，工具={}）。请立即继续执行被批准的操作，不要重新询问。",
+                item.id, item.tool_name
+            ),
+            metadata,
+        };
+        let _ = self.process_inbound(&inbound).await?;
+        Ok(())
     }
 
     pub async fn reject_request(
@@ -3351,6 +3194,9 @@ impl AgentJobExecutor {
 #[async_trait::async_trait]
 impl crate::cron::CronJobExecutor for AgentJobExecutor {
     async fn execute(&self, job: &crate::cron::CronJob) -> anyhow::Result<String> {
+        let cfg = self.runtime.get_config().await;
+        let mut prompt = job.prompt.clone();
+        let mut session_id = format!("automation-{}", job.id);
         let mut metadata = HashMap::new();
         metadata.insert(
             "source".to_string(),
@@ -3365,12 +3211,48 @@ impl crate::cron::CronJobExecutor for AgentJobExecutor {
             serde_json::Value::String(job.name.clone()),
         );
 
+        if let Some(task_id) = job.task_id.as_deref() {
+            metadata.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.to_string()),
+            );
+            let store = crate::task::TaskStore::open(cfg.workspace_dir.join(".omninova-tasks.db"))?;
+            match store.get(task_id)? {
+                Some(mut task) => {
+                    match crate::task::prepare_wake(&mut task) {
+                        crate::task::WakeDecision::Skip { reason } => {
+                            return Ok(format!("skipped: {reason}"));
+                        }
+                        crate::task::WakeDecision::Stop { reason } => {
+                            let _ = store.upsert(&task);
+                            if let Ok(cron) =
+                                crate::cron::CronStore::open(cfg.workspace_dir.join("cron.json"))
+                                    .await
+                            {
+                                let _ = cron.set_enabled(&job.id, false).await;
+                            }
+                            return Ok(format!("stopped: {reason}"));
+                        }
+                        crate::task::WakeDecision::Run { prompt: next } => {
+                            store.upsert(&task)?;
+                            prompt = next;
+                            if let Some(existing) = task.session_id {
+                                session_id = existing;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Ok(format!("skipped: task {task_id} not found"));
+                }
+            }
+        }
+
         let inbound = InboundMessage {
             channel: ChannelKind::Cli,
             user_id: Some("automation".to_string()),
-            // A stable session per job lets the agent keep context across runs.
-            session_id: Some(format!("automation-{}", job.id)),
-            text: job.prompt.clone(),
+            session_id: Some(session_id),
+            text: prompt,
             metadata,
         };
 
@@ -8820,6 +8702,18 @@ fn session_key(channel: &ChannelKind, session_id: &str) -> String {
     format!("{:?}:{session_id}", channel).to_lowercase()
 }
 
+fn parse_resume_channel(raw: Option<&str>) -> ChannelKind {
+    match raw.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "cli" => ChannelKind::Cli,
+        "web" | "webchat" => ChannelKind::Web,
+        "feishu" | "lark" => ChannelKind::Feishu,
+        "wecom" => ChannelKind::Wecom,
+        "dingtalk" => ChannelKind::Dingtalk,
+        other if !other.is_empty() => ChannelKind::Other(other.to_string()),
+        _ => ChannelKind::Cli,
+    }
+}
+
 fn split_session_key(key: &str) -> (Option<String>, Option<String>) {
     let Some((channel, session_id)) = key.split_once(':') else {
         return (None, Some(key.to_string()));
@@ -9089,9 +8983,16 @@ async fn load_session_history(
     channel: &ChannelKind,
     session_id: &str,
 ) -> anyhow::Result<SessionHistoryLoad> {
+    let key = session_key(channel, session_id);
+    if let Ok(Some(messages)) = crate::session::load_messages(&config.workspace_dir, &key).await {
+        return Ok(SessionHistoryLoad {
+            messages: apply_task_pins(config, session_id, messages),
+            warning: None,
+        });
+    }
+
     let path = session_store_path(config);
     let loaded = load_session_store(&path).await?;
-    let key = session_key(channel, session_id);
     let Some(record) = loaded.store.sessions.get(&key) else {
         return Ok(SessionHistoryLoad {
             messages: Vec::new(),
@@ -9108,10 +9009,21 @@ async fn load_session_history(
             warning: loaded.warning,
         });
     }
+    let messages = record.messages.clone();
+    if !messages.is_empty() {
+        let _ = crate::session::save_messages(&config.workspace_dir, &key, &messages).await;
+    }
     Ok(SessionHistoryLoad {
-        messages: record.messages.clone(),
+        messages: apply_task_pins(config, session_id, messages),
         warning: loaded.warning,
     })
+}
+
+fn apply_task_pins(config: &Config, session_id: &str, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let Ok(store) = crate::task::TaskStore::open(config.workspace_dir.join(".omninova-tasks.db")) else {
+        return messages;
+    };
+    crate::task::merge_pinned_messages(&store, session_id, messages)
 }
 
 async fn save_session_history(
@@ -9131,6 +9043,9 @@ async fn save_session_history(
     messages = truncate_history_preserving_system(messages, max_history_messages);
     messages = sanitize_messages_for_provider(messages);
 
+    let key = session_key(channel, session_id);
+    crate::session::save_messages(&config.workspace_dir, &key, &messages).await?;
+
     let path = session_store_path(config);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -9144,7 +9059,6 @@ async fn save_session_history(
             !session_expired(now, record.updated_at, config.gateway.session_ttl_secs)
         });
 
-    let key = session_key(channel, session_id);
     store.sessions.insert(
         key,
         SessionRecord {
@@ -9477,7 +9391,7 @@ async fn http_api_status(
     State(runtime): State<GatewayRuntime>,
 ) -> Result<Json<serde_json::Value>, Json<GatewayError>> {
     let health = runtime.health().await;
-    let cfg = runtime.get_config().await;
+    let cfg = config_with_subagents(runtime.get_config().await);
     let tools = create_default_tools(&cfg);
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     Ok(Json(serde_json::json!({
@@ -9511,6 +9425,7 @@ async fn http_api_tools(
                 "name": t.name(),
                 "description": t.description(),
                 "parameters": t.parameters_schema(),
+                "capabilities": crate::tools::capabilities_or_unknown(t.name()),
             })
         })
         .collect();
@@ -9698,6 +9613,7 @@ async fn http_api_cron_add(
         next_run: None,
         last_error: None,
         created_at: crate::cron::now_timestamp(),
+        task_id: None,
     };
     let id = job.id.clone();
     store.add(job).await.map_err(|e| {
@@ -9727,75 +9643,15 @@ pub struct GatewayError {
     pub message: String,
 }
 
+/// Tools that need no memory backend or session, for callers that only want to
+/// enumerate what this workspace offers (CLI `tools`, `/api/tools`).
 pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
-    create_workspace_tools(&config.workspace_dir, config)
-}
-
-/// Build all workspace-scoped tools with the given effective workspace root.
-pub fn create_workspace_tools(
-    effective_workspace: &PathBuf,
-    config: &Config,
-) -> Vec<Box<dyn Tool>> {
-    let workspace = effective_workspace.clone();
-    let shell_allowlist = resolve_shell_allowlist(config);
-    vec![
-        Box::new(FileReadTool::new(workspace.clone())),
-        Box::new(FileWriteTool::new(workspace.clone())),
-        Box::new(FileEditTool::new(workspace.clone())),
-        Box::new(FilePatchTool::new(workspace.clone())),
-        Box::new(FileListTool::new(workspace.clone())),
-        Box::new(GlobSearchTool::new(workspace.clone())),
-        Box::new(ContentSearchTool::new(workspace.clone())),
-        Box::new(GitOperationsTool::new(workspace.clone())),
-        Box::new(ShellTool::new(
-            workspace.clone(),
-            shell_allowlist,
-            Some(30),
-            config.clone(),
-        )),
-        Box::new(PdfReadTool::new(workspace.clone())),
-        Box::new(KnowledgeSearchTool::new(workspace)),
-    ]
-}
-
-pub fn create_all_tools(config: &Config, memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
-    let mut tools = create_default_tools(config);
-
-    if config.http_request.enabled {
-        tools.push(Box::new(HttpRequestTool::new(
-            config.http_request.allowed_domains.clone(),
-        )));
-    }
-
-    if config.web_fetch.enabled {
-        tools.push(Box::new(WebFetchTool::new(
-            config.web_fetch.allowed_domains.clone(),
-        )));
-    }
-
-    if config.web_search.enabled {
-        if let Some(key) = &config.web_search.brave_api_key {
-            tools.push(Box::new(WebSearchTool::new(key.clone())));
-        }
-    }
-
-    if config.browser.enabled {
-        tools.push(Box::new(BrowserTool::new(
-            config.browser.allowed_domains.clone(),
-            config.browser.native_headless,
-            config.browser.attach_only,
-            config.browser.cdp_url.clone(),
-        )));
-    }
-
-    tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
-    tools.push(Box::new(MemoryRecallTool::new(memory)));
-    tools.push(Box::new(KnowledgeSearchTool::new(config.workspace_dir.clone())));
-
-    tools
-        .into_iter()
-        .filter(|tool| is_tool_globally_allowed(config, tool.name()))
-        .collect()
+    crate::tools::build_tools(&ToolBuildContext {
+        config,
+        workspace: &config.workspace_dir,
+        memory: None,
+        session_id: None,
+    })
 }
 
 #[async_trait::async_trait]
@@ -9804,7 +9660,7 @@ impl AgentInvoker for GatewayRuntime {
     /// goes through the full `process_inbound` pipeline, so routing, security,
     /// audit, lineage tracking and concurrency limits all apply unchanged.
     async fn invoke_agent(&self, request: DelegateRequest) -> anyhow::Result<String> {
-        let cfg = self.config.read().await.clone();
+        let cfg = config_with_subagents(self.config.read().await.clone());
         if !cfg.agents.contains_key(&request.agent) {
             anyhow::bail!("delegate target '{}' is not configured", request.agent);
         }
@@ -9862,6 +9718,14 @@ impl AgentInvoker for GatewayRuntime {
     }
 }
 
+/// Fold built-in and workspace subagent definitions into a cloned config so
+/// routing and the `delegate` tool see them, without writing them back to
+/// `config.toml`.
+fn config_with_subagents(mut config: Config) -> Config {
+    crate::subagent::merge_into_config(&mut config);
+    config
+}
+
 /// Attach the `delegate` tool when the current agent is allowed to spawn
 /// subagents. Returns whether the tool was attached.
 fn attach_delegate_tool(
@@ -9873,13 +9737,8 @@ fn attach_delegate_tool(
     parent_depth: u32,
     tools: &mut Vec<Box<dyn Tool>>,
 ) -> bool {
-    let mut targets: Vec<String> = cfg
-        .agents
-        .keys()
-        .filter(|name| name.as_str() != route_agent_name)
-        .cloned()
-        .collect();
-    if targets.is_empty() {
+    let listed = crate::subagent::available_targets(cfg, route_agent_name);
+    if listed.is_empty() {
         return false;
     }
     if !is_tool_globally_allowed(cfg, "delegate") {
@@ -9907,10 +9766,16 @@ fn attach_delegate_tool(
             return false;
         }
     }
-    targets.sort();
+    let targets: Vec<String> = listed.iter().map(|item| item.name.clone()).collect();
+    let catalog = listed
+        .iter()
+        .map(|item| format!("- {}: {}", item.name, item.description))
+        .collect::<Vec<_>>()
+        .join("\n");
     tools.push(Box::new(DelegateTool::new(
         Arc::new(runtime.clone()),
         targets,
+        catalog,
         route_agent_name.to_string(),
         parent_session_id.map(ToString::to_string),
         channel.clone(),
@@ -9950,30 +9815,22 @@ fn apply_skills_for_request(
     result
 }
 
+#[cfg(test)]
 fn create_tools_for_route(
     config: &Config,
     route_agent_name: &str,
     memory: Arc<dyn Memory>,
     effective_workspace: &PathBuf,
+    session_id: Option<&str>,
 ) -> Vec<Box<dyn Tool>> {
-    let mut tools = create_workspace_tools(effective_workspace, config);
-    // Long-term memory is what lets the agent carry facts across sessions and
-    // restarts, so it belongs in the default toolset rather than only in
-    // `create_all_tools`.
-    tools.push(Box::new(MemoryStoreTool::new(memory.clone())));
-    tools.push(Box::new(MemoryRecallTool::new(memory)));
-
-    let Some(delegate) = config.agents.get(route_agent_name) else {
-        return tools;
-    };
-    if delegate.allowed_tools.is_empty() {
-        return tools;
-    }
-    let allowed: HashSet<&str> = delegate.allowed_tools.iter().map(String::as_str).collect();
+    let mut tools = crate::tools::build_tools(&ToolBuildContext {
+        config,
+        workspace: effective_workspace,
+        memory: Some(&memory),
+        session_id,
+    });
+    assembly::apply_agent_tool_allowlist(config, route_agent_name, &mut tools);
     tools
-        .into_iter()
-        .filter(|tool| allowed.contains(tool.name()))
-        .collect()
 }
 
 fn resolve_agent_max_tool_iterations(config: &Config, route_agent_name: &str) -> usize {
@@ -10025,7 +9882,7 @@ mod tests {
         let effective_ws = PathBuf::from("/fake/workspace");
 
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
-        let tools = create_tools_for_route(&config, "researcher", memory, &effective_ws);
+        let tools = create_tools_for_route(&config, "researcher", memory, &effective_ws, None);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["file_read", "shell"]);
     }
@@ -10040,11 +9897,35 @@ mod tests {
             "omninova",
             memory,
             &PathBuf::from("/fake/workspace"),
+            None,
         );
 
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert!(names.contains(&"memory_store"), "names={names:?}");
         assert!(names.contains(&"memory_recall"), "names={names:?}");
+    }
+
+    #[test]
+    fn explore_builtin_is_read_only() {
+        let mut config = Config::default();
+        crate::subagent::merge_into_config(&mut config);
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
+        let tools = create_tools_for_route(
+            &config,
+            "explore",
+            memory,
+            &PathBuf::from("/fake/workspace"),
+            None,
+        );
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert!(names.contains(&"file_read"), "names={names:?}");
+        assert!(names.contains(&"content_search"), "names={names:?}");
+        for forbidden in ["file_write", "shell", "file_patch", "git_operations"] {
+            assert!(
+                !names.contains(&forbidden),
+                "explore must not get {forbidden}: {names:?}"
+            );
+        }
     }
 
     #[test]
@@ -10133,6 +10014,62 @@ mod tests {
             &ChannelKind::Cli,
             0,
             &mut tools2
+        ));
+    }
+
+    #[test]
+    fn builtins_make_delegate_available_without_toml_agents() {
+        let mut config = Config::default();
+        crate::subagent::merge_into_config(&mut config);
+        let runtime = GatewayRuntime::new(config.clone());
+        let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+
+        assert!(attach_delegate_tool(
+            &config,
+            &runtime,
+            "omninova",
+            None,
+            &ChannelKind::Cli,
+            0,
+            &mut tools
+        ));
+        let spec = tools.last().unwrap().spec();
+        let enum_names = spec.parameters["properties"]["agent"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(enum_names.contains(&"explore"), "enum={enum_names:?}");
+        assert!(
+            enum_names.contains(&"general-purpose"),
+            "enum={enum_names:?}"
+        );
+        let catalog = spec.parameters["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(catalog.contains("explore"), "catalog={catalog}");
+        assert!(
+            catalog.contains("只读"),
+            "explore description should tell the parent when to use it: {catalog}"
+        );
+    }
+
+    #[test]
+    fn read_only_explore_does_not_get_the_delegate_tool() {
+        let mut config = Config::default();
+        crate::subagent::merge_into_config(&mut config);
+        let runtime = GatewayRuntime::new(config.clone());
+        let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+
+        assert!(!attach_delegate_tool(
+            &config,
+            &runtime,
+            "explore",
+            None,
+            &ChannelKind::Cli,
+            0,
+            &mut tools
         ));
     }
 

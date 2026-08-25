@@ -55,8 +55,8 @@ const CHANNEL_LABELS = new Map<string, string>(
   CHANNEL_PRESETS.map((preset) => [preset.id, preset.name])
 );
 
-function formatEnabledChannels(channelIds: string[]): string {
-  return channelIds
+function formatEnabledChannels(channelIds?: string[]): string {
+  return (channelIds ?? [])
     .map((channelId) => CHANNEL_LABELS.get(channelId) ?? channelId)
     .join("、");
 }
@@ -586,7 +586,9 @@ export function Setup({
         if (channelIdIsKnown(currentChannelId)) {
           return currentChannelId;
         }
-        const enabledChannels = nextGatewayStatus.enabled_channels.filter(channelIdIsKnown);
+        // Older/running gateway binaries may omit this newer field.  Keep the
+        // settings dialog usable while the bundled CLI is being upgraded.
+        const enabledChannels = (nextGatewayStatus.enabled_channels ?? []).filter(channelIdIsKnown);
         const remembered = readRememberedChannelId();
         const rememberedEnabled = remembered && enabledChannels.includes(remembered)
           ? remembered
@@ -1614,7 +1616,7 @@ export function Setup({
               onValidationChange={setChannelValidationError}
               selectedChannelId={activeChannelId}
               onSelectedChannelChange={setActiveChannelId}
-              enabledChannelIds={gatewayStatus.enabled_channels}
+              enabledChannelIds={gatewayStatus.enabled_channels ?? []}
               publicBaseUrl={draftPublicBase ?? undefined}
               gatewayUrl={gatewayStatus.running ? gatewayStatus.url : undefined}
               onHealthCheck={async () => {
