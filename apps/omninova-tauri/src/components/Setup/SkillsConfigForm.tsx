@@ -269,8 +269,14 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     () => new Set(summary?.runtimeVisibleSlugs ?? []),
     [summary]
   );
-  const runtimeEnabled = summary?.openSkillsEnabled ?? false;
-  const enableUnsaved = config.open_skills_enabled !== runtimeEnabled;
+
+  // Skills are a built-in capability now. Keep legacy configurations enabled
+  // without exposing a redundant runtime switch in the settings UI.
+  useEffect(() => {
+    if (!config.open_skills_enabled) {
+      onChange({ ...config, open_skills_enabled: true });
+    }
+  }, [config, onChange]);
 
   useEffect(() => {
     try {
@@ -315,9 +321,8 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     []
   );
 
-  // Load categories + featured once the module is enabled.
+  // Load categories + featured when the settings surface opens.
   useEffect(() => {
-    if (!config.open_skills_enabled) return;
     void (async () => {
       try {
         const cats = await invokeTauri<SkillHubCategory[]>("skillhub_category_list");
@@ -335,7 +340,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
         // keep preset fallback on failure
       }
     })();
-  }, [config.open_skills_enabled]);
+  }, []);
 
   const loadMarket = useCallback(
     async (page: number, category: string, keyword: string, append: boolean) => {
@@ -361,17 +366,16 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     []
   );
 
-  // Debounced reload when the module is enabled and filters change.
+  // Debounced reload when filters change.
   const debounceRef = useRef<number | undefined>(undefined);
   useEffect(() => {
-    if (!config.open_skills_enabled) return;
     window.clearTimeout(debounceRef.current);
     debounceRef.current = window.setTimeout(() => {
       setMarketPage(1);
       void loadMarket(1, activeCategory, marketKeyword, false);
     }, 300);
     return () => window.clearTimeout(debounceRef.current);
-  }, [config.open_skills_enabled, activeCategory, marketKeyword, loadMarket]);
+  }, [activeCategory, marketKeyword, loadMarket]);
 
   const handleLoadMore = () => {
     const next = marketPage + 1;
@@ -514,10 +518,10 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
           <MarketBrandIcon item={item} />
         </div>
         <div className="market-card-body">
-          <div className="market-card-name">
-            {item.name}
+          <div className="market-card-title-row">
+            <div className="market-card-name" title={item.name}>{item.name}</div>
             {installed ? (
-              <span className="market-card-tag" style={{ marginLeft: 8 }}>
+              <span className="market-card-tag market-card-installed-tag">
                 {runtimeVisible ? "已安装 · Runtime 可见" : "已安装"}
               </span>
             ) : null}
@@ -526,12 +530,17 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
             {item.description || "（该技能未提供描述）"}
           </div>
           <div className="market-card-meta">
-            <span className="market-card-downloads">
-              下载 {formatDownloads(item.downloads)}
+            <span className="market-card-meta-item market-card-downloads">
+              <span>下载</span><strong>{formatDownloads(item.downloads)}</strong>
             </span>
-            <span className="market-card-tag">版本 {item.version || "最新"}</span>
+            <span className="market-card-meta-item market-card-version">
+              <span>版本</span><strong>{item.version || "最新"}</strong>
+            </span>
             {item.category ? (
-              <span className="market-card-tag">
+              <span
+                className="market-card-tag market-card-category"
+                title={categories.find((c) => c.key === item.category)?.name ?? item.category}
+              >
                 {categories.find((c) => c.key === item.category)?.name ?? item.category}
               </span>
             ) : null}
@@ -611,41 +620,7 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
   return (
     <div className="setup-stack">
-      {/* Enable toggle */}
-      <section className="setup-section">
-        <div className="section-heading">
-          <div>
-            <h2>技能运行状态</h2>
-            <div className="section-subtitle">
-              允许 Agent 加载并使用外部技能（SKILL.md 格式）
-            </div>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={config.open_skills_enabled}
-            className={`skill-switch ${config.open_skills_enabled ? "is-on" : ""}`}
-            onClick={() =>
-              onChange({ ...config, open_skills_enabled: !config.open_skills_enabled })
-            }
-          >
-            <span className="skill-switch-knob" />
-          </button>
-        </div>
-        <div className="skill-dir-hint" style={{ marginTop: 10 }}>
-          Runtime 启用（已保存）：<strong>{runtimeEnabled ? "是" : "否"}</strong>
-          {enableUnsaved ? " · 开关有未保存更改，保存配置后 Agent 才会使用" : null}
-          <br />
-          已安装目录：<code>{summary?.dir || config.open_skills_dir || "（尚未扫描）"}</code>
-          {summary?.generation != null ? ` · generation ${summary.generation}` : null}
-          <br />
-          「已安装」只表示文件存在；Agent 注入还需 Runtime 启用以保存配置为准。
-        </div>
-      </section>
-
-      {config.open_skills_enabled && (
-        <>
-          {/* Basic config */}
+      {/* Basic config */}
           <section className="setup-section">
             <h3>基础配置</h3>
             <div className="setup-grid">
@@ -932,8 +907,6 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
               </div>
             )}
           </section>
-        </>
-      )}
     </div>
   );
 };
