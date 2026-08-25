@@ -358,6 +358,51 @@ function nextAttachmentId(): string {
   return `attachment-${Date.now()}-${composerAttachmentSeq}`;
 }
 
+function extractImageDataUrls(content: string): string[] {
+  const urls: string[] = [];
+  const marker = "data:image/";
+  let from = 0;
+  while (from < content.length) {
+    const start = content.indexOf(marker, from);
+    if (start < 0) break;
+    const header = content.indexOf(";base64,", start);
+    if (header < 0) {
+      from = start + marker.length;
+      continue;
+    }
+    let end = header + ";base64,".length;
+    while (end < content.length) {
+      const code = content.charCodeAt(end);
+      const isB64 =
+        (code >= 48 && code <= 57) ||
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122) ||
+        code === 43 ||
+        code === 47 ||
+        code === 61;
+      const isSpace = code === 32 || code === 10 || code === 13 || code === 9;
+      if (isB64 || isSpace) end += 1;
+      else break;
+    }
+    const url = content.slice(start, end).replace(/\s+/g, "");
+    if (url.includes(";base64,") && !urls.includes(url)) urls.push(url);
+    from = end;
+  }
+  return urls;
+}
+
+function stripInlineImageDataUrls(content: string): string {
+  return content
+    .replace(
+      /!\[([^\]]*)\]\(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+\)/g,
+      "![$1](已作为视觉输入附加)",
+    )
+    .replace(
+      /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g,
+      "[已作为视觉输入附加]",
+    );
+}
+
 /** 将拖放/选择/粘贴的文件转为结构化附件（浏览器 File API 路径） */
 async function buildAttachmentsFromFiles(
   files: FileList | readonly File[]
@@ -2767,8 +2812,15 @@ export function Chat({
       }
     }
 
+    const imageUrls = pendingAttachments.flatMap((attachment) =>
+      attachment.kind === "image" ? extractImageDataUrls(attachment.content) : [],
+    );
     const attachmentBlock = pendingAttachments
-      .map((attachment) => attachment.content.trim())
+      .map((attachment) => {
+        const raw = attachment.content.trim();
+        if (!raw) return "";
+        return attachment.kind === "image" ? stripInlineImageDataUrls(raw) : raw;
+      })
       .filter(Boolean)
       .join("\n\n");
     const selectionBlock = selectedAskContext
@@ -2943,6 +2995,7 @@ export function Chat({
                 : {}),
             }
           : {}),
+        ...(imageUrls.length ? { images: imageUrls } : {}),
       };
       if (import.meta.env.DEV) {
         console.log(

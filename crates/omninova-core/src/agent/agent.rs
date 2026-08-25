@@ -98,13 +98,7 @@ impl Agent {
             .await;
 
         self.compact_context_if_needed().await;
-
-        if images.is_empty() {
-            self.messages.push(ChatMessage::user(message));
-        } else {
-            self.messages
-                .push(ChatMessage::user_with_images(message, images.to_vec()));
-        }
+        self.push_user_turn(message, images);
 
         // One budget spans the whole request: planner, executor and reflector
         // calls all draw from it.
@@ -130,6 +124,7 @@ impl Agent {
     pub async fn process_message_with_events(
         &mut self,
         message: &str,
+        images: &[String],
     ) -> Result<(String, Vec<ToolExecutionEvent>)> {
         self.apply_request_system_prompt();
 
@@ -144,7 +139,7 @@ impl Agent {
             .await;
 
         self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
+        self.push_user_turn(message, images);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
         let dispatcher = AgentDispatcher::new(
@@ -178,6 +173,7 @@ impl Agent {
         external_run_id: Option<String>,
         external_session_id: Option<String>,
         cancel_token: AgentCancellationToken,
+        images: &[String],
     ) -> Result<(String, Vec<AgentRunEvent>)> {
         self.apply_request_system_prompt();
 
@@ -192,7 +188,7 @@ impl Agent {
             .await;
 
         self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
+        self.push_user_turn(message, images);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
 
@@ -500,6 +496,15 @@ impl Agent {
         self.messages = apply_compaction(plan, &summary);
     }
 
+    fn push_user_turn(&mut self, message: &str, images: &[String]) {
+        if images.is_empty() {
+            self.messages.push(ChatMessage::user(message));
+        } else {
+            self.messages
+                .push(ChatMessage::user_with_images(message, images.to_vec()));
+        }
+    }
+
     pub fn export_non_system_messages(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
@@ -715,6 +720,7 @@ mod tests {
                 Some("run-explicit-message".to_string()),
                 Some("session-explicit-message".to_string()),
                 AgentCancellationToken::new(),
+                &[],
             )
             .await
             .expect("explicit skill request should complete");
@@ -747,6 +753,7 @@ mod tests {
                 Some("run-empty-output".to_string()),
                 None,
                 AgentCancellationToken::new(),
+                &[],
             )
             .await
             .expect_err("empty output must fail visibly");
@@ -780,6 +787,7 @@ mod tests {
                 Some("run-content-filter".to_string()),
                 None,
                 AgentCancellationToken::new(),
+                &[],
             )
             .await
             .expect_err("provider content filter must fail without fallback");
@@ -823,6 +831,7 @@ mod tests {
                 Some("run-tool-followup".to_string()),
                 None,
                 AgentCancellationToken::new(),
+                &[],
             )
             .await
             .expect("tool call should continue to a second model iteration");
@@ -855,10 +864,47 @@ mod tests {
                 Some("run-normal-stream".to_string()),
                 None,
                 AgentCancellationToken::new(),
+                &[],
             )
             .await
             .expect("normal request should complete");
         assert_eq!(reply, "normal visible reply");
+    }
+
+    #[tokio::test]
+    async fn streaming_user_turn_keeps_images_for_provider() {
+        let (provider, requests) = SequenceProvider::new(vec![response(
+            Some("saw the image"),
+            Vec::new(),
+            "stop",
+        )]);
+        let mut agent = agent_with_provider(
+            Box::new(provider),
+            Vec::new(),
+            AgentConfig::default(),
+        );
+        let images = vec!["data:image/png;base64,QUJDRA==".to_string()];
+        let (reply, _) = agent
+            .process_message_with_events_streaming(
+                "what is in the image?",
+                Box::new(|_| {}),
+                Some("run-vision".to_string()),
+                None,
+                AgentCancellationToken::new(),
+                &images,
+            )
+            .await
+            .expect("vision turn should complete");
+        assert_eq!(reply, "saw the image");
+        let captured = requests.lock().unwrap();
+        let user = captured[0]
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("user message");
+        assert_eq!(
+            user.images.as_deref(),
+            Some(images.as_slice())
+        );
     }
 
     #[tokio::test]

@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::channels::{ChannelKind, InboundMessage};
 use crate::gateway::GatewayRuntime;
@@ -18,6 +21,10 @@ struct WsClientMessage {
     msg_type: String,
     content: Option<String>,
     session_id: Option<String>,
+    #[serde(default)]
+    metadata: HashMap<String, Value>,
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,12 +97,28 @@ async fn handle_ws_session(mut socket: WebSocket, runtime: GatewayRuntime) {
             continue;
         }
 
+        let mut metadata = client_msg.metadata;
+        if !client_msg.images.is_empty() {
+            let urls: Vec<Value> = client_msg
+                .images
+                .into_iter()
+                .filter(|url| !url.is_empty())
+                .map(Value::String)
+                .collect();
+            match metadata.get_mut("images") {
+                Some(Value::Array(items)) => items.extend(urls),
+                _ => {
+                    metadata.insert("images".to_string(), Value::Array(urls));
+                }
+            }
+        }
+
         let inbound = InboundMessage {
             channel: ChannelKind::Web,
             user_id: Some("ws-user".to_string()),
             session_id: client_msg.session_id,
             text: content,
-            metadata: Default::default(),
+            metadata,
         };
 
         let response = match runtime.process_inbound(&inbound).await {

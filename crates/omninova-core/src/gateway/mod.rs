@@ -10,6 +10,7 @@ pub mod feishu_store;
 pub mod feishu_worker;
 pub mod control;
 pub mod pairing;
+mod vision;
 pub mod ws;
 pub mod wecom_card;
 pub mod wecom_http_card;
@@ -1915,32 +1916,35 @@ impl GatewayRuntime {
             }
         }
 
-        let raw_vision_images = collect_desktop_vision_images(&cfg, inbound);
-        let vision_images = if provider_supports_openai_vision(route.provider.as_deref()) {
-            raw_vision_images.clone()
-        } else {
-            Vec::new()
+        let extra_images = {
+            let mut images = collect_desktop_vision_images(&cfg, inbound);
+            images.extend(metadata_string_array(
+                inbound,
+                &["images", "attachment_images", "vision_images"],
+            ));
+            images
         };
-        if !raw_vision_images.is_empty() && vision_images.is_empty() {
+        let vision = crate::gateway::vision::resolve_inbound_vision(
+            &inbound.text,
+            extra_images,
+            provider_supports_openai_vision(route.provider.as_deref()),
+        );
+        if vision.dropped_unsupported > 0 {
             steps.push(ExecutionStep::error(
-                "桌面视觉",
+                "视觉输入",
                 "当前 Provider 不支持图像输入，请改用 OpenAI 兼容的视觉模型（如 GPT-4o、DeepSeek-VL、豆包视觉等）",
             ));
-        } else if !vision_images.is_empty() {
+        } else if !vision.images.is_empty() {
             steps.push(ExecutionStep::done(
-                "桌面视觉",
-                format!("已附加 {} 张屏幕截图", vision_images.len()),
+                "视觉输入",
+                format!("已附加 {} 张图片", vision.images.len()),
             ));
         }
 
         steps.push(ExecutionStep::running("Agent 执行", "调用模型；如模型请求工具，将继续执行工具循环"));
-        let (reply, run_events) = if vision_images.is_empty() {
-            agent.process_message_with_events(&inbound.text).await?
-        } else {
-            // Vision is not yet supported in process_message_with_events; degrade.
-            let reply = agent.process_message(&inbound.text).await?;
-            (reply, Vec::new())
-        };
+        let (reply, run_events) = agent
+            .process_message_with_events(&vision.text, &vision.images)
+            .await?;
         let run_events: Vec<RunEvent> = run_events.into_iter().map(RunEvent::from).collect();
         steps.push(
             ExecutionStep::done("Agent 执行", "模型返回最终回复")
@@ -2143,6 +2147,31 @@ impl GatewayRuntime {
             }
         }
 
+        let extra_images = {
+            let mut images = collect_desktop_vision_images(&cfg, inbound);
+            images.extend(metadata_string_array(
+                inbound,
+                &["images", "attachment_images", "vision_images"],
+            ));
+            images
+        };
+        let vision = crate::gateway::vision::resolve_inbound_vision(
+            &inbound.text,
+            extra_images,
+            provider_supports_openai_vision(route.provider.as_deref()),
+        );
+        if vision.dropped_unsupported > 0 {
+            steps.push(ExecutionStep::error(
+                "视觉输入",
+                "当前 Provider 不支持图像输入，请改用 OpenAI 兼容的视觉模型（如 GPT-4o、DeepSeek-VL、豆包视觉等）",
+            ));
+        } else if !vision.images.is_empty() {
+            steps.push(ExecutionStep::done(
+                "视觉输入",
+                format!("已附加 {} 张图片", vision.images.len()),
+            ));
+        }
+
         // Use the frontend-provided run_id if available, otherwise generate a new one.
         let run_id = metadata_str(inbound, &["run_id"])
             .map(String::from)
@@ -2181,11 +2210,12 @@ impl GatewayRuntime {
         tracing::debug!(target: "e2e", "[e2e-gateway-agent-call] timestamp={} run_id={}", now_ts(), run_id);
         let result = agent
             .process_message_with_events_streaming(
-                &inbound.text,
+                &vision.text,
                 Box::new(emit_fn),
                 Some(run_id.clone()),
                 session_id,
                 cancel_token.clone(),
+                &vision.images,
             )
             .await;
         tracing::debug!(target: "e2e", "[e2e-gateway-agent-return] timestamp={} run_id={}", now_ts(), run_id);
