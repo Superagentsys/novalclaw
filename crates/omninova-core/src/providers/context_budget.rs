@@ -51,6 +51,73 @@ pub const UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS: u64 = 48_000;
 /// 8K estimated tokens is a small recent-turn budget for this best-effort path.
 pub const UNKNOWN_BUDGET_RECENT_TAIL_TOKENS: u64 = 8_000;
 
+/// Semantic marker for requests blocked locally by C1 before Provider dispatch.
+pub const CONTEXT_BUDGET_EXCEEDED_MARKER: &str = "ContextBudgetExceeded";
+
+/// Semantic marker for Provider-reported context overflow that is eligible for
+/// bounded reactive recovery (forced maintenance + one retry).
+pub const CONTEXT_WINDOW_EXCEEDED_MARKER: &str = "ContextWindowExceeded";
+
+/// Optional numeric window extracted from a Provider overflow message for
+/// diagnostics only. Never persisted as trusted model metadata in C3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderOverflowInfo {
+    pub provider_reported_window: Option<u64>,
+}
+
+/// Recognizes a Provider-reported context overflow from an error string.
+///
+/// This intentionally only classifies explicit semantic overflow evidence:
+/// common OpenAI-compatible codes/phrases are accepted, while generic HTTP 400
+/// bodies without those phrases are not treated as overflow.
+pub fn context_window_exceeded_info(error: &anyhow::Error) -> Option<ProviderOverflowInfo> {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    let patterns = [
+        "context_length_exceeded",
+        "context window exceeded",
+        "maximum context length",
+        "context length exceeded",
+        "maximum input tokens",
+        "too many input tokens",
+        "input too long",
+    ];
+    let is_overflow = text.contains(CONTEXT_WINDOW_EXCEEDED_MARKER)
+        || patterns.iter().any(|pattern| lower.contains(pattern));
+    if !is_overflow {
+        return None;
+    }
+    Some(ProviderOverflowInfo {
+        provider_reported_window: extract_reported_window(&text),
+    })
+}
+
+fn extract_reported_window(text: &str) -> Option<u64> {
+    // Accept forms like "maximum context length is 1048576 tokens" or
+    // "context window is 1048576 tokens".
+    let lower = text.to_ascii_lowercase();
+    for keyword in [
+        "maximum context length is ",
+        "context length is ",
+        "context window is ",
+        "max context length is ",
+        "maximum context length ",
+    ] {
+        if let Some(pos) = lower.find(keyword) {
+            let rest = &lower[pos + keyword.len()..];
+            let number: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect();
+            let cleaned = number.replace(',', "");
+            if let Ok(value) = cleaned.parse::<u64>() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// Where the resolved context-window size came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBudgetSource {

@@ -15,6 +15,18 @@ const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对�
 省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
 不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
 
+
+/// Maintenance mode used by the Context Runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMaintenanceMode {
+    /// Normal proactive maintenance (C2/C2.1/C2.2).
+    Normal,
+    /// Forced recovery after a Provider-reported context overflow (C3).
+    /// Even when local pressure thresholds are not crossed, this mode runs
+    /// tool-result pruning and structured compaction in a bounded way.
+    ForcedOverflowRecovery,
+}
+
 /// One authoritative context-maintenance path used by both turn-boundary
 /// compaction and mid-turn Provider-request preparation.
 ///
@@ -34,19 +46,57 @@ pub async fn maintain_context(
     max_history_messages: usize,
     compact_context: bool,
 ) -> Vec<ChatMessage> {
+    maintain_context_with_mode(
+        provider,
+        messages,
+        tool_specs,
+        max_history_messages,
+        compact_context,
+        ContextMaintenanceMode::Normal,
+    )
+    .await
+}
+
+/// Forced context recovery used after a Provider reports `ContextWindowExceeded`.
+///
+/// This is intentionally more aggressive than normal proactive maintenance:
+/// it always prunes oversized tool results and attempts structured compaction
+/// when pruning alone is not sufficient, regardless of local pressure
+/// thresholds. It still respects tool-pair safety and durability.
+pub async fn force_context_recovery(
+    provider: &dyn Provider,
+    messages: Vec<ChatMessage>,
+    tool_specs: &[ToolSpec],
+    max_history_messages: usize,
+) -> Vec<ChatMessage> {
+    maintain_context_with_mode(
+        provider,
+        messages,
+        tool_specs,
+        max_history_messages,
+        true,
+        ContextMaintenanceMode::ForcedOverflowRecovery,
+    )
+    .await
+}
+
+async fn maintain_context_with_mode(
+    provider: &dyn Provider,
+    messages: Vec<ChatMessage>,
+    tool_specs: &[ToolSpec],
+    max_history_messages: usize,
+    compact_context: bool,
+    mode: ContextMaintenanceMode,
+) -> Vec<ChatMessage> {
+    let forced = mode == ContextMaintenanceMode::ForcedOverflowRecovery;
     let Some(budget) = provider.context_budget() else {
-        // Unknown budget: best-effort proactive maintenance only.
-        // 1. Legacy message-count fallback remains active.
-        // 2. Absolute oversized tool-result protection is independent of the
-        //    message count, so a single 1.9M-char tool result is never left
-        //    fully model-visible merely because 34 <= 50.
         let estimator = TokenEstimator::new();
         let mut messages = normalize_transient_system_messages(messages);
         let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
         let largest_tool = largest_tool_result_tokens(&messages, &estimator);
         let oversized_tool_trigger = largest_tool > UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS;
         let message_count_trigger = messages.len() > max_history_messages.max(1);
-        let should_prune = oversized_tool_trigger || message_count_trigger;
+        let should_prune = forced || oversized_tool_trigger || message_count_trigger;
 
         if should_prune {
             tracing::info!(
@@ -58,6 +108,7 @@ pub async fn maintain_context(
                 largest_tool_result_tokens = %largest_tool,
                 unknown_budget_oversize_trigger = %oversized_tool_trigger,
                 message_count_trigger = %message_count_trigger,
+                forced = %forced,
                 "unknown_budget_context_maintenance"
             );
             let (mut current, pruned_count) = prune_oversized_tool_results(
@@ -82,21 +133,21 @@ pub async fn maintain_context(
                 return current;
             }
 
-            // If pruning was only needed for an oversized tool result and the
-            // message count is still within the legacy budget, no count-based
-            // summarization is required.
-            if !message_count_trigger {
+            if !forced && !message_count_trigger {
                 return current;
             }
 
-            // Otherwise continue to the legacy message-count compaction below.
             messages = current;
         }
 
         if !compact_context {
             return messages;
         }
-        let max_history = max_history_messages.max(1);
+        let max_history = if forced {
+            (messages.len() / 2).max(1)
+        } else {
+            max_history_messages.max(1)
+        };
         let Some(plan) = plan_compaction(&messages, max_history) else {
             return messages;
         };
@@ -124,7 +175,7 @@ pub async fn maintain_context(
     let messages = normalize_transient_system_messages(messages);
     let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
     let pressure_threshold = budget.pressure_threshold();
-    if before <= pressure_threshold {
+    if !forced && before <= pressure_threshold {
         return messages;
     }
 
@@ -133,13 +184,20 @@ pub async fn maintain_context(
         estimated_before = %before,
         pressure_threshold = %pressure_threshold,
         max_input = %budget.max_input_tokens,
+        forced = %forced,
         "context_pressure_detected"
     );
 
-    // 1. Prune oversized historical tool results. Recent tail is preserved so
-    // the current tool turn remains usable.
-    let max_tool_result_tokens = budget.max_input_tokens.saturating_div(20).max(1);
-    let recent_tail_tokens = budget.recent_tail_budget();
+    let max_tool_result_tokens = if forced {
+        UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS
+    } else {
+        budget.max_input_tokens.saturating_div(20).max(1)
+    };
+    let recent_tail_tokens = if forced {
+        UNKNOWN_BUDGET_RECENT_TAIL_TOKENS
+    } else {
+        budget.recent_tail_budget()
+    };
     let (mut current, pruned_count) =
         prune_oversized_tool_results(messages, max_tool_result_tokens, recent_tail_tokens);
     let after_tool_prune = estimator.estimate_messages_with_tools(&current, tool_specs);
@@ -149,6 +207,7 @@ pub async fn maintain_context(
             tool_results_pruned = %pruned_count,
             estimated_before = %before,
             estimated_after = %after_tool_prune,
+            forced = %forced,
             "tool_results_pruned"
         );
     }
@@ -157,15 +216,28 @@ pub async fn maintain_context(
         return current;
     }
 
-    // 2. If still above target, run bounded structured compaction.
-    if after_tool_prune > budget.target_after_compaction() {
+    let should_compact = if forced {
+        true
+    } else {
+        after_tool_prune > budget.target_after_compaction()
+    };
+    if should_compact {
         let mut last_estimate = after_tool_prune;
         for _pass in 0..MAX_MAINTENANCE_PASSES {
-            let max_history = max_history_messages.max(1);
+            let max_history = if forced {
+                (current.len() / 2).max(1)
+            } else {
+                max_history_messages.max(1)
+            };
+            let tail_budget = if forced {
+                None
+            } else {
+                Some(budget.recent_tail_budget())
+            };
             let Some(plan) = plan_compaction_with_tail_tokens(
                 &current,
                 max_history,
-                Some(budget.recent_tail_budget()),
+                tail_budget,
             ) else {
                 break;
             };
@@ -226,6 +298,7 @@ pub async fn maintain_context(
                 estimated_before = %before,
                 estimated_after = %after_compact,
                 max_input = %budget.max_input_tokens,
+                forced = %forced,
                 "context_compaction_completed"
             );
             if after_compact <= budget.target_after_compaction() {
@@ -563,5 +636,38 @@ mod tests {
         let out_tool = out.iter().find(|m| m.role == "tool").expect("tool remains");
         assert_eq!(out_tool.content, before_content);
         assert_eq!(out_tool.original_tool_content.as_deref(), Some(huge.as_str()));
+    }
+
+    #[tokio::test]
+    async fn forced_recovery_unknown_budget_prunes_and_compacts() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let huge = "x".repeat(200_000);
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..8 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        messages.push(ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-1","name":"big_tool","arguments":"{}"}]}"#));
+        messages.push(ChatMessage::tool(format!(r#"{{"tool_call_id":"call-1","content":"{huge}"}}"#)));
+        messages.push(ChatMessage::assistant("continue"));
+        let out = force_context_recovery(&provider, messages, &[], 50).await;
+        assert!(out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
+        assert!(summaries.lock().unwrap().len() >= 1, "forced recovery should run structured compaction");
+    }
+
+    #[tokio::test]
+    async fn forced_recovery_known_budget_compacts_even_when_below_pressure() {
+        let (provider, _, summaries) = BudgetProvider::new(200_000);
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..8 {
+            messages.push(ChatMessage::user(format!("u{i} {}", "x".repeat(200))));
+            messages.push(ChatMessage::assistant(format!("a{i} {}", "y".repeat(200))));
+        }
+        let estimator = TokenEstimator::new();
+        let before = estimator.estimate_messages_with_tools(&messages, &[]);
+        let out = force_context_recovery(&provider, messages, &[], 50).await;
+        let after = estimator.estimate_messages_with_tools(&out, &[]);
+        assert!(summaries.lock().unwrap().len() >= 1);
+        assert!(after < before);
     }
 }

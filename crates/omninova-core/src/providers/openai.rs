@@ -1,5 +1,9 @@
+use crate::agent::context::force_context_recovery;
 use crate::config::TransportMode;
-use crate::providers::context_budget::{ContextBudget, TokenEstimator};
+use crate::providers::context_budget::{
+    context_window_exceeded_info, ContextBudget, TokenEstimator, CONTEXT_BUDGET_EXCEEDED_MARKER,
+    CONTEXT_WINDOW_EXCEEDED_MARKER,
+};
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
     TokenUsage, ToolCall as ProviderToolCall,
@@ -990,7 +994,8 @@ impl OpenAiProvider {
             "context_preflight"
         );
         Err(anyhow::anyhow!(
-            "ContextBudgetExceeded: estimated_input_tokens={estimated_input_tokens}, context_window_tokens={}, max_input_tokens={}, output_reserve_tokens={}, safety_reserve_tokens={}, model={}",
+            "{}: estimated_input_tokens={estimated_input_tokens}, context_window_tokens={}, max_input_tokens={}, output_reserve_tokens={}, safety_reserve_tokens={}, model={}",
+            CONTEXT_BUDGET_EXCEEDED_MARKER,
             budget.context_window_tokens,
             budget.max_input_tokens,
             budget.output_reserve_tokens,
@@ -1329,15 +1334,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
-        let started = Instant::now();
-        let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
-            self.chat_inner(request, client, attempt)
-        });
-        match tokio::time::timeout(self.timeouts.request, driver).await {
-            Ok(result) => result,
-            Err(_) => Err(self.request_timeout_error(started, &attempts)),
-        }
+        self.run_chat_with_overflow_recovery(request).await
     }
 
     async fn chat_stream(
@@ -1358,21 +1355,69 @@ impl Provider for OpenAiProvider {
                 attempt,
             )
         });
-        match tokio::time::timeout(self.timeouts.request, driver).await {
-            Ok(result) => {
-                if let Ok(response) = &result {
-                    log_provider_stream_ok(
-                        &self.model,
-                        first_delta_ms.load(Ordering::Relaxed),
-                        started.elapsed().as_millis() as u64,
-                        "complete",
-                        response.finish_reason.as_deref(),
+        let mut result = match tokio::time::timeout(self.timeouts.request, driver).await {
+            Ok(result) => result,
+            Err(_) => Err(self.request_timeout_error(started, &attempts)),
+        };
+        if let Err(error) = &result {
+            if let Some(info) = context_window_exceeded_info(error) {
+                tracing::warn!(
+                    target: "omninova_core::providers::context",
+                    context_overflow_detected = true,
+                    provider_reported_window = ?info.provider_reported_window,
+                    context_overflow_retry_attempt = 1,
+                    "context_overflow_recovery_started"
+                );
+                let tools = request.tools.unwrap_or(&[]);
+                let recovered = force_context_recovery(
+                    self,
+                    request.messages.to_vec(),
+                    tools,
+                    usize::MAX,
+                )
+                .await;
+                let estimator = TokenEstimator::new();
+                let recovered_estimate = estimator.estimate_messages_with_tools(&recovered, tools);
+                let original_estimate = estimator.estimate_messages_with_tools(request.messages, tools);
+                if recovered_estimate < original_estimate {
+                    let recovered_request = ProviderChatRequest {
+                        messages: &recovered,
+                        tools: Some(tools),
+                    };
+                    let attempts2 = AtomicU32::new(0);
+                    let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
+                        self.chat_stream_inner(
+                            recovered_request,
+                            token_tx.clone(),
+                            &first_delta_ms,
+                            started,
+                            client,
+                            attempt,
+                        )
+                    });
+                    result = match tokio::time::timeout(self.timeouts.request, driver2).await {
+                        Ok(result) => result,
+                        Err(_) => Err(self.request_timeout_error(started, &attempts2)),
+                    };
+                } else {
+                    tracing::warn!(
+                        target: "omninova_core::providers::context",
+                        context_overflow_recovery_result = "non_shrinking",
+                        "context_overflow_recovery_blocked"
                     );
                 }
-                result
             }
-            Err(_) => Err(self.request_timeout_error(started, &attempts)),
         }
+        if let Ok(response) = &result {
+            log_provider_stream_ok(
+                &self.model,
+                first_delta_ms.load(Ordering::Relaxed),
+                started.elapsed().as_millis() as u64,
+                "complete",
+                response.finish_reason.as_deref(),
+            );
+        }
+        result
     }
 
     async fn health_check(&self) -> bool {
@@ -1460,6 +1505,64 @@ impl OpenAiProvider {
                 }
             }
         }
+    }
+
+    async fn run_chat_with_overflow_recovery(
+        &self,
+        mut request: ProviderChatRequest<'_>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let started = Instant::now();
+        let attempts = AtomicU32::new(0);
+        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
+            self.chat_inner(request, client, attempt)
+        });
+        let mut result = match tokio::time::timeout(self.timeouts.request, driver).await {
+            Ok(result) => result,
+            Err(_) => Err(self.request_timeout_error(started, &attempts)),
+        };
+        if let Err(error) = &result {
+            if let Some(info) = context_window_exceeded_info(error) {
+                tracing::warn!(
+                    target: "omninova_core::providers::context",
+                    context_overflow_detected = true,
+                    provider_reported_window = ?info.provider_reported_window,
+                    context_overflow_retry_attempt = 1,
+                    "context_overflow_recovery_started"
+                );
+                let tools = request.tools.unwrap_or(&[]);
+                let recovered = force_context_recovery(
+                    self,
+                    request.messages.to_vec(),
+                    tools,
+                    usize::MAX,
+                )
+                .await;
+                let estimator = TokenEstimator::new();
+                let recovered_estimate = estimator.estimate_messages_with_tools(&recovered, tools);
+                let original_estimate = estimator.estimate_messages_with_tools(request.messages, tools);
+                if recovered_estimate < original_estimate {
+                    request = ProviderChatRequest {
+                        messages: &recovered,
+                        tools: Some(tools),
+                    };
+                    let attempts2 = AtomicU32::new(0);
+                    let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
+                        self.chat_inner(request, client, attempt)
+                    });
+                    result = match tokio::time::timeout(self.timeouts.request, driver2).await {
+                        Ok(result) => result,
+                        Err(_) => Err(self.request_timeout_error(started, &attempts2)),
+                    };
+                } else {
+                    tracing::warn!(
+                        target: "omninova_core::providers::context",
+                        context_overflow_recovery_result = "non_shrinking",
+                        "context_overflow_recovery_blocked"
+                    );
+                }
+            }
+        }
+        result
     }
 
     fn request_timeout_error(&self, started: Instant, attempts: &AtomicU32) -> anyhow::Error {
