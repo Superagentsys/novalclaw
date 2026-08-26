@@ -1,6 +1,10 @@
 use crate::config::{Config, ModelProviderConfig, ProviderConfig};
 use crate::providers::context_budget::resolve_context_budget;
-use crate::providers::{AnthropicProvider, GeminiProvider, MockProvider, OpenAiProvider, Provider};
+use crate::providers::{
+    AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, MockProvider, OpenAiProvider,
+    Provider,
+};
+use async_trait::async_trait;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderSelection {
@@ -44,18 +48,26 @@ pub fn build_provider_with_selection(
     config: &Config,
     selection: &ProviderSelection,
 ) -> Box<dyn Provider> {
-    let provider_name = selection
-        .provider
-        .as_deref()
-        .or(config.default_provider.as_deref())
-        .unwrap_or("openai")
-        .to_lowercase();
+    let (provider_name, selected_model) = match resolve_effective_selection(config, selection) {
+        Ok(selection) => selection,
+        Err(reason) => {
+            tracing::warn!(
+                target: "omninova_core::providers::selection",
+                provider = %selection
+                    .provider
+                    .as_deref()
+                    .or(config.default_provider.as_deref())
+                    .unwrap_or("openai"),
+                reason = %reason,
+                "[provider-selection-blocked]"
+            );
+            return Box::new(UnavailableProvider { reason });
+        }
+    };
 
     let listed = find_listed_provider(config, &provider_name);
-    let profile = config
-        .model_providers
-        .get(&provider_name)
-        .or_else(|| listed.and_then(|item| config.model_providers.get(&item.id)));
+    let profile = find_model_provider(config, &provider_name)
+        .or_else(|| listed.and_then(|item| find_model_provider(config, &item.id)));
     let kind = listed
         .map(|item| item.provider_type.to_lowercase())
         .filter(|value| !value.is_empty())
@@ -63,7 +75,7 @@ pub fn build_provider_with_selection(
 
     let api_key = resolve_api_key(&provider_name, config, profile)
         .or_else(|| listed.and_then(|item| resolve_listed_api_key(item)));
-    let model = selection.model.clone().unwrap_or_else(|| {
+    let model = selected_model.unwrap_or_else(|| {
         resolve_model(
             &kind,
             config,
@@ -134,7 +146,7 @@ pub fn build_provider_with_selection(
                     timeouts,
                 )
                 .with_transport_mode(transport_mode)
-                    .with_context_budget(context_budget),
+                .with_context_budget(context_budget),
             )
         }
         _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(
@@ -153,11 +165,101 @@ pub fn build_provider_with_selection(
     }
 }
 
+fn resolve_effective_selection(
+    config: &Config,
+    selection: &ProviderSelection,
+) -> Result<(String, Option<String>), String> {
+    // `Some` is treated as requested intent (Agent, Automation, UI route, or
+    // request metadata). `None` is the implicit/default path.
+    let provider_name = selection
+        .provider
+        .as_deref()
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openai")
+        .trim()
+        .to_lowercase();
+    let selected_model = selection
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if configured_provider_enabled(config, &provider_name) == Some(false) {
+        return Err(format!(
+            "provider '{provider_name}' is disabled and cannot be dispatched"
+        ));
+    }
+
+    if let Some(model) = selected_model.as_deref() {
+        if !configured_model_is_selectable(config, &provider_name, model) {
+            return Err(format!(
+                "model '{model}' is not available on provider '{provider_name}'"
+            ));
+        }
+    }
+
+    Ok((provider_name, selected_model))
+}
+
+/// `model_providers` is the normalized runtime authority. The legacy
+/// list-style entry is consulted only when no named profile exists.
+fn configured_provider_enabled(config: &Config, provider_name: &str) -> Option<bool> {
+    find_model_provider(config, provider_name)
+        .map(|provider| provider.enabled)
+        .or_else(|| find_listed_provider(config, provider_name).map(|provider| provider.enabled))
+}
+
+fn configured_model_is_selectable(config: &Config, provider_name: &str, model: &str) -> bool {
+    let models = if let Some(profile) = find_model_provider(config, provider_name) {
+        &profile.models
+    } else if let Some(listed) = find_listed_provider(config, provider_name) {
+        &listed.models
+    } else {
+        // Built-ins and OpenAI-compatible providers without an explicit model
+        // catalog keep their historical free-form model behavior.
+        return true;
+    };
+    models.is_empty() || models.iter().any(|candidate| candidate == model)
+}
+
+fn find_model_provider<'a>(
+    config: &'a Config,
+    provider_name: &str,
+) -> Option<&'a ModelProviderConfig> {
+    config.model_providers.get(provider_name).or_else(|| {
+        config
+            .model_providers
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(provider_name))
+            .map(|(_, provider)| provider)
+    })
+}
+
 fn find_listed_provider<'a>(config: &'a Config, provider_name: &str) -> Option<&'a ProviderConfig> {
     config
         .providers
         .iter()
         .find(|item| item.id.eq_ignore_ascii_case(provider_name))
+}
+
+struct UnavailableProvider {
+    reason: String,
+}
+
+#[async_trait]
+impl Provider for UnavailableProvider {
+    fn name(&self) -> &str {
+        "unavailable"
+    }
+
+    async fn chat(&self, _request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+        anyhow::bail!("Provider selection blocked: {}", self.reason)
+    }
+
+    async fn health_check(&self) -> bool {
+        false
+    }
 }
 
 fn resolve_dispatch_kind(provider_name: &str, kind: &str, has_base_url: bool) -> String {
@@ -311,6 +413,19 @@ fn looks_like_raw_secret(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn configured_provider(id: &str, model: &str, enabled: bool) -> (String, ModelProviderConfig) {
+        (
+            id.to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://provider.example/v1".into()),
+                default_model: Some(model.into()),
+                models: vec![model.into()],
+                enabled,
+                ..ModelProviderConfig::default()
+            },
+        )
+    }
+
     #[test]
     fn custom_listed_provider_uses_openai_compatible_client() {
         let mut config = Config::default();
@@ -343,6 +458,140 @@ mod tests {
             },
         );
         assert_eq!(provider.name(), "openai");
+    }
+
+    async fn assert_local_unavailable(provider: Box<dyn Provider>, expected_fragment: &str) {
+        assert_eq!(provider.name(), "unavailable");
+        assert_eq!(provider.model(), None);
+        let messages = vec![crate::providers::ChatMessage::user("hello")];
+        let error = provider
+            .chat(crate::providers::ChatRequest {
+                messages: &messages,
+                tools: None,
+            })
+            .await
+            .expect_err("blocked selection must fail locally without HTTP");
+        assert!(
+            error.to_string().contains(expected_fragment),
+            "unexpected local error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_disabled_provider_is_blocked_without_substitution() {
+        let mut config = Config::default();
+        config.default_provider = Some("enabled-default".into());
+        config.default_model = Some("current-model".into());
+        config.model_providers.extend([
+            configured_provider("enabled-default", "current-model", true),
+            configured_provider("stale-provider", "stale-model", false),
+        ]);
+
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("stale-provider".into()),
+                model: Some("stale-model".into()),
+            },
+        );
+        assert_local_unavailable(provider, "is disabled").await;
+    }
+
+    #[tokio::test]
+    async fn disabled_default_provider_is_blocked_before_outbound_request() {
+        let mut config = Config::default();
+        config.default_provider = Some("disabled-default".into());
+        config.default_model = Some("disabled-model".into());
+        config.model_providers.extend([
+            configured_provider("disabled-default", "disabled-model", false),
+            configured_provider("other-enabled", "other-model", true),
+        ]);
+
+        let provider = build_provider_from_config(&config);
+        assert_local_unavailable(provider, "is disabled").await;
+    }
+
+    #[test]
+    fn implicit_default_uses_enabled_provider_model() {
+        let mut config = Config::default();
+        config.default_provider = Some("enabled-default".into());
+        let (id, profile) = configured_provider("enabled-default", "current-model", true);
+        config.model_providers.insert(id, profile);
+
+        let provider = build_provider_from_config(&config);
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model(), Some("current-model"));
+    }
+
+    #[tokio::test]
+    async fn explicit_unavailable_model_is_blocked_without_substitution() {
+        let mut config = Config::default();
+        config.default_provider = Some("custom-current".into());
+        config.default_model = Some("current-model".into());
+        let (id, profile) = configured_provider("custom-current", "current-model", true);
+        config.model_providers.insert(id, profile);
+
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("custom-current".into()),
+                model: Some("removed-model".into()),
+            },
+        );
+        assert_local_unavailable(provider, "is not available").await;
+    }
+
+    #[test]
+    fn implicit_model_uses_provider_default() {
+        let mut config = Config::default();
+        config.default_provider = Some("custom-current".into());
+        let (id, profile) = configured_provider("custom-current", "current-model", true);
+        config.model_providers.insert(id, profile);
+
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("custom-current".into()),
+                model: None,
+            },
+        );
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model(), Some("current-model"));
+    }
+
+    #[test]
+    fn named_profile_is_authoritative_over_enabled_legacy_duplicate() {
+        let mut config = Config::default();
+        config.default_provider = Some("duplicate".into());
+        config.default_model = Some("legacy-model".into());
+        let (id, profile) = configured_provider("duplicate", "modern-model", false);
+        config.model_providers.insert(id, profile);
+        config.providers.push(ProviderConfig {
+            id: "duplicate".into(),
+            name: "Duplicate".into(),
+            provider_type: "openai".into(),
+            api_key_env: None,
+            base_url: Some("https://legacy.example/v1".into()),
+            models: vec!["legacy-model".into()],
+            enabled: true,
+        });
+
+        assert_eq!(
+            configured_provider_enabled(&config, "duplicate"),
+            Some(false)
+        );
+        assert_eq!(build_provider_from_config(&config).name(), "unavailable");
+    }
+
+    #[test]
+    fn api_key_env_name_resolves_environment_value_without_logging_it() {
+        let _guard = crate::config::env::test_env_lock().lock().unwrap();
+        const NAME: &str = "OMNINOVA_FACTORY_TEST_KEY";
+        const VALUE: &str = "test-secret-value";
+        std::env::set_var(NAME, VALUE);
+        let resolved = resolve_secret_or_env(NAME);
+        std::env::remove_var(NAME);
+        assert_eq!(resolved.as_deref(), Some(VALUE));
     }
 }
 

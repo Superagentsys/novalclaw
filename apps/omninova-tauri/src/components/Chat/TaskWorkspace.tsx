@@ -590,6 +590,7 @@ export function TaskInspector({
         ))}
       </div>
       <div className="task-inspector-body">
+        {/* Keep Process mounted while switching Files/Logs so timeline state does not reset. */}
         <div className="task-inspector-tabpane" hidden={tab !== "process"}>
           {approval ? (
             <ApprovalGateCard
@@ -599,17 +600,23 @@ export function TaskInspector({
             />
           ) : null}
           {liveSessionId ? (
-            <AgentRunTimeline events={[]} isRunning defaultCollapsed={false} liveSessionId={liveSessionId} />
+            <AgentRunTimeline
+              events={[]}
+              isRunning
+              defaultCollapsed={false}
+              liveSessionId={liveSessionId}
+              sessionId={task?.sessionId}
+            />
           ) : processEntries.length ? (
             <ol className="task-inspector-process-list">
               {processEntries.map((item, index) => (
                 <li
-                  key={`${item.at}-${index}`}
+                  key={item.operationId ?? `${item.at}-${index}`}
                   data-status={item.status || (item.tone === "error" ? "failed" : item.tone === "success" ? "completed" : "waiting")}
                 >
                   <span className="task-inspector-process-icon">
                     <UiIcon
-                      name={item.kind === "file" ? "file" : item.kind === "approval" ? "safety" : item.kind === "model" ? "agent" : item.kind === "tool" ? "tool" : "sync"}
+                      name={item.kind === "file" ? "file" : item.kind === "approval" ? "safety" : item.kind === "model" ? "agent" : item.kind === "tool" ? "tool" : item.kind === "context" ? "sync" : "sync"}
                       size={13}
                     />
                   </span>

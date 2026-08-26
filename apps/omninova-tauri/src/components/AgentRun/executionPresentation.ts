@@ -97,6 +97,22 @@ export const MODEL_STARTED_LABEL = "等待模型响应";
 export const MODEL_STREAMING_LABEL = "正在接收模型输出";
 export const MODEL_COMPLETED_LABEL = "模型响应完成";
 
+/** Context Runtime Process labels. Runtime semantics stay in Core events. */
+export const CONTEXT_PRESSURE_LABEL = "检测到上下文压力";
+export const CONTEXT_MAINTENANCE_CONDITION_LABEL = "检测到上下文维护条件";
+export const CONTEXT_PRUNING_STARTED_LABEL = "正在裁剪大型工具结果";
+export const CONTEXT_PRUNING_COMPLETED_LABEL = "已裁剪大型工具结果";
+export const CONTEXT_COMPACTION_STARTED_LABEL = "正在压缩上下文";
+export const CONTEXT_COMPACTION_COMPLETED_LABEL = "上下文压缩完成";
+export const CONTEXT_COMPACTION_FAILED_LABEL = "上下文压缩失败";
+export const CONTEXT_COMPACTION_INCOMPLETE_LABEL = "上下文压缩未完成";
+export const CONTEXT_PRUNING_INCOMPLETE_LABEL = "工具结果裁剪未完成";
+export const CONTEXT_RECOVERY_STARTED_LABEL = "正在执行上下文恢复";
+export const CONTEXT_RECOVERY_COMPLETED_LABEL = "上下文恢复完成";
+export const CONTEXT_RECOVERY_FAILED_LABEL = "上下文恢复失败";
+export const CONTEXT_RECOVERY_INCOMPLETE_LABEL = "上下文恢复未完成";
+export const CONTEXT_SECOND_OVERFLOW_DETAIL = "自动维护后仍超过模型上下文容量";
+
 const SECRET_PATTERNS: RegExp[] = [
   /sk-[A-Za-z0-9_-]{8,}/gi,
   /(?:bearer|authorization)\s+[A-Za-z0-9._~+/=-]+/gi,

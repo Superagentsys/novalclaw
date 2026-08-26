@@ -9,8 +9,8 @@ use crate::providers::context_budget::{
     CONTEXT_BUDGET_EXCEEDED_MARKER,
 };
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ProviderHttpError, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -907,13 +907,45 @@ fn semantic_provider_error_code(body: &str) -> Option<&'static str> {
         .copied()
 }
 
+fn safe_provider_error_metadata(body: &str) -> (Option<String>, String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (
+            None,
+            format!("provider returned a non-JSON error body (body_len={})", body.len()),
+        );
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .map(|value| sanitize_network_error_fragment(&value));
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_network_error_fragment)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "provider rejected the request".to_string());
+    (code, message)
+}
+
 async fn api_error(provider_name: &str, response: Response) -> AttemptError {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     let retry_reason = transient_http_reason(status.as_u16())
         .filter(|_| semantic_provider_error_code(&text).is_none());
+    let (code, message) = safe_provider_error_metadata(&text);
     AttemptError::permanent(
-        anyhow::anyhow!("{provider_name} API error ({status}): {text}"),
+        anyhow::Error::new(ProviderHttpError {
+            provider: provider_name.to_string(),
+            status: status.as_u16(),
+            code,
+            message,
+        }),
         "request",
         "http_error",
     )
@@ -2890,6 +2922,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_403_surfaces_typed_access_error_without_retry() {
+        let (result, _deltas, attempts) = stream_against_script(
+            vec![Scripted::Status(
+                403,
+                "{\"error\":{\"code\":\"permission_denied\",\"message\":\"model access denied\"}}",
+            )],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let error = result.expect_err("403 must fail");
+        let failure = error
+            .downcast_ref::<ProviderHttpError>()
+            .expect("HTTP failures remain structurally inspectable");
+        assert_eq!(failure.status, 403);
+        assert_eq!(failure.code.as_deref(), Some("permission_denied"));
+        assert!(failure.is_access_failure());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn provider_error_metadata_redacts_sensitive_or_non_json_bodies() {
+        let (code, message) = safe_provider_error_metadata(
+            "{\"error\":{\"code\":\"auth_error\",\"message\":\"Authorization: Bearer secret-value\"}}",
+        );
+        assert_eq!(code.as_deref(), Some("auth_error"));
+        assert_eq!(message, "<redacted-sensitive-error-source>");
+
+        let (_, message) = safe_provider_error_metadata("<html>denied secret page</html>");
+        assert!(message.contains("non-JSON"));
+        assert!(!message.contains("secret page"));
+    }
+
+    #[tokio::test]
     async fn two_transient_failures_stop_after_the_single_replay() {
         let (result, _deltas, attempts) = stream_against_script(
             vec![
@@ -3429,6 +3494,28 @@ mod tests {
         let (base_url, requests) = serve_scripted(vec![Scripted::Status(
             400,
             "{\"error\":{\"message\":\"bad request\"}}",
+        )])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert!(overflow_kind_names(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_http_403_does_not_start_overflow_recovery() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(
+            403,
+            "{\"error\":{\"message\":\"forbidden\"}}",
         )])
         .await;
         let provider = OpenAiProvider::new(

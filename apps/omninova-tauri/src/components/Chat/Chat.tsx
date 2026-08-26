@@ -23,7 +23,21 @@ import {
 } from "../../utils/chatStorage";
 import type {
   AgentRunEvent,
+  AgentRunEventContextLifecycle,
+  AgentRunEventContextUsage,
 } from "../AgentRun/types";
+import {
+  applyLifecycleToActivity,
+  finalizeOpenContextOperations,
+} from "../AgentRun/contextLifecycle";
+import {
+  applyContextUsageLifecycle,
+  applyContextUsageSnapshot,
+  emptyContextUsageState,
+  finishContextUsageRun,
+  switchContextUsageIdentity,
+  type ContextUsageIdentity,
+} from "../AgentRun/contextUsageState";
 import {
   addTask,
   formatDuration,
@@ -69,6 +83,8 @@ import {
 import { CommandPalette as CommandPaletteMenu } from "./CommandPalette";
 import { ContractReviewPanel, ContractReviewReport } from "./ContractReviewPanel";
 import { MessageActions } from "./MessageActions";
+import { ContextUsageBadge } from "./ContextUsageBadge";
+import "./ContextUsageBadge.css";
 import type {
   ContractReviewStage,
   ContractReviewEngineCard,
@@ -708,6 +724,29 @@ export function Chat({
   const elapsedSec = activeRun?.elapsedSec ?? 0;
   const activeSteps = useMemo(() => activeRun?.steps ?? [], [activeRun?.steps]);
   const activeRunId = activeRun?.runId ?? null;
+  const contextUsageIdentity = useMemo<ContextUsageIdentity>(() => {
+    const selected = parseModelSelection(selectedModel);
+    return {
+      sessionId,
+      provider: selectedModel === "auto" ? defaultProviderId : selected.providerId ?? "",
+      model: selectedModel === "auto" ? defaultModelId : selected.model ?? "",
+      liveRunId: activeRunId,
+    };
+  }, [activeRunId, defaultModelId, defaultProviderId, selectedModel, sessionId]);
+  const [contextUsageState, setContextUsageState] = useState(() =>
+    emptyContextUsageState(contextUsageIdentity)
+  );
+  useEffect(() => {
+    setContextUsageState((previous) =>
+      switchContextUsageIdentity(previous, contextUsageIdentity)
+    );
+  }, [contextUsageIdentity]);
+  // Invalidate stale data in the same render as a session/model switch. The
+  // effect above then commits this identity for subsequent event reduction.
+  const visibleContextUsageState = useMemo(
+    () => switchContextUsageIdentity(contextUsageState, contextUsageIdentity),
+    [contextUsageIdentity, contextUsageState]
+  );
   const activeToolApproval = activeRunId ? pendingToolApprovals[activeRunId] : undefined;
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
@@ -1383,6 +1422,7 @@ export function Chat({
               : status === "failed"
                 ? "打开任务检查器查看最后步骤，修正配置后重新执行。"
                 : undefined,
+          activity: finalizeOpenContextOperations(target.activity ?? []),
         });
       });
     },
@@ -2193,12 +2233,47 @@ export function Chat({
           kind: "lifecycle",
           status: "running",
         });
+      } else if (eventType === "context_usage") {
+        const snapshot = rawPayload.snapshot;
+        if (snapshot && typeof snapshot === "object") {
+          const usagePayload = payload as AgentRunEventContextUsage;
+          const authoritativeSnapshot = {
+            ...usagePayload.snapshot,
+            run_id: usagePayload.snapshot.run_id ?? runId,
+          };
+          setContextUsageState((previous) =>
+            applyContextUsageSnapshot(previous, authoritativeSnapshot)
+          );
+        }
+      } else if (eventType === "context_lifecycle") {
+        const lifecycle = rawPayload.event;
+        if (lifecycle && typeof lifecycle === "object") {
+          const contextPayload = {
+            type: "context_lifecycle",
+            run_id: runId,
+            event: lifecycle,
+          } as AgentRunEventContextLifecycle;
+          setContextUsageState((previous) =>
+            applyContextUsageLifecycle(previous, contextPayload)
+          );
+          setTaskHistory((prev) => {
+            const target = prev.find((task) => task.runId === runId);
+            if (!target) return prev;
+            const activity = applyLifecycleToActivity(target.activity ?? [], contextPayload, {
+              runId,
+              sessionId: target.sessionId,
+            }).slice(-120);
+            return patchTask(prev, runId, { activity });
+          });
+        }
       }
       if (
         !isTerminalEvent
       ) {
         return;
       }
+
+      setContextUsageState((previous) => finishContextUsageRun(previous, runId));
 
       const avatarId = findAvatarIdByRunId(runId);
       if (!avatarId) {
@@ -4295,6 +4370,7 @@ export function Chat({
                 </div>
 
                 <div className="chat-composer-tools-center">
+                  <ContextUsageBadge state={visibleContextUsageState} />
                   <div className="chat-composer-model-shell">
                     <ModelPicker
                       value={selectedModel}

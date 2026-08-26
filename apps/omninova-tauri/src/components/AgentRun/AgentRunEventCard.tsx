@@ -1,4 +1,5 @@
 import React, { memo, useMemo, useState } from "react";
+import { formatCoreDurationMs, isContextStep } from "./contextLifecycle";
 import { getErrorPresentation, sanitizeDisplayText } from "./executionPresentation";
 import type { AgentRunStep } from "./types";
 import { UiIcon } from "../UiIcon";
@@ -16,7 +17,7 @@ function hasLongOutput(text: string): boolean {
 }
 
 function successTitle(step: AgentRunStep): string {
-  if (step.status === "error") {
+  if (step.status === "error" && !isContextStep(step)) {
     const presentation = getErrorPresentation(step.result_summary ?? "", {
       toolName: step.tool_name,
       type: "tool",
@@ -78,8 +79,9 @@ function OutputBlock({ outputs, kind = "tool" }: { outputs: string[]; kind?: "to
 export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function AgentRunEventCard({
   step,
 }) {
+  const contextStep = isContextStep(step);
   const errorPresentation =
-    step.status === "error"
+    step.status === "error" && !contextStep
       ? getErrorPresentation(step.result_summary ?? "", { toolName: step.tool_name, type: "tool" })
       : null;
   const title = errorPresentation?.title ?? successTitle(step);
@@ -89,6 +91,13 @@ export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function
       ? `${step.changed_files.length} 个文件`
       : step.changed_files[0]?.path;
   const hasDiff = step.additions > 0 || step.deletions > 0;
+  const contextDetail = contextStep && step.status !== "error" ? step.result_summary : undefined;
+  const durationLabel =
+    contextStep && typeof step.duration_ms === "number"
+      ? formatCoreDurationMs(step.duration_ms)
+      : typeof step.duration_ms === "number"
+        ? `${step.duration_ms}ms`
+        : null;
 
   return (
     <article className={`agent-run-step agent-run-step--${step.status}`}>
@@ -99,9 +108,10 @@ export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function
         <div className="agent-run-step-main">
           <div className="agent-run-step-title">{title}</div>
           <div className="agent-run-step-meta">
-            {typeof step.duration_ms === "number" ? (
-              <span>{step.duration_ms}ms</span>
+            {durationLabel && !contextDetail?.includes(durationLabel) ? (
+              <span>{durationLabel}</span>
             ) : null}
+            {contextDetail ? <span>{contextDetail}</span> : null}
             {fileCount ? <span>{fileCount}</span> : null}
             {fileSummary && step.tool_name !== "file_list" ? <span>{fileSummary}</span> : null}
             {hasDiff ? (
@@ -113,6 +123,8 @@ export const AgentRunEventCard: React.FC<AgentRunEventCardProps> = memo(function
         </div>
         {errorPresentation?.detail ? (
           <div className="agent-run-step-error-detail">{errorPresentation.detail}</div>
+        ) : contextStep && step.status === "error" && step.result_summary ? (
+          <div className="agent-run-step-error-detail">{step.result_summary}</div>
         ) : null}
         {step.changed_files.length > 1 ? (
           <div className="agent-run-files">

@@ -1,7 +1,28 @@
-use crate::tools::ToolSpec;
 use crate::providers::context_budget::ContextBudget;
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// Structured HTTP failure returned by a model provider.
+///
+/// The response detail is deliberately sanitized before construction. Keeping
+/// the status as typed metadata lets background runtimes distinguish terminal
+/// credential/access failures from transient transport failures without
+/// parsing user-facing error strings.
+#[derive(Debug, thiserror::Error)]
+#[error("{provider} API error (HTTP {status}): {message}")]
+pub struct ProviderHttpError {
+    pub provider: String,
+    pub status: u16,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl ProviderHttpError {
+    pub fn is_access_failure(&self) -> bool {
+        matches!(self.status, 401 | 403)
+    }
+}
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

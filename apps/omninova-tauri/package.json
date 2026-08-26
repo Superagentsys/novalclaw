@@ -38,7 +38,8 @@
     "check:deps": "node ./scripts/postinstall-deps.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "npx --yes tsx --test src/components/AgentRun/contextLifecycle.test.ts src/components/AgentRun/contextUsage.test.ts src/components/Chat/ContextUsageBadge.test.tsx"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",

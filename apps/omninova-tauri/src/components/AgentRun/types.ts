@@ -311,12 +311,98 @@ export interface ContextUsageSnapshot {
   measured_at: number;
 }
 
+export type ContextLifecycleEventKindType =
+  | "context_pressure_detected"
+  | "context_pruning_started"
+  | "context_pruning_completed"
+  | "context_compaction_started"
+  | "context_compaction_completed"
+  | "context_compaction_failed"
+  | "context_overflow_recovery_started"
+  | "context_overflow_recovery_completed"
+  | "context_overflow_recovery_failed";
+
+export interface ContextPressureDetectedKind {
+  type: "context_pressure_detected";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  context_window_tokens?: number | null;
+  pressure_threshold_tokens?: number | null;
+  budget_source?: string | null;
+}
+
+export interface ContextPruningStartedKind {
+  type: "context_pruning_started";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+}
+
+export interface ContextPruningCompletedKind {
+  type: "context_pruning_completed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  estimated_after: number;
+  pruned_tool_result_count?: number;
+}
+
+export interface ContextCompactionStartedKind {
+  type: "context_compaction_started";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+}
+
+export interface ContextCompactionCompletedKind {
+  type: "context_compaction_completed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  estimated_after: number;
+  checkpoint_created?: boolean;
+}
+
+export interface ContextCompactionFailedKind {
+  type: "context_compaction_failed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  reason?: string;
+}
+
+export interface ContextOverflowRecoveryStartedKind {
+  type: "context_overflow_recovery_started";
+  mode: ContextTelemetryMode;
+  provider_reported_window?: number | null;
+  estimated_before: number;
+}
+
+export interface ContextOverflowRecoveryCompletedKind {
+  type: "context_overflow_recovery_completed";
+  mode: ContextTelemetryMode;
+  estimated_after: number;
+}
+
+export interface ContextOverflowRecoveryFailedKind {
+  type: "context_overflow_recovery_failed";
+  mode: ContextTelemetryMode;
+  reason?: string;
+}
+
+export type ContextLifecycleEventKind =
+  | ContextPressureDetectedKind
+  | ContextPruningStartedKind
+  | ContextPruningCompletedKind
+  | ContextCompactionStartedKind
+  | ContextCompactionCompletedKind
+  | ContextCompactionFailedKind
+  | ContextOverflowRecoveryStartedKind
+  | ContextOverflowRecoveryCompletedKind
+  | ContextOverflowRecoveryFailedKind
+  | { type: string; [key: string]: unknown };
+
 export interface ContextLifecycleEvent {
   operation_id: string;
   run_id?: string | null;
   session_id?: string | null;
   mode: ContextTelemetryMode;
-  kind: Record<string, unknown> & { type: string };
+  kind: ContextLifecycleEventKind;
   timestamp: number;
 }
 
