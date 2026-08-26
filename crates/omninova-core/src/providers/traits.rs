@@ -161,6 +161,11 @@ pub trait Provider: Send + Sync {
     /// Provider name (e.g., "openai", "anthropic")
     fn name(&self) -> &str;
 
+    /// Optional model id this provider will send. Default is unknown.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Send a chat request to the LLM
     async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse>;
 

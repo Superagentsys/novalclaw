@@ -1,8 +1,12 @@
 use crate::agent::context::force_context_recovery;
 use crate::config::TransportMode;
+use crate::observability::{
+    build_snapshot, current_context, emit_lifecycle, emit_snapshot, new_operation_id,
+    ContextLifecycleEventKind, ContextTelemetryMode, MeasurementKind,
+};
 use crate::providers::context_budget::{
-    context_window_exceeded_info, ContextBudget, TokenEstimator, CONTEXT_BUDGET_EXCEEDED_MARKER,
-    CONTEXT_WINDOW_EXCEEDED_MARKER,
+    context_window_exceeded_info, ContextBudget, ProviderOverflowInfo, TokenEstimator,
+    CONTEXT_BUDGET_EXCEEDED_MARKER,
 };
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
@@ -1004,6 +1008,137 @@ impl OpenAiProvider {
         ))
     }
 
+    fn observe_preflight(
+        &self,
+        request_body: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Option<crate::observability::ContextRequestIdentity> {
+        let ctx = current_context()?;
+        if !ctx.snapshots_enabled() {
+            return None;
+        }
+        let mut identity = ctx.allocate_request_identity();
+        if identity.provider.is_empty() {
+            identity.provider = self.name().to_string();
+        }
+        if identity.model.is_empty() {
+            identity.model = self.model.clone();
+        }
+        let snapshot = build_snapshot(
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.request_revision,
+            identity.provider.clone(),
+            identity.model.clone(),
+            MeasurementKind::FinalRequestEstimate,
+            messages,
+            tools,
+            self.context_budget.as_ref(),
+            Some(request_body),
+        );
+        emit_snapshot(snapshot);
+        Some(identity)
+    }
+
+    fn observe_provider_actual(
+        &self,
+        identity: Option<&crate::observability::ContextRequestIdentity>,
+        request_body: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        usage: Option<&TokenUsage>,
+    ) {
+        let Some(actual) = usage.and_then(|u| u.input_tokens) else {
+            return;
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let snapshot = build_snapshot(
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.request_revision,
+            identity.provider.clone(),
+            identity.model.clone(),
+            MeasurementKind::ProviderActual,
+            messages,
+            tools,
+            self.context_budget.as_ref(),
+            Some(request_body),
+        )
+        .with_provider_actual(actual);
+        emit_snapshot(snapshot);
+    }
+
+    fn begin_overflow_recovery(
+        &self,
+        info: ProviderOverflowInfo,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> String {
+        let estimated_before =
+            TokenEstimator::new().estimate_messages_with_tools(messages, tools);
+        let operation_id = new_operation_id();
+        emit_lifecycle(
+            operation_id.clone(),
+            ContextTelemetryMode::ForcedOverflowRecovery,
+            ContextLifecycleEventKind::ContextOverflowRecoveryStarted {
+                mode: ContextTelemetryMode::ForcedOverflowRecovery,
+                provider_reported_window: info.provider_reported_window,
+                estimated_before,
+            },
+        );
+        operation_id
+    }
+
+    fn finish_overflow_recovery(
+        &self,
+        operation_id: String,
+        result: &anyhow::Result<ProviderChatResponse>,
+        recovered_estimate: u64,
+        did_retry: bool,
+    ) {
+        let mode = ContextTelemetryMode::ForcedOverflowRecovery;
+        if !did_retry {
+            emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "non_shrinking".to_string(),
+                },
+            );
+            return;
+        }
+        match result {
+            Ok(_) => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryCompleted {
+                    mode,
+                    estimated_after: recovered_estimate,
+                },
+            ),
+            Err(error) if context_window_exceeded_info(error).is_some() => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "context_window_exceeded".to_string(),
+                },
+            ),
+            Err(_) => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "retry_error".to_string(),
+                },
+            ),
+        }
+    }
+
     fn build_client(connect_timeout: Duration, mode: TransportMode) -> Client {
         let mut builder = Client::builder()
             // A broken proxy or unreachable provider should fail quickly instead
@@ -1333,6 +1468,10 @@ impl Provider for OpenAiProvider {
         "openai"
     }
 
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
         self.run_chat_with_overflow_recovery(request).await
     }
@@ -1360,7 +1499,7 @@ impl Provider for OpenAiProvider {
             Err(_) => Err(self.request_timeout_error(started, &attempts)),
         };
         if let Err(error) = &result {
-            if let Some(info) = context_window_exceeded_info(error) {
+                if let Some(info) = context_window_exceeded_info(error) {
                 tracing::warn!(
                     target: "omninova_core::providers::context",
                     context_overflow_detected = true,
@@ -1369,6 +1508,7 @@ impl Provider for OpenAiProvider {
                     "context_overflow_recovery_started"
                 );
                 let tools = request.tools.unwrap_or(&[]);
+                let recovery_op = self.begin_overflow_recovery(info, request.messages, tools);
                 let recovered = force_context_recovery(
                     self,
                     request.messages.to_vec(),
@@ -1399,12 +1539,14 @@ impl Provider for OpenAiProvider {
                         Ok(result) => result,
                         Err(_) => Err(self.request_timeout_error(started, &attempts2)),
                     };
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, true);
                 } else {
                     tracing::warn!(
                         target: "omninova_core::providers::context",
                         context_overflow_recovery_result = "non_shrinking",
                         "context_overflow_recovery_blocked"
                     );
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, false);
                 }
             }
         }
@@ -1530,6 +1672,7 @@ impl OpenAiProvider {
                     "context_overflow_recovery_started"
                 );
                 let tools = request.tools.unwrap_or(&[]);
+                let recovery_op = self.begin_overflow_recovery(info, request.messages, tools);
                 let recovered = force_context_recovery(
                     self,
                     request.messages.to_vec(),
@@ -1553,12 +1696,14 @@ impl OpenAiProvider {
                         Ok(result) => result,
                         Err(_) => Err(self.request_timeout_error(started, &attempts2)),
                     };
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, true);
                 } else {
                     tracing::warn!(
                         target: "omninova_core::providers::context",
                         context_overflow_recovery_result = "non_shrinking",
                         "context_overflow_recovery_blocked"
                     );
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, false);
                 }
             }
         }
@@ -1606,6 +1751,8 @@ impl OpenAiProvider {
                     "serialize_error",
                 )
             })?;
+        let tool_specs = request.tools.unwrap_or(&[]);
+        let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
         self.preflight_context(&request_body)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
 
@@ -1645,6 +1792,13 @@ impl OpenAiProvider {
         })?;
         let mut result = Self::parse_native_response(choice.message, choice.finish_reason);
         result.usage = usage;
+        self.observe_provider_actual(
+            request_identity.as_ref(),
+            &request_body,
+            request.messages,
+            tool_specs,
+            result.usage.as_ref(),
+        );
         Ok(result)
     }
 
@@ -1676,6 +1830,8 @@ impl OpenAiProvider {
                     "serialize_error",
                 )
             })?;
+        let tool_specs = request.tools.unwrap_or(&[]);
+        let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
         self.preflight_context(&request_body)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
 
@@ -1783,6 +1939,13 @@ impl OpenAiProvider {
             Some(text)
         };
 
+        self.observe_provider_actual(
+            request_identity.as_ref(),
+            &request_body,
+            request.messages,
+            tool_specs,
+            usage.as_ref(),
+        );
         Ok(ProviderChatResponse {
             text: final_text,
             tool_calls,
@@ -3198,5 +3361,212 @@ mod tests {
         provider
             .preflight_context(&"x".repeat(2_000_000))
             .expect("unknown budget must not fabricate a hard limit");
+    }
+
+    fn overflow_history() -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..24 {
+            messages.push(ChatMessage::user(format!("u{i} {}", "x".repeat(80))));
+            messages.push(ChatMessage::assistant(format!("a{i} {}", "y".repeat(80))));
+        }
+        messages
+    }
+
+    fn overflow_error_body() -> &'static str {
+        r#"{"error":{"code":"context_length_exceeded","message":"maximum context length is 128000 tokens"}}"#
+    }
+
+    const OK_SUMMARY: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+    const OK_FINAL: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+    fn overflow_kind_names(sink: &crate::observability::VecContextTelemetry) -> Vec<&'static str> {
+        sink.events()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. } => {
+                    Some("overflow_started")
+                }
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. } => {
+                    Some("overflow_completed")
+                }
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. } => {
+                    Some("overflow_failed")
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn chat_with_telemetry(
+        provider: OpenAiProvider,
+        messages: Vec<ChatMessage>,
+    ) -> (
+        Arc<crate::observability::VecContextTelemetry>,
+        anyhow::Result<ProviderChatResponse>,
+    ) {
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        let result = crate::observability::with_context_telemetry(
+            Some("session-o1".to_string()),
+            Some("run-o1".to_string()),
+            "openai",
+            "overflow-model",
+            sink.clone(),
+            async {
+                provider
+                    .chat(ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                    })
+                    .await
+            },
+        )
+        .await;
+        (sink, result)
+    }
+
+    #[tokio::test]
+    async fn generic_http_400_does_not_start_overflow_recovery() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(
+            400,
+            "{\"error\":{\"message\":\"bad request\"}}",
+        )])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert!(overflow_kind_names(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_overflow_starts_recovery() {
+        let (base_url, _requests) = serve_scripted(vec![Scripted::Status(400, overflow_error_body())])
+            .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, _result) =
+            chat_with_telemetry(provider, vec![ChatMessage::user("hi")]).await;
+        let names = overflow_kind_names(&sink);
+        assert_eq!(names.first().copied(), Some("overflow_started"));
+        assert!(!names.contains(&"overflow_completed"));
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_completed_only_after_successful_retry() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(200, OK_FINAL),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert_eq!(result.expect("retry succeeds").text.as_deref(), Some("Hello"));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. }
+                )
+            })
+            .expect("started");
+        let completed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. }
+                )
+            })
+            .expect("completed");
+        assert_eq!(started.operation_id, completed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. }
+            )
+        }));
+        let actuals: Vec<_> = sink
+            .snapshots()
+            .into_iter()
+            .filter(|s| s.measurement_kind == crate::observability::MeasurementKind::ProviderActual)
+            .collect();
+        assert!(actuals.iter().any(|s| s.provider_actual_input_tokens == Some(42)));
+        assert!(actuals.iter().all(|s| s.session_id.as_deref() == Some("session-o1")));
+        assert!(actuals.iter().all(|s| s.model == "overflow-model"));
+    }
+
+    #[tokio::test]
+    async fn second_overflow_emits_failed_not_completed() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(400, overflow_error_body()),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. }
+                )
+            })
+            .expect("started");
+        let failed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. }
+                )
+            })
+            .expect("failed");
+        assert_eq!(started.operation_id, failed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. }
+            )
+        }));
     }
 }

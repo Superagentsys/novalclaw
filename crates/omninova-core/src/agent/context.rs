@@ -1,7 +1,11 @@
 use crate::agent::history::{
     apply_compaction, build_structured_checkpoint, normalize_transient_system_messages,
     plan_compaction, plan_compaction_with_tail_tokens, prune_oversized_tool_results,
-    render_for_summary, truncate_history_preserving_system, SUMMARY_MARKER,
+    render_for_summary, truncate_history_preserving_system, CHECKPOINT_MARKER, SUMMARY_MARKER,
+};
+use crate::observability::{
+    emit_lifecycle, new_operation_id, pause_usage_snapshots, ContextLifecycleEventKind,
+    ContextTelemetryMode,
 };
 use crate::providers::context_budget::{
     largest_tool_result_tokens, TokenEstimator, MAX_MAINTENANCE_PASSES, MAX_SUMMARY_SOURCE_CHARS,
@@ -14,6 +18,29 @@ const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对�
 用户的目标与偏好、已确认的事实与决定、未完成的任务与下一步、关键文件路径与命令、阻塞原因。\
 省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
 不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
+
+fn telemetry_mode(
+    mode: ContextMaintenanceMode,
+    unknown_budget_oversize: bool,
+) -> ContextTelemetryMode {
+    match mode {
+        ContextMaintenanceMode::ForcedOverflowRecovery => {
+            ContextTelemetryMode::ForcedOverflowRecovery
+        }
+        ContextMaintenanceMode::Normal if unknown_budget_oversize => {
+            ContextTelemetryMode::UnknownBudgetOversize
+        }
+        ContextMaintenanceMode::Normal => ContextTelemetryMode::Proactive,
+    }
+}
+
+fn has_checkpoint(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.role == "system"
+            && (message.content.starts_with(CHECKPOINT_MARKER)
+                || message.content.starts_with(SUMMARY_MARKER))
+    })
+}
 
 
 /// Maintenance mode used by the Context Runtime.
@@ -97,6 +124,7 @@ async fn maintain_context_with_mode(
         let oversized_tool_trigger = largest_tool > UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS;
         let message_count_trigger = messages.len() > max_history_messages.max(1);
         let should_prune = forced || oversized_tool_trigger || message_count_trigger;
+        let mode_label = telemetry_mode(mode, oversized_tool_trigger);
 
         if should_prune {
             tracing::info!(
@@ -111,12 +139,43 @@ async fn maintain_context_with_mode(
                 forced = %forced,
                 "unknown_budget_context_maintenance"
             );
+            let pressure_op = new_operation_id();
+            emit_lifecycle(
+                pressure_op,
+                mode_label,
+                ContextLifecycleEventKind::ContextPressureDetected {
+                    mode: mode_label,
+                    estimated_before: before,
+                    context_window_tokens: None,
+                    pressure_threshold_tokens: None,
+                    budget_source: Some("unknown".to_string()),
+                },
+            );
+            let prune_op = new_operation_id();
+            emit_lifecycle(
+                prune_op.clone(),
+                mode_label,
+                ContextLifecycleEventKind::ContextPruningStarted {
+                    mode: mode_label,
+                    estimated_before: before,
+                },
+            );
             let (mut current, pruned_count) = prune_oversized_tool_results(
                 messages,
                 UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS,
                 UNKNOWN_BUDGET_RECENT_TAIL_TOKENS,
             );
             let after_tool_prune = estimator.estimate_messages_with_tools(&current, tool_specs);
+            emit_lifecycle(
+                prune_op,
+                mode_label,
+                ContextLifecycleEventKind::ContextPruningCompleted {
+                    mode: mode_label,
+                    estimated_before: before,
+                    estimated_after: after_tool_prune,
+                    pruned_tool_result_count: pruned_count,
+                },
+            );
             if pruned_count > 0 {
                 tracing::info!(
                     target: "omninova_core::context",
@@ -151,10 +210,21 @@ async fn maintain_context_with_mode(
         let Some(plan) = plan_compaction(&messages, max_history) else {
             return messages;
         };
+        let compact_op = new_operation_id();
+        let compact_before = estimator.estimate_messages_with_tools(&messages, tool_specs);
+        emit_lifecycle(
+            compact_op.clone(),
+            mode_label,
+            ContextLifecycleEventKind::ContextCompactionStarted {
+                mode: mode_label,
+                estimated_before: compact_before,
+            },
+        );
         let request_messages = vec![
             ChatMessage::system(SUMMARIZER_PROMPT),
             ChatMessage::user(render_for_summary(&plan.summarize)),
         ];
+        let _pause_snapshots = pause_usage_snapshots();
         let summary = match provider
             .chat(ChatRequest {
                 messages: &request_messages,
@@ -165,16 +235,38 @@ async fn maintain_context_with_mode(
             Ok(response) => response.text.unwrap_or_default(),
             Err(error) => {
                 tracing::warn!("context compaction failed, truncating instead: {error}");
+                emit_lifecycle(
+                    compact_op,
+                    mode_label,
+                    ContextLifecycleEventKind::ContextCompactionFailed {
+                        mode: mode_label,
+                        estimated_before: compact_before,
+                        reason: "provider_error".to_string(),
+                    },
+                );
                 return truncate_history_preserving_system(messages, max_history);
             }
         };
-        return apply_compaction(plan, &summary);
+        let compacted = apply_compaction(plan, &summary);
+        let estimated_after = estimator.estimate_messages_with_tools(&compacted, tool_specs);
+        emit_lifecycle(
+            compact_op,
+            mode_label,
+            ContextLifecycleEventKind::ContextCompactionCompleted {
+                mode: mode_label,
+                estimated_before: compact_before,
+                estimated_after,
+                checkpoint_created: has_checkpoint(&compacted),
+            },
+        );
+        return compacted;
     };
 
     let estimator = TokenEstimator::new();
     let messages = normalize_transient_system_messages(messages);
     let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
     let pressure_threshold = budget.pressure_threshold();
+    let mode_label = telemetry_mode(mode, false);
     if !forced && before <= pressure_threshold {
         return messages;
     }
@@ -187,6 +279,17 @@ async fn maintain_context_with_mode(
         forced = %forced,
         "context_pressure_detected"
     );
+    emit_lifecycle(
+        new_operation_id(),
+        mode_label,
+        ContextLifecycleEventKind::ContextPressureDetected {
+            mode: mode_label,
+            estimated_before: before,
+            context_window_tokens: Some(budget.context_window_tokens),
+            pressure_threshold_tokens: Some(pressure_threshold),
+            budget_source: Some(budget.source.as_str().to_string()),
+        },
+    );
 
     let max_tool_result_tokens = if forced {
         UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS
@@ -198,9 +301,28 @@ async fn maintain_context_with_mode(
     } else {
         budget.recent_tail_budget()
     };
+    let prune_op = new_operation_id();
+    emit_lifecycle(
+        prune_op.clone(),
+        mode_label,
+        ContextLifecycleEventKind::ContextPruningStarted {
+            mode: mode_label,
+            estimated_before: before,
+        },
+    );
     let (mut current, pruned_count) =
         prune_oversized_tool_results(messages, max_tool_result_tokens, recent_tail_tokens);
     let after_tool_prune = estimator.estimate_messages_with_tools(&current, tool_specs);
+    emit_lifecycle(
+        prune_op,
+        mode_label,
+        ContextLifecycleEventKind::ContextPruningCompleted {
+            mode: mode_label,
+            estimated_before: before,
+            estimated_after: after_tool_prune,
+            pruned_tool_result_count: pruned_count,
+        },
+    );
     if pruned_count > 0 {
         tracing::info!(
             target: "omninova_core::context",
@@ -244,6 +366,15 @@ async fn maintain_context_with_mode(
             if plan.summarize.is_empty() {
                 break;
             }
+            let compact_op = new_operation_id();
+            emit_lifecycle(
+                compact_op.clone(),
+                mode_label,
+                ContextLifecycleEventKind::ContextCompactionStarted {
+                    mode: mode_label,
+                    estimated_before: last_estimate,
+                },
+            );
             let render = render_for_summary(&plan.summarize);
             let bounded_render: String = if render.chars().count() > MAX_SUMMARY_SOURCE_CHARS {
                 render.chars().take(MAX_SUMMARY_SOURCE_CHARS).collect()
@@ -254,6 +385,7 @@ async fn maintain_context_with_mode(
                 ChatMessage::system(SUMMARIZER_PROMPT),
                 ChatMessage::user(bounded_render),
             ];
+            let _pause_snapshots = pause_usage_snapshots();
             let summary = match provider
                 .chat(ChatRequest {
                     messages: &request_messages,
@@ -264,10 +396,28 @@ async fn maintain_context_with_mode(
                 Ok(response) => response.text.unwrap_or_default(),
                 Err(error) => {
                     tracing::warn!("context compaction failed: {error}");
+                    emit_lifecycle(
+                        compact_op,
+                        mode_label,
+                        ContextLifecycleEventKind::ContextCompactionFailed {
+                            mode: mode_label,
+                            estimated_before: last_estimate,
+                            reason: "provider_error".to_string(),
+                        },
+                    );
                     break;
                 }
             };
             if summary.trim().is_empty() {
+                emit_lifecycle(
+                    compact_op,
+                    mode_label,
+                    ContextLifecycleEventKind::ContextCompactionFailed {
+                        mode: mode_label,
+                        estimated_before: last_estimate,
+                        reason: "empty_summary".to_string(),
+                    },
+                );
                 break;
             }
             let checkpoint = build_structured_checkpoint(&current, &summary);
@@ -289,6 +439,15 @@ async fn maintain_context_with_mode(
                     after = %after_compact,
                     "context_compaction_failed: non-shrinking"
                 );
+                emit_lifecycle(
+                    compact_op,
+                    mode_label,
+                    ContextLifecycleEventKind::ContextCompactionFailed {
+                        mode: mode_label,
+                        estimated_before: last_estimate,
+                        reason: "non_shrinking".to_string(),
+                    },
+                );
                 break;
             }
             current = compacted;
@@ -300,6 +459,16 @@ async fn maintain_context_with_mode(
                 max_input = %budget.max_input_tokens,
                 forced = %forced,
                 "context_compaction_completed"
+            );
+            emit_lifecycle(
+                compact_op,
+                mode_label,
+                ContextLifecycleEventKind::ContextCompactionCompleted {
+                    mode: mode_label,
+                    estimated_before: before,
+                    estimated_after: after_compact,
+                    checkpoint_created: has_checkpoint(&current),
+                },
             );
             if after_compact <= budget.target_after_compaction() {
                 break;
@@ -314,6 +483,10 @@ async fn maintain_context_with_mode(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::observability::{
+        with_context_telemetry, ContextLifecycleEvent, ContextLifecycleEventKind,
+        VecContextTelemetry,
+    };
     use crate::providers::context_budget::{ContextBudget, ContextBudgetSource};
     use crate::providers::{ChatMessage, ChatResponse, TokenUsage};
     use crate::security::SecurityContext;
@@ -669,5 +842,287 @@ mod tests {
         let after = estimator.estimate_messages_with_tools(&out, &[]);
         assert!(summaries.lock().unwrap().len() >= 1);
         assert!(after < before);
+    }
+
+    fn kind_name(event: &ContextLifecycleEvent) -> &'static str {
+        match &event.kind {
+            ContextLifecycleEventKind::ContextPressureDetected { .. } => "pressure",
+            ContextLifecycleEventKind::ContextPruningStarted { .. } => "pruning_started",
+            ContextLifecycleEventKind::ContextPruningCompleted { .. } => "pruning_completed",
+            ContextLifecycleEventKind::ContextCompactionStarted { .. } => "compaction_started",
+            ContextLifecycleEventKind::ContextCompactionCompleted { .. } => "compaction_completed",
+            ContextLifecycleEventKind::ContextCompactionFailed { .. } => "compaction_failed",
+            ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. } => "overflow_started",
+            ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. } => {
+                "overflow_completed"
+            }
+            ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. } => "overflow_failed",
+        }
+    }
+
+    async fn with_recorded_telemetry<F, Fut, T>(f: F) -> (Arc<VecContextTelemetry>, T)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let sink = Arc::new(VecContextTelemetry::new());
+        let out = with_context_telemetry(
+            Some("session-o1".to_string()),
+            Some("run-o1".to_string()),
+            "test-provider",
+            "test-model",
+            sink.clone(),
+            f(),
+        )
+        .await;
+        (sink, out)
+    }
+
+    #[tokio::test]
+    async fn pruning_only_path_does_not_emit_compaction() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let huge = "x".repeat(1_924_822);
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..16 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        messages.push(ChatMessage::assistant(
+            r#"{"tool_calls":[{"id":"call-old","name":"big_tool","arguments":"{}"}]}"#,
+        ));
+        messages.push(ChatMessage::tool(format!(
+            r#"{{"tool_call_id":"call-old","content":"{huge}"}}"#
+        )));
+        messages.push(ChatMessage::assistant("continue"));
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 50, true).await
+        })
+        .await;
+        let names: Vec<_> = sink.events().iter().map(kind_name).collect();
+        assert!(names.contains(&"pruning_started"));
+        assert!(names.contains(&"pruning_completed"));
+        assert!(!names.contains(&"compaction_started"));
+        assert!(!names.contains(&"compaction_completed"));
+        assert!(summaries.lock().unwrap().is_empty());
+        let prune_ops: Vec<_> = sink
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    ContextLifecycleEventKind::ContextPruningStarted { .. }
+                        | ContextLifecycleEventKind::ContextPruningCompleted { .. }
+                )
+            })
+            .map(|e| e.operation_id.clone())
+            .collect();
+        assert_eq!(prune_ops[0], prune_ops[1]);
+    }
+
+    #[tokio::test]
+    async fn real_structured_compaction_emits_started_then_completed() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..60 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 50, true).await
+        })
+        .await;
+        assert!(summaries.lock().unwrap().len() >= 1);
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionStarted { .. }))
+            .expect("compaction started");
+        let completed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    ContextLifecycleEventKind::ContextCompactionCompleted { .. }
+                )
+            })
+            .expect("compaction completed");
+        assert_eq!(started.operation_id, completed.operation_id);
+        match &completed.kind {
+            ContextLifecycleEventKind::ContextCompactionCompleted {
+                estimated_after, ..
+            } => {
+                assert!(*estimated_after > 0);
+            }
+            _ => unreachable!(),
+        }
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                ContextLifecycleEventKind::ContextCompactionFailed { .. }
+            )
+        }));
+    }
+
+    struct NonShrinkingSummarizer {
+        budget: ContextBudget,
+    }
+
+    #[async_trait]
+    impl Provider for NonShrinkingSummarizer {
+        fn name(&self) -> &str {
+            "non-shrink"
+        }
+
+        fn context_budget(&self) -> Option<ContextBudget> {
+            Some(self.budget)
+        }
+
+        async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+            let is_summarizer = request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("你是对话摘要器"));
+            if is_summarizer {
+                return Ok(ChatResponse {
+                    text: Some("Z".repeat(80_000)),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    finish_reason: Some("stop".to_string()),
+                });
+            }
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct FailingSummarizer {
+        budget: ContextBudget,
+    }
+
+    #[async_trait]
+    impl Provider for FailingSummarizer {
+        fn name(&self) -> &str {
+            "fail-sum"
+        }
+
+        fn context_budget(&self) -> Option<ContextBudget> {
+            Some(self.budget)
+        }
+
+        async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+            let is_summarizer = request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("你是对话摘要器"));
+            if is_summarizer {
+                anyhow::bail!("summarizer down");
+            }
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn pressure_messages() -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..20 {
+            messages.push(ChatMessage::user(format!("u{i} {}", "x".repeat(400))));
+            messages.push(ChatMessage::assistant(format!("a{i} {}", "y".repeat(400))));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn non_shrinking_compaction_emits_failed_not_completed() {
+        let provider = NonShrinkingSummarizer {
+            budget: ContextBudget::new(
+                50_000,
+                Some(16_384),
+                ContextBudgetSource::BuiltIn,
+            ),
+        };
+        let messages = pressure_messages();
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 10, true).await
+        })
+        .await;
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionStarted { .. }))
+            .expect("compaction started");
+        let failed = events
+            .iter()
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionFailed { .. }))
+            .expect("compaction failed");
+        assert_eq!(started.operation_id, failed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                ContextLifecycleEventKind::ContextCompactionCompleted { .. }
+            )
+        }));
+        match &failed.kind {
+            ContextLifecycleEventKind::ContextCompactionFailed { reason, .. } => {
+                assert_eq!(reason, "non_shrinking");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn summarizer_error_emits_failed_not_completed() {
+        let provider = FailingSummarizer {
+            budget: ContextBudget::new(
+                50_000,
+                Some(16_384),
+                ContextBudgetSource::BuiltIn,
+            ),
+        };
+        let messages = pressure_messages();
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 10, true).await
+        })
+        .await;
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionStarted { .. }))
+            .expect("compaction started");
+        let failed = events
+            .iter()
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionFailed { .. }))
+            .expect("compaction failed");
+        assert_eq!(started.operation_id, failed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                ContextLifecycleEventKind::ContextCompactionCompleted { .. }
+            )
+        }));
+        match &failed.kind {
+            ContextLifecycleEventKind::ContextCompactionFailed { reason, .. } => {
+                assert_eq!(reason, "provider_error");
+            }
+            _ => unreachable!(),
+        }
     }
 }

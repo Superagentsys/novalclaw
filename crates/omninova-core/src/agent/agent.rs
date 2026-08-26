@@ -8,6 +8,7 @@ use crate::agent::prompt::bootstrap_system_messages;
 use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
+use crate::observability::{with_context_telemetry, SharedSink};
 use crate::providers::{ChatMessage, Provider};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
@@ -193,9 +194,6 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
-
         let budget = BudgetTracker::new(self.config.budget.clone());
 
         // Use the frontend-provided run_id if available, otherwise generate one.
@@ -217,26 +215,51 @@ impl Agent {
             drain_handle.drain().await;
         });
 
-        bus.run_started(self.config.name.clone(), external_session_id, None);
+        bus.run_started(self.config.name.clone(), external_session_id.clone(), None);
 
-        let dispatcher = AgentDispatcher::new(
-                             self.provider.as_ref(),
-                             &self.tools,
-                             &self.tool_specs,
-                             self.config.max_tool_iterations,
-                             &self.security,
-                             &budget,
-                             self.config.max_history_messages,
-                             self.config.compact_context,
-                         )
-        .with_event_bus(Some(bus.clone()))
-        .with_cancel_token(Some(cancel_token.clone()));
-
-        let run_future = dispatcher.run_streaming_with_bus(&mut self.messages);
-        let dispatch_result = tokio::select! {
-            result = run_future => result,
-            _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
-        };
+        let provider_name = self
+            .security
+            .audit()
+            .context()
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.name().to_string());
+        let model_name = self
+            .provider
+            .model()
+            .map(str::to_string)
+            .or_else(|| self.security.audit().context().model.clone())
+            .unwrap_or_default();
+        let sink: SharedSink = Arc::new(bus.clone());
+        let session_id = external_session_id.clone();
+        let dispatch_result = with_context_telemetry(
+            session_id,
+            Some(run_id.clone()),
+            provider_name,
+            model_name,
+            sink,
+            async {
+                self.compact_context_if_needed().await;
+                self.messages.push(ChatMessage::user(message));
+                let dispatcher = AgentDispatcher::new(
+                    self.provider.as_ref(),
+                    &self.tools,
+                    &self.tool_specs,
+                    self.config.max_tool_iterations,
+                    &self.security,
+                    &budget,
+                    self.config.max_history_messages,
+                    self.config.compact_context,
+                )
+                .with_event_bus(Some(bus.clone()))
+                .with_cancel_token(Some(cancel_token.clone()));
+                tokio::select! {
+                    result = dispatcher.run_streaming_with_bus(&mut self.messages) => result,
+                    _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
+                }
+            },
+        )
+        .await;
 
         let reply_text = match dispatch_result {
             Ok(reply) => {

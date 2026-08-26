@@ -66,7 +66,9 @@ export type AgentRunEvent =
   | AgentRunEventRunCompleted
   | AgentRunEventRunFailed
   | AgentRunEventRunCancelled
-  | AgentRunEventError;
+  | AgentRunEventError
+  | AgentRunEventContextUsage
+  | AgentRunEventContextLifecycle;
 
 export interface AgentRunEventRunStarted {
   type: "run_started";
@@ -269,6 +271,65 @@ export interface AgentRunEventError {
   type: "error";
   run_id: string;
   message: string;
+}
+
+export type ContextMeasurementKind =
+  | "candidate_estimate"
+  | "final_request_estimate"
+  | "provider_actual";
+
+export type ContextTelemetryMode =
+  | "proactive"
+  | "unknown_budget_oversize"
+  | "forced_overflow_recovery";
+
+export interface ContextUsageBreakdown {
+  system_tokens: number;
+  conversation_tokens: number;
+  tool_schema_tokens: number;
+  tool_result_tokens: number;
+  request_overhead_tokens: number;
+}
+
+export interface ContextUsageSnapshot {
+  session_id?: string | null;
+  run_id?: string | null;
+  request_revision: number;
+  provider: string;
+  model: string;
+  measurement_kind: ContextMeasurementKind;
+  estimated_input_tokens: number;
+  provider_actual_input_tokens?: number | null;
+  context_window_tokens?: number | null;
+  max_input_tokens?: number | null;
+  output_reserve_tokens?: number | null;
+  safety_reserve_tokens?: number | null;
+  pressure_threshold_tokens?: number | null;
+  budget_source?: string | null;
+  usage_ratio?: number | null;
+  breakdown: ContextUsageBreakdown;
+  measured_at: number;
+}
+
+export interface ContextLifecycleEvent {
+  operation_id: string;
+  run_id?: string | null;
+  session_id?: string | null;
+  mode: ContextTelemetryMode;
+  kind: Record<string, unknown> & { type: string };
+  timestamp: number;
+}
+
+export interface AgentRunEventContextUsage {
+  type: "context_usage";
+  run_id: string;
+  snapshot: ContextUsageSnapshot;
+}
+
+export interface AgentRunEventContextLifecycle {
+  type: "context_lifecycle";
+  run_id: string;
+  event: ContextLifecycleEvent;
 }
 
 export type RunEvent =
