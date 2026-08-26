@@ -33,6 +33,24 @@ pub const MAX_MAINTENANCE_PASSES: usize = 2;
 /// Cap for source text handed to the summarizer if the old prefix is huge.
 pub const MAX_SUMMARY_SOURCE_CHARS: usize = 200_000;
 
+/// Conservative per-tool-result soft cap used when no model context window is
+/// known. It is deliberately not a "context window": it only prevents a single
+/// oversized historical tool result from remaining fully model-visible when
+/// there is no authoritative budget to detect pressure.
+///
+/// 48,000 estimated tokens is intentionally conservative:
+/// - It is below common small/medium model limits (~64K-128K) even after
+///   reserving output space.
+/// - It is large enough to keep normal file reads / command outputs usable.
+/// - It is small enough that a single ~1.9M-char tool result (roughly 2.4M
+///   estimated tokens) is always caught.
+pub const UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS: u64 = 48_000;
+
+/// When the budget is unknown, we still protect the most recent tail so the
+/// current tool interaction is not pruned before the model can consume it.
+/// 8K estimated tokens is a small recent-turn budget for this best-effort path.
+pub const UNKNOWN_BUDGET_RECENT_TAIL_TOKENS: u64 = 8_000;
+
 /// Where the resolved context-window size came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBudgetSource {
@@ -157,6 +175,22 @@ impl TokenEstimator {
         }
         total.saturating_add(8)
     }
+}
+
+/// Returns the largest estimated tool-result payload currently present in the
+/// model-visible context. Used by the unknown-budget safety path.
+pub fn largest_tool_result_tokens(messages: &[ChatMessage], estimator: &TokenEstimator) -> u64 {
+    let mut largest = 0u64;
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        let estimated = estimator.estimate_text(&message.content);
+        if estimated > largest {
+            largest = estimated;
+        }
+    }
+    largest
 }
 
 /// Resolves a context budget from config and/or built-in metadata.

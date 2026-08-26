@@ -4,7 +4,8 @@ use crate::agent::history::{
     render_for_summary, truncate_history_preserving_system, SUMMARY_MARKER,
 };
 use crate::providers::context_budget::{
-    TokenEstimator, MAX_MAINTENANCE_PASSES, MAX_SUMMARY_SOURCE_CHARS,
+    largest_tool_result_tokens, TokenEstimator, MAX_MAINTENANCE_PASSES, MAX_SUMMARY_SOURCE_CHARS,
+    UNKNOWN_BUDGET_RECENT_TAIL_TOKENS, UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS,
 };
 use crate::providers::{ChatMessage, ChatRequest, Provider};
 use crate::tools::ToolSpec;
@@ -34,10 +35,67 @@ pub async fn maintain_context(
     compact_context: bool,
 ) -> Vec<ChatMessage> {
     let Some(budget) = provider.context_budget() else {
+        // Unknown budget: best-effort proactive maintenance only.
+        // 1. Legacy message-count fallback remains active.
+        // 2. Absolute oversized tool-result protection is independent of the
+        //    message count, so a single 1.9M-char tool result is never left
+        //    fully model-visible merely because 34 <= 50.
+        let estimator = TokenEstimator::new();
+        let mut messages = normalize_transient_system_messages(messages);
+        let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
+        let largest_tool = largest_tool_result_tokens(&messages, &estimator);
+        let oversized_tool_trigger = largest_tool > UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS;
+        let message_count_trigger = messages.len() > max_history_messages.max(1);
+        let should_prune = oversized_tool_trigger || message_count_trigger;
+
+        if should_prune {
+            tracing::info!(
+                target: "omninova_core::context",
+                budget_source = "unknown",
+                context_window = tracing::field::Empty,
+                message_count = %messages.len(),
+                estimated_input = %before,
+                largest_tool_result_tokens = %largest_tool,
+                unknown_budget_oversize_trigger = %oversized_tool_trigger,
+                message_count_trigger = %message_count_trigger,
+                "unknown_budget_context_maintenance"
+            );
+            let (mut current, pruned_count) = prune_oversized_tool_results(
+                messages,
+                UNKNOWN_BUDGET_TOOL_SOFT_CAP_TOKENS,
+                UNKNOWN_BUDGET_RECENT_TAIL_TOKENS,
+            );
+            let after_tool_prune = estimator.estimate_messages_with_tools(&current, tool_specs);
+            if pruned_count > 0 {
+                tracing::info!(
+                    target: "omninova_core::context",
+                    budget_source = "unknown",
+                    message_count = %current.len(),
+                    estimated_before = %before,
+                    estimated_after = %after_tool_prune,
+                    pruning_triggered = true,
+                    "unknown_budget_tool_results_pruned"
+                );
+            }
+
+            if !compact_context {
+                return current;
+            }
+
+            // If pruning was only needed for an oversized tool result and the
+            // message count is still within the legacy budget, no count-based
+            // summarization is required.
+            if !message_count_trigger {
+                return current;
+            }
+
+            // Otherwise continue to the legacy message-count compaction below.
+            messages = current;
+        }
+
         if !compact_context {
             return messages;
         }
-        // Unknown budget: keep the legacy count-based fallback.
         let max_history = max_history_messages.max(1);
         let Some(plan) = plan_compaction(&messages, max_history) else {
             return messages;
@@ -242,12 +300,13 @@ mod tests {
                     finish_reason: Some("stop".to_string()),
                 });
             }
+            const NORMAL_TOOL_CALLS: usize = 8;
             let round = self.tool_round.fetch_add(1, Ordering::SeqCst);
-            if round == 0 {
+            if round < NORMAL_TOOL_CALLS {
                 return Ok(ChatResponse {
                     text: None,
                     tool_calls: vec![crate::providers::ToolCall {
-                        id: "call-1".to_string(),
+                        id: format!("call-{}", round + 1),
                         name: "big_tool".to_string(),
                         arguments: "{}".to_string(),
                     }],
@@ -266,6 +325,58 @@ mod tests {
                     input_tokens: Some(100),
                     output_tokens: Some(10),
                 }),
+                reasoning_content: None,
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct UnknownBudgetProvider {
+        compact_summaries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UnknownBudgetProvider {
+        fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+            let compact_summaries = Arc::new(Mutex::new(Vec::new()));
+            (Self {
+                compact_summaries: compact_summaries.clone(),
+            }, compact_summaries)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for UnknownBudgetProvider {
+        fn name(&self) -> &str {
+            "unknown-budget"
+        }
+
+        fn context_budget(&self) -> Option<ContextBudget> {
+            None
+        }
+
+        async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+            let is_summarizer = request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("你是对话摘要器"));
+            if is_summarizer {
+                self.compact_summaries.lock().unwrap().push("summary".to_string());
+                return Ok(ChatResponse {
+                    text: Some("summary".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                    finish_reason: Some("stop".to_string()),
+                });
+            }
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![],
+                usage: None,
                 reasoning_content: None,
                 finish_reason: Some("stop".to_string()),
             })
@@ -295,7 +406,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: "T".repeat(120_000),
+                output: "X".repeat(5_000),
                 error: None,
             })
         }
@@ -303,9 +414,13 @@ mod tests {
 
     #[tokio::test]
     async fn long_run_mid_turn_compaction_preserves_continuity_and_stays_under_budget() {
-        let (provider, requests, summaries) = BudgetProvider::new(200_000);
+        let (provider, requests, summaries) = BudgetProvider::new(60_000);
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::InMemoryMemory::new());
-        let security = SecurityContext::from_config(&Config::default());
+        let mut config = Config::default();
+        config.autonomy.level = "autonomous".to_string();
+        config.approvals.enabled = false;
+        config.security.tool_policy.allowed_tools = vec!["big_tool".to_string()];
+        let security = SecurityContext::from_config(&config);
         let mut config = crate::config::AgentConfig::default();
         config.compact_context = true;
         config.max_history_messages = 10;
@@ -377,5 +492,76 @@ mod tests {
         } else {
             assert!(summaries.lock().unwrap().len() >= 1);
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_budget_oversized_tool_prunes_independent_of_message_count() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let huge = "x".repeat(1_924_822);
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..16 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        messages.push(ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-old","name":"big_tool","arguments":"{}"}]}"#));
+        messages.push(ChatMessage::tool(format!(r#"{{"tool_call_id":"call-old","content":"{huge}"}}"#)));
+        messages.push(ChatMessage::assistant("continue"));
+        assert!(messages.len() <= 50);
+        let estimator = TokenEstimator::new();
+        let before = estimator.estimate_messages_with_tools(&messages, &[]);
+        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let after = estimator.estimate_messages_with_tools(&out, &[]);
+        assert!(out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
+        assert!(after < before);
+        assert!(summaries.lock().unwrap().is_empty(), "count fallback should not run when only oversize triggered");
+    }
+
+    #[tokio::test]
+    async fn unknown_budget_small_tool_results_no_unnecessary_maintenance() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::user("goal"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-1","name":"big_tool","arguments":"{}"}]}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"call-1","content":"small result"}"#.to_string()),
+            ChatMessage::assistant("continue"),
+        ];
+        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        assert!(!out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
+        assert!(summaries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_budget_message_count_fallback_still_functions() {
+        let (provider, summaries) = UnknownBudgetProvider::new();
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..60 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        assert!(messages.len() > 50);
+        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        assert!(out.len() < 122, "count-based compaction should shrink history");
+        assert!(summaries.lock().unwrap().len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_budget_pruning_is_idempotent_for_already_pruned_content() {
+        let (provider, _summaries) = UnknownBudgetProvider::new();
+        let huge = "x".repeat(1_000_000);
+        let mut tool = ChatMessage::tool(format!(r#"{{"tool_call_id":"call-1","content":"{huge}"}}"#));
+        tool.original_tool_content = Some(huge.clone());
+        tool.content = r#"{"tool_call_id":"call-1","content":"[Tool output pruned from model context]\n..."}"#.to_string();
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-1","name":"big_tool","arguments":"{}"}]}"#),
+            tool,
+            ChatMessage::assistant("continue"),
+        ];
+        let before_content = messages[2].content.clone();
+        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let out_tool = out.iter().find(|m| m.role == "tool").expect("tool remains");
+        assert_eq!(out_tool.content, before_content);
+        assert_eq!(out_tool.original_tool_content.as_deref(), Some(huge.as_str()));
     }
 }

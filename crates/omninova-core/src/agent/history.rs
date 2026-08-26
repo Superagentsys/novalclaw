@@ -299,6 +299,14 @@ pub fn prune_oversized_tool_results(
             out.push(message);
             continue;
         }
+        // Idempotency: an already-pruned tool message keeps its full original
+        // in `original_tool_content`; do not repeatedly rewrite or shrink it.
+        if message.original_tool_content.is_some()
+            && message.content.contains("[Tool output pruned from model context]")
+        {
+            out.push(message);
+            continue;
+        }
         if let Some(pruned_content) = prune_tool_content(&message.content) {
             if message.original_tool_content.is_none() {
                 if let Some(original) = extract_tool_content(&message.content) {
