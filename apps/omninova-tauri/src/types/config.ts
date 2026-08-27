@@ -513,10 +513,13 @@ export interface GatewayChatHistoryMessage {
 }
 
 export interface GatewaySessionHistoryResponse {
-  sessionId: string;
+  sessionId?: string;
+  session_id?: string;
   channel: string;
   messages: GatewayChatHistoryMessage[];
   updatedAt?: number | null;
+  updated_at?: number | null;
+  context_projection?: import("../components/AgentRun/contextUsageState").PersistedContextProjectionView | null;
 }
 
 export interface ExecutionStep {

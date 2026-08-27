@@ -12,11 +12,13 @@ import {
 import {
   areStoredMessagesEqual,
   fetchSessionHistory,
+  fetchSessionHistoryWithProjection,
   fetchWebSessionsFromGateway,
   formatTime,
   loadChatStorage,
   mergeAvatarSessions,
   mergeLocalMessageMetadata,
+  projectSessionContext,
   saveChatStorage,
   type StoredAvatarSession,
   type StoredChatMessage,
@@ -33,9 +35,12 @@ import {
 import {
   applyContextUsageLifecycle,
   applyContextUsageSnapshot,
+  applySessionOpenCandidate,
   emptyContextUsageState,
+  failContextUsageProjection,
   finishContextUsageRun,
   identityKey,
+  restorePersistedContextProjection,
   switchContextUsageIdentity,
   type ContextUsageIdentity,
 } from "../AgentRun/contextUsageState";
@@ -754,6 +759,96 @@ export function Chat({
     () => switchContextUsageIdentity(contextUsageState, contextUsageIdentity),
     [contextUsageIdentity, contextUsageState]
   );
+  const contextProjectedKeyRef = useRef("");
+  useEffect(() => {
+    if (gatewayStatus !== "connected") return;
+    if (!sessionId || !contextUsageIdentity.provider || !contextUsageIdentity.model) return;
+    if (activeRunId) return;
+    const key = identityKey({
+      sessionId: contextUsageIdentity.sessionId,
+      provider: contextUsageIdentity.provider,
+      model: contextUsageIdentity.model,
+    });
+    if (contextProjectedKeyRef.current === key) return;
+    contextProjectedKeyRef.current = key;
+    const identity = {
+      sessionId: contextUsageIdentity.sessionId,
+      provider: contextUsageIdentity.provider,
+      model: contextUsageIdentity.model,
+      liveRunId: contextUsageIdentity.liveRunId,
+    };
+    let cancelled = false;
+    void (async () => {
+      try {
+        const history = await fetchSessionHistoryWithProjection(sessionId);
+        if (cancelled) return;
+        setContextUsageState((previous) =>
+          restorePersistedContextProjection(
+            switchContextUsageIdentity(previous, identity),
+            history.contextProjection
+          )
+        );
+        const projected = await projectSessionContext({
+          sessionId,
+          provider: identity.provider,
+          model: identity.model,
+        });
+        if (cancelled) return;
+        setContextUsageState((previous) => {
+          let next = switchContextUsageIdentity(previous, identity);
+          if (projected.unavailable && !projected.current) {
+            return failContextUsageProjection(next);
+          }
+          if (projected.current) {
+            next = applySessionOpenCandidate(next, projected.current);
+            if (next.current) {
+              contextUsageCacheRef.current.set(
+                identityKey({
+                  sessionId: identity.sessionId,
+                  provider: identity.provider,
+                  model: identity.model,
+                }),
+                next.current
+              );
+            }
+          }
+          const actual = projected.last_actual ?? projected.lastActual;
+          if (actual && actual.input_tokens > 0) {
+            next = {
+              ...next,
+              lastActual: {
+                inputTokens: actual.input_tokens,
+                revision: actual.request_revision,
+                runId: actual.run_id ?? null,
+                provider: actual.provider,
+                model: actual.model,
+              },
+            };
+          }
+          if (!next.current) {
+            return failContextUsageProjection(next);
+          }
+          return next;
+        });
+      } catch {
+        if (cancelled) return;
+        setContextUsageState((previous) =>
+          failContextUsageProjection(switchContextUsageIdentity(previous, identity))
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeRunId,
+    contextUsageIdentity.liveRunId,
+    contextUsageIdentity.model,
+    contextUsageIdentity.provider,
+    contextUsageIdentity.sessionId,
+    gatewayStatus,
+    sessionId,
+  ]);
   const activeToolApproval = activeRunId ? pendingToolApprovals[activeRunId] : undefined;
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];

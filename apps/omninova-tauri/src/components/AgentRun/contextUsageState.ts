@@ -46,6 +46,8 @@ export interface ContextUsageState {
   compactionOperationId: string | null;
   pruningOperationId: string | null;
   recoveryOperationId: string | null;
+  refreshing: boolean;
+  unavailable: boolean;
 }
 
 export type ContextActiveStatus = "compaction" | "pruning" | "recovery" | null;
@@ -83,6 +85,10 @@ export interface ContextUsageView {
   activeStatusLabel: string | null;
   compactText: string;
   parity: ContextUsageParity | null;
+  refreshing: boolean;
+  unavailable: boolean;
+  breakdownIndependent: boolean;
+  breakdownCaption: string | null;
 }
 
 const KIND_RANK: Record<ContextMeasurementKind, number> = {
@@ -99,7 +105,102 @@ export function emptyContextUsageState(identity: ContextUsageIdentity): ContextU
     compactionOperationId: null,
     pruningOperationId: null,
     recoveryOperationId: null,
+    refreshing: false,
+    unavailable: false,
   };
+}
+
+export function beginContextUsageRefresh(state: ContextUsageState): ContextUsageState {
+  if (state.refreshing && !state.unavailable) return state;
+  return { ...state, refreshing: true, unavailable: false };
+}
+
+export interface PersistedContextActualView {
+  input_tokens: number;
+  request_revision: number;
+  run_id?: string | null;
+  provider: string;
+  model: string;
+}
+
+export interface PersistedContextProjectionView {
+  snapshot: ContextUsageSnapshot;
+  last_actual?: PersistedContextActualView | null;
+}
+
+export function restorePersistedContextProjection(
+  state: ContextUsageState,
+  persisted: PersistedContextProjectionView | null | undefined
+): ContextUsageState {
+  if (!persisted?.snapshot) {
+    return beginContextUsageRefresh(state);
+  }
+  if (!snapshotMatchesIdentity(persisted.snapshot, state.identity)) {
+    return beginContextUsageRefresh(state);
+  }
+  if (persisted.snapshot.measurement_kind === "provider_actual") {
+    return beginContextUsageRefresh(state);
+  }
+  let next: ContextUsageState = {
+    ...state,
+    current: persisted.snapshot,
+    refreshing: true,
+    unavailable: false,
+  };
+  const actual = persisted.last_actual;
+  if (
+    actual &&
+    actual.input_tokens > 0 &&
+    (!state.identity.provider || actual.provider === state.identity.provider) &&
+    (!state.identity.model || actual.model === state.identity.model)
+  ) {
+    next = {
+      ...next,
+      lastActual: {
+        inputTokens: actual.input_tokens,
+        revision: actual.request_revision,
+        runId: actual.run_id ?? null,
+        provider: actual.provider,
+        model: actual.model,
+      },
+    };
+  }
+  return next;
+}
+
+export function applySessionOpenCandidate(
+  state: ContextUsageState,
+  snapshot: ContextUsageSnapshot
+): ContextUsageState {
+  if (!snapshotMatchesIdentity(snapshot, state.identity)) {
+    return { ...state, refreshing: false };
+  }
+  if (snapshot.measurement_kind === "provider_actual") {
+    const actual: ContextUsageActual = {
+      inputTokens: snapshot.provider_actual_input_tokens ?? 0,
+      revision: snapshot.request_revision,
+      runId: snapshot.run_id ?? null,
+      provider: snapshot.provider,
+      model: snapshot.model,
+    };
+    if (actual.inputTokens <= 0) {
+      return { ...state, refreshing: false, unavailable: false };
+    }
+    return { ...state, lastActual: actual, refreshing: false, unavailable: false };
+  }
+  return {
+    ...state,
+    current: snapshot,
+    refreshing: false,
+    unavailable: false,
+  };
+}
+
+export function failContextUsageProjection(state: ContextUsageState): ContextUsageState {
+  if (state.current) {
+    return { ...state, refreshing: false, unavailable: false };
+  }
+  return { ...state, refreshing: false, unavailable: true };
 }
 
 export function identityKey(identity: Pick<ContextUsageIdentity, "sessionId" | "provider" | "model">): string {
@@ -229,7 +330,7 @@ export function applyContextUsageSnapshot(
     if (!shouldTakeActual(actual, state.lastActual, state.identity.liveRunId, state.current)) {
       return state;
     }
-    return { ...state, lastActual: actual };
+    return { ...state, lastActual: actual, refreshing: false };
   }
 
   if (!estimateKind(snapshot.measurement_kind)) {
@@ -238,7 +339,7 @@ export function applyContextUsageSnapshot(
   if (!shouldTakeEstimate(snapshot, state.current, state.identity.liveRunId)) {
     return state;
   }
-  return { ...state, current: snapshot };
+  return { ...state, current: snapshot, refreshing: false, unavailable: false };
 }
 
 function lifecycleKindType(event: ContextLifecycleEvent | undefined): string {
@@ -287,8 +388,12 @@ export function applyContextUsageLifecycle(
 
 export function measurementLabel(
   kind: ContextMeasurementKind | null,
-  exact: boolean
+  exact: boolean,
+  provenance: ContextMeasurementProvenance | null = null
 ): string {
+  if (provenance === "exact_tokenizer") {
+    return exact ? "本地 Tokenizer" : "本地 Tokenizer · 待 Provider 对账";
+  }
   if (exact) {
     return kind === "final_request_estimate" ? "发送前精确计数" : "精确计数";
   }
@@ -397,9 +502,18 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
         ? `上下文输入  ${percent}% · ${formatTokenCount(estimatedTokens, totalFormat)} / ${formatTokenCount(maxInputTokens, "exact")} · ${statusShort}`
         : `上下文估算 ${formatTokenCount(estimatedTokens as number, totalFormat)} · 窗口未知 · ${statusShort}`;
   }
+  if (state.unavailable && estimatedTokens == null) {
+    compactText = "上下文暂不可用";
+  } else if (state.refreshing) {
+    compactText = estimatedTokens == null
+      ? "正在刷新…"
+      : `${compactText} · 正在刷新…`;
+  }
+
+  const breakdownIndependent = provenance === "exact_tokenizer";
 
   return {
-    placeholder: current == null,
+    placeholder: current == null && !state.unavailable && !state.refreshing,
     knownBudget,
     estimatedTokens,
     maxInputTokens,
@@ -415,7 +529,8 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
     measurementExact,
     measurementLabel: measurementLabel(
       current?.measurement_kind ?? null,
-      measurementExact
+      measurementExact,
+      provenance
     ),
     lastActualTokens,
     actualIsCurrent: matchesCurrentActual,
@@ -426,6 +541,10 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
     activeStatusLabel: active.label,
     compactText,
     parity,
+    refreshing: state.refreshing,
+    unavailable: state.unavailable,
+    breakdownIndependent,
+    breakdownCaption: breakdownIndependent ? "以下项目为独立估算" : null,
   };
 }
 

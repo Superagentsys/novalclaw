@@ -1,5 +1,7 @@
 import { invokeTauri } from "./tauri";
 import type { SessionTreeResponse } from "../types/config";
+import type { ContextUsageSnapshot } from "../components/AgentRun/types";
+import type { PersistedContextProjectionView } from "../components/AgentRun/contextUsageState";
 
 export const CHAT_STORAGE_KEY = "omninova-chat-sessions-v1";
 
@@ -41,10 +43,23 @@ export interface GatewayChatHistoryMessage {
 }
 
 export interface GatewaySessionHistoryResponse {
-  sessionId: string;
+  sessionId?: string;
+  session_id?: string;
   channel: string;
   messages: GatewayChatHistoryMessage[];
   updatedAt?: number | null;
+  updated_at?: number | null;
+  context_projection?: PersistedContextProjectionView | null;
+  contextProjection?: PersistedContextProjectionView | null;
+}
+
+export interface GatewayContextProjectionResponse {
+  restored?: PersistedContextProjectionView | null;
+  current?: ContextUsageSnapshot | null;
+  last_actual?: PersistedContextProjectionView["last_actual"];
+  lastActual?: PersistedContextProjectionView["last_actual"];
+  unavailable?: boolean;
+  error?: string | null;
 }
 
 const DEFAULT_AVATARS: StoredAvatarSession[] = [
@@ -195,6 +210,16 @@ export function toUiMessages(
 export async function fetchSessionHistory(
   sessionId: string
 ): Promise<StoredChatMessage[]> {
+  const res = await fetchSessionHistoryWithProjection(sessionId);
+  return res.messages;
+}
+
+export async function fetchSessionHistoryWithProjection(
+  sessionId: string
+): Promise<{
+  messages: StoredChatMessage[];
+  contextProjection: PersistedContextProjectionView | null;
+}> {
   const res = await invokeTauri<GatewaySessionHistoryResponse>(
     "get_chat_session_history",
     {
@@ -204,7 +229,25 @@ export async function fetchSessionHistory(
       },
     }
   );
-  return toUiMessages(res.messages ?? []);
+  return {
+    messages: toUiMessages(res.messages ?? []),
+    contextProjection: res.context_projection ?? res.contextProjection ?? null,
+  };
+}
+
+export async function projectSessionContext(args: {
+  sessionId: string;
+  provider: string;
+  model: string;
+}): Promise<GatewayContextProjectionResponse> {
+  return invokeTauri<GatewayContextProjectionResponse>("project_session_context", {
+    query: {
+      sessionId: args.sessionId,
+      channel: "web",
+      provider: args.provider,
+      model: args.model,
+    },
+  });
 }
 
 export async function fetchWebSessionsFromGateway(): Promise<StoredAvatarSession[]> {

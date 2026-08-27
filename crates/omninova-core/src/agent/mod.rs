@@ -11,6 +11,7 @@ pub mod run_control;
 pub mod tool_runner;
 
 pub use agent::Agent;
+pub use prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
 pub use agent_event::{AgentRunEvent, DiffStats, StepStatus, ChangeType};
 pub use budget::BudgetTracker;
 pub use event_bus::{EventBus, EventBusDrainHandle, build_tool_summary, build_tool_prepare_summary, build_tool_start_summary, truncate_for_display, extract_diff_stats, compute_content_diff, TimedBlock};

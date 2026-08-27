@@ -3,8 +3,12 @@ import { describe, it } from "node:test";
 import {
   applyContextUsageLifecycle,
   applyContextUsageSnapshot,
+  applySessionOpenCandidate,
+  beginContextUsageRefresh,
   emptyContextUsageState,
+  failContextUsageProjection,
   finishContextUsageRun,
+  restorePersistedContextProjection,
   selectContextUsageView,
   switchContextUsageIdentity,
   type ContextUsageIdentity,
@@ -724,5 +728,109 @@ describe("O3 context usage visualization", () => {
     for (const forbidden of ["hello", "prompt", "messages", "tools", "content"]) {
       assert.equal(json.includes(forbidden), false, json);
     }
+  });
+});
+
+describe("R1 session-driven context projection UI", () => {
+  it("D. last-known snapshot remains visible while local refresh runs", () => {
+    let state = emptyContextUsageState(identity);
+    state = restorePersistedContextProjection(state, {
+      snapshot: snapshot({
+        measurement_kind: "candidate_estimate",
+        estimated_input_tokens: 11_300,
+        request_revision: 4,
+      }),
+    });
+    const refreshing = selectContextUsageView(state);
+    assert.equal(refreshing.refreshing, true);
+    assert.equal(refreshing.placeholder, false);
+    assert.equal(refreshing.estimatedTokens, 11_300);
+    assert.match(refreshing.compactText, /正在刷新/);
+    state = applySessionOpenCandidate(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 12_000,
+      request_revision: 1,
+      run_id: null,
+    }));
+    const next = selectContextUsageView(state);
+    assert.equal(next.refreshing, false);
+    assert.equal(next.estimatedTokens, 12_000);
+  });
+
+  it("O. reconstruction failure exits loading to unavailable", () => {
+    let state = emptyContextUsageState(identity);
+    state = beginContextUsageRefresh(state);
+    assert.equal(selectContextUsageView(state).placeholder, false);
+    assert.match(selectContextUsageView(state).compactText, /正在刷新/);
+    state = failContextUsageProjection(state);
+    const view = selectContextUsageView(state);
+    assert.equal(view.unavailable, true);
+    assert.equal(view.refreshing, false);
+    assert.equal(view.placeholder, false);
+    assert.equal(view.compactText, "上下文暂不可用");
+  });
+
+  it("I. ProviderActual stays previous actual after session-open candidate", () => {
+    let state = emptyContextUsageState(identity);
+    state = restorePersistedContextProjection(state, {
+      snapshot: snapshot({
+        measurement_kind: "candidate_estimate",
+        estimated_input_tokens: 11_300,
+        request_revision: 4,
+      }),
+      last_actual: {
+        input_tokens: 4_777,
+        request_revision: 4,
+        run_id: "run-a",
+        provider: "openai",
+        model: "gpt-test",
+      },
+    });
+    state = applySessionOpenCandidate(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 12_100,
+      request_revision: 1,
+      run_id: null,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.estimatedTokens, 12_100);
+    assert.equal(view.lastActualTokens, 4_777);
+    assert.equal(view.actualLabel, "上次请求实际");
+    assert.equal(view.actualIsCurrent, false);
+  });
+
+  it("F. provider/model mismatch does not restore old snapshot as current", () => {
+    let state = emptyContextUsageState({
+      ...identity,
+      provider: "anthropic",
+      model: "claude-sonnet",
+    });
+    state = restorePersistedContextProjection(state, {
+      snapshot: snapshot({
+        measurement_kind: "candidate_estimate",
+        estimated_input_tokens: 99,
+        request_revision: 1,
+        provider: "deepseek",
+        model: "deepseek-chat",
+      }),
+    });
+    const view = selectContextUsageView(state);
+    assert.equal(view.estimatedTokens, null);
+    assert.equal(view.refreshing, true);
+  });
+
+  it("breakdown for exact tokenizer is labeled as independent estimates", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 11_300,
+      request_revision: 1,
+      measurement_provenance: "exact_tokenizer",
+      measurement_exact: false,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.breakdownIndependent, true);
+    assert.equal(view.breakdownCaption, "以下项目为独立估算");
+    assert.equal(view.measurementLabel, "本地 Tokenizer · 待 Provider 对账");
   });
 });

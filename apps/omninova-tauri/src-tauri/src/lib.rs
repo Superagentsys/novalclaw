@@ -19,7 +19,7 @@ use omninova_core::gateway::{
     check_dingtalk_public_route, check_gateway_public_health,
     dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
     feishu_public_callback_urls, normalize_gateway_public_config,
-    normalize_public_webhook_base_url, AgentJobExecutor, GatewayHealth, GatewayInboundResponse,
+    normalize_public_webhook_base_url, AgentJobExecutor, GatewayHealth,     GatewayInboundResponse, GatewayContextProjectionResponse,
     DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
@@ -1786,6 +1786,38 @@ async fn get_chat_session_history(
     let channel = query.channel.unwrap_or(ChannelKind::Web);
     Ok(runtime
         .get_session_history(&channel, &query.session_id)
+        .await)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiContextProjectionQuery {
+    session_id: String,
+    #[serde(default)]
+    channel: Option<ChannelKind>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[tauri::command]
+async fn project_session_context(
+    query: UiContextProjectionQuery,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayContextProjectionResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let channel = query.channel.unwrap_or(ChannelKind::Web);
+    Ok(runtime
+        .project_session_context(
+            &channel,
+            &query.session_id,
+            query.provider,
+            query.model,
+        )
         .await)
 }
 
@@ -5129,6 +5161,7 @@ pub fn run() {
             knowledge_search,
             debug_shell_stream,
             get_chat_session_history,
+            project_session_context,
             delete_chat_session,
             session_tree_snapshot,
             check_browser_dep,

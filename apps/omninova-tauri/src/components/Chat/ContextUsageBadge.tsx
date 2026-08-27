@@ -109,12 +109,15 @@ function compactStatusLabel(view: ContextUsageView): string | null {
 }
 
 function badgeSummary(view: ContextUsageView): string {
+  if (view.unavailable && view.estimatedTokens == null) return "上下文暂不可用";
+  if (view.refreshing && view.estimatedTokens == null) return "正在刷新…";
   if (view.placeholder) return "正在计算…";
   const total = formatTokenCount(view.estimatedTokens ?? 0, view.totalFormat);
+  const refresh = view.refreshing ? " · 正在刷新…" : "";
   if (!view.knownBudget || view.maxInputTokens == null || view.percent == null) {
-    return `${total} · 窗口未知`;
+    return `${total} · 窗口未知${refresh}`;
   }
-  return `${view.percent}% · ${total} / ${formatTokenCount(view.maxInputTokens, "exact")}`;
+  return `${view.percent}% · ${total} / ${formatTokenCount(view.maxInputTokens, "exact")}${refresh}`;
 }
 
 interface ContextUsageBadgeContentProps {
@@ -167,22 +170,30 @@ export function ContextUsageBadgeContent({
           <header className="context-usage-header">
             <div className="context-usage-heading">
               <span className="context-usage-title">
-                {view.placeholder
-                  ? "上下文"
-                  : view.knownBudget && view.percent != null
-                    ? `上下文输入 ${view.percent}%`
-                    : "上下文估算"}
+                {view.unavailable && view.estimatedTokens == null
+                  ? "上下文暂不可用"
+                  : view.placeholder
+                    ? "上下文"
+                    : view.knownBudget && view.percent != null
+                      ? `上下文输入 ${view.percent}%`
+                      : "上下文估算"}
               </span>
-              {!view.placeholder ? (
+              {!view.placeholder && !view.unavailable ? (
                 <span className="context-usage-kind">{view.measurementLabel}</span>
+              ) : view.refreshing ? (
+                <span className="context-usage-kind">正在刷新…</span>
               ) : null}
             </div>
             <span className="context-usage-total">
-              {view.placeholder
-                ? "正在计算…"
-                : view.knownBudget && estimateText && maxText
-                  ? `${estimateText} / ${maxText}`
-                  : estimateText}
+              {view.unavailable && view.estimatedTokens == null
+                ? "—"
+                : view.refreshing && view.estimatedTokens == null
+                  ? "正在刷新…"
+                  : view.placeholder
+                    ? "正在计算…"
+                    : view.knownBudget && estimateText && maxText
+                      ? `${estimateText} / ${maxText}`
+                      : estimateText}
             </span>
           </header>
 
@@ -197,7 +208,7 @@ export function ContextUsageBadgeContent({
                 aria-valuenow={view.barPercent}
                 aria-valuetext={`${view.percent}% · ${estimateText} / ${maxText}`}
               >
-                {visibleBreakdown.length > 0 && view.estimatedTokens ? (
+                {visibleBreakdown.length > 0 && view.estimatedTokens && !view.breakdownIndependent ? (
                   <span
                     className="context-usage-segments"
                     style={{ width: `${view.barPercent}%` }}
@@ -249,6 +260,9 @@ export function ContextUsageBadgeContent({
                 <span id={`${panelId}-breakdown`}>估算构成</span>
                 {view.revision != null ? <span>Revision {view.revision}</span> : null}
               </div>
+              {view.breakdownCaption ? (
+                <p className="context-usage-hint">{view.breakdownCaption}</p>
+              ) : null}
               <dl className="context-usage-rows context-usage-rows--breakdown">
                 {visibleBreakdown.map((item) => (
                   <div key={item.key} className="context-usage-row">

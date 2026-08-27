@@ -1,5 +1,6 @@
 pub mod agent_menu;
 mod assembly;
+mod context_projection;
 pub mod dingtalk_card;
 pub mod dingtalk_card_stream;
 pub mod dingtalk_commands;
@@ -1954,6 +1955,12 @@ impl GatewayRuntime {
                 .into_iter()
                 .map(ChatMessage::strip_images_for_history)
                 .collect();
+            let projection = {
+                let snapshot = agent
+                    .project_open_context(inbound.session_id.clone())
+                    .await;
+                Some(crate::observability::merge_persisted_projection(None, &snapshot))
+            };
             if let Err(e) = save_session_history(
                 &cfg,
                 &inbound.channel,
@@ -1964,6 +1971,7 @@ impl GatewayRuntime {
                 lineage.parent_agent_id.clone(),
                 route.agent_name.clone(),
                 lineage.spawn_depth,
+                projection,
             )
             .await
             {
@@ -2170,7 +2178,18 @@ impl GatewayRuntime {
         let run_guard = ActiveRunGuard::new(self.run_registry.clone(), run_id.clone());
 
         let events_tx_inner = events_tx.clone();
+        let captured_projection = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<crate::observability::PersistedContextProjection>,
+        ));
+        let captured_for_emit = captured_projection.clone();
         let emit_fn = move |evt: crate::agent::AgentRunEvent| {
+            if let crate::agent::AgentRunEvent::context_usage { snapshot, .. } = &evt {
+                let mut guard = captured_for_emit.lock().unwrap();
+                *guard = Some(crate::observability::merge_persisted_projection(
+                    guard.clone(),
+                    snapshot,
+                ));
+            }
             if let Ok(v) = serde_json::to_value(&evt) {
                 let _ = events_tx_inner.send(v);
             }
@@ -2201,6 +2220,16 @@ impl GatewayRuntime {
                     .into_iter()
                     .map(ChatMessage::strip_images_for_history)
                     .collect();
+                let mut projection = captured_projection.lock().unwrap().clone();
+                if projection.is_none() {
+                    let snapshot = agent
+                        .project_open_context(inbound.session_id.clone())
+                        .await;
+                    projection = Some(crate::observability::merge_persisted_projection(
+                        None,
+                        &snapshot,
+                    ));
+                }
                 if let Err(e) = save_session_history(
                     &cfg,
                     &inbound.channel,
@@ -2211,6 +2240,7 @@ impl GatewayRuntime {
                     lineage.parent_agent_id.clone(),
                     route.agent_name.clone(),
                     lineage.spawn_depth,
+                    projection,
                 )
                 .await
                 {
@@ -2685,16 +2715,16 @@ impl GatewayRuntime {
             .await
             .map(|loaded| loaded.messages)
             .unwrap_or_default();
-        let updated_at = load_session_record(&cfg, channel, session_id)
+        let record = load_session_record(&cfg, channel, session_id)
             .await
             .ok()
-            .flatten()
-            .map(|r| r.updated_at);
+            .flatten();
         GatewaySessionHistoryResponse {
             session_id: session_id.to_string(),
             channel: channel_label(channel),
             messages: messages_for_chat_ui(&messages),
-            updated_at,
+            updated_at: record.as_ref().map(|r| r.updated_at),
+            context_projection: record.and_then(|r| r.context_projection),
         }
     }
 
@@ -4412,6 +4442,9 @@ impl ExecutionStep {
 
 // Re-exports for backward compatibility with external crate users.
 pub use crate::agent::AgentRunEvent;
+pub use context_projection::{
+    GatewayContextProjectionRequest, GatewayContextProjectionResponse,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewaySessionTreeResponse {
@@ -4489,6 +4522,8 @@ pub struct GatewaySessionHistoryResponse {
     pub messages: Vec<GatewayChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_projection: Option<crate::observability::PersistedContextProjection>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -8687,6 +8722,8 @@ struct SessionRecord {
     #[serde(default)]
     spawn_depth: u32,
     updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_projection: Option<crate::observability::PersistedContextProjection>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -9036,6 +9073,7 @@ async fn save_session_history(
     parent_agent_id: Option<String>,
     agent_name: String,
     spawn_depth: u32,
+    context_projection: Option<crate::observability::PersistedContextProjection>,
 ) -> anyhow::Result<()> {
     // Backstop for the in-agent summarizer: keeps the bootstrap prompt and any
     // compaction summary instead of blindly slicing off the oldest messages.
@@ -9059,6 +9097,10 @@ async fn save_session_history(
             !session_expired(now, record.updated_at, config.gateway.session_ttl_secs)
         });
 
+    let existing_projection = store
+        .sessions
+        .get(&key)
+        .and_then(|record| record.context_projection.clone());
     store.sessions.insert(
         key,
         SessionRecord {
@@ -9068,6 +9110,7 @@ async fn save_session_history(
             agent_name: Some(agent_name),
             spawn_depth,
             updated_at: now,
+            context_projection: context_projection.or(existing_projection),
         },
     );
 

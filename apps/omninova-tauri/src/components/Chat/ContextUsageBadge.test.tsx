@@ -7,7 +7,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   applyContextUsageLifecycle,
   applyContextUsageSnapshot,
+  beginContextUsageRefresh,
   emptyContextUsageState,
+  failContextUsageProjection,
   selectContextUsageView,
   type ContextUsageIdentity,
 } from "../AgentRun/contextUsageState.ts";
@@ -297,5 +299,39 @@ describe("ContextUsageBadge popover layout", () => {
     assert.match(html, /-16/);
     assert.doesNotMatch(html, /hello world/);
     assert.doesNotMatch(html, /tool_call/);
+  });
+});
+
+describe("R1 session restore badge states", () => {
+  it("D. last-known value stays visible while refreshing", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({ estimated_input_tokens: 11_300 }));
+    state = { ...state, refreshing: true };
+    const html = renderToStaticMarkup(
+      <ContextUsageBadgeContent
+        view={selectContextUsageView(state)}
+        open={true}
+        panelId="refreshing"
+        onToggle={() => undefined}
+      />
+    );
+    assert.match(html, /11\.3K|~11K|11,300|11K/);
+    assert.match(html, /正在刷新/);
+    assert.doesNotMatch(html, />正在计算…</);
+  });
+
+  it("O. unavailable replaces infinite calculating", () => {
+    let state = emptyContextUsageState(identity);
+    state = failContextUsageProjection(beginContextUsageRefresh(state));
+    const html = renderToStaticMarkup(
+      <ContextUsageBadgeContent
+        view={selectContextUsageView(state)}
+        open={true}
+        panelId="unavailable"
+        onToggle={() => undefined}
+      />
+    );
+    assert.match(html, /上下文暂不可用/);
+    assert.doesNotMatch(html, /正在计算…/);
   });
 });

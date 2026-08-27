@@ -2,9 +2,8 @@ use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::event_bus::EventBus;
 use crate::agent::context::maintain_context;
-use crate::agent::history::SUMMARY_MARKER;
 use crate::agent::planner::{self, Reflection};
-use crate::agent::prompt::bootstrap_system_messages;
+use crate::agent::prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
 use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
@@ -566,20 +565,52 @@ impl Agent {
     /// Skill instructions are request-scoped working context. Rebuild the
     /// bootstrap system prompt from this request's config and drop leftover
     /// full SKILL.md payloads before the next model turn.
-    fn apply_request_system_prompt(&mut self) {
-        self.messages =
-            crate::skills::sanitize_skill_working_context(std::mem::take(&mut self.messages));
-        let bootstrap = bootstrap_system_messages(&self.config);
-        if bootstrap.is_empty() {
-            return;
-        }
-        if let Some(first) = self.messages.first() {
-            if first.role == "system" && !first.content.starts_with(SUMMARY_MARKER) {
-                self.messages[0] = bootstrap.into_iter().next().unwrap();
-                return;
-            }
-        }
-        self.messages.splice(0..0, bootstrap);
+    pub(crate) fn apply_request_system_prompt(&mut self) {
+        self.messages = reconstruct_model_visible_messages(
+            &self.config,
+            std::mem::take(&mut self.messages),
+        );
+    }
+
+    /// Restore ledger history and current system/tool surface for projection.
+    /// Does not prune, compact, append a user message, or call the Provider.
+    pub(crate) fn reconstruct_for_projection(&mut self, history: Vec<ChatMessage>) {
+        self.import_messages(history);
+        self.apply_request_system_prompt();
+    }
+
+    /// Measure the reconstructed model-visible context locally.
+    /// Never calls Provider, pruning, or compaction.
+    pub(crate) async fn project_open_context(
+        &self,
+        session_id: Option<String>,
+    ) -> crate::observability::ContextUsageSnapshot {
+        let provider_name = self
+            .security
+            .audit()
+            .context()
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.name().to_string());
+        let model_name = self
+            .security
+            .audit()
+            .context()
+            .model
+            .clone()
+            .or_else(|| self.provider.model().map(str::to_string))
+            .unwrap_or_default();
+        let budget = self.provider.context_budget();
+        crate::observability::measure_projected_context(
+            session_id,
+            &provider_name,
+            &model_name,
+            self.provider.exact_tokenizer().map(str::to_string),
+            budget.as_ref(),
+            &self.messages,
+            &self.tool_specs,
+        )
+        .await
     }
 }
 

@@ -261,6 +261,16 @@ async fn dispatch(runtime: &GatewayRuntime, command: &str, args: Value) -> Resul
             let history = runtime.get_session_history(&channel, &session_id).await;
             serde_json::to_value(history).map_err(|e| e.to_string())
         }
+        "project_session_context" => {
+            let session_id = args_string(&args, &["sessionId", "session_id"])?;
+            let channel = parse_channel(args_opt_string(&args, &["channel"]).as_deref());
+            let provider = args_opt_string(&args, &["provider"]);
+            let model = args_opt_string(&args, &["model"]);
+            let projected = runtime
+                .project_session_context(&channel, &session_id, provider, model)
+                .await;
+            serde_json::to_value(projected).map_err(|e| e.to_string())
+        }
         "delete_chat_session" => {
             let session_id = args_string(&args, &["sessionId", "session_id"])?;
             let channel = parse_channel(args_opt_string(&args, &["channel"]).as_deref());

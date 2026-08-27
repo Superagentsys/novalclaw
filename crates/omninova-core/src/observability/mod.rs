@@ -1,8 +1,14 @@
+pub mod context_projection;
 pub mod context_telemetry;
 pub mod log;
 pub mod prometheus;
 pub mod token_parity;
 
+pub use self::context_projection::{
+    compatible_current_snapshot, compatible_last_actual, measure_projected_context,
+    merge_persisted_projection, projection_identity_compatible, PersistedContextActual,
+    PersistedContextProjection,
+};
 pub use self::context_telemetry::{
     build_snapshot, clear_global_context_telemetry, current_context, emit_candidate_usage,
     emit_event, emit_lifecycle, emit_snapshot, new_operation_id, pause_usage_snapshots,
