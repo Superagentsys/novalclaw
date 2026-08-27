@@ -3,11 +3,13 @@ pub mod log;
 pub mod prometheus;
 
 pub use self::context_telemetry::{
-    build_snapshot, clear_global_context_telemetry, current_context, emit_event, emit_lifecycle,
-    emit_snapshot, new_operation_id, pause_usage_snapshots, set_global_context_telemetry,
-    with_context_telemetry, ContextLifecycleEvent, ContextLifecycleEventKind,
-    ContextRequestIdentity, ContextTelemetryContext, ContextTelemetryMode, ContextTelemetrySink,
-    ContextUsageBreakdown, ContextUsageSnapshot, MeasurementKind, SharedSink, TelemetryRecord,
+    build_snapshot, clear_global_context_telemetry, current_context, emit_candidate_usage,
+    emit_event, emit_lifecycle, emit_snapshot, new_operation_id, pause_usage_snapshots,
+    set_exact_tokenizer, set_global_context_telemetry, spawn_context_usage_task,
+    with_context_telemetry,
+    ContextLifecycleEvent, ContextLifecycleEventKind, ContextRequestIdentity,
+    ContextTelemetryContext, ContextTelemetryMode, ContextTelemetrySink, ContextUsageBreakdown,
+    ContextUsageSnapshot, MeasurementKind, MeasurementProvenance, SharedSink, TelemetryRecord,
     VecContextTelemetry,
 };
 pub use self::prometheus::{

@@ -113,6 +113,7 @@ describe("O3 context usage visualization", () => {
     assert.equal(view.barPercent, null);
     assert.equal(view.maxInputTokens, null);
     assert.match(view.compactText, /窗口未知/);
+    assert.match(view.compactText, /上下文估算/);
     assert.equal(view.compactText.includes("%"), false);
     assert.equal(view.compactText.includes("/"), false);
   });
@@ -132,7 +133,7 @@ describe("O3 context usage visualization", () => {
     const view = selectContextUsageView(state);
     assert.equal(view.measurementKind, "final_request_estimate");
     assert.equal(view.estimatedTokens, 421_000);
-    assert.equal(view.measurementLabel, "发送前估算");
+    assert.equal(view.measurementLabel, "发送前保守估算");
   });
 
   it("E. actual stays separate from the estimate", () => {
@@ -176,7 +177,7 @@ describe("O3 context usage visualization", () => {
     const view = selectContextUsageView(state);
     assert.equal(view.estimatedTokens, 430_000);
     assert.equal(view.measurementKind, "candidate_estimate");
-    assert.equal(view.measurementLabel, "当前估算");
+    assert.equal(view.measurementLabel, "当前保守估算");
     assert.equal(view.lastActualTokens, 417_000);
     assert.equal(view.revision, 43);
   });
@@ -221,7 +222,7 @@ describe("O3 context usage visualization", () => {
     assert.equal(view.percent, null);
     assert.equal(view.maxInputTokens, null);
     assert.equal(view.estimatedTokens, null);
-    assert.equal(view.compactText, "上下文 —");
+    assert.equal(view.compactText, "上下文输入 —");
   });
 
   it("I. breakdown belongs to the same snapshot as the displayed total", () => {
@@ -394,5 +395,120 @@ describe("O3 context usage visualization", () => {
     const view = selectContextUsageView(state);
     assert.equal(view.activeStatus, null);
     assert.equal(view.estimatedTokens, 545_000);
+  });
+
+  it("F2 F. actual total and estimated breakdown keep different provenance", () => {
+    let state = emptyContextUsageState(identity);
+    const estimatedBreakdown = breakdown(421_000);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 421_000,
+      request_revision: 12,
+      measurement_provenance: "safety_estimate",
+      breakdown: estimatedBreakdown,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 421_000,
+      provider_actual_input_tokens: 4_777,
+      request_revision: 12,
+      measurement_provenance: "provider_actual",
+      breakdown: estimatedBreakdown,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.estimatedTokens, 421_000);
+    assert.equal(view.measurementProvenance, "safety_estimate");
+    assert.equal(view.measurementLabel, "发送前保守估算");
+    assert.equal(view.lastActualTokens, 4_777);
+    assert.equal(view.actualIsCurrent, true);
+    assert.equal(view.actualLabel, "当前请求实际");
+    assert.deepEqual(view.breakdown, estimatedBreakdown);
+  });
+
+  it("F2 G. frontend never rescales estimated breakdown to ProviderActual", () => {
+    let state = emptyContextUsageState(identity);
+    const estimatedBreakdown = breakdown(421_000);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 421_000,
+      request_revision: 3,
+      breakdown: estimatedBreakdown,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 421_000,
+      provider_actual_input_tokens: 4_777,
+      request_revision: 3,
+      breakdown: estimatedBreakdown,
+    }));
+    const view = selectContextUsageView(state);
+    const breakdownTotal =
+      (view.breakdown?.system_tokens ?? 0) +
+      (view.breakdown?.conversation_tokens ?? 0) +
+      (view.breakdown?.tool_schema_tokens ?? 0) +
+      (view.breakdown?.tool_result_tokens ?? 0) +
+      (view.breakdown?.request_overhead_tokens ?? 0);
+    assert.equal(view.lastActualTokens, 4_777);
+    assert.equal(view.estimatedTokens, 421_000);
+    assert.equal(breakdownTotal, 421_000);
+    assert.notEqual(breakdownTotal, view.lastActualTokens);
+    assert.deepEqual(view.breakdown, estimatedBreakdown);
+  });
+
+  it("F2 previous actual is labelled after a newer candidate", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 19_696,
+      request_revision: 3,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 19_696,
+      provider_actual_input_tokens: 4_777,
+      request_revision: 3,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 21_000,
+      request_revision: 4,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.actualIsCurrent, false);
+    assert.equal(view.actualLabel, "上次请求实际");
+    assert.equal(view.lastActualTokens, 4_777);
+    assert.equal(view.estimatedTokens, 21_000);
+  });
+
+  it("F2 ProviderCountApi renders exact without tilde", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_812,
+      request_revision: 3,
+      measurement_provenance: "provider_count_api",
+      measurement_exact: true,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.measurementProvenance, "provider_count_api");
+    assert.equal(view.totalFormat, "exact");
+    assert.equal(view.measurementLabel, "发送前精确计数");
+    assert.equal(view.estimatedTokens, 4_812);
+  });
+
+  it("ProviderCountApi source does not imply exact precision", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_812,
+      request_revision: 3,
+      measurement_provenance: "provider_count_api",
+      measurement_exact: false,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.measurementProvenance, "provider_count_api");
+    assert.equal(view.measurementExact, false);
+    assert.equal(view.totalFormat, "estimate");
+    assert.equal(view.measurementLabel, "发送前保守估算");
   });
 });

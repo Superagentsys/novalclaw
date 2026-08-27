@@ -104,6 +104,7 @@ impl Agent {
             self.messages
                 .push(ChatMessage::user_with_images(message, images.to_vec()));
         }
+        self.refresh_candidate();
 
         // One budget spans the whole request: planner, executor and reflector
         // calls all draw from it.
@@ -146,6 +147,7 @@ impl Agent {
 
         self.compact_context_if_needed().await;
         self.messages.push(ChatMessage::user(message));
+        self.refresh_candidate();
 
         let budget = BudgetTracker::new(self.config.budget.clone());
         let dispatcher = AgentDispatcher::new(
@@ -239,8 +241,17 @@ impl Agent {
             model_name,
             sink,
             async {
+                crate::observability::set_exact_tokenizer(
+                    self.provider.exact_tokenizer().map(str::to_string),
+                );
                 self.compact_context_if_needed().await;
                 self.messages.push(ChatMessage::user(message));
+                self.refresh_candidate();
+                crate::observability::emit_candidate_usage(
+                    &self.messages,
+                    &self.tool_specs,
+                    self.provider.context_budget().as_ref(),
+                );
                 let dispatcher = AgentDispatcher::new(
                     self.provider.as_ref(),
                     &self.tools,
@@ -317,6 +328,7 @@ impl Agent {
 
         self.compact_context_if_needed().await;
         self.messages.push(ChatMessage::user(message));
+        self.refresh_candidate();
 
         let budget = BudgetTracker::new(self.config.budget.clone());
         let dispatcher = AgentDispatcher::new(
@@ -391,6 +403,7 @@ impl Agent {
                     step,
                     task
                 )));
+                self.refresh_candidate();
                 let dispatcher = AgentDispatcher::new(
                                      self.provider.as_ref(),
                                      &self.tools,
@@ -417,6 +430,7 @@ impl Agent {
                         match verdict {
                             Reflection::Complete { final_answer } => {
                                 self.messages.push(ChatMessage::assistant(&final_answer));
+                                self.refresh_candidate();
                                 return Ok(final_answer);
                             }
                             Reflection::Continue => {}
@@ -459,6 +473,7 @@ impl Agent {
             "All planned steps have been executed. Based on the results above, provide the \
              final answer to the original task now. Original task: {task}"
         )));
+        self.refresh_candidate();
         let dispatcher = AgentDispatcher::new(
                              self.provider.as_ref(),
                              &self.tools,
@@ -492,7 +507,16 @@ impl Agent {
             render_transcript(executed)
         );
         self.messages.push(ChatMessage::assistant(&text));
+        self.refresh_candidate();
         Ok(text)
+    }
+
+    fn refresh_candidate(&self) {
+        crate::observability::emit_candidate_usage(
+            &self.messages,
+            &self.tool_specs,
+            self.provider.context_budget().as_ref(),
+        );
     }
 
     /// Condense older turns into a summary once history outgrows
@@ -619,6 +643,10 @@ mod tests {
     impl Provider for SequenceProvider {
         fn name(&self) -> &str {
             "sequence"
+        }
+
+        fn model(&self) -> Option<&str> {
+            Some("sequence-model")
         }
 
         async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
@@ -920,5 +948,168 @@ mod tests {
         let mut agent = mock_agent(cfg);
         let reply = agent.process_message("task").await.expect("reply");
         assert!(reply.contains("[budget exceeded]"), "got: {reply}");
+    }
+
+    fn usage_snapshots(events: &[AgentRunEvent]) -> Vec<crate::observability::ContextUsageSnapshot> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentRunEvent::context_usage { snapshot, .. } => Some(snapshot.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn h_tool_result_append_emits_candidate_immediately() {
+        let tools = vec![crate::tools::ToolSpec {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }];
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("run echo"),
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"call-echo","name":"echo","arguments":"{}"}]}"#,
+            ),
+        ];
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        crate::observability::with_context_telemetry(
+            Some("session-h".into()),
+            Some("run-h".into()),
+            "sequence",
+            "sequence-model",
+            sink.clone(),
+            async {
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                let tool_payload = serde_json::json!({
+                    "tool_call_id": "call-echo",
+                    "content": "T".repeat(3_000),
+                })
+                .to_string();
+                messages.push(ChatMessage::tool(tool_payload));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+            },
+        )
+        .await;
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|s| {
+            s.measurement_kind == crate::observability::MeasurementKind::CandidateEstimate
+        }));
+        assert!(snapshots[1].request_revision > snapshots[0].request_revision);
+        assert!(
+            snapshots[1].breakdown.tool_result_tokens > 1_000,
+            "appended tool result must appear in Candidate: {:?}",
+            snapshots[1].breakdown
+        );
+        assert!(snapshots[1].estimated_input_tokens > snapshots[0].estimated_input_tokens);
+        assert_eq!(snapshots[1].session_id.as_deref(), Some("session-h"));
+        assert_eq!(snapshots[1].model, "sequence-model");
+    }
+
+    #[tokio::test]
+    async fn h_user_assistant_tool_context_mutation_refreshes_candidate_revision() {
+        let tools = vec![crate::tools::ToolSpec {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }];
+        let mut messages = vec![ChatMessage::system("sys")];
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        crate::observability::with_context_telemetry(
+            Some("session-h2".into()),
+            Some("run-h2".into()),
+            "sequence",
+            "sequence-model",
+            sink.clone(),
+            async {
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::user("run echo"));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::assistant(
+                    r#"{"tool_calls":[{"id":"call-echo","name":"echo","arguments":"{}"}]}"#,
+                ));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::tool(
+                    serde_json::json!({"tool_call_id":"call-echo","content":"ok"}).to_string(),
+                ));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+            },
+        )
+        .await;
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 4);
+        for window in snapshots.windows(2) {
+            assert!(window[1].request_revision > window[0].request_revision);
+            assert_eq!(
+                window[1].measurement_kind,
+                crate::observability::MeasurementKind::CandidateEstimate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn k_session_restore_emits_initial_candidate_after_assembly() {
+        let (provider, requests) = SequenceProvider::new(vec![response(
+            Some("next"),
+            Vec::new(),
+            "stop",
+        )]);
+        let mut config = AgentConfig::default();
+        config.compact_context = false;
+        config.system_prompt = Some("restored system".into());
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), config);
+        agent.import_messages(vec![
+            ChatMessage::system("restored system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer ".to_string() + &"z".repeat(200)),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::<AgentRunEvent>::new()));
+        let event_sink = events.clone();
+        agent
+            .process_message_with_events_streaming(
+                "follow up",
+                Box::new(move |event| event_sink.lock().unwrap().push(event)),
+                Some("run-k".into()),
+                Some("session-k".into()),
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect("restored session");
+        let snapshots = usage_snapshots(&events.lock().unwrap());
+        let first = snapshots.first().expect("restored session must emit Candidate");
+        assert_eq!(
+            first.measurement_kind,
+            crate::observability::MeasurementKind::CandidateEstimate
+        );
+        assert_eq!(first.session_id.as_deref(), Some("session-k"));
+        assert_eq!(first.run_id.as_deref(), Some("run-k"));
+        assert_eq!(first.provider, "sequence");
+        assert_eq!(first.model, "sequence-model");
+        assert_eq!(first.request_revision, 1);
+        assert!(first.estimated_input_tokens > 0);
+        let after_user = snapshots.iter().find(|s| {
+            s.measurement_kind == crate::observability::MeasurementKind::CandidateEstimate
+                && s.request_revision > 1
+        });
+        assert!(
+            after_user.is_some(),
+            "user append must emit a newer Candidate: {:?}",
+            snapshots
+                .iter()
+                .map(|s| (s.measurement_kind, s.request_revision))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first.breakdown.system_tokens > 0 || first.breakdown.conversation_tokens > 0,
+            "restored history missing from candidate: {:?}",
+            first.breakdown
+        );
+        assert!(
+            !requests.lock().unwrap().is_empty(),
+            "provider still runs after the restored candidate"
+        );
     }
 }

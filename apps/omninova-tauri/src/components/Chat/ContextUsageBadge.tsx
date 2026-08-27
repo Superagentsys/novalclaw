@@ -1,11 +1,15 @@
 import React, {
+  useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   BREAKDOWN_LABELS,
   selectContextUsageView,
@@ -13,6 +17,80 @@ import {
   type ContextUsageView,
 } from "../AgentRun/contextUsageState";
 import { formatTokenCount } from "../AgentRun/contextTokens";
+
+export const CONTEXT_USAGE_VIEWPORT_MARGIN = 12;
+export const CONTEXT_USAGE_PREFERRED_WIDTH = 360;
+const CONTEXT_USAGE_GAP = 8;
+const CONTEXT_USAGE_MAX_HEIGHT = 520;
+
+export type ContextUsageRect = {
+  top: number;
+  left: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+};
+
+export type ContextUsagePopoverPosition = {
+  left: number;
+  top: number;
+  width: number;
+  placement: "above" | "below";
+};
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+export function measureContextUsagePopoverWidth(viewportWidth: number): number {
+  return Math.max(0, Math.min(CONTEXT_USAGE_PREFERRED_WIDTH, viewportWidth - CONTEXT_USAGE_VIEWPORT_MARGIN * 2));
+}
+
+export function measureContextUsagePopoverMaxHeight(viewportHeight: number): number {
+  return Math.max(
+    0,
+    Math.min(
+      CONTEXT_USAGE_MAX_HEIGHT,
+      viewportHeight * 0.7,
+      viewportHeight - CONTEXT_USAGE_VIEWPORT_MARGIN * 2
+    )
+  );
+}
+
+export function computeContextUsagePopoverPosition(args: {
+  trigger: ContextUsageRect;
+  viewport: { width: number; height: number };
+  popover: { width: number; height: number };
+  gap?: number;
+  margin?: number;
+}): ContextUsagePopoverPosition {
+  const margin = args.margin ?? CONTEXT_USAGE_VIEWPORT_MARGIN;
+  const gap = args.gap ?? CONTEXT_USAGE_GAP;
+  const width = Math.min(args.popover.width, measureContextUsagePopoverWidth(args.viewport.width));
+  const height = Math.min(args.popover.height, measureContextUsagePopoverMaxHeight(args.viewport.height));
+  const needed = height + gap;
+  const canPlaceAbove = args.trigger.top - margin >= needed;
+  const placement: "above" | "below" = canPlaceAbove ? "above" : "below";
+  const desiredTop =
+    placement === "above" ? args.trigger.top - gap - height : args.trigger.bottom + gap;
+  const desiredLeft = args.trigger.right - width;
+  return {
+    left: clamp(desiredLeft, margin, args.viewport.width - width - margin),
+    top: clamp(desiredTop, margin, args.viewport.height - height - margin),
+    width,
+    placement,
+  };
+}
+
+export function isOutsideContextUsageClick(
+  target: { contains?(node: unknown): boolean } | EventTarget | null,
+  surfaces: Array<{ contains(node: unknown): boolean } | null | undefined>
+): boolean {
+  if (!target) return true;
+  return surfaces.every((surface) => !surface?.contains(target));
+}
 
 const BREAKDOWN_MARKER_CLASS: Record<string, string> = {
   system_tokens: "is-system",
@@ -31,11 +109,11 @@ function compactStatusLabel(view: ContextUsageView): string | null {
 
 function badgeSummary(view: ContextUsageView): string {
   if (view.placeholder) return "正在计算…";
-  const estimate = formatTokenCount(view.estimatedTokens ?? 0, "estimate");
+  const total = formatTokenCount(view.estimatedTokens ?? 0, view.totalFormat);
   if (!view.knownBudget || view.maxInputTokens == null || view.percent == null) {
-    return `${estimate} · 窗口未知`;
+    return `${total} · 窗口未知`;
   }
-  return `${view.percent}% · ${estimate} / ${formatTokenCount(view.maxInputTokens, "exact")}`;
+  return `${view.percent}% · ${total} / ${formatTokenCount(view.maxInputTokens, "exact")}`;
 }
 
 interface ContextUsageBadgeContentProps {
@@ -43,6 +121,10 @@ interface ContextUsageBadgeContentProps {
   open: boolean;
   panelId: string;
   triggerRef?: RefObject<HTMLButtonElement | null>;
+  panelRef?: RefObject<HTMLDivElement | null>;
+  panelStyle?: CSSProperties;
+  placement?: "above" | "below";
+  portal?: boolean;
   onToggle: () => void;
 }
 
@@ -52,10 +134,16 @@ export function ContextUsageBadgeContent({
   open,
   panelId,
   triggerRef,
+  panelRef,
+  panelStyle,
+  placement,
+  portal = false,
   onToggle,
 }: ContextUsageBadgeContentProps) {
   const estimateText =
-    view.estimatedTokens == null ? null : formatTokenCount(view.estimatedTokens, "estimate");
+    view.estimatedTokens == null
+      ? null
+      : formatTokenCount(view.estimatedTokens, view.totalFormat);
   const maxText =
     view.knownBudget && view.maxInputTokens != null
       ? formatTokenCount(view.maxInputTokens, "exact")
@@ -65,31 +153,15 @@ export function ContextUsageBadgeContent({
     ? BREAKDOWN_LABELS.filter((item) => view.breakdown![item.key] > 0)
     : [];
 
-  return (
-    <React.Fragment>
-      <button
-        ref={triggerRef}
-        type="button"
-        className="context-usage-trigger"
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        aria-controls={panelId}
-        aria-label={`${view.compactText}${view.activeStatusLabel ? `，${view.activeStatusLabel}` : ""}`}
-        onClick={onToggle}
-      >
-        <span className="context-usage-kicker">上下文</span>
-        <span className={`context-usage-value${view.placeholder ? " is-placeholder" : ""}`}>
-          {badgeSummary(view)}
-        </span>
-        {statusLabel ? <span className="context-usage-status">{statusLabel}</span> : null}
-      </button>
-
-      {open ? (
+  const panel = open ? (
         <div
+          ref={panelRef}
           id={panelId}
           className="context-usage-panel"
           role="dialog"
           aria-label="上下文用量详情"
+          data-placement={placement}
+          style={panelStyle}
         >
           <header className="context-usage-header">
             <div className="context-usage-heading">
@@ -97,7 +169,7 @@ export function ContextUsageBadgeContent({
                 {view.placeholder
                   ? "上下文"
                   : view.knownBudget && view.percent != null
-                    ? `上下文已用 ${view.percent}%`
+                    ? `上下文输入 ${view.percent}%`
                     : "上下文估算"}
               </span>
               {!view.placeholder ? (
@@ -166,10 +238,14 @@ export function ContextUsageBadgeContent({
             </div>
           ) : null}
 
+          {!view.placeholder ? (
+            <p className="context-usage-hint">当前模型可见上下文，不含输入框未发送草稿。</p>
+          ) : null}
+
           {visibleBreakdown.length > 0 ? (
             <section className="context-usage-section" aria-labelledby={`${panelId}-breakdown`}>
               <div className="context-usage-section-heading">
-                <span id={`${panelId}-breakdown`}>输入构成</span>
+                <span id={`${panelId}-breakdown`}>估算构成</span>
                 {view.revision != null ? <span>Revision {view.revision}</span> : null}
               </div>
               <dl className="context-usage-rows context-usage-rows--breakdown">
@@ -180,7 +256,7 @@ export function ContextUsageBadgeContent({
                         className={`context-usage-marker ${BREAKDOWN_MARKER_CLASS[item.key]}`}
                         aria-hidden="true"
                       />
-                      {item.label}
+                      <span className="context-usage-row-label">{item.label}</span>
                     </dt>
                     <dd>{formatTokenCount(view.breakdown![item.key], "estimate")}</dd>
                   </div>
@@ -236,12 +312,12 @@ export function ContextUsageBadgeContent({
                   <dd>
                     {view.estimatedTokens == null
                       ? "—"
-                      : `${formatTokenCount(view.estimatedTokens, "estimate")} · ${view.estimatedTokens.toLocaleString("zh-CN")}`}
+                      : `${formatTokenCount(view.estimatedTokens, view.totalFormat)} · ${view.estimatedTokens.toLocaleString("zh-CN")}`}
                   </dd>
                 </div>
-                {view.lastActualTokens != null ? (
+                {view.lastActualTokens != null && view.actualLabel ? (
                   <div className="context-usage-row">
-                    <dt>上次请求实际</dt>
+                    <dt>{view.actualLabel}</dt>
                     <dd>
                       {formatTokenCount(view.lastActualTokens, "exact")} · {view.lastActualTokens.toLocaleString("zh-CN")}
                     </dd>
@@ -258,7 +334,34 @@ export function ContextUsageBadgeContent({
             </div>
           ) : null}
         </div>
-      ) : null}
+  ) : null;
+
+  const portaled =
+    portal && typeof document !== "undefined" && document.body
+      ? panel
+        ? createPortal(panel, document.body)
+        : null
+      : panel;
+
+  return (
+    <React.Fragment>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="context-usage-trigger"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-controls={panelId}
+        aria-label={`${view.compactText}${view.activeStatusLabel ? `，${view.activeStatusLabel}` : ""}`}
+        onClick={onToggle}
+      >
+        <span className="context-usage-kicker">上下文</span>
+        <span className={`context-usage-value${view.placeholder ? " is-placeholder" : ""}`}>
+          {badgeSummary(view)}
+        </span>
+        {statusLabel ? <span className="context-usage-status">{statusLabel}</span> : null}
+      </button>
+      {portaled}
     </React.Fragment>
   );
 }
@@ -266,14 +369,68 @@ export function ContextUsageBadgeContent({
 export function ContextUsageBadge({ state }: { state: ContextUsageState }) {
   const view = useMemo(() => selectContextUsageView(state), [state]);
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<ContextUsagePopoverPosition | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const panelId = useId();
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const panel = panelRef.current;
+    if (!trigger || !panel) return;
+    const rect = trigger.getBoundingClientRect();
+    const next = computeContextUsagePopoverPosition({
+      trigger: {
+        top: rect.top,
+        left: rect.left,
+        right: rect.right,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height,
+      },
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      popover: {
+        width: measureContextUsagePopoverWidth(window.innerWidth),
+        height: Math.min(panel.offsetHeight, measureContextUsagePopoverMaxHeight(window.innerHeight)),
+      },
+    });
+    setPosition(next);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPosition(null);
+      return;
+    }
+    updatePosition();
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        updatePosition();
+      });
+    };
+    if (!panelRef.current) schedule();
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    if (panelRef.current) observer?.observe(panelRef.current);
+    return () => {
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+      observer?.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [open, updatePosition, view]);
 
   useEffect(() => {
     if (!open) return;
     const onPointer = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      if (isOutsideContextUsageClick(event.target, [triggerRef.current, panelRef.current])) {
+        setOpen(false);
+      }
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -288,13 +445,28 @@ export function ContextUsageBadge({ state }: { state: ContextUsageState }) {
     };
   }, [open]);
 
+  const panelStyle: CSSProperties | undefined = open
+    ? {
+        left: position?.left ?? 0,
+        top: position?.top ?? 0,
+        width: position?.width ?? measureContextUsagePopoverWidth(
+          typeof window === "undefined" ? CONTEXT_USAGE_PREFERRED_WIDTH : window.innerWidth
+        ),
+        visibility: position ? "visible" : "hidden",
+      }
+    : undefined;
+
   return (
-    <div ref={rootRef} className={`context-usage${open ? " is-open" : ""}`}>
+    <div className={`context-usage${open ? " is-open" : ""}`}>
       <ContextUsageBadgeContent
         view={view}
         open={open}
         panelId={panelId}
         triggerRef={triggerRef}
+        panelRef={panelRef}
+        panelStyle={panelStyle}
+        placement={position?.placement}
+        portal
         onToggle={() => setOpen((value) => !value)}
       />
     </div>

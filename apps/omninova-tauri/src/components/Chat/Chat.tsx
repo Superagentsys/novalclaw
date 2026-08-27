@@ -35,9 +35,11 @@ import {
   applyContextUsageSnapshot,
   emptyContextUsageState,
   finishContextUsageRun,
+  identityKey,
   switchContextUsageIdentity,
   type ContextUsageIdentity,
 } from "../AgentRun/contextUsageState";
+import type { ContextUsageSnapshot } from "../AgentRun/types";
 import {
   addTask,
   formatDuration,
@@ -736,10 +738,15 @@ export function Chat({
   const [contextUsageState, setContextUsageState] = useState(() =>
     emptyContextUsageState(contextUsageIdentity)
   );
+  const contextUsageCacheRef = useRef<Map<string, ContextUsageSnapshot>>(new Map());
   useEffect(() => {
-    setContextUsageState((previous) =>
-      switchContextUsageIdentity(previous, contextUsageIdentity)
-    );
+    setContextUsageState((previous) => {
+      const next = switchContextUsageIdentity(previous, contextUsageIdentity);
+      if (next.current) return next;
+      const cached = contextUsageCacheRef.current.get(identityKey(contextUsageIdentity));
+      if (!cached) return next;
+      return applyContextUsageSnapshot(next, cached);
+    });
   }, [contextUsageIdentity]);
   // Invalidate stale data in the same render as a session/model switch. The
   // effect above then commits this identity for subsequent event reduction.
@@ -2241,9 +2248,20 @@ export function Chat({
             ...usagePayload.snapshot,
             run_id: usagePayload.snapshot.run_id ?? runId,
           };
-          setContextUsageState((previous) =>
-            applyContextUsageSnapshot(previous, authoritativeSnapshot)
-          );
+          setContextUsageState((previous) => {
+            const next = applyContextUsageSnapshot(previous, authoritativeSnapshot);
+            if (next.current) {
+              contextUsageCacheRef.current.set(
+                identityKey({
+                  sessionId: next.identity.sessionId,
+                  provider: next.identity.provider,
+                  model: next.identity.model,
+                }),
+                next.current
+              );
+            }
+            return next;
+          });
         }
       } else if (eventType === "context_lifecycle") {
         const lifecycle = rawPayload.event;

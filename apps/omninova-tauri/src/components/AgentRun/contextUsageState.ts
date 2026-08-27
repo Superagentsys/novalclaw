@@ -19,6 +19,7 @@ import type {
   AgentRunEventContextLifecycle,
   ContextLifecycleEvent,
   ContextMeasurementKind,
+  ContextMeasurementProvenance,
   ContextUsageBreakdown,
   ContextUsageSnapshot,
 } from "./types";
@@ -62,8 +63,13 @@ export interface ContextUsageView {
   thresholdPercent: number | null;
   breakdown: ContextUsageBreakdown | null;
   measurementKind: ContextMeasurementKind | null;
+  measurementProvenance: ContextMeasurementProvenance | null;
+  measurementExact: boolean;
   measurementLabel: string;
   lastActualTokens: number | null;
+  actualIsCurrent: boolean;
+  actualLabel: string | null;
+  totalFormat: "estimate" | "exact";
   revision: number | null;
   activeStatus: ContextActiveStatus;
   activeStatusLabel: string | null;
@@ -270,10 +276,33 @@ export function applyContextUsageLifecycle(
   return state;
 }
 
-export function measurementLabel(kind: ContextMeasurementKind | null): string {
-  if (kind === "final_request_estimate") return "发送前估算";
+export function measurementLabel(
+  kind: ContextMeasurementKind | null,
+  exact: boolean
+): string {
+  if (exact) {
+    return kind === "final_request_estimate" ? "发送前精确计数" : "精确计数";
+  }
+  if (kind === "final_request_estimate") return "发送前保守估算";
   if (kind === "provider_actual") return "实际";
-  return "当前估算";
+  return "当前保守估算";
+}
+
+function snapshotProvenance(snapshot: ContextUsageSnapshot | null): ContextMeasurementProvenance | null {
+  if (!snapshot) return null;
+  return snapshot.measurement_provenance ?? "safety_estimate";
+}
+
+function actualMatchesCurrent(
+  actual: ContextUsageActual | null,
+  current: ContextUsageSnapshot | null
+): boolean {
+  if (!actual || !current) return false;
+  if (actual.revision !== current.request_revision) return false;
+  if (actual.runId && current.run_id && actual.runId !== current.run_id) return false;
+  if (actual.provider && current.provider && actual.provider !== current.provider) return false;
+  if (actual.model && current.model && actual.model !== current.model) return false;
+  return true;
 }
 
 function activeStatus(state: ContextUsageState): { status: ContextActiveStatus; label: string | null } {
@@ -309,21 +338,29 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
   const active = activeStatus(state);
   const statusShort = compactStatusShort(active.status);
 
-  let compactText = "上下文 —";
+  const provenance = snapshotProvenance(current);
+  const measurementExact = current?.measurement_exact === true;
+  const totalFormat: "estimate" | "exact" = measurementExact ? "exact" : "estimate";
+  const matchesCurrentActual = actualMatchesCurrent(state.lastActual, current);
+  const lastActualTokens = state.lastActual?.inputTokens ?? null;
+  const actualLabel =
+    lastActualTokens == null ? null : matchesCurrentActual ? "当前请求实际" : "上次请求实际";
+
+  let compactText = "上下文输入 —";
   if (estimatedTokens != null) {
-    const estimate = formatTokenCount(estimatedTokens, "estimate");
+    const totalText = formatTokenCount(estimatedTokens, totalFormat);
     if (!knownBudget || maxInputTokens == null || percent == null) {
-      compactText = `上下文  ${estimate} · 窗口未知`;
+      compactText = `上下文估算 ${totalText} · 窗口未知`;
     } else {
-      compactText = `上下文  ${percent}% · ${estimate} / ${formatTokenCount(maxInputTokens, "exact")}`;
+      compactText = `上下文输入  ${percent}% · ${totalText} / ${formatTokenCount(maxInputTokens, "exact")}`;
     }
   }
   if (statusShort) {
     compactText = estimatedTokens == null
-      ? `上下文  — · ${statusShort}`
+      ? `上下文输入  — · ${statusShort}`
       : knownBudget && maxInputTokens != null && percent != null
-        ? `上下文  ${percent}% · ${formatTokenCount(estimatedTokens, "estimate")} / ${formatTokenCount(maxInputTokens, "exact")} · ${statusShort}`
-        : `上下文  ${formatTokenCount(estimatedTokens as number, "estimate")} · 窗口未知 · ${statusShort}`;
+        ? `上下文输入  ${percent}% · ${formatTokenCount(estimatedTokens, totalFormat)} / ${formatTokenCount(maxInputTokens, "exact")} · ${statusShort}`
+        : `上下文估算 ${formatTokenCount(estimatedTokens as number, totalFormat)} · 窗口未知 · ${statusShort}`;
   }
 
   return {
@@ -339,8 +376,16 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
     thresholdPercent: threshold,
     breakdown: current?.breakdown ?? null,
     measurementKind: current?.measurement_kind ?? null,
-    measurementLabel: measurementLabel(current?.measurement_kind ?? null),
-    lastActualTokens: state.lastActual?.inputTokens ?? null,
+    measurementProvenance: provenance,
+    measurementExact,
+    measurementLabel: measurementLabel(
+      current?.measurement_kind ?? null,
+      measurementExact
+    ),
+    lastActualTokens,
+    actualIsCurrent: matchesCurrentActual,
+    actualLabel,
+    totalFormat,
     revision: current?.request_revision ?? null,
     activeStatus: active.status,
     activeStatusLabel: active.label,

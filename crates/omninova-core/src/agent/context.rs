@@ -176,6 +176,11 @@ async fn maintain_context_with_mode(
                     pruned_tool_result_count: pruned_count,
                 },
             );
+            crate::observability::emit_candidate_usage(
+                &current,
+                tool_specs,
+                provider.context_budget().as_ref(),
+            );
             if pruned_count > 0 {
                 tracing::info!(
                     target: "omninova_core::context",
@@ -224,27 +229,29 @@ async fn maintain_context_with_mode(
             ChatMessage::system(SUMMARIZER_PROMPT),
             ChatMessage::user(render_for_summary(&plan.summarize)),
         ];
-        let _pause_snapshots = pause_usage_snapshots();
-        let summary = match provider
-            .chat(ChatRequest {
-                messages: &request_messages,
-                tools: None,
-            })
-            .await
-        {
-            Ok(response) => response.text.unwrap_or_default(),
-            Err(error) => {
-                tracing::warn!("context compaction failed, truncating instead: {error}");
-                emit_lifecycle(
-                    compact_op,
-                    mode_label,
-                    ContextLifecycleEventKind::ContextCompactionFailed {
-                        mode: mode_label,
-                        estimated_before: compact_before,
-                        reason: "provider_error".to_string(),
-                    },
-                );
-                return truncate_history_preserving_system(messages, max_history);
+        let summary = {
+            let _pause_snapshots = pause_usage_snapshots();
+            match provider
+                .chat(ChatRequest {
+                    messages: &request_messages,
+                    tools: None,
+                })
+                .await
+            {
+                Ok(response) => response.text.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!("context compaction failed, truncating instead: {error}");
+                    emit_lifecycle(
+                        compact_op,
+                        mode_label,
+                        ContextLifecycleEventKind::ContextCompactionFailed {
+                            mode: mode_label,
+                            estimated_before: compact_before,
+                            reason: "provider_error".to_string(),
+                        },
+                    );
+                    return truncate_history_preserving_system(messages, max_history);
+                }
             }
         };
         let compacted = apply_compaction(plan, &summary);
@@ -258,6 +265,11 @@ async fn maintain_context_with_mode(
                 estimated_after,
                 checkpoint_created: has_checkpoint(&compacted),
             },
+        );
+        crate::observability::emit_candidate_usage(
+            &compacted,
+            tool_specs,
+            provider.context_budget().as_ref(),
         );
         return compacted;
     };
@@ -323,6 +335,11 @@ async fn maintain_context_with_mode(
             pruned_tool_result_count: pruned_count,
         },
     );
+    crate::observability::emit_candidate_usage(
+        &current,
+        tool_specs,
+        provider.context_budget().as_ref(),
+    );
     if pruned_count > 0 {
         tracing::info!(
             target: "omninova_core::context",
@@ -385,27 +402,29 @@ async fn maintain_context_with_mode(
                 ChatMessage::system(SUMMARIZER_PROMPT),
                 ChatMessage::user(bounded_render),
             ];
-            let _pause_snapshots = pause_usage_snapshots();
-            let summary = match provider
-                .chat(ChatRequest {
-                    messages: &request_messages,
-                    tools: None,
-                })
-                .await
-            {
-                Ok(response) => response.text.unwrap_or_default(),
-                Err(error) => {
-                    tracing::warn!("context compaction failed: {error}");
-                    emit_lifecycle(
-                        compact_op,
-                        mode_label,
-                        ContextLifecycleEventKind::ContextCompactionFailed {
-                            mode: mode_label,
-                            estimated_before: last_estimate,
-                            reason: "provider_error".to_string(),
-                        },
-                    );
-                    break;
+            let summary = {
+                let _pause_snapshots = pause_usage_snapshots();
+                match provider
+                    .chat(ChatRequest {
+                        messages: &request_messages,
+                        tools: None,
+                    })
+                    .await
+                {
+                    Ok(response) => response.text.unwrap_or_default(),
+                    Err(error) => {
+                        tracing::warn!("context compaction failed: {error}");
+                        emit_lifecycle(
+                            compact_op,
+                            mode_label,
+                            ContextLifecycleEventKind::ContextCompactionFailed {
+                                mode: mode_label,
+                                estimated_before: last_estimate,
+                                reason: "provider_error".to_string(),
+                            },
+                        );
+                        break;
+                    }
                 }
             };
             if summary.trim().is_empty() {
@@ -470,6 +489,11 @@ async fn maintain_context_with_mode(
                     checkpoint_created: has_checkpoint(&current),
                 },
             );
+            crate::observability::emit_candidate_usage(
+                &current,
+                tool_specs,
+                provider.context_budget().as_ref(),
+            );
             if after_compact <= budget.target_after_compaction() {
                 break;
             }
@@ -485,7 +509,7 @@ mod tests {
     use crate::config::Config;
     use crate::observability::{
         with_context_telemetry, ContextLifecycleEvent, ContextLifecycleEventKind,
-        VecContextTelemetry,
+        MeasurementKind, VecContextTelemetry,
     };
     use crate::providers::context_budget::{ContextBudget, ContextBudgetSource};
     use crate::providers::{ChatMessage, ChatResponse, TokenUsage};
@@ -1124,5 +1148,69 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn i_pruning_completion_emits_smaller_candidate() {
+        let (provider, _) = UnknownBudgetProvider::new();
+        let huge = "x".repeat(1_924_822);
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..16 {
+            messages.push(ChatMessage::user(format!("u{i}")));
+            messages.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        messages.push(ChatMessage::assistant(
+            r#"{"tool_calls":[{"id":"call-old","name":"big_tool","arguments":"{}"}]}"#,
+        ));
+        messages.push(ChatMessage::tool(format!(
+            r#"{{"tool_call_id":"call-old","content":"{huge}"}}"#
+        )));
+        messages.push(ChatMessage::assistant("continue"));
+        let before = TokenEstimator::new().estimate_messages_with_tools(&messages, &[]);
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 50, true).await
+        })
+        .await;
+        let candidates: Vec<_> = sink
+            .snapshots()
+            .into_iter()
+            .filter(|s| s.measurement_kind == MeasurementKind::CandidateEstimate)
+            .collect();
+        assert!(!candidates.is_empty(), "pruning must emit CandidateEstimate");
+        assert!(
+            candidates.iter().any(|s| s.estimated_input_tokens < before),
+            "pruned candidate was not smaller than {before}: {:?}",
+            candidates
+                .iter()
+                .map(|s| s.estimated_input_tokens)
+                .collect::<Vec<_>>()
+        );
+        assert!(candidates.iter().all(|s| s.model == "test-model"));
+        assert!(candidates.iter().all(|s| s.request_revision >= 1));
+    }
+
+    #[tokio::test]
+    async fn j_compaction_completion_emits_smaller_candidate() {
+        let (provider, _) = UnknownBudgetProvider::new();
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..60 {
+            messages.push(ChatMessage::user(format!("u{i} {}", "x".repeat(80))));
+            messages.push(ChatMessage::assistant(format!("a{i} {}", "y".repeat(80))));
+        }
+        let before = TokenEstimator::new().estimate_messages_with_tools(&messages, &[]);
+        let (sink, _out) = with_recorded_telemetry(|| async {
+            maintain_context(&provider, messages, &[], 50, true).await
+        })
+        .await;
+        let candidates: Vec<_> = sink
+            .snapshots()
+            .into_iter()
+            .filter(|s| s.measurement_kind == MeasurementKind::CandidateEstimate)
+            .collect();
+        assert!(!candidates.is_empty(), "compaction must emit CandidateEstimate");
+        assert!(
+            candidates.iter().any(|s| s.estimated_input_tokens < before),
+            "compacted candidate was not smaller than {before}"
+        );
     }
 }

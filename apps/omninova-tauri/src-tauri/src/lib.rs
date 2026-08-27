@@ -3378,6 +3378,7 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
         _ => None,
     }
 }
@@ -3469,6 +3470,18 @@ fn setup_config_to_core(
                         .model_providers
                         .get(&provider.id)
                         .and_then(|p| p.max_output_tokens),
+                    exact_tokenizer: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.exact_tokenizer.clone()),
+                    canonical_model: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.canonical_model.clone()),
+                    provider_family: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.provider_family.clone()),
                 },
             )
         })

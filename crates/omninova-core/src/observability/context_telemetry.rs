@@ -1,4 +1,6 @@
 use crate::providers::context_budget::{ContextBudget, TokenEstimator};
+use crate::providers::native_request::native_context_view_json;
+use crate::providers::token_counter::{measure_display_tokens, DisplayMeasurement};
 use crate::providers::ChatMessage;
 use crate::tools::ToolSpec;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,17 @@ pub enum MeasurementKind {
     /// C1 final Provider-native envelope (`estimate_request(request_body)`).
     FinalRequestEstimate,
     /// Provider-reported `usage.input_tokens` for the same request identity.
+    ProviderActual,
+}
+
+/// Provenance of the display total. Safety estimates must never be labelled exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementProvenance {
+    #[default]
+    SafetyEstimate,
+    ExactTokenizer,
+    ProviderCountApi,
     ProviderActual,
 }
 
@@ -52,6 +65,12 @@ pub struct ContextUsageSnapshot {
     pub provider: String,
     pub model: String,
     pub measurement_kind: MeasurementKind,
+    #[serde(default)]
+    pub measurement_provenance: MeasurementProvenance,
+    /// Explicit precision truth. Provenance identifies the source only and
+    /// must never be interpreted as automatic proof of exactness.
+    #[serde(default)]
+    pub measurement_exact: bool,
     pub estimated_input_tokens: u64,
     pub provider_actual_input_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
@@ -68,9 +87,13 @@ pub struct ContextUsageSnapshot {
 /// Builds a snapshot from the same local estimator authority as C1.
 ///
 /// When `request_body` is supplied, `estimated_input_tokens` is exactly
-/// `TokenEstimator::estimate_request(request_body)` (the C1 final envelope
-/// accounting) and `request_overhead_tokens` absorbs the difference between
-/// category subtotals and that final envelope estimate.
+/// `TokenEstimator::estimate_request(request_body)` (the C1 final envelope)
+/// and categories are measured from that Provider-native JSON. Overhead is the
+/// remainder after native semantic categories.
+///
+/// Candidate snapshots (`request_body` absent) classify the same native
+/// message/tool objects via `native_context_view_json`, while the total stays
+/// `TokenEstimator::estimate_messages_with_tools`.
 pub fn build_snapshot(
     session_id: Option<String>,
     run_id: Option<String>,
@@ -84,38 +107,37 @@ pub fn build_snapshot(
     request_body: Option<&str>,
 ) -> ContextUsageSnapshot {
     let estimator = TokenEstimator::new();
-    let mut breakdown = ContextUsageBreakdown::default();
-
-    for message in messages {
-        let tokens = estimator.estimate_text(&message.content);
-        match message.role.as_str() {
-            "system" => breakdown.system_tokens = breakdown.system_tokens.saturating_add(tokens),
-            "tool" => breakdown.tool_result_tokens = breakdown.tool_result_tokens.saturating_add(tokens),
-            _ => breakdown.conversation_tokens = breakdown.conversation_tokens.saturating_add(tokens),
-        }
-        if let Some(images) = &message.images {
-            let image_tokens = (images.len() as u64).saturating_mul(1_024);
-            breakdown.conversation_tokens = breakdown.conversation_tokens.saturating_add(image_tokens);
-        }
-    }
-
-    for tool in tools {
-        let spec = serde_json::to_string(tool).unwrap_or_default();
-        breakdown.tool_schema_tokens = breakdown
-            .tool_schema_tokens
-            .saturating_add(estimator.estimate_text(&spec));
-    }
-
-    let category_total = breakdown.total();
-    let estimated_input_tokens = if let Some(body) = request_body {
-        estimator.estimate_request(body)
+    let model = model.into();
+    let provider = provider.into();
+    let configured = current_context().and_then(|ctx| ctx.exact_tokenizer.lock().ok()?.clone());
+    let (safety_total, mut breakdown) = if let Some(body) = request_body {
+        (
+            estimator.estimate_request(body),
+            classify_native_request_json(body, &estimator),
+        )
     } else {
-        // Same local estimator as `TokenEstimator::estimate_messages_with_tools`
-        // (the +8 envelope constant). C1 still overrides this when a serialized
-        // Provider body is supplied.
-        category_total.saturating_add(8)
+        let view = native_context_view_json(messages, tools);
+        (
+            estimator.estimate_messages_with_tools(messages, tools),
+            classify_native_request_json(&view, &estimator),
+        )
     };
-    finalize_breakdown(&mut breakdown, estimated_input_tokens);
+    finalize_breakdown(&mut breakdown, safety_total);
+    let display = measure_display_tokens(
+        &model,
+        configured.as_deref(),
+        messages,
+        tools,
+        request_body,
+    );
+    let (estimated_input_tokens, measurement_provenance, measurement_exact) = match display {
+        DisplayMeasurement::Exact(tokens) => {
+            (tokens, MeasurementProvenance::ExactTokenizer, true)
+        }
+        DisplayMeasurement::SafetyEstimate(tokens) => {
+            (tokens, MeasurementProvenance::SafetyEstimate, false)
+        }
+    };
 
     let context_window_tokens = budget.map(|b| b.context_window_tokens);
     let max_input_tokens = budget.map(|b| b.max_input_tokens);
@@ -141,9 +163,11 @@ pub fn build_snapshot(
         session_id,
         run_id,
         request_revision,
-        provider: provider.into(),
-        model: model.into(),
+        provider,
+        model,
         measurement_kind,
+        measurement_provenance,
+        measurement_exact,
         estimated_input_tokens,
         provider_actual_input_tokens: None,
         context_window_tokens,
@@ -156,6 +180,44 @@ pub fn build_snapshot(
         breakdown,
         measured_at: now_ms(),
     }
+}
+
+fn classify_native_request_json(body: &str, estimator: &TokenEstimator) -> ContextUsageBreakdown {
+    let mut breakdown = ContextUsageBreakdown::default();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return breakdown;
+    };
+
+    if let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let serialized = serde_json::to_string(message).unwrap_or_default();
+            let tokens = estimator.estimate_text(&serialized);
+            match message.get("role").and_then(serde_json::Value::as_str) {
+                Some("system") => {
+                    breakdown.system_tokens = breakdown.system_tokens.saturating_add(tokens);
+                }
+                Some("tool") => {
+                    breakdown.tool_result_tokens =
+                        breakdown.tool_result_tokens.saturating_add(tokens);
+                }
+                _ => {
+                    breakdown.conversation_tokens =
+                        breakdown.conversation_tokens.saturating_add(tokens);
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) {
+        for tool in tools {
+            let serialized = serde_json::to_string(tool).unwrap_or_default();
+            breakdown.tool_schema_tokens = breakdown
+                .tool_schema_tokens
+                .saturating_add(estimator.estimate_text(&serialized));
+        }
+    }
+
+    breakdown
 }
 
 fn finalize_breakdown(breakdown: &mut ContextUsageBreakdown, estimated: u64) {
@@ -185,9 +247,19 @@ fn finalize_breakdown(breakdown: &mut ContextUsageBreakdown, estimated: u64) {
 }
 
 impl ContextUsageSnapshot {
+    pub fn with_provider_count_api(mut self, tokens: u64, exact: bool) -> Self {
+        self.estimated_input_tokens = tokens;
+        self.measurement_kind = MeasurementKind::FinalRequestEstimate;
+        self.measurement_provenance = MeasurementProvenance::ProviderCountApi;
+        self.measurement_exact = exact;
+        self
+    }
+
     pub fn with_provider_actual(mut self, actual_input_tokens: u64) -> Self {
         self.provider_actual_input_tokens = Some(actual_input_tokens);
         self.measurement_kind = MeasurementKind::ProviderActual;
+        self.measurement_provenance = MeasurementProvenance::ProviderActual;
+        self.measurement_exact = true;
         self
     }
 }
@@ -359,6 +431,7 @@ pub struct ContextTelemetryContext {
     pub model: String,
     request_revision: AtomicU64,
     snapshots_enabled: AtomicBool,
+    exact_tokenizer: Mutex<Option<String>>,
     sink: SharedSink,
 }
 
@@ -377,6 +450,7 @@ impl ContextTelemetryContext {
             model: model.into(),
             request_revision: AtomicU64::new(0),
             snapshots_enabled: AtomicBool::new(true),
+            exact_tokenizer: Mutex::new(None),
             sink,
         }
     }
@@ -398,6 +472,49 @@ impl ContextTelemetryContext {
     pub fn snapshots_enabled(&self) -> bool {
         self.snapshots_enabled.load(Ordering::SeqCst)
     }
+
+    /// Rejects late snapshots for an older request revision. This is checked
+    /// at the emission boundary, so async ProviderCountApi results cannot
+    /// overwrite a newer request's current measurement even when they arrive
+    /// out of order.
+    pub fn is_stale_revision(&self, snapshot: &ContextUsageSnapshot) -> bool {
+        if snapshot.session_id.is_some()
+            && self.session_id.is_some()
+            && snapshot.session_id != self.session_id
+        {
+            return false;
+        }
+        if snapshot.run_id.is_some()
+            && self.run_id.is_some()
+            && snapshot.run_id != self.run_id
+        {
+            return false;
+        }
+        if snapshot.provider != self.provider || snapshot.model != self.model {
+            return false;
+        }
+        let latest = self.request_revision.load(Ordering::SeqCst);
+        snapshot.request_revision < latest
+    }
+}
+
+pub fn set_exact_tokenizer(name: Option<String>) {
+    let Some(ctx) = current_context() else {
+        return;
+    };
+    *ctx.exact_tokenizer.lock().unwrap() = name.filter(|value| !value.trim().is_empty());
+}
+
+/// Spawns a display-only telemetry future under the same ContextTelemetryContext.
+/// Used by provider-native count calls so they never block the normal model
+/// request and still participate in revision-based stale-result suppression.
+pub fn spawn_context_usage_task<F>(ctx: Arc<ContextTelemetryContext>, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _ = CURRENT_CONTEXT.scope(ctx, fut).await;
+    });
 }
 
 tokio::task_local! {
@@ -486,12 +603,56 @@ pub fn clear_global_context_telemetry() {
 
 pub fn emit_snapshot(snapshot: ContextUsageSnapshot) {
     if let Some(ctx) = current_context() {
+        if ctx.is_stale_revision(&snapshot) {
+            return;
+        }
         ctx.sink.emit_usage(snapshot);
         return;
     }
     if let Some(sink) = global_sink_guard().lock().unwrap().as_ref() {
         sink.emit_usage(snapshot);
     }
+}
+
+/// Emits a production CandidateEstimate for the current model-visible Agent
+/// context. This is not the final Provider envelope.
+pub fn emit_candidate_usage(
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    budget: Option<&ContextBudget>,
+) {
+    let Some(ctx) = current_context() else {
+        return;
+    };
+    if !ctx.snapshots_enabled() {
+        return;
+    }
+    if ctx.provider.trim().is_empty() || ctx.model.trim().is_empty() {
+        return;
+    }
+    if messages.is_empty() && tools.is_empty() {
+        return;
+    }
+    let identity = ctx.allocate_request_identity();
+    let snapshot = build_snapshot(
+        identity.session_id.clone(),
+        identity.run_id.clone(),
+        identity.request_revision,
+        identity.provider.clone(),
+        identity.model.clone(),
+        MeasurementKind::CandidateEstimate,
+        messages,
+        tools,
+        budget,
+        None,
+    );
+    // A candidate is a display-only context projection. If a later revision
+    // has already started (e.g. a model request allocated the final identity),
+    // this candidate is stale and must not overwrite it.
+    if ctx.is_stale_revision(&snapshot) {
+        return;
+    }
+    emit_snapshot(snapshot);
 }
 
 pub fn emit_event(event: ContextLifecycleEvent) {
@@ -879,5 +1040,593 @@ mod tests {
         assert_ne!(snap_b.estimated_input_tokens, 222);
         assert_eq!(snap_a.session_id, identity_a.session_id);
         assert_eq!(snap_b.run_id, identity_b.run_id);
+    }
+
+    fn final_native_body(messages: &[ChatMessage], tools: &[ToolSpec]) -> String {
+        let request = crate::providers::native_request::NativeChatRequest {
+            model: "gpt-4o".into(),
+            messages: crate::providers::native_request::convert_messages(messages),
+            temperature: 0.2,
+            max_tokens: Some(1024),
+            tools: crate::providers::native_request::convert_tools(if tools.is_empty() {
+                None
+            } else {
+                Some(tools)
+            }),
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some("auto".into())
+            },
+            stream: Some(true),
+        };
+        serde_json::to_string(&request).unwrap()
+    }
+
+    fn overhead_ratio(snapshot: &ContextUsageSnapshot) -> f64 {
+        snapshot.breakdown.request_overhead_tokens as f64
+            / snapshot.estimated_input_tokens.max(1) as f64
+    }
+
+    #[test]
+    fn a_final_native_request_total_matches_estimator() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let body = final_native_body(&messages, &tools);
+        let snapshot = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            3,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        assert_eq!(
+            snapshot.estimated_input_tokens,
+            TokenEstimator::new().estimate_request(&body)
+        );
+        assert_eq!(snapshot.measurement_kind, MeasurementKind::FinalRequestEstimate);
+    }
+
+    #[test]
+    fn b_native_breakdown_sums_exactly_to_final_estimate() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let body = final_native_body(&messages, &tools);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        assert_eq!(snapshot.breakdown.total(), snapshot.estimated_input_tokens);
+        eprintln!(
+            "mixed overhead_ratio={:.4} system={} conversation={} tool_schema={} tool_result={} overhead={}",
+            overhead_ratio(&snapshot),
+            snapshot.breakdown.system_tokens,
+            snapshot.breakdown.conversation_tokens,
+            snapshot.breakdown.tool_schema_tokens,
+            snapshot.breakdown.tool_result_tokens,
+            snapshot.breakdown.request_overhead_tokens
+        );
+    }
+
+    #[test]
+    fn c_large_system_prompt_is_classified_as_system_not_overhead() {
+        let messages = vec![ChatMessage::system("S".repeat(20_000))];
+        let body = final_native_body(&messages, &[]);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &[],
+            None,
+            Some(&body),
+        );
+        eprintln!("large_system overhead_ratio={:.4}", overhead_ratio(&snapshot));
+        assert!(
+            snapshot.breakdown.system_tokens * 5 > snapshot.estimated_input_tokens * 4,
+            "system content leaked into overhead: {:?}",
+            snapshot.breakdown
+        );
+        assert!(overhead_ratio(&snapshot) < 0.20);
+        assert_eq!(snapshot.breakdown.total(), snapshot.estimated_input_tokens);
+    }
+
+    #[test]
+    fn d_large_conversation_is_classified_as_conversation_not_overhead() {
+        let messages = vec![
+            ChatMessage::user("U".repeat(12_000)),
+            ChatMessage::assistant("A".repeat(12_000)),
+        ];
+        let body = final_native_body(&messages, &[]);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &[],
+            None,
+            Some(&body),
+        );
+        eprintln!("large_conversation overhead_ratio={:.4}", overhead_ratio(&snapshot));
+        assert!(
+            snapshot.breakdown.conversation_tokens * 5 > snapshot.estimated_input_tokens * 4,
+            "conversation leaked into overhead: {:?}",
+            snapshot.breakdown
+        );
+        assert!(overhead_ratio(&snapshot) < 0.20);
+    }
+
+    #[test]
+    fn e_many_tool_schemas_are_classified_as_tool_schema() {
+        let tools: Vec<ToolSpec> = (0..24)
+            .map(|i| ToolSpec {
+                name: format!("tool_{i}"),
+                description: format!("description-{i}-{}", "d".repeat(400)),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            })
+            .collect();
+        let messages = vec![ChatMessage::user("hi")];
+        let body = final_native_body(&messages, &tools);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        eprintln!("many_tools overhead_ratio={:.4}", overhead_ratio(&snapshot));
+        assert!(
+            snapshot.breakdown.tool_schema_tokens > snapshot.breakdown.conversation_tokens,
+            "tool schemas leaked into overhead: {:?}",
+            snapshot.breakdown
+        );
+        assert!(
+            snapshot.breakdown.tool_schema_tokens * 2 > snapshot.estimated_input_tokens,
+            "tool schemas not dominant: {:?}",
+            snapshot.breakdown
+        );
+    }
+
+    #[test]
+    fn f_hidden_original_tool_content_is_not_counted() {
+        let visible = "visible-result".repeat(20);
+        let mut tool = ChatMessage::tool(format!(
+            r#"{{"tool_call_id":"call-1","content":"{visible}"}}"#
+        ));
+        tool.original_tool_content = Some("H".repeat(1_900_000));
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"call-1","name":"read","arguments":"{}"}]}"#,
+            ),
+            tool,
+        ];
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &[],
+            None,
+            None,
+        );
+        assert!(
+            snapshot.estimated_input_tokens < 20_000,
+            "hidden original_tool_content was counted: {}",
+            snapshot.estimated_input_tokens
+        );
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("HHHH"));
+    }
+
+    #[test]
+    fn g_visible_pruned_tool_result_is_counted() {
+        let visible = "V".repeat(1_200);
+        let messages = vec![ChatMessage::tool(format!(
+            r#"{{"tool_call_id":"call-1","content":"{visible}"}}"#
+        ))];
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &[],
+            None,
+            None,
+        );
+        assert!(
+            snapshot.breakdown.tool_result_tokens > 1_000,
+            "visible tool result missing: {:?}",
+            snapshot.breakdown
+        );
+        eprintln!(
+            "pruned_tool_result overhead_ratio={:.4}",
+            overhead_ratio(&snapshot)
+        );
+    }
+
+    #[test]
+    fn l_candidate_then_final_keeps_kind_and_revision_order() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let candidate = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            4,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &tools,
+            None,
+            None,
+        );
+        let body = final_native_body(&messages, &tools);
+        let final_snap = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            5,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        assert_eq!(candidate.measurement_kind, MeasurementKind::CandidateEstimate);
+        assert_eq!(
+            final_snap.measurement_kind,
+            MeasurementKind::FinalRequestEstimate
+        );
+        assert!(final_snap.request_revision > candidate.request_revision);
+        assert_eq!(
+            candidate.estimated_input_tokens,
+            TokenEstimator::new().estimate_messages_with_tools(&messages, &tools)
+        );
+        assert_eq!(
+            final_snap.estimated_input_tokens,
+            TokenEstimator::new().estimate_request(&body)
+        );
+    }
+
+    #[test]
+    fn simple_chat_overhead_is_reported() {
+        let messages = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        let body = final_native_body(&messages, &[]);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &[],
+            None,
+            Some(&body),
+        );
+        eprintln!(
+            "simple_chat overhead_ratio={:.4} breakdown={:?}",
+            overhead_ratio(&snapshot),
+            snapshot.breakdown
+        );
+        assert_eq!(snapshot.breakdown.total(), snapshot.estimated_input_tokens);
+        assert!(snapshot.breakdown.conversation_tokens > 0);
+    }
+
+    #[test]
+    fn mixed_realistic_agent_request_overhead_is_reported() {
+        let tools = sample_tools();
+        let messages = vec![
+            ChatMessage::system("You are OmniNova. ".to_string() + &"rule ".repeat(400)),
+            ChatMessage::user("please inspect the repo ".to_string() + &"ctx ".repeat(200)),
+            ChatMessage::assistant(
+                r#"{"content":"calling","tool_calls":[{"id":"c1","name":"test","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"c1","content":"ok result"}"#),
+        ];
+        let body = final_native_body(&messages, &tools);
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        eprintln!(
+            "mixed overhead_ratio={:.4} mixed={:?}",
+            overhead_ratio(&snapshot),
+            snapshot.breakdown
+        );
+        assert_eq!(snapshot.breakdown.total(), snapshot.estimated_input_tokens);
+        assert!(snapshot.breakdown.system_tokens > snapshot.breakdown.request_overhead_tokens);
+        assert!(snapshot.breakdown.conversation_tokens > 0);
+        assert!(snapshot.breakdown.tool_schema_tokens > 0);
+        assert!(snapshot.breakdown.tool_result_tokens > 0);
+    }
+
+    #[test]
+    fn c_exact_tokenizer_is_used_only_for_trusted_model() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let exact = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "omninova-test-exact",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &tools,
+            None,
+            None,
+        );
+        let unknown = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::CandidateEstimate,
+            &messages,
+            &tools,
+            None,
+            None,
+        );
+        assert_eq!(
+            exact.measurement_provenance,
+            MeasurementProvenance::ExactTokenizer
+        );
+        assert_eq!(
+            unknown.measurement_provenance,
+            MeasurementProvenance::SafetyEstimate
+        );
+        assert_eq!(
+            unknown.estimated_input_tokens,
+            TokenEstimator::new().estimate_messages_with_tools(&messages, &tools)
+        );
+        assert_ne!(exact.estimated_input_tokens, unknown.estimated_input_tokens);
+        assert_eq!(unknown.breakdown.total(), unknown.estimated_input_tokens);
+        assert_ne!(exact.breakdown.total(), exact.estimated_input_tokens);
+    }
+
+    #[test]
+    fn d_unknown_tokenizer_keeps_safety_estimate_total() {
+        let messages = sample_messages();
+        let snapshot = build_snapshot(
+            None,
+            None,
+            1,
+            "openai",
+            "mystery-model",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &[],
+            None,
+            Some(&final_native_body(&messages, &[])),
+        );
+        assert_eq!(
+            snapshot.measurement_provenance,
+            MeasurementProvenance::SafetyEstimate
+        );
+        assert_eq!(
+            snapshot.estimated_input_tokens,
+            TokenEstimator::new().estimate_request(&final_native_body(&messages, &[]))
+        );
+    }
+
+    #[test]
+    fn f_provider_actual_total_does_not_rewrite_estimated_breakdown() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let body = final_native_body(&messages, &tools);
+        let estimate = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            9,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        let actual = estimate.clone().with_provider_actual(4_777);
+        assert_eq!(actual.measurement_kind, MeasurementKind::ProviderActual);
+        assert_eq!(
+            actual.measurement_provenance,
+            MeasurementProvenance::ProviderActual
+        );
+        assert_eq!(actual.provider_actual_input_tokens, Some(4_777));
+        assert_eq!(actual.breakdown, estimate.breakdown);
+        assert_ne!(actual.breakdown.total(), 4_777);
+        assert_eq!(actual.request_revision, 9);
+    }
+
+    #[test]
+    fn provider_count_api_marks_exact_without_touching_breakdown() {
+        let messages = sample_messages();
+        let tools = sample_tools();
+        let body = final_native_body(&messages, &tools);
+        let estimate = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            9,
+            "openai",
+            "gpt-4o",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &tools,
+            None,
+            Some(&body),
+        );
+        let exact = estimate.clone().with_provider_count_api(4_812, true);
+        assert_eq!(exact.measurement_kind, MeasurementKind::FinalRequestEstimate);
+        assert_eq!(
+            exact.measurement_provenance,
+            MeasurementProvenance::ProviderCountApi
+        );
+        assert!(exact.measurement_exact);
+        assert_eq!(exact.estimated_input_tokens, 4_812);
+        assert_eq!(exact.provider_actual_input_tokens, None);
+        assert_eq!(exact.breakdown, estimate.breakdown);
+        assert_ne!(exact.breakdown.total(), 4_812);
+    }
+
+    #[test]
+    fn provider_count_api_source_does_not_imply_exactness() {
+        let messages = sample_messages();
+        let estimate = build_snapshot(
+            Some("session-1".into()),
+            Some("run-1".into()),
+            9,
+            "anthropic",
+            "claude-sonnet-4-5",
+            MeasurementKind::FinalRequestEstimate,
+            &messages,
+            &[],
+            None,
+            None,
+        );
+        let inexact = estimate.with_provider_count_api(4_812, false);
+        assert_eq!(
+            inexact.measurement_provenance,
+            MeasurementProvenance::ProviderCountApi
+        );
+        assert!(!inexact.measurement_exact);
+    }
+
+    #[tokio::test]
+    async fn stale_provider_count_snapshot_is_not_emitted_through_telemetry_path() {
+        let sink = Arc::new(VecContextTelemetry::new());
+        let ctx = Arc::new(ContextTelemetryContext::new(
+            Some("session-stale".into()),
+            Some("run-stale".into()),
+            "anthropic",
+            "claude-sonnet-4-5",
+            sink.clone(),
+        ));
+        // Use with_context_telemetry to install the context; inside it emit a
+        // revision 10 late result after revision 11 has already been allocated.
+        crate::observability::with_context_telemetry(
+            ctx.session_id.clone(),
+            ctx.run_id.clone(),
+            ctx.provider.clone(),
+            ctx.model.clone(),
+            sink.clone(),
+            async {
+                let ctx = current_context().expect("context installed");
+                // Allocate revision 10 (the old request) and revision 11 (newer).
+                let old = ctx.allocate_request_identity();
+                assert_eq!(old.request_revision, 1);
+                let new = ctx.allocate_request_identity();
+                assert_eq!(new.request_revision, 2);
+                let messages = sample_messages();
+                let body = final_native_body(&messages, &[]);
+                let old_snapshot = build_snapshot(
+                    old.session_id.clone(),
+                    old.run_id.clone(),
+                    old.request_revision,
+                    old.provider.clone(),
+                    old.model.clone(),
+                    MeasurementKind::FinalRequestEstimate,
+                    &messages,
+                    &[],
+                    None,
+                    Some(&body),
+                )
+                .with_provider_count_api(100, true);
+                emit_snapshot(old_snapshot);
+                let new_snapshot = build_snapshot(
+                    new.session_id.clone(),
+                    new.run_id.clone(),
+                    new.request_revision,
+                    new.provider.clone(),
+                    new.model.clone(),
+                    MeasurementKind::FinalRequestEstimate,
+                    &messages,
+                    &[],
+                    None,
+                    Some(&body),
+                )
+                .with_provider_count_api(200, true);
+                emit_snapshot(new_snapshot);
+            },
+        )
+        .await;
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].request_revision, 2);
+        assert_eq!(snapshots[0].estimated_input_tokens, 200);
+    }
+
+    #[tokio::test]
+    async fn spawn_context_usage_task_preserves_context_identity_and_revision_after_await() {
+        let sink = Arc::new(VecContextTelemetry::new());
+        let ctx = Arc::new(ContextTelemetryContext::new(
+            Some("session-async".into()),
+            Some("run-async".into()),
+            "anthropic",
+            "claude-sonnet-4-5",
+            sink,
+        ));
+        let identity = ctx.allocate_request_identity();
+        let expected = identity.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        spawn_context_usage_task(ctx, async move {
+            tokio::task::yield_now().await;
+            let current = current_context().expect("CURRENT_CONTEXT is installed in spawned task");
+            let observed = ContextRequestIdentity {
+                session_id: current.session_id.clone(),
+                run_id: current.run_id.clone(),
+                request_revision: current.request_revision.load(Ordering::SeqCst),
+                provider: current.provider.clone(),
+                model: current.model.clone(),
+            };
+            tx.send(observed).unwrap();
+        });
+
+        let observed = rx.await.expect("spawned telemetry task completed");
+        assert_eq!(observed, expected);
     }
 }

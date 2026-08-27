@@ -1,5 +1,9 @@
 use crate::config::{Config, ModelProviderConfig, ProviderConfig};
 use crate::providers::context_budget::resolve_context_budget;
+use crate::providers::model_capabilities::{
+    resolve_model_capabilities, ProviderCountApiKind, TokenStrategy,
+};
+use crate::providers::token_counter::resolve_exact_tokenizer_name;
 use crate::providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, MockProvider, OpenAiProvider,
     Provider,
@@ -103,6 +107,11 @@ pub fn build_provider_with_selection(
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
     let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
     let context_budget = resolve_context_budget(config, &model, profile);
+    let exact_tokenizer = resolve_exact_tokenizer_name(&model, profile).map(str::to_string);
+    let anthropic_count_trusted = matches!(
+        resolve_model_capabilities(&model, profile).token_strategy,
+        TokenStrategy::ProviderCountApi(ProviderCountApiKind::AnthropicNative)
+    );
 
     let dispatch = resolve_dispatch_kind(&provider_name, &kind, base_url.is_some());
     match dispatch.as_str() {
@@ -116,7 +125,9 @@ pub fn build_provider_with_selection(
                 timeouts,
             )
             .with_transport_mode(transport_mode)
-            .with_context_budget(context_budget),
+            .with_context_budget(context_budget)
+            .with_exact_tokenizer(exact_tokenizer)
+            .with_anthropic_count_trusted(anthropic_count_trusted),
         ),
         "gemini" => Box::new(
             GeminiProvider::new(
@@ -128,7 +139,8 @@ pub fn build_provider_with_selection(
                 timeouts,
             )
             .with_transport_mode(transport_mode)
-            .with_context_budget(context_budget),
+            .with_context_budget(context_budget)
+            .with_exact_tokenizer(exact_tokenizer),
         ),
         "mock" => Box::new(MockProvider::new("mock-provider")),
         "openai-compat" => {
@@ -146,7 +158,8 @@ pub fn build_provider_with_selection(
                     timeouts,
                 )
                 .with_transport_mode(transport_mode)
-                .with_context_budget(context_budget),
+                .with_context_budget(context_budget)
+                .with_exact_tokenizer(exact_tokenizer),
             )
         }
         _ if OPENAI_COMPATIBLE.contains(&dispatch.as_str()) => Box::new(
@@ -159,7 +172,8 @@ pub fn build_provider_with_selection(
                 timeouts,
             )
             .with_transport_mode(transport_mode)
-            .with_context_budget(context_budget),
+            .with_context_budget(context_budget)
+            .with_exact_tokenizer(exact_tokenizer),
         ),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
     }
@@ -336,6 +350,12 @@ fn resolve_model(
 /// OpenAI 兼容 provider 自动补上 `/v1`，避免请求打到错误路径（404）。
 fn normalize_openai_base_url(provider_name: &str, url: String) -> String {
     let trimmed = url.trim().trim_end_matches('/').to_string();
+    if provider_name == "anthropic" {
+        // Anthropic native endpoints are used for token counting; do not
+        // append the OpenAI-compatible `/v1` segment that the compatibility
+        // transport would otherwise need.
+        return trimmed;
+    }
     let needs_v1 = matches!(provider_name, "ollama" | "lmstudio")
         && !trimmed.ends_with("/v1")
         && !trimmed.contains("/v1/");

@@ -2,11 +2,16 @@ use crate::agent::context::force_context_recovery;
 use crate::config::TransportMode;
 use crate::observability::{
     build_snapshot, current_context, emit_lifecycle, emit_snapshot, new_operation_id,
-    ContextLifecycleEventKind, ContextTelemetryMode, MeasurementKind,
+    ContextLifecycleEventKind, ContextRequestIdentity, ContextTelemetryMode, MeasurementKind,
 };
 use crate::providers::context_budget::{
     context_window_exceeded_info, ContextBudget, ProviderOverflowInfo, TokenEstimator,
     CONTEXT_BUDGET_EXCEEDED_MARKER,
+};
+use crate::providers::anthropic_count::{count_anthropic_tokens, AnthropicCountConfig};
+use crate::providers::native_request::{
+    convert_messages as convert_native_messages, convert_tools as convert_native_tools,
+    NativeChatRequest, NativeToolCall,
 };
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -15,7 +20,7 @@ use crate::providers::traits::{
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -448,6 +453,9 @@ pub struct OpenAiProvider {
     transport_mode: TransportMode,
     client: Client,
     context_budget: Option<ContextBudget>,
+    exact_tokenizer: Option<String>,
+    anthropic_native_count: Option<AnthropicCountConfig>,
+    anthropic_count_trusted: bool,
 }
 
 struct ConsumeOutcome {
@@ -698,21 +706,6 @@ where
     }
 }
 
-#[derive(Debug, Serialize)]
-struct NativeChatRequest {
-    model: String,
-    messages: Vec<NativeMessage>,
-    temperature: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-}
-
 // --- Streaming (SSE) chunk shapes ---
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
@@ -801,48 +794,6 @@ fn completion_state(
     } else {
         ResponseCompletionState::NoOutput
     }
-}
-
-#[derive(Debug, Serialize)]
-struct NativeMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<NativeToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolSpec {
-    #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolCall {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    function: NativeFunctionCall,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeFunctionCall {
-    name: String,
-    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -979,12 +930,38 @@ impl OpenAiProvider {
             transport_mode,
             client,
             context_budget: None,
+            exact_tokenizer: None,
+            anthropic_native_count: None,
+            anthropic_count_trusted: false,
         }
     }
 
     /// Sets an optional authoritative context budget for final preflight.
     pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
         self.context_budget = budget;
+        self
+    }
+
+    /// Sets an optional trusted display tokenizer name. Unknown names are ignored.
+    pub fn with_exact_tokenizer(mut self, name: Option<String>) -> Self {
+        self.exact_tokenizer = name.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Enables observation-only Anthropic `/v1/messages/count_tokens` calls
+    /// for this OpenAI-compatible transport when the model is trusted.
+    pub fn with_anthropic_native_count(mut self, base_url: Option<&str>, credential: Option<&str>) -> Self {
+        self.anthropic_native_count = base_url.map(|base_url| AnthropicCountConfig {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            credential: credential.map(str::to_string),
+        });
+        self
+    }
+
+    /// Records that the resolved provider/profile/model mapping is trusted by
+    /// ModelCapabilityRegistry for Anthropic-native count conversion.
+    pub fn with_anthropic_count_trusted(mut self, trusted: bool) -> Self {
+        self.anthropic_count_trusted = trusted;
         self
     }
 
@@ -996,6 +973,8 @@ impl OpenAiProvider {
         self
     }
 
+    /// C1 hard preflight: conservative TokenEstimator only. Display metering
+    /// (exact tokenizer / ProviderActual) must not be used here.
     fn preflight_context(&self, request_body: &str) -> anyhow::Result<()> {
         let Some(budget) = self.context_budget else {
             return Ok(());
@@ -1045,7 +1024,7 @@ impl OpenAiProvider {
         request_body: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
-    ) -> Option<crate::observability::ContextRequestIdentity> {
+    ) -> Option<ContextRequestIdentity> {
         let ctx = current_context()?;
         if !ctx.snapshots_enabled() {
             return None;
@@ -1075,7 +1054,7 @@ impl OpenAiProvider {
 
     fn observe_provider_actual(
         &self,
-        identity: Option<&crate::observability::ContextRequestIdentity>,
+        identity: Option<&ContextRequestIdentity>,
         request_body: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
@@ -1313,129 +1292,6 @@ impl OpenAiProvider {
         .retryable(transient_transport_reason(&diagnostics))
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools
-            .filter(|items| !items.is_empty())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|tool| NativeToolSpec {
-                        kind: "function".to_string(),
-                        function: NativeToolFunctionSpec {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.parameters.clone(),
-                        },
-                    })
-                    .collect()
-            })
-    }
-
-    fn user_content_value(message: &ChatMessage) -> serde_json::Value {
-        let images = message.images.as_deref().unwrap_or_default();
-        if images.is_empty() {
-            return serde_json::Value::String(message.content.clone());
-        }
-
-        let mut parts = vec![serde_json::json!({
-            "type": "text",
-            "text": message.content,
-        })];
-        for url in images {
-            parts.push(serde_json::json!({
-                "type": "image_url",
-                "image_url": { "url": url },
-            }));
-        }
-        serde_json::Value::Array(parts)
-    }
-
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
-        messages
-            .iter()
-            .filter_map(|m| {
-                if m.role == "assistant" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
-                            {
-                                if !parsed_calls.is_empty() {
-                                    let tool_calls = parsed_calls
-                                        .into_iter()
-                                        .map(|tc| NativeToolCall {
-                                            id: Some(tc.id),
-                                            kind: Some("function".to_string()),
-                                            function: NativeFunctionCall {
-                                                name: tc.name,
-                                                arguments: tc.arguments,
-                                            },
-                                        })
-                                        .collect::<Vec<_>>();
-                                    let content = value
-                                        .get("content")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(ToString::to_string);
-                                    let reasoning_content = value
-                                        .get("reasoning_content")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(ToString::to_string);
-                                    return Some(NativeMessage {
-                                        role: "assistant".to_string(),
-                                        content: content.map(serde_json::Value::String),
-                                        tool_call_id: None,
-                                        tool_calls: Some(tool_calls),
-                                        reasoning_content,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if m.role == "tool" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        let tool_call_id = value
-                            .get("tool_call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .map(ToString::to_string);
-                        let content = value
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-                        if tool_call_id.is_some() {
-                            return Some(NativeMessage {
-                                role: "tool".to_string(),
-                                content: content.map(serde_json::Value::String),
-                                tool_call_id,
-                                tool_calls: None,
-                                reasoning_content: None,
-                            });
-                        }
-                    }
-                    return None;
-                }
-
-                let content = if m.role == "user" {
-                    Some(Self::user_content_value(m))
-                } else {
-                    Some(serde_json::Value::String(m.content.clone()))
-                };
-
-                Some(NativeMessage {
-                    role: m.role.clone(),
-                    content,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                })
-            })
-            .collect()
-    }
-
     fn parse_native_response(
         message: NativeResponseMessage,
         finish_reason: Option<String>,
@@ -1607,6 +1463,65 @@ impl Provider for OpenAiProvider {
     fn context_budget(&self) -> Option<ContextBudget> {
         self.context_budget
     }
+
+    fn exact_tokenizer(&self) -> Option<&str> {
+        self.exact_tokenizer.as_deref()
+    }
+
+    async fn measure_provider_count_tokens(
+        &self,
+        identity: Option<ContextRequestIdentity>,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        request_body: &str,
+    ) {
+        if !self.anthropic_count_trusted || !self.can_use_provider_count_api(model) {
+            return;
+        }
+        let Some(identity) = identity else {
+            return;
+        };
+        let Some(config) = self.anthropic_native_count.clone() else {
+            return;
+        };
+        let Some(ctx) = current_context() else {
+            return;
+        };
+        let model = model.to_string();
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
+        let request_body = request_body.to_string();
+        let budget = self.context_budget;
+        let timeout = self.timeouts.connect.min(Duration::from_millis(750));
+        crate::observability::spawn_context_usage_task(ctx, async move {
+            let Some(measurement) = count_anthropic_tokens(
+                &config,
+                &model,
+                &messages,
+                &tools,
+                timeout,
+            )
+            .await
+            else {
+                return;
+            };
+            let snapshot = build_snapshot(
+                identity.session_id.clone(),
+                identity.run_id.clone(),
+                identity.request_revision,
+                identity.provider.clone(),
+                identity.model.clone(),
+                MeasurementKind::FinalRequestEstimate,
+                &messages,
+                &tools,
+                budget.as_ref(),
+                Some(&request_body),
+            )
+            .with_provider_count_api(measurement.tokens, measurement.exact);
+            emit_snapshot(snapshot);
+        });
+    }
 }
 
 impl OpenAiProvider {
@@ -1764,10 +1679,10 @@ impl OpenAiProvider {
         client: Client,
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = convert_native_tools(request.tools);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
-            messages: Self::convert_messages(request.messages),
+            messages: convert_native_messages(request.messages),
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -1787,6 +1702,14 @@ impl OpenAiProvider {
         let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
         self.preflight_context(&request_body)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
+        self.measure_provider_count_tokens(
+            request_identity.clone(),
+            &self.model,
+            request.messages,
+            tool_specs,
+            &request_body,
+        )
+        .await;
 
         let response = self
             .authorized_post(&client, "/chat/completions")
@@ -1843,10 +1766,10 @@ impl OpenAiProvider {
         client: Client,
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = convert_native_tools(request.tools);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
-            messages: Self::convert_messages(request.messages),
+            messages: convert_native_messages(request.messages),
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -1866,6 +1789,14 @@ impl OpenAiProvider {
         let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
         self.preflight_context(&request_body)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
+        self.measure_provider_count_tokens(
+            request_identity.clone(),
+            &self.model,
+            request.messages,
+            tool_specs,
+            &request_body,
+        )
+        .await;
 
         let response = self
             .authorized_post(&client, "/chat/completions")

@@ -1,4 +1,7 @@
 use crate::providers::context_budget::ContextBudget;
+use crate::providers::model_capabilities::{
+    resolve_model_capabilities, ProviderCountApiKind, TokenStrategy,
+};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -213,8 +216,37 @@ pub trait Provider: Send + Sync {
     /// Check if the provider is healthy
     async fn health_check(&self) -> bool;
 
+    /// Optional model-aware exact tokenizer for display metering only.
+    fn exact_tokenizer(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns the authoritative context budget if one is known.
     fn context_budget(&self) -> Option<ContextBudget> {
         None
+    }
+
+    /// Starts a provider-native display token measurement from the finalized
+    /// model-visible request. This is display telemetry only: failures are
+    /// swallowed by the default implementation, and it must never block or
+    /// affect the normal model request.
+    async fn measure_provider_count_tokens(
+        &self,
+        _identity: Option<crate::observability::ContextRequestIdentity>,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+        _request_body: &str,
+    ) {
+    }
+
+    /// Whether this provider is trusted to use its native count API for the
+    /// given model. The default implementation consults the capability
+    /// registry; providers may narrow it further.
+    fn can_use_provider_count_api(&self, model: &str) -> bool {
+        matches!(
+            resolve_model_capabilities(model, None).token_strategy,
+            TokenStrategy::ProviderCountApi(ProviderCountApiKind::AnthropicNative)
+        )
     }
 }

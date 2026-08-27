@@ -271,6 +271,7 @@ pub fn resolve_context_budget(
     model: &str,
     profile: Option<&ModelProviderConfig>,
 ) -> Option<ContextBudget> {
+    // Explicit profile window is highest priority, matching legacy behavior.
     if let Some(window) = profile.and_then(|p| p.context_window_tokens) {
         return Some(ContextBudget::new(
             window,
@@ -279,23 +280,21 @@ pub fn resolve_context_budget(
         ));
     }
 
-    if let Some(window) = builtin_context_window(model) {
-        return Some(ContextBudget::new(
-            window,
-            profile.and_then(|p| p.max_output_tokens),
-            ContextBudgetSource::BuiltIn,
-        ));
-    }
-
-    None
-}
-
-fn builtin_context_window(model: &str) -> Option<u64> {
-    // Exact trusted metadata only. No name-prefix guessing.
-    match model {
-        "gpt-4o" | "gpt-4o-mini" | "gpt-4-turbo" => Some(128_000),
-        _ => None,
-    }
+    // Trusted exact registry entry. Built-in entries are exact model IDs only.
+    let caps = crate::providers::model_capabilities::resolve_model_capabilities(model, profile);
+    let window = caps.context_window_tokens?;
+    let source = if profile.map(|p| p.context_window_tokens.is_some()).unwrap_or(false) {
+        ContextBudgetSource::ExplicitConfig
+    } else {
+        ContextBudgetSource::BuiltIn
+    };
+    Some(ContextBudget::new(
+        window,
+        profile
+            .and_then(|p| p.max_output_tokens)
+            .or(caps.max_output_tokens),
+        source,
+    ))
 }
 
 #[cfg(test)]
@@ -343,6 +342,25 @@ mod tests {
         let budget = resolve_context_budget(&cfg, "gpt-4o", None).unwrap();
         assert_eq!(budget.context_window_tokens, 128_000);
         assert_eq!(budget.source, ContextBudgetSource::BuiltIn);
+        assert_eq!(budget.output_reserve_tokens, 16_384);
+    }
+
+    #[test]
+    fn unknown_model_alias_does_not_inherit_builtin_window() {
+        let cfg = Config::default();
+        assert!(resolve_context_budget(&cfg, "gpt-4o-my-proxy", None).is_none());
+        assert!(resolve_context_budget(&cfg, "gpt-4o-mini-custom", None).is_none());
+    }
+
+    #[test]
+    fn a_safety_estimator_formula_is_unchanged() {
+        let estimator = TokenEstimator::new();
+        let text = "hello";
+        assert_eq!(
+            estimator.estimate_text(text),
+            text.chars().count() as u64 + (text.len() / 4) as u64 + 4
+        );
+        assert_eq!(estimator.estimate_request(text), estimator.estimate_text(text) + 8);
     }
 
     #[test]

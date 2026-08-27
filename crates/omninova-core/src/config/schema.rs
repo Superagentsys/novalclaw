@@ -302,6 +302,18 @@ pub struct ModelProviderConfig {
     /// reserve when known.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Optional trusted display tokenizer implementation name. Unknown names
+    /// are ignored; this never infers a tokenizer from a model alias.
+    #[serde(default)]
+    pub exact_tokenizer: Option<String>,
+    /// Optional canonical model id used when this profile is an alias/proxy.
+    /// This is the only supported way to map an alias to trusted capabilities.
+    #[serde(default)]
+    pub canonical_model: Option<String>,
+    /// Optional explicit provider family, e.g. "anthropic" or "openai".
+    /// This never overrides capability resolution by itself; it is metadata.
+    #[serde(default)]
+    pub provider_family: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

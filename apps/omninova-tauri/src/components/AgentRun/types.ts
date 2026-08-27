@@ -278,6 +278,12 @@ export type ContextMeasurementKind =
   | "final_request_estimate"
   | "provider_actual";
 
+export type ContextMeasurementProvenance =
+  | "safety_estimate"
+  | "exact_tokenizer"
+  | "provider_count_api"
+  | "provider_actual";
+
 export type ContextTelemetryMode =
   | "proactive"
   | "unknown_budget_oversize"
@@ -298,6 +304,8 @@ export interface ContextUsageSnapshot {
   provider: string;
   model: string;
   measurement_kind: ContextMeasurementKind;
+  measurement_provenance?: ContextMeasurementProvenance | null;
+  measurement_exact?: boolean | null;
   estimated_input_tokens: number;
   provider_actual_input_tokens?: number | null;
   context_window_tokens?: number | null;

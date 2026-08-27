@@ -9,7 +9,6 @@ use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
 use std::sync::Arc;
-use tracing;
 
 const EMPTY_MODEL_OUTPUT_ERROR: &str =
     "模型本次未返回可显示的内容，请重试或更换技能。";
@@ -251,6 +250,24 @@ impl<'a> AgentDispatcher<'a> {
         self
     }
 
+    fn refresh_candidate(&self, messages: &[ChatMessage]) {
+        crate::observability::emit_candidate_usage(
+            messages,
+            self.tool_specs,
+            self.provider.context_budget().as_ref(),
+        );
+    }
+
+    fn push_assistant(&self, messages: &mut Vec<ChatMessage>, content: impl Into<String>) {
+        messages.push(ChatMessage::assistant(content));
+        self.refresh_candidate(messages);
+    }
+
+    fn push_tool(&self, messages: &mut Vec<ChatMessage>, content: impl Into<String>) {
+        messages.push(ChatMessage::tool(content));
+        self.refresh_candidate(messages);
+    }
+
     /// Run the tool-calling loop against `messages` and return final assistant text.
     /// Uses the legacy path (no real-time events).
     pub async fn run(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
@@ -275,7 +292,7 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -351,7 +368,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -361,7 +378,7 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
@@ -373,10 +390,10 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
                 if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                    self.push_assistant(messages, &reply);
                     return Ok(reply);
                 }
             }
@@ -426,7 +443,7 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 if let Some(ref bus) = self.event_bus {
                     bus.run_failed(format!("budget exceeded: {reason}"));
                 }
@@ -558,7 +575,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     skill_active,
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -568,7 +585,7 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
             for tool_call in response.tool_calls {
                 if let Some(token) = &self.cancel_token {
@@ -610,10 +627,10 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
                 if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                    self.push_assistant(messages, &reply);
                     return Ok(reply);
                 }
             }
@@ -646,7 +663,7 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 let _ = events.send(AgentEvent::Done(text.clone()));
                 return Ok(text);
             }
@@ -712,7 +729,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 let _ = events.send(AgentEvent::Done(text.clone()));
                 return Ok(text);
             }
@@ -723,7 +740,7 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
@@ -745,10 +762,10 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
                 if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                    self.push_assistant(messages, &reply);
                     let _ = events.send(AgentEvent::Done(reply.clone()));
                     return Ok(reply);
                 }
@@ -779,7 +796,7 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -838,7 +855,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -848,7 +865,7 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
@@ -863,10 +880,10 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
                 if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                    self.push_assistant(messages, &reply);
                     return Ok(reply);
                 }
             }
