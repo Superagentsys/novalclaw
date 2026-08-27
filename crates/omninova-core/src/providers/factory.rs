@@ -1,7 +1,7 @@
 use crate::config::{Config, ModelProviderConfig, ProviderConfig};
 use crate::providers::context_budget::resolve_context_budget;
 use crate::providers::model_capabilities::{
-    resolve_model_capabilities, ProviderCountApiKind, TokenStrategy,
+    resolve_model_capabilities_with_endpoint, ProviderCountApiKind, TokenStrategy,
 };
 use crate::providers::token_counter::resolve_exact_tokenizer_name;
 use crate::providers::{
@@ -107,9 +107,10 @@ pub fn build_provider_with_selection(
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
     let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
     let context_budget = resolve_context_budget(config, &model, profile);
-    let exact_tokenizer = resolve_exact_tokenizer_name(&model, profile).map(str::to_string);
+    let exact_tokenizer =
+        resolve_exact_tokenizer_name(&model, profile, base_url.as_deref()).map(str::to_string);
     let anthropic_count_trusted = matches!(
-        resolve_model_capabilities(&model, profile).token_strategy,
+        resolve_model_capabilities_with_endpoint(&model, profile, base_url.as_deref()).token_strategy,
         TokenStrategy::ProviderCountApi(ProviderCountApiKind::AnthropicNative)
     );
 
@@ -612,6 +613,84 @@ mod tests {
         let resolved = resolve_secret_or_env(NAME);
         std::env::remove_var(NAME);
         assert_eq!(resolved.as_deref(), Some(VALUE));
+    }
+
+    #[test]
+    fn c_official_deepseek_endpoint_wires_flash_tokenizer() {
+        let mut config = Config::default();
+        config.model_providers.insert(
+            "deepseek".into(),
+            ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                default_model: Some("deepseek-v4-flash".into()),
+                models: vec!["deepseek-v4-flash".into()],
+                ..ModelProviderConfig::default()
+            },
+        );
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        assert_eq!(provider.exact_tokenizer(), Some("deepseek_v4_flash_0731"));
+        let budget = provider.context_budget().expect("flash budget");
+        assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+    }
+
+    #[test]
+    fn d_third_party_endpoint_does_not_wire_flash_tokenizer() {
+        let mut config = Config::default();
+        config.model_providers.insert(
+            "proxy".into(),
+            ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                base_url: Some("https://wetoken.pro/v1".into()),
+                default_model: Some("deepseek-v4-flash".into()),
+                models: vec!["deepseek-v4-flash".into()],
+                ..ModelProviderConfig::default()
+            },
+        );
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("proxy".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        assert_eq!(provider.exact_tokenizer(), None);
+        let budget = provider.context_budget().expect("flash budget still applies");
+        assert_eq!(budget.context_window_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn e_explicit_mapping_wires_flash_tokenizer_on_alias() {
+        let mut config = Config::default();
+        config.model_providers.insert(
+            "proxy".into(),
+            ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                base_url: Some("https://third-party.example/v1".into()),
+                default_model: Some("my-deepseek".into()),
+                models: vec!["my-deepseek".into()],
+                canonical_model: Some("deepseek-v4-flash".into()),
+                exact_tokenizer: Some("deepseek_v4_flash_0731".into()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        let provider = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("proxy".into()),
+                model: Some("my-deepseek".into()),
+            },
+        );
+        assert_eq!(provider.exact_tokenizer(), Some("deepseek_v4_flash_0731"));
     }
 }
 

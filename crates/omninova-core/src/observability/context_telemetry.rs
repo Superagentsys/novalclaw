@@ -131,9 +131,10 @@ pub fn build_snapshot(
         request_body,
     );
     let (estimated_input_tokens, measurement_provenance, measurement_exact) = match display {
-        DisplayMeasurement::Exact(tokens) => {
-            (tokens, MeasurementProvenance::ExactTokenizer, true)
-        }
+        DisplayMeasurement::Exact {
+            tokens,
+            production_validated,
+        } => (tokens, MeasurementProvenance::ExactTokenizer, production_validated),
         DisplayMeasurement::SafetyEstimate(tokens) => {
             (tokens, MeasurementProvenance::SafetyEstimate, false)
         }
@@ -606,10 +607,12 @@ pub fn emit_snapshot(snapshot: ContextUsageSnapshot) {
         if ctx.is_stale_revision(&snapshot) {
             return;
         }
+        crate::observability::token_parity::observe_token_parity(&snapshot);
         ctx.sink.emit_usage(snapshot);
         return;
     }
     if let Some(sink) = global_sink_guard().lock().unwrap().as_ref() {
+        crate::observability::token_parity::observe_token_parity(&snapshot);
         sink.emit_usage(snapshot);
     }
 }
@@ -1480,6 +1483,50 @@ mod tests {
         assert_eq!(actual.breakdown, estimate.breakdown);
         assert_ne!(actual.breakdown.total(), 4_777);
         assert_eq!(actual.request_revision, 9);
+    }
+
+    #[tokio::test]
+    async fn n_deepseek_local_count_stays_separate_from_provider_actual() {
+        let sink: SharedSink = Arc::new(VecContextTelemetry::new());
+        with_context_telemetry(
+            Some("session-ds".into()),
+            Some("run-ds".into()),
+            "deepseek",
+            "deepseek-v4-flash",
+            sink,
+            async {
+                set_exact_tokenizer(Some("deepseek_v4_flash_0731".into()));
+                let messages = vec![ChatMessage::user("hello")];
+                let snapshot = build_snapshot(
+                    Some("session-ds".into()),
+                    Some("run-ds".into()),
+                    3,
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    MeasurementKind::FinalRequestEstimate,
+                    &messages,
+                    &[],
+                    None,
+                    None,
+                );
+                assert_eq!(
+                    snapshot.measurement_provenance,
+                    MeasurementProvenance::ExactTokenizer
+                );
+                assert!(!snapshot.measurement_exact);
+                assert_ne!(snapshot.breakdown.total(), snapshot.estimated_input_tokens);
+                let actual = snapshot.clone().with_provider_actual(4_001);
+                assert_eq!(actual.measurement_kind, MeasurementKind::ProviderActual);
+                assert_eq!(
+                    actual.measurement_provenance,
+                    MeasurementProvenance::ProviderActual
+                );
+                assert_eq!(actual.provider_actual_input_tokens, Some(4_001));
+                assert_eq!(actual.breakdown, snapshot.breakdown);
+                assert_ne!(actual.estimated_input_tokens, 4_001);
+            },
+        )
+        .await;
     }
 
     #[test]

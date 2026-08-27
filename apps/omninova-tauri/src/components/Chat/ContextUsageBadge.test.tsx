@@ -263,4 +263,39 @@ describe("ContextUsageBadge popover layout", () => {
     assert.equal(measureContextUsagePopoverWidth(300), 276);
     assert.equal(measureContextUsagePopoverWidth(1280), 360);
   });
+
+  it("V1.2C parity rows show tokenizer vs ProviderActual numbers only", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 7,
+      measurement_provenance: "exact_tokenizer",
+      measurement_exact: false,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 7,
+      measurement_provenance: "provider_actual",
+    }));
+    const html = renderToStaticMarkup(
+      <ContextUsageBadgeContent
+        view={selectContextUsageView(state)}
+        open={true}
+        panelId="context-usage-parity"
+        onToggle={() => undefined}
+      />
+    );
+    assert.match(html, /本地 Tokenizer/);
+    assert.match(html, /Provider 实际/);
+    assert.match(html, /差值/);
+    assert.match(html, /相对误差/);
+    assert.match(html, /4,545/);
+    assert.match(html, /4,561/);
+    assert.match(html, /-16/);
+    assert.doesNotMatch(html, /hello world/);
+    assert.doesNotMatch(html, /tool_call/);
+  });
 });

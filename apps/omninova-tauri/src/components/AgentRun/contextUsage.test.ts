@@ -511,4 +511,218 @@ describe("O3 context usage visualization", () => {
     assert.equal(view.totalFormat, "estimate");
     assert.equal(view.measurementLabel, "发送前保守估算");
   });
+
+  it("V1.2C A. same revision exact tokenizer + actual creates parity", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 7,
+      measurement_provenance: "exact_tokenizer",
+      measurement_exact: false,
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 7,
+      measurement_provenance: "provider_actual",
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.measurementProvenance, "exact_tokenizer");
+    assert.equal(view.measurementExact, false);
+    assert.ok(view.parity);
+    assert.equal(view.parity?.localTokens, 4_545);
+    assert.equal(view.parity?.actualTokens, 4_561);
+    assert.equal(view.parity?.delta, -16);
+    assert.equal(view.parity?.absError, 16);
+  });
+
+  it("V1.2C B. different revisions are never compared", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 100,
+      request_revision: 8,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 100,
+      provider_actual_input_tokens: 110,
+      request_revision: 7,
+      measurement_provenance: "provider_actual",
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.parity, null);
+    assert.equal(view.actualIsCurrent, false);
+  });
+
+  it("V1.2C C. different provider/model are never compared", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 100,
+      request_revision: 3,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 100,
+      provider_actual_input_tokens: 110,
+      request_revision: 3,
+      provider: "other",
+      model: "other-model",
+      measurement_provenance: "provider_actual",
+    }));
+    assert.equal(selectContextUsageView(state).parity, null);
+    assert.equal(selectContextUsageView(state).lastActualTokens, null);
+  });
+
+  it("V1.2C D. actual arriving before local remains safe then pairs", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_561,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 9,
+      measurement_provenance: "provider_actual",
+    }));
+    assert.equal(selectContextUsageView(state).parity, null);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 9,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.parity?.localTokens, 4_545);
+    assert.equal(view.parity?.actualTokens, 4_561);
+  });
+
+  it("V1.2C E. local arriving before actual works", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 200,
+      request_revision: 4,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 200,
+      provider_actual_input_tokens: 210,
+      request_revision: 4,
+      measurement_provenance: "provider_actual",
+    }));
+    assert.equal(selectContextUsageView(state).parity?.delta, -10);
+  });
+
+  it("V1.2C F. stale revision does not replace current UI state", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 5,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 5,
+      measurement_provenance: "provider_actual",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 99,
+      request_revision: 4,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 99,
+      provider_actual_input_tokens: 88,
+      request_revision: 4,
+      measurement_provenance: "provider_actual",
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.estimatedTokens, 4_545);
+    assert.equal(view.lastActualTokens, 4_561);
+    assert.equal(view.revision, 5);
+    assert.equal(view.parity?.localTokens, 4_545);
+    assert.equal(view.parity?.actualTokens, 4_561);
+  });
+
+  it("V1.2C G. parity diagnostic does not alter context lifecycle", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 2,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 2,
+      measurement_provenance: "provider_actual",
+    }));
+    const before = selectContextUsageView(state).parity;
+    state = applyContextUsageLifecycle(state, lifecycle("op-parity", {
+      type: "context_compaction_started",
+      mode: "proactive",
+      estimated_before: 4_545,
+    }));
+    const view = selectContextUsageView(state);
+    assert.deepEqual(view.parity, before);
+    assert.equal(view.activeStatus, "compaction");
+    assert.equal(view.estimatedTokens, 4_545);
+    assert.equal(view.lastActualTokens, 4_561);
+  });
+
+  it("V1.2C H. SafetyEstimate is not compared as ExactTokenizer parity", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 6,
+      measurement_provenance: "safety_estimate",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 6,
+      measurement_provenance: "provider_actual",
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.measurementProvenance, "safety_estimate");
+    assert.equal(view.parity, null);
+    assert.equal(view.lastActualTokens, 4_561);
+  });
+
+  it("V1.2C I. parity diagnostic contains only numbers and metadata", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "final_request_estimate",
+      estimated_input_tokens: 4_545,
+      request_revision: 1,
+      measurement_provenance: "exact_tokenizer",
+    }));
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "provider_actual",
+      estimated_input_tokens: 4_545,
+      provider_actual_input_tokens: 4_561,
+      request_revision: 1,
+      measurement_provenance: "provider_actual",
+    }));
+    const json = JSON.stringify(selectContextUsageView(state).parity);
+    assert.match(json, /"localTokens":4545/);
+    assert.match(json, /"actualTokens":4561/);
+    for (const forbidden of ["hello", "prompt", "messages", "tools", "content"]) {
+      assert.equal(json.includes(forbidden), false, json);
+    }
+  });
 });

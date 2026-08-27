@@ -50,6 +50,14 @@ export interface ContextUsageState {
 
 export type ContextActiveStatus = "compaction" | "pruning" | "recovery" | null;
 
+export interface ContextUsageParity {
+  localTokens: number;
+  actualTokens: number;
+  delta: number;
+  absError: number;
+  relativeErrorPercent: number;
+}
+
 export interface ContextUsageView {
   placeholder: boolean;
   knownBudget: boolean;
@@ -74,6 +82,7 @@ export interface ContextUsageView {
   activeStatus: ContextActiveStatus;
   activeStatusLabel: string | null;
   compactText: string;
+  parity: ContextUsageParity | null;
 }
 
 const KIND_RANK: Record<ContextMeasurementKind, number> = {
@@ -305,6 +314,31 @@ function actualMatchesCurrent(
   return true;
 }
 
+export function selectTokenizerParity(
+  current: ContextUsageSnapshot | null,
+  actual: ContextUsageActual | null
+): ContextUsageParity | null {
+  if (!current || !actual) return null;
+  if (current.measurement_provenance !== "exact_tokenizer") return null;
+  if (!actualMatchesCurrent(actual, current)) return null;
+  if (actual.inputTokens <= 0) return null;
+  const localTokens = current.estimated_input_tokens;
+  const actualTokens = actual.inputTokens;
+  const delta = localTokens - actualTokens;
+  const absError = Math.abs(delta);
+  return {
+    localTokens,
+    actualTokens,
+    delta,
+    absError,
+    relativeErrorPercent: (absError / actualTokens) * 100,
+  };
+}
+
+export function formatParityRelativeError(percent: number): string {
+  return `${percent.toFixed(2).replace(/\.?0+$/, "")}%`.replace(/^%$/, "0%");
+}
+
 function activeStatus(state: ContextUsageState): { status: ContextActiveStatus; label: string | null } {
   if (state.compactionOperationId) {
     return { status: "compaction", label: CONTEXT_COMPACTION_STARTED_LABEL };
@@ -345,6 +379,7 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
   const lastActualTokens = state.lastActual?.inputTokens ?? null;
   const actualLabel =
     lastActualTokens == null ? null : matchesCurrentActual ? "当前请求实际" : "上次请求实际";
+  const parity = selectTokenizerParity(current, state.lastActual);
 
   let compactText = "上下文输入 —";
   if (estimatedTokens != null) {
@@ -390,6 +425,7 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
     activeStatus: active.status,
     activeStatusLabel: active.label,
     compactText,
+    parity,
   };
 }
 

@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub(crate) mod anthropic_count;
 pub mod context_budget;
+pub(crate) mod deepseek_v4;
 pub mod factory;
 pub mod gemini;
 pub mod model_capabilities;

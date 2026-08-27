@@ -13,6 +13,7 @@ import { createPortal } from "react-dom";
 import {
   BREAKDOWN_LABELS,
   selectContextUsageView,
+  formatParityRelativeError,
   type ContextUsageState,
   type ContextUsageView,
 } from "../AgentRun/contextUsageState";
@@ -322,6 +323,30 @@ export function ContextUsageBadgeContent({
                       {formatTokenCount(view.lastActualTokens, "exact")} · {view.lastActualTokens.toLocaleString("zh-CN")}
                     </dd>
                   </div>
+                ) : null}
+                {view.parity ? (
+                  <>
+                    <div className="context-usage-row">
+                      <dt>本地 Tokenizer</dt>
+                      <dd>
+                        {formatTokenCount(view.parity.localTokens, "exact")} · {view.parity.localTokens.toLocaleString("zh-CN")}
+                      </dd>
+                    </div>
+                    <div className="context-usage-row">
+                      <dt>Provider 实际</dt>
+                      <dd>
+                        {formatTokenCount(view.parity.actualTokens, "exact")} · {view.parity.actualTokens.toLocaleString("zh-CN")}
+                      </dd>
+                    </div>
+                    <div className="context-usage-row">
+                      <dt>差值</dt>
+                      <dd>{view.parity.delta.toLocaleString("zh-CN")}</dd>
+                    </div>
+                    <div className="context-usage-row">
+                      <dt>相对误差</dt>
+                      <dd>{formatParityRelativeError(view.parity.relativeErrorPercent)}</dd>
+                    </div>
+                  </>
                 ) : null}
               </dl>
             </section>

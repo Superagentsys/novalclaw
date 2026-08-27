@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -63,6 +63,7 @@ qrcode.workspace = true
 ratatui = "0.29"
 aes = "0.8"
 zip = { version = "2", features = ["deflate"] }
+tokenizers = { version = "0.21.4", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
 # `test-util` is not part of tokio's `full` feature; it provides the paused

@@ -346,6 +346,32 @@ mod tests {
     }
 
     #[test]
+    fn a_official_flash_budget_is_one_million_by_384k() {
+        let cfg = Config::default();
+        let budget = resolve_context_budget(&cfg, "deepseek-v4-flash", None).unwrap();
+        assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+        assert_eq!(budget.source, ContextBudgetSource::BuiltIn);
+    }
+
+    #[test]
+    fn b_official_pro_budget_matches_flash_without_exact_tokenizer() {
+        let cfg = Config::default();
+        let budget = resolve_context_budget(&cfg, "deepseek-v4-pro", None).unwrap();
+        assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+        let caps = crate::providers::model_capabilities::resolve_model_capabilities_with_endpoint(
+            "deepseek-v4-pro",
+            None,
+            Some("https://api.deepseek.com/v1"),
+        );
+        assert_eq!(
+            caps.token_strategy,
+            crate::providers::model_capabilities::TokenStrategy::Unavailable
+        );
+    }
+
+    #[test]
     fn unknown_model_alias_does_not_inherit_builtin_window() {
         let cfg = Config::default();
         assert!(resolve_context_budget(&cfg, "gpt-4o-my-proxy", None).is_none());
