@@ -200,7 +200,9 @@ fn xml_visible_text(xml: &str) -> String {
     decode_xml_entities(result.trim())
 }
 
-fn extract_office_text(path: &Path, extension: &str) -> Result<String, String> {
+/// Extract user-visible text from an Office Open XML document without exposing
+/// the package's internal XML files.
+pub(crate) fn extract_office_text(path: &Path, extension: &str) -> Result<String, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("Office 文档结构无效：{error}"))?;

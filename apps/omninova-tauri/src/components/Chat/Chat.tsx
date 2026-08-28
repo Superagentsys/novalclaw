@@ -120,6 +120,11 @@ const MESSAGE_EDIT_MAX_HEIGHT = 240;
 const COMPOSER_HELP_TEXT =
   "可用命令：\n/help — 显示帮助\n/skills — 打开技能设置\n输入 / 打开命令面板，选择已安装技能后再发送任务。";
 
+function isVisibleTaskArtifactPath(path: string): boolean {
+  const filename = path.split(/[\\/]/).pop() ?? path;
+  return !filename.toLowerCase().endsWith(".xml");
+}
+
 function resizeMessageEditor(textarea: HTMLTextAreaElement) {
   textarea.style.height = "0px";
   const nextHeight = Math.min(textarea.scrollHeight, MESSAGE_EDIT_MAX_HEIGHT);
@@ -723,7 +728,12 @@ export function Chat({
     const selected = selectedTaskRunId
       ? taskHistory.find((task) => task.runId === selectedTaskRunId)
       : null;
-    return selected ?? taskHistory.find((task) => task.avatarId === activeAvatarId) ?? null;
+    // A task selected in one Agent must not leak into another Agent's
+    // inspector. Keeping the selection scoped to its owner also prevents the
+    // live process view from being rebound and restarted during Agent switches.
+    return (selected?.avatarId === activeAvatarId ? selected : null)
+      ?? taskHistory.find((task) => task.avatarId === activeAvatarId)
+      ?? null;
   }, [activeAvatarId, selectedTaskRunId, taskHistory]);
 
   // Grow the composer with its content up to the CSS max-height, then scroll.
@@ -1156,9 +1166,11 @@ export function Chat({
         if (!latest) return prev;
         const byPath = new Map<string, TaskChangedFile>();
         for (const file of latest.changedFiles ?? []) {
+          if (!isVisibleTaskArtifactPath(file.path)) continue;
           byPath.set(file.path.replace(/\\/g, "/"), file);
         }
         for (const artifact of detected) {
+          if (!isVisibleTaskArtifactPath(artifact.path)) continue;
           const key = artifact.path.replace(/\\/g, "/");
           const existing = byPath.get(key);
           byPath.set(key, {
@@ -2041,7 +2053,7 @@ export function Chat({
         });
       } else if (eventType === "file_changed" || eventType === "fileChanged") {
         const path = typeof rawPayload.path === "string" ? rawPayload.path : "";
-        if (path) {
+        if (path && isVisibleTaskArtifactPath(path)) {
           setTaskHistory((prev) => {
             const target = prev.find((task) => task.runId === runId);
             if (!target) return prev;
@@ -3612,7 +3624,9 @@ export function Chat({
                           <div className="chat-task-signals">
                             <span>
                               <UiIcon name="file" size={11} />
-                              {task.changedFiles?.length ?? 0} 个文件
+                              {(task.changedFiles ?? []).filter((file) =>
+                                isVisibleTaskArtifactPath(file.path)
+                              ).length} 个文件
                             </span>
                             {taskNeedsAttention(task.status) ? (
                               <span className="chat-task-attention">

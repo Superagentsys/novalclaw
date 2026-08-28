@@ -15,6 +15,20 @@ use tracing::{info, warn};
 
 const DEFAULT_POLL_SECS: u64 = 30;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 300;
+/// A desktop app can be suspended or closed across a scheduled wall-clock
+/// time. Do not execute a stale daily/weekly cron slot hours later when the app
+/// next opens; a short grace still absorbs normal polling and wake-up jitter.
+const CRON_MISFIRE_GRACE_SECS: i64 = 5 * 60;
+
+fn is_stale_cron_slot(
+    schedule: &Schedule,
+    now: time::OffsetDateTime,
+    due_at: time::OffsetDateTime,
+) -> bool {
+    matches!(schedule, Schedule::Cron(_))
+        && now > due_at
+        && (now - due_at).whole_seconds() > CRON_MISFIRE_GRACE_SECS
+}
 
 /// Guards against two schedulers running in one process: the desktop app starts
 /// one at launch and the embedded gateway would otherwise start a second,
@@ -108,6 +122,24 @@ impl CronScheduler {
                 continue;
             }
 
+            if is_stale_cron_slot(&schedule, now, due_at) {
+                // Re-arm at the next intended local wall-clock occurrence.
+                // Previously an overdue slot was executed immediately at app
+                // startup, which made a 17:34 job appear at 14:14/13:56/etc.
+                let next = schedule.next_after(now, tz).map(format_timestamp);
+                if let Err(error) = self.store.set_next_run(&job.id, next).await {
+                    warn!("failed to skip stale automation '{}': {error}", job.name);
+                } else {
+                    info!(
+                        "automation: skipped stale slot for '{}' (due {}, now {})",
+                        job.name,
+                        format_timestamp(due_at),
+                        format_timestamp(now)
+                    );
+                }
+                continue;
+            }
+
             self.execute(&job, "schedule").await;
 
             // Reschedule from now rather than from the missed slot so a laptop
@@ -167,6 +199,38 @@ impl CronScheduler {
             warn!("failed to persist automation run: {error}");
         }
         run
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn skips_old_wall_clock_slot_after_desktop_restart() {
+        let schedule = Schedule::parse("34 17 * * *").unwrap();
+        let due = datetime!(2026-08-26 09:34:00 UTC);
+        let restarted = datetime!(2026-08-27 06:14:00 UTC);
+        assert!(is_stale_cron_slot(&schedule, restarted, due));
+    }
+
+    #[test]
+    fn keeps_normal_polling_jitter_and_interval_jobs() {
+        let cron = Schedule::parse("34 17 * * *").unwrap();
+        let due = datetime!(2026-08-27 09:34:00 UTC);
+        assert!(!is_stale_cron_slot(
+            &cron,
+            datetime!(2026-08-27 09:34:45 UTC),
+            due,
+        ));
+
+        let interval = Schedule::parse("every 30m").unwrap();
+        assert!(!is_stale_cron_slot(
+            &interval,
+            datetime!(2026-08-27 12:00:00 UTC),
+            due,
+        ));
     }
 }
 

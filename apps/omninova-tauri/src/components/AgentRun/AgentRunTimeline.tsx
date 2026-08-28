@@ -15,6 +15,42 @@ import { buildAgentDiffState } from "../AgentDiff/diffStore";
 
 type RawEvent = RunEvent | AgentRunEvent | Record<string, unknown>;
 
+interface CachedLiveRun {
+  events: RawEvent[];
+  startedAt: number;
+  running: boolean;
+  elapsedSec: number;
+}
+
+// The inspector can switch between Agents while several runs remain active.
+// Keep a bounded per-run snapshot outside the component so remounting or
+// rebinding the timeline never makes an existing run look as if it restarted.
+const LIVE_RUN_CACHE = new Map<string, CachedLiveRun>();
+const MAX_CACHED_RUNS = 24;
+const MAX_CACHED_EVENTS = 800;
+
+function cachedRun(runId: string): CachedLiveRun {
+  const existing = LIVE_RUN_CACHE.get(runId);
+  if (existing) return existing;
+  const created = { events: [], startedAt: Date.now(), running: true, elapsedSec: 0 };
+  LIVE_RUN_CACHE.set(runId, created);
+  while (LIVE_RUN_CACHE.size > MAX_CACHED_RUNS) {
+    const oldest = LIVE_RUN_CACHE.keys().next().value;
+    if (!oldest) break;
+    LIVE_RUN_CACHE.delete(oldest);
+  }
+  return created;
+}
+
+function cacheRunEvents(runId: string, events: RawEvent[], running = true): RawEvent[] {
+  const snapshot = cachedRun(runId);
+  const next = dedupeEvents([...snapshot.events, ...events]).slice(-MAX_CACHED_EVENTS);
+  snapshot.events = next;
+  snapshot.running = running;
+  snapshot.elapsedSec = Math.max(snapshot.elapsedSec, (Date.now() - snapshot.startedAt) / 1000);
+  return next;
+}
+
 interface AgentRunTimelineProps {
   events?: RunEvent[];
   isRunning?: boolean;
@@ -143,7 +179,7 @@ function cleanTitle(title: string, toolName: string): string {
   return getToolRunningLabel(toolName);
 }
 
-function completedTitle(_startTitle: string, toolName: string, success: boolean, _summary: string): string {
+function completedTitle(toolName: string, success: boolean): string {
   if (success) return getToolCompletedLabel(toolName);
   return getToolFailedLabel(toolName);
 }
@@ -344,7 +380,7 @@ function aggregateSteps(events: RawEvent[]): AgentRunStep[] {
         step.additions = diff.additions;
         step.deletions = diff.deletions;
       }
-      step.title = completedTitle(step.title, toolName, success, resultSummary);
+      step.title = completedTitle(toolName, success);
       return;
     }
 
@@ -445,13 +481,14 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
       let unlisten: (() => void) | undefined;
       const pendingModelDeltas = new Map<string, AgentRunEvent>();
       let deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
-      const startTime = Date.now();
+      const snapshot = cachedRun(liveSessionId);
+      const startTime = snapshot.startedAt;
 
       const flushModelDeltas = () => {
         if (pendingModelDeltas.size === 0) return;
         const flushed = Array.from(pendingModelDeltas.values());
         pendingModelDeltas.clear();
-        setLiveEvents((prev) => dedupeEvents([...prev, ...flushed]));
+        setLiveEvents(() => cacheRunEvents(liveSessionId, flushed, true));
       };
 
       const scheduleDeltaFlush = () => {
@@ -464,13 +501,17 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
 
       queueMicrotask(() => {
         if (disposed) return;
-        setLiveEvents([]);
-        setIsLiveRunning(true);
-        setLiveElapsed(0);
+        setLiveEvents(snapshot.events);
+        setIsLiveRunning(snapshot.running);
+        setLiveElapsed(Math.max(snapshot.elapsedSec, (Date.now() - startTime) / 1000));
       });
-      liveTimerRef.current = setInterval(() => {
-        setLiveElapsed((Date.now() - startTime) / 1000);
-      }, 250);
+      if (snapshot.running) {
+        liveTimerRef.current = setInterval(() => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          snapshot.elapsedSec = elapsed;
+          setLiveElapsed(elapsed);
+        }, 250);
+      }
 
       listenAgentRunEvents<AgentRunEvent>("agent-run-event", (event) => {
         const payload = event.payload as AgentRunEvent;
@@ -479,7 +520,20 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
           console.log("[agent-run-event-run-id]", payload.run_id);
         }
 
-        if (disposed || payload.run_id !== liveSessionId) return;
+        if (disposed) return;
+        if (payload.run_id !== liveSessionId) {
+          // Preserve lifecycle/tool/file events for background Agents. Model
+          // deltas are intentionally omitted here to keep the cache compact.
+          if (payload.type !== "model_delta") {
+            const terminal =
+              payload.type === "run_completed" ||
+              payload.type === "run_failed" ||
+              payload.type === "run_cancelled" ||
+              payload.type === "error";
+            cacheRunEvents(payload.run_id, [payload], !terminal);
+          }
+          return;
+        }
         const isTerminal =
           payload.type === "run_completed" ||
           payload.type === "run_failed" ||
@@ -504,10 +558,12 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
         }
 
         flushModelDeltas();
-        setLiveEvents((prev) => dedupeEvents([...prev, payload]));
+        setLiveEvents(() => cacheRunEvents(liveSessionId, [payload], !isTerminal));
 
         if (isTerminal) {
           terminalRunIdsRef.current.add(payload.run_id);
+          snapshot.running = false;
+          snapshot.elapsedSec = (Date.now() - startTime) / 1000;
           setIsLiveRunning(false);
           if (liveTimerRef.current) {
             clearInterval(liveTimerRef.current);

@@ -64,6 +64,11 @@ function isImageArtifact(path: string): boolean {
   return IMAGE_EXTENSIONS.has(extensionOf(path));
 }
 
+/** XML files are normally Office package/build internals, not user deliverables. */
+function isVisibleTaskArtifact(file: TaskChangedFile): boolean {
+  return extensionOf(file.path) !== "xml";
+}
+
 function artifactKindLabel(path: string): string {
   const extension = extensionOf(path);
   if (IMAGE_EXTENSIONS.has(extension)) return `${extension.toUpperCase()} 图片`;
@@ -266,7 +271,7 @@ export function TaskDeliverable({
   onOpenInspector: (tab?: InspectorTab) => void;
 }) {
   if (!task) return null;
-  const files = task.changedFiles ?? [];
+  const files = (task.changedFiles ?? []).filter(isVisibleTaskArtifact);
   const isComplete = task.status === "completed";
 
   return (
@@ -440,7 +445,10 @@ export function TaskInspector({
     { id: "logs", label: "日志", icon: "history" },
     { id: "results", label: "成果", icon: "check" },
   ];
-  const files = useMemo(() => task?.changedFiles ?? [], [task?.changedFiles]);
+  const files = useMemo(
+    () => (task?.changedFiles ?? []).filter(isVisibleTaskArtifact),
+    [task?.changedFiles]
+  );
   const activity = useMemo(() => task?.activity ?? [], [task?.activity]);
   const processEntries = useMemo(
     () => activity.filter((item) => item.kind || item.label),

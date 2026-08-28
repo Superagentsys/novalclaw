@@ -1835,6 +1835,10 @@ struct SkillSummaryItem {
     name: String,
     description: String,
     subdomain: Option<String>,
+    slug: Option<String>,
+    icon: Option<String>,
+    #[serde(rename = "iconUrl")]
+    icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2577,10 +2581,44 @@ async fn skills_package_summary(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+            let slug = skill
+                .path
+                .strip_prefix(&target)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .map(|component| component.as_os_str().to_string_lossy().to_string())
+                .filter(|value| !value.is_empty());
+            let icon = skill
+                .metadata
+                .metadata
+                .get("emoji")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    skill.metadata.metadata
+                        .get("openclaw")
+                        .and_then(|value| value.get("emoji"))
+                        .and_then(|value| value.as_str())
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let icon_url = ["iconUrl", "icon_url", "logoUrl", "logo_url", "icon", "logo"]
+                .iter()
+                .find_map(|key| {
+                    skill.metadata.metadata
+                        .get(*key)
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+                        .map(str::to_string)
+                });
             SkillSummaryItem {
                 name: skill.metadata.name.clone(),
                 description,
                 subdomain,
+                slug,
+                icon,
+                icon_url,
             }
         })
         .collect::<Vec<_>>();
@@ -4169,6 +4207,11 @@ fn collect_recent_workspace_files(
             Ok(value) => value.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
+        // Office build XML is an implementation detail, not a task
+        // deliverable. The finished document is collected separately.
+        if artifact_extension(&path) == "xml" {
+            continue;
+        }
         output.push(CollectedTaskArtifact {
             extension: artifact_extension(&path),
             path: relative,
@@ -4741,6 +4784,18 @@ fn task_artifact_preview(
             let bytes = std::fs::read(&resolved).map_err(|error| error.to_string())?;
             data_url = Some(safe_svg_preview_data_url(&bytes)?);
         }
+    } else if matches!(extension.as_str(), "docx" | "pptx" | "xlsx") {
+        kind = "text".to_string();
+        let mut value = composer_attachments::extract_office_text(&resolved, &extension)?;
+        if value.len() > MAX_TEXT_BYTES as usize {
+            let mut end = MAX_TEXT_BYTES as usize;
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value.truncate(end);
+            value.push_str("\n\n… 预览已截断，请使用“打开文件”查看完整内容。");
+        }
+        text_preview = Some(value);
     } else if matches!(
         extension.as_str(),
         "txt" | "md" | "markdown" | "json" | "jsonl" | "yaml" | "yml" | "toml" |
