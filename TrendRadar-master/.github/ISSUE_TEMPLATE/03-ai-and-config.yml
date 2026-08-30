@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-issue-forms.json
+
+name: ✨ AI 提示词分享与配置求助
+description: 分享你调优的 ai_analysis_prompt.txt 或寻求设置帮助
+title: "[AI/配置] "
+labels: ["config", "AI"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### ✨ 提示词分享计划
+        欢迎在此分享你精心调优的 `ai_analysis_prompt.txt` 内容！
+        优秀的提示词可以让 AI 分析更精准、更有趣。
+
+        ---
+        如果是**寻求配置帮助**，请尽量贴出你的错误表现。
+
+        ---
+        ### 📌 如何查看版本号？
+
+        | 部署方式 | 查看方法 |
+        |---------|---------|
+        | **Docker** | 查看容器启动日志，版本号显示在日志开头 |
+        | **GitHub Actions** | 查看 [README 文档](https://github.com/sansan0/TrendRadar) 顶部的 ![version](https://img.shields.io/badge/version-blue) 徽章 |
+        | **本地 Python** | 查看项目根目录的 `version` 文件 |
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: 🏷️ 目的
+      options:
+        - 分享我的 AI 提示词 (ai_analysis_prompt.txt)
+        - 寻求 AI 分析设置帮助
+        - 寻求基础功能配置帮助 (Webhook/RSS等)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 📦 TrendRadar 版本（求助时必填）
+      description: |
+        如果是寻求帮助，请提供版本号。
+        💡 Docker 用户：查看容器启动日志 | GitHub Actions 用户：查看文档顶部 version 徽章
+      placeholder: v5.2.0 或 commit hash（分享提示词可留空）
+    validations:
+      required: false
+
+  - type: input
+    id: ai-model
+    attributes:
+      label: 🤖 AI 模型名称
+      description: |
+        请提供你使用的具体模型名称。
+        AI 分析效果与模型能力密切相关，不同模型表现差异很大。
+        分享提示词时也请注明，方便其他用户参考。
+      placeholder: "例如：deepseek/deepseek-chat、openai/gpt-4o、gemini/gemini-2.5-flash"
+    validations:
+      required: false
+
+  - type: textarea
+    id: share-content
+    attributes:
+      label: 📄 内容描述
+      placeholder: |
+        - 如果是分享：请贴出你的提示词代码块，并简述它的分析风格。
+        - 如果是求助：请贴出你的配置片段（隐藏 Key）和遇到的现象。
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 📷 效果截图（推荐）
+      description: |
+        ⚠️ **重要提示**：请提供**完整截图**，不要只截取局部！
+        - 分享时：展示 AI 分析的完整输出效果
+        - 求助时：展示完整的错误信息或异常表现
+
+        局部截图往往缺少关键信息，会导致问题难以定位。
+      placeholder: 拖拽分析结果截图或配置截图到这里，请确保截图完整。
+    validations:
+      required: false

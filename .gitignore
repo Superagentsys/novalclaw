@@ -33,3 +33,25 @@ apps/omninova-ios/build/
 apps/omninova-ios/DerivedData/
 apps/omninova-ios/release-assets/
 apps/omninova-ios/*.xcuserdatad/
+
+# npm cache
+.npm-cache/
+
+# rust installer
+rustup-init.exe
+
+# python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+Thumbs.db
+
+# temp files
+_demo_raw.json
+_req.json
+_resp_*.txt
+_test.json

@@ -1,0 +1,33 @@
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+
+# 从官方镜像拷贝 uv 二进制
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# 先安装依赖（利用 Docker 层缓存）
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-install-project --no-dev
+
+# 复制 MCP 服务器代码和 trendradar 模块
+COPY mcp_server/ ./mcp_server/
+COPY trendradar/ ./trendradar/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+# 创建必要目录
+RUN mkdir -p /app/config /app/output
+
+ENV PYTHONUNBUFFERED=1 \
+    CONFIG_PATH=/app/config/config.yaml \
+    FREQUENCY_WORDS_PATH=/app/config/frequency_words.txt
+
+# MCP HTTP 服务端口（默认 3333，可通过环境变量 MCP_PORT 覆盖）
+ENV MCP_PORT=3333
+EXPOSE 3333
+
+# 启动 MCP 服务器（HTTP 模式）
+CMD sh -c "python -m mcp_server.server --transport http --host 0.0.0.0 --port ${MCP_PORT}"

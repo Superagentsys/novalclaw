@@ -1,0 +1,201 @@
+name: Issue Guard
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  moderate:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      models: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # AI 内容审核（垃圾检测 + 链接检测 + AI 生成检测）
+      - uses: github/ai-moderator@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          spam-label: 'spam'
+          ai-label: 'ai-generated'
+          minimize-detected-comments: true
+          enable-spam-detection: true
+          enable-link-spam-detection: true
+          enable-ai-detection: true
+
+      # 两层防护：
+      # 1) 账号 < 7 天 → 直接删除/关闭
+      # 2) 账号 >= 7 天 + AI 判定为垃圾 → 也删除/关闭
+      - name: Spam defense
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const MIN_ACCOUNT_AGE_DAYS = 7;
+            const event = context.eventName;
+
+            // 解析事件上下文
+            let username, authorAssociation, number, nodeId, commentId;
+            let isIssue = false, isPR = false, isComment = false;
+
+            if (event === 'issues') {
+              const issue = context.payload.issue;
+              username = issue.user.login;
+              authorAssociation = issue.author_association;
+              number = issue.number;
+              isIssue = true;
+            } else if (event === 'issue_comment') {
+              const comment = context.payload.comment;
+              username = comment.user.login;
+              authorAssociation = comment.author_association;
+              number = context.payload.issue.number;
+              nodeId = comment.node_id;
+              commentId = comment.id;
+              isComment = true;
+              isIssue = true;
+            } else if (event === 'pull_request') {
+              const pr = context.payload.pull_request;
+              username = pr.user.login;
+              authorAssociation = pr.author_association;
+              number = pr.number;
+              isPR = true;
+            } else if (event === 'pull_request_review_comment') {
+              const comment = context.payload.comment;
+              username = comment.user.login;
+              authorAssociation = comment.author_association;
+              number = context.payload.pull_request.number;
+              nodeId = comment.node_id;
+              commentId = comment.id;
+              isComment = true;
+              isPR = true;
+            }
+
+            // 跳过项目成员
+            if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(authorAssociation)) {
+              core.info(`Skip: ${username} (${authorAssociation})`);
+              return;
+            }
+
+            // 获取账号年龄
+            const { data: user } = await github.rest.users.getByUsername({ username });
+            const accountAgeDays = Math.floor((Date.now() - new Date(user.created_at)) / 86400000);
+            const isNewAccount = accountAgeDays < MIN_ACCOUNT_AGE_DAYS;
+
+            // 判断是否需要拦截
+            let shouldBlock = false;
+            let reason = '';
+
+            if (isNewAccount) {
+              // 第一层：新账号直接拦截
+              shouldBlock = true;
+              reason = `new account (${accountAgeDays}d < ${MIN_ACCOUNT_AGE_DAYS}d)`;
+            } else {
+              // 第二层：老账号检查 AI 垃圾判定
+              let isSpam = false;
+              if (isComment) {
+                const { node } = await github.graphql(`
+                  query($id: ID!) {
+                    node(id: $id) {
+                      ... on IssueComment { isMinimized }
+                      ... on PullRequestReviewComment { isMinimized }
+                    }
+                  }
+                `, { id: nodeId });
+                isSpam = node?.isMinimized === true;
+              } else {
+                const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                  ...context.repo,
+                  issue_number: number
+                });
+                isSpam = labels.some(l => l.name === 'spam');
+              }
+
+              if (isSpam) {
+                shouldBlock = true;
+                reason = `spam detected (account age: ${accountAgeDays}d)`;
+              }
+            }
+
+            if (!shouldBlock) {
+              core.info(`${username} (${accountAgeDays}d): OK`);
+              return;
+            }
+
+            core.info(`Blocking ${event} #${number} from ${username}: ${reason}`);
+
+            // 根据拦截原因生成不同提示
+            const notice = isNewAccount
+              ? [
+                  `@${username} 你好，感谢你对本项目的关注！`,
+                  '',
+                  '为维护社区环境、防止垃圾信息和自动化 bot 的干扰，',
+                  `本项目要求 GitHub 账号注册满 **${MIN_ACCOUNT_AGE_DAYS} 天**后才能参与互动。`,
+                  '',
+                  `你的账号注册时间为 ${accountAgeDays} 天，暂时无法参与。`,
+                  `请在账号满 ${MIN_ACCOUNT_AGE_DAYS} 天后重新提交，或通过项目 README 中的联系方式反馈。`,
+                  '',
+                  '感谢理解与支持 🙏',
+                ].join('\n')
+              : [
+                  `@${username} 你好，`,
+                  '',
+                  '你的内容已被自动审核系统标记为垃圾信息并移除。',
+                  '',
+                  '**如有误判，还请见谅！** 请通过项目 README 中的联系方式反馈。',
+                  '',
+                  '感谢理解 🙏',
+                ].join('\n');
+
+            // 执行拦截操作
+            if (isComment) {
+              // 评论：直接删除
+              if (isIssue) {
+                await github.rest.issues.deleteComment({
+                  ...context.repo,
+                  comment_id: commentId
+                });
+              } else {
+                await github.rest.pulls.deleteReviewComment({
+                  ...context.repo,
+                  comment_id: commentId
+                });
+              }
+            } else if (isIssue) {
+              // 新建 Issue：评论提示 → 关闭 → 锁定
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: number,
+                body: notice
+              });
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: number,
+                state: 'closed',
+                state_reason: 'not_planned'
+              });
+              await github.rest.issues.lock({
+                ...context.repo,
+                issue_number: number,
+                lock_reason: 'spam'
+              });
+            } else if (isPR) {
+              // 新建 PR：评论提示 → 关闭
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: number,
+                body: notice
+              });
+              await github.rest.pulls.update({
+                ...context.repo,
+                pull_number: number,
+                state: 'closed'
+              });
+            }

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP 爬取结果</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
+        .platform { margin-bottom: 30px; }
+        .platform-name { background: #4CAF50; color: white; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+        .news-item { padding: 8px; border-bottom: 1px solid #eee; }
+        .rank { color: #666; font-weight: bold; margin-right: 10px; }
+        .title { color: #333; }
+        .link { color: #1976D2; text-decoration: none; margin-left: 10px; font-size: 0.9em; }
+        .link:hover { text-decoration: underline; }
+        .failed { background: #ffebee; padding: 10px; border-radius: 5px; margin-top: 20px; }
+        .failed h3 { color: #c62828; margin-top: 0; }
+        .timestamp { color: #666; font-size: 0.9em; text-align: right; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MCP 爬取结果</h1>
+        <p class="timestamp">爬取时间: 2026-06-15 20:44:45</p>
+
+        <div class="platform">
+            <div class="platform-name">微博</div>
+            <div class="news-item">
+                <span class="rank">1.</span>
+                <span class="title">苏翊鸣回应恋情</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E8%8B%8F%E7%BF%8A%E9%B8%A3%E5%9B%9E%E5%BA%94%E6%81%8B%E6%83%85%23&amp;t=31&amp;band_rank=1&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">2.</span>
+                <span class="title">本届世界杯惨案来得太快了</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E6%9C%AC%E5%B1%8A%E4%B8%96%E7%95%8C%E6%9D%AF%E6%83%A8%E6%A1%88%E6%9D%A5%E5%BE%97%E5%A4%AA%E5%BF%AB%E4%BA%86&amp;t=31&amp;band_rank=2&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">3.</span>
+                <span class="title">暴雨强对流双预警齐发</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E6%9A%B4%E9%9B%A8%E5%BC%BA%E5%AF%B9%E6%B5%81%E5%8F%8C%E9%A2%84%E8%AD%A6%E9%BD%90%E5%8F%91&amp;t=31&amp;band_rank=3&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">4.</span>
+                <span class="title">好久不见迪丽热巴走红毯</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E5%A5%BD%E4%B9%85%E4%B8%8D%E8%A7%81%E8%BF%AA%E4%B8%BD%E7%83%AD%E5%B7%B4%E8%B5%B0%E7%BA%A2%E6%AF%AF%23&amp;t=31&amp;band_rank=4&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">5.</span>
+                <span class="title">删了几千张照片结果内存没变</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E5%88%A0%E4%BA%86%E5%87%A0%E5%8D%83%E5%BC%A0%E7%85%A7%E7%89%87%E7%BB%93%E6%9E%9C%E5%86%85%E5%AD%98%E6%B2%A1%E5%8F%98&amp;t=31&amp;band_rank=5&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">6.</span>
+                <span class="title">第一次见公摊面积这么大的鞋</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E7%AC%AC%E4%B8%80%E6%AC%A1%E8%A7%81%E5%85%AC%E6%91%8A%E9%9D%A2%E7%A7%AF%E8%BF%99%E4%B9%88%E5%A4%A7%E7%9A%84%E9%9E%8B&amp;t=31&amp;band_rank=6&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">7.</span>
+                <span class="title">王者荣耀 命格</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E7%8E%8B%E8%80%85%E8%8D%A3%E8%80%80%20%E5%91%BD%E6%A0%BC&amp;t=31&amp;band_rank=7&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">8.</span>
+                <span class="title">我国成功发射一箭8星</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E6%88%91%E5%9B%BD%E6%88%90%E5%8A%9F%E5%8F%91%E5%B0%84%E4%B8%80%E7%AE%AD8%E6%98%9F&amp;t=31&amp;band_rank=8&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">9.</span>
+                <span class="title">命好的人体现在哪些方面</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E5%91%BD%E5%A5%BD%E7%9A%84%E4%BA%BA%E4%BD%93%E7%8E%B0%E5%9C%A8%E5%93%AA%E4%BA%9B%E6%96%B9%E9%9D%A2&amp;t=31&amp;band_rank=9&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">10.</span>
+                <span class="title">迪丽热巴玫粉高定</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E8%BF%AA%E4%B8%BD%E7%83%AD%E5%B7%B4%E7%8E%AB%E7%B2%89%E9%AB%98%E5%AE%9A%23&amp;t=31&amp;band_rank=10&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">11.</span>
+                <span class="title">珠峰向导被遗忘在死亡区6天6夜生还</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E7%8F%A0%E5%B3%B0%E5%90%91%E5%AF%BC%E8%A2%AB%E9%81%97%E5%BF%98%E5%9C%A8%E6%AD%BB%E4%BA%A1%E5%8C%BA6%E5%A4%A96%E5%A4%9C%E7%94%9F%E8%BF%98&amp;t=31&amp;band_rank=11&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">12.</span>
+                <span class="title">朱一龙敏感度</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E6%9C%B1%E4%B8%80%E9%BE%99%E6%95%8F%E6%84%9F%E5%BA%A6&amp;t=31&amp;band_rank=12&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">13.</span>
+                <span class="title">戚薇李承铉女儿11岁近照</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E6%88%9A%E8%96%87%E6%9D%8E%E6%89%BF%E9%93%89%E5%A5%B3%E5%84%BF11%E5%B2%81%E8%BF%91%E7%85%A7%23&amp;t=31&amp;band_rank=13&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">14.</span>
+                <span class="title">比尔盖茨自曝出轨20多次</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E6%AF%94%E5%B0%94%E7%9B%96%E8%8C%A8%E8%87%AA%E6%9B%9D%E5%87%BA%E8%BD%A820%E5%A4%9A%E6%AC%A1%23&amp;t=31&amp;band_rank=14&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">15.</span>
+                <span class="title">首尔电视剧大赏官方辟谣</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E9%A6%96%E5%B0%94%E7%94%B5%E8%A7%86%E5%89%A7%E5%A4%A7%E8%B5%8F%E5%AE%98%E6%96%B9%E8%BE%9F%E8%B0%A3&amp;t=31&amp;band_rank=15&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">16.</span>
+                <span class="title">TF四代突围2.0</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23TF%E5%9B%9B%E4%BB%A3%E7%AA%81%E5%9B%B42.0%23&amp;t=31&amp;band_rank=16&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">17.</span>
+                <span class="title">iG官宣TheShy归队</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23iG%E5%AE%98%E5%AE%A3TheShy%E5%BD%92%E9%98%9F%23&amp;t=31&amp;band_rank=17&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">18.</span>
+                <span class="title">周雨彤回应两年前的争议</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E5%91%A8%E9%9B%A8%E5%BD%A4%E5%9B%9E%E5%BA%94%E4%B8%A4%E5%B9%B4%E5%89%8D%E7%9A%84%E4%BA%89%E8%AE%AE%23&amp;t=31&amp;band_rank=18&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">19.</span>
+                <span class="title">王俊凯董子健合照被判AI了</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E7%8E%8B%E4%BF%8A%E5%87%AF%E8%91%A3%E5%AD%90%E5%81%A5%E5%90%88%E7%85%A7%E8%A2%AB%E5%88%A4AI%E4%BA%86%23&amp;t=31&amp;band_rank=19&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">20.</span>
+                <span class="title">疑似巴西队无人在意内马尔</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E7%96%91%E4%BC%BC%E5%B7%B4%E8%A5%BF%E9%98%9F%E6%97%A0%E4%BA%BA%E5%9C%A8%E6%84%8F%E5%86%85%E9%A9%AC%E5%B0%94%23&amp;t=31&amp;band_rank=20&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">21.</span>
+                <span class="title">王鹤棣胸口纹身</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E7%8E%8B%E9%B9%A4%E6%A3%A3%E8%83%B8%E5%8F%A3%E7%BA%B9%E8%BA%AB&amp;t=31&amp;band_rank=21&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">22.</span>
+                <span class="title">贺峻霖回复严浩翔的祝福</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E8%B4%BA%E5%B3%BB%E9%9C%96%E5%9B%9E%E5%A4%8D%E4%B8%A5%E6%B5%A9%E7%BF%94%E7%9A%84%E7%A5%9D%E7%A6%8F%23&amp;t=31&amp;band_rank=22&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">23.</span>
+                <span class="title">弟弟被拐后姐姐被妈妈从小打到大</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E5%BC%9F%E5%BC%9F%E8%A2%AB%E6%8B%90%E5%90%8E%E5%A7%90%E5%A7%90%E8%A2%AB%E5%A6%88%E5%A6%88%E4%BB%8E%E5%B0%8F%E6%89%93%E5%88%B0%E5%A4%A7%23&amp;t=31&amp;band_rank=23&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">24.</span>
+                <span class="title">粉丝澄清朱一龙敲的是中国羯鼓</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E7%B2%89%E4%B8%9D%E6%BE%84%E6%B8%85%E6%9C%B1%E4%B8%80%E9%BE%99%E6%95%B2%E7%9A%84%E6%98%AF%E4%B8%AD%E5%9B%BD%E7%BE%AF%E9%BC%93%23&amp;t=31&amp;band_rank=24&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">25.</span>
+                <span class="title">白鹿说丞磊一看剧本要坐18集轮椅就接了</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E7%99%BD%E9%B9%BF%E8%AF%B4%E4%B8%9E%E7%A3%8A%E4%B8%80%E7%9C%8B%E5%89%A7%E6%9C%AC%E8%A6%81%E5%9D%9018%E9%9B%86%E8%BD%AE%E6%A4%85%E5%B0%B1%E6%8E%A5%E4%BA%86%23&amp;t=31&amp;band_rank=25&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">26.</span>
+                <span class="title">FBI特工已获准进入柬埔寨电诈园区</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23FBI%E7%89%B9%E5%B7%A5%E5%B7%B2%E8%8E%B7%E5%87%86%E8%BF%9B%E5%85%A5%E6%9F%AC%E5%9F%94%E5%AF%A8%E7%94%B5%E8%AF%88%E5%9B%AD%E5%8C%BA%23&amp;t=31&amp;band_rank=26&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">27.</span>
+                <span class="title">郑钦文vs萨卡里</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%E9%83%91%E9%92%A6%E6%96%87vs%E8%90%A8%E5%8D%A1%E9%87%8C&amp;t=31&amp;band_rank=27&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">28.</span>
+                <span class="title">伊朗队抵美限时参赛踢完几小时离境</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E4%BC%8A%E6%9C%97%E9%98%9F%E6%8A%B5%E7%BE%8E%E9%99%90%E6%97%B6%E5%8F%82%E8%B5%9B%E8%B8%A2%E5%AE%8C%E5%87%A0%E5%B0%8F%E6%97%B6%E7%A6%BB%E5%A2%83%23&amp;t=31&amp;band_rank=28&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">29.</span>
+                <span class="title">中国纯硅成功突破</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E4%B8%AD%E5%9B%BD%E7%BA%AF%E7%A1%85%E6%88%90%E5%8A%9F%E7%AA%81%E7%A0%B4%23&amp;t=31&amp;band_rank=29&amp;Refer=top" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">30.</span>
+                <span class="title">服饰大额膨胀券承包你一夏</span>
+                <a class="link" href="https://s.weibo.com/weibo?q=%23%E6%9C%8D%E9%A5%B0%E5%A4%A7%E9%A2%9D%E8%86%A8%E8%83%80%E5%88%B8%E6%89%BF%E5%8C%85%E4%BD%A0%E4%B8%80%E5%A4%8F%23&amp;t=31&amp;band_rank=30&amp;Refer=top" target="_blank">链接</a>
+            </div>
+        </div>
+
+        <div class="platform">
+            <div class="platform-name">知乎</div>
+            <div class="news-item">
+                <span class="rank">1.</span>
+                <span class="title">市场监管总局约谈山姆总部，要求其严防全链条食品安全风险，山姆的品控出了什么问题？此次约谈有何警示意义？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049810638076130456" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">2.</span>
+                <span class="title">优必选「机器人伴侣」10 天预售 3800 台，限成年人购买，不做家务只做陪伴，你看好这款产品市场前景吗？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049162105648051147" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">3.</span>
+                <span class="title">茅台总经理王莉称「停售冰淇淋、咖啡和巧克力，未来联名将非常谨慎」，如何解读？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049757922381357309" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">4.</span>
+                <span class="title">蔚来李斌称做好今年全行业跌 15%~20% 的准备，多位车企高管预警非常时期至少持续五年，背后根源是什么？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049485598407373278" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">5.</span>
+                <span class="title">有没有一个陌生人的善意，让你记了很多年？</span>
+                <a class="link" href="https://www.zhihu.com/question/2047738931140208620" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">6.</span>
+                <span class="title">美伊达成和平协议，霍尔木兹海峡将全面开放，双方为何选择此时结束冲突？会是长期停战吗？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049749994161141547" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">7.</span>
+                <span class="title">世界上的河流都是山脉为源头汇入大海，为什么没有源头是大海最终汇入盆地的咸水河流呢，理论上是成立的？</span>
+                <a class="link" href="https://www.zhihu.com/question/1918289152497123845" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">8.</span>
+                <span class="title">有哪些著名的被演砸的角色？</span>
+                <a class="link" href="https://www.zhihu.com/question/23316612" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">9.</span>
+                <span class="title">赵露思、王鹤棣等接连官宣演唱会，网友指责割韭菜，如何看待明星扎堆开跨界演唱会？</span>
+                <a class="link" href="https://www.zhihu.com/question/2048387442667778638" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">10.</span>
+                <span class="title">如果微信开始收费，每年的年费是 500，您是否还会继续使用呢？</span>
+                <a class="link" href="https://www.zhihu.com/question/378265004" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">11.</span>
+                <span class="title">遇见小面就渝见小面商标侵权一案致歉，称现已撤诉称无偿赠予已注册商标，如何看待这一选择？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049764917226337970" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">12.</span>
+                <span class="title">巴西世界杯小组赛 1-1 摩洛哥全网吵翻，被吐槽已成一人球队，问题可能出在哪里？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049475872764032459" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">13.</span>
+                <span class="title">iG 宣布 TheShy 回归队伍征战 2026 第三赛段，对此你有什么想说的？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049899564811773860" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">14.</span>
+                <span class="title">如何看待《三角洲行动》清雨毁号事件受害者「五月拾伍」维权成功后开设护航店被指「屠龙者终成恶龙」？</span>
+                <a class="link" href="https://www.zhihu.com/question/2048693819370218825" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">15.</span>
+                <span class="title">你知道的最冷的冷知识是什么？</span>
+                <a class="link" href="https://www.zhihu.com/question/51459956" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">16.</span>
+                <span class="title">国宴为什么不能吃汤面？</span>
+                <a class="link" href="https://www.zhihu.com/question/2039258144304583331" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">17.</span>
+                <span class="title">李立群吐槽在台湾看不到世界杯，凌晨 2 点开电视除了棒球就是 NBA，配图「烦死了」，对岸是足球荒漠吗？</span>
+                <a class="link" href="https://www.zhihu.com/question/2049133049393189788" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">18.</span>
+                <span class="title">王濛说自己经验和天赋现在的运动员接收不进去，怎么理解？顶级运动员的方法论是不可复制的吗？</span>
+                <a class="link" href="https://www.zhihu.com/question/2048731297963405394" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">19.</span>
+                <span class="title">全新 RTX3060 显卡再上市售价 2349 元，性价比如何？</span>
+                <a class="link" href="https://www.zhihu.com/question/2047077275779306805" target="_blank">链接</a>
+            </div>
+            <div class="news-item">
+                <span class="rank">20.</span>
+                <span class="title">素数「17」在自然数中有什么存在感？</span>
+                <a class="link" href="https://www.zhihu.com/question/661281536" target="_blank">链接</a>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>

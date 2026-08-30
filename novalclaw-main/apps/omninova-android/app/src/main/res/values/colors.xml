@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="omninova_primary">#FF3A5CFF</color>
+    <color name="omninova_primary_dark">#FF1F2A4D</color>
+    <color name="omninova_accent">#FF32D6B0</color>
+    <color name="omninova_warning">#FFFF9F1C</color>
+    <color name="omninova_danger">#FFE63946</color>
+</resources>

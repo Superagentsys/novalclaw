@@ -1,0 +1,40 @@
+# TrendRadar Bridge Configuration for OmniNova Claw
+# =====================================================
+# 将此文件内容合并到 OmniNova 的 config.toml 中
+
+[skills.trendradar]
+enabled = true
+display_name = "热点新闻聚合与分析"
+description = "26个工具：热榜爬取、关键词分析、AI筛选、情感分析、趋势预测、跨平台聚合、通知推送等"
+
+# --- MCP Server 连接 ---
+[skills.trendradar.mcp]
+transport = "http"                   # "stdio" 或 "http"
+host = "127.0.0.1"                   # HTTP 模式下的地址
+port = 3333                          # HTTP 模式下的端口
+# command = "python -m mcp_server --transport stdio"  # stdio 模式下的启动命令
+
+# --- 定时自动爬取（可选）---
+[skills.trendradar.cron]
+enabled = false
+schedule = "*/30 * * * *"            # 每30分钟触发一次爬取
+# 如果启用，OmniNova 的 cron 调度器将定期调用 trigger_crawl
+
+# --- 自动推送（可选）---
+[skills.trendradar.auto_push]
+enabled = false
+# 当爬取到新热点时自动推送到指定渠道
+channels = []                        # 如 ["telegram", "slack"]
+
+# --- 工具白名单（可选，不配置则全部启用）---
+# [skills.trendradar.tools]
+# enabled = [
+#     "get_latest_news",
+#     "get_trending_topics",
+#     "search_news",
+#     "analyze_topic_trend",
+#     "analyze_sentiment",
+#     "aggregate_news",
+#     "read_article",
+#     "send_notification"
+# ]

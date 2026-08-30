@@ -1,0 +1,76 @@
+services:
+  trendradar:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: trendradar
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${WEBSERVER_PORT:-8080}:${WEBSERVER_PORT:-8080}"
+
+    volumes:
+      - ../config:/app/config:ro
+      - ../output:/app/output
+
+    environment:
+      - TZ=Asia/Shanghai
+      # Web 服务器
+      - WEBSERVER_PORT=${WEBSERVER_PORT:-8080}
+      # 通知渠道
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - DINGTALK_WEBHOOK_URL=${DINGTALK_WEBHOOK_URL:-}
+      - WEWORK_WEBHOOK_URL=${WEWORK_WEBHOOK_URL:-}
+      - WEWORK_MSG_TYPE=${WEWORK_MSG_TYPE:-}
+      # 邮件配置
+      - EMAIL_FROM=${EMAIL_FROM:-}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD:-}
+      - EMAIL_TO=${EMAIL_TO:-}
+      - EMAIL_SMTP_SERVER=${EMAIL_SMTP_SERVER:-}
+      - EMAIL_SMTP_PORT=${EMAIL_SMTP_PORT:-}
+      # ntfy配置
+      - NTFY_SERVER_URL=${NTFY_SERVER_URL:-https://ntfy.sh}
+      - NTFY_TOPIC=${NTFY_TOPIC:-}
+      - NTFY_TOKEN=${NTFY_TOKEN:-}
+      # Bark配置
+      - BARK_URL=${BARK_URL:-}
+      # Slack配置
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      # 通用Webhook配置
+      - GENERIC_WEBHOOK_URL=${GENERIC_WEBHOOK_URL:-}
+      - GENERIC_WEBHOOK_TEMPLATE=${GENERIC_WEBHOOK_TEMPLATE:-}
+      # AI 配置（ai_analysis 和 ai_translation 共享模型配置）
+      - AI_ANALYSIS_ENABLED=${AI_ANALYSIS_ENABLED:-}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_MODEL=${AI_MODEL:-}
+      - AI_API_BASE=${AI_API_BASE:-}
+      # 远程存储配置（S3 兼容协议）
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
+      - S3_REGION=${S3_REGION:-}
+      # 运行模式
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-*/30 * * * *}
+      - RUN_MODE=${RUN_MODE:-cron}
+      - IMMEDIATE_RUN=${IMMEDIATE_RUN:-true}
+
+  trendradar-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mcp
+    container_name: trendradar-mcp
+    restart: unless-stopped
+
+    ports:
+      - "${MCP_HOST:-127.0.0.1}:${MCP_PORT:-3333}:3333"
+
+    volumes:
+      - ../config:/app/config:ro
+      - ../output:/app/output
+
+    environment:
+      - TZ=Asia/Shanghai
+      - MCP_PORT=${MCP_PORT:-3333}

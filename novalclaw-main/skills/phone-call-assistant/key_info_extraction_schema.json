@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OmniNova Phone Call Key Information Extraction",
+  "description": "通话关键信息抽取 schema。客户端本地粗抽取 + 网关大模型二次归一化。附加到 conversation_log_schema.json 的 metadata.extracted 字段。",
+  "type": "object",
+  "required": ["schema_version", "call_intent", "confidence"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "call_intent": {
+      "type": "string",
+      "enum": [
+        "delivery",
+        "business_inquiry",
+        "sales",
+        "marketing",
+        "fraud_suspected",
+        "customer_service",
+        "personal",
+        "appointment",
+        "recruitment",
+        "survey",
+        "unknown"
+      ],
+      "description": "通话意图分类"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "意图分类置信度"
+    },
+    "caller_identity": {
+      "type": ["object", "null"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "organization": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "verified": { "type": "boolean", "default": false }
+      }
+    },
+    "contact_info": {
+      "type": ["object", "null"],
+      "properties": {
+        "phone": { "type": ["string", "null"] },
+        "phone_redacted": { "type": ["string", "null"], "description": "脱敏版本如 138****1234" },
+        "email": { "type": ["string", "null"] },
+        "address": { "type": ["string", "null"] }
+      }
+    },
+    "appointment": {
+      "type": ["object", "null"],
+      "properties": {
+        "scheduled_at": { "type": ["string", "null"], "format": "date-time" },
+        "location": { "type": ["string", "null"] },
+        "purpose": { "type": ["string", "null"] }
+      }
+    },
+    "key_entities": {
+      "type": "array",
+      "description": "通话中出现的关键实体",
+      "items": {
+        "type": "object",
+        "required": ["type", "value"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "person",
+              "organization",
+              "product",
+              "amount",
+              "date",
+              "location",
+              "order_id",
+              "tracking_number",
+              "other"
+            ]
+          },
+          "value": { "type": "string" },
+          "context": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "action_items": {
+      "type": "array",
+      "description": "Agent 需要后续跟进的动作",
+      "items": {
+        "type": "object",
+        "required": ["action", "priority"],
+        "properties": {
+          "action": { "type": "string" },
+          "priority": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "urgent"]
+          },
+          "due_at": { "type": ["string", "null"], "format": "date-time" },
+          "assignee": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "summary": {
+      "type": ["string", "null"],
+      "description": "一句话总结（≤ 80 字）"
+    },
+    "sentiment": {
+      "type": "string",
+      "enum": ["positive", "neutral", "negative", "hostile", "unknown"],
+      "default": "unknown"
+    },
+    "spam_decision": {
+      "type": ["object", "null"],
+      "properties": {
+        "matched_rule_id": { "type": ["string", "null"] },
+        "severity": { "type": ["string", "null"], "enum": ["block", "silence", "allow", null] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "redactions": {
+      "type": "array",
+      "description": "因隐私屏蔽的片段位置",
+      "items": {
+        "type": "object",
+        "required": ["type", "location"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["id_card", "bank_card", "password", "other_sensitive"]
+          },
+          "location": {
+            "type": "object",
+            "properties": {
+              "turn_index": { "type": "integer", "minimum": 0 },
+              "offset_start": { "type": "integer", "minimum": 0 },
+              "offset_end": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

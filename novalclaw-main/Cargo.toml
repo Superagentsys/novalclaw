@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "apps/omninova-tauri/src-tauri",
+    "crates/omninova-core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["omninova"]
+license = "MIT OR Apache-2.0"
+description = "OmniNova Claw - Next-gen AI assistant powered by novalclaw architecture"
+
+[workspace.dependencies]
+# Core dependencies from novalclaw
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "=0.12.0", default-features = false, features = ["json", "rustls-tls", "http2"] }
+uuid = { version = "=1.11.0", features = ["v4", "std"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+config = "=0.13.4"
+toml = "=0.8.12"
+toml_edit = "=0.22.8"
+directories = "6.0"
+urlencoding = "2.1"
+base64 = "0.22"
+image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png"] }
+prometheus = "0.14"
+time = "=0.3.36"
+time-core = "=0.1.2"
+time-macros = "=0.2.18"
+deranged = "=0.3.11"
+num-conv = "=0.1.0"
+url = "=2.5.2"
+indexmap = "2.5.0"
+pest = "=2.7.15"
+pest_derive = "=2.7.15"
+pest_generator = "=2.7.15"
+pest_meta = "=2.7.15"
+serde_with = "=3.11.0"
+serde_with_macros = "=3.11.0"
+globset = "=0.4.15"
+proc-macro-crate = "=3.1.0"
+home = "=0.5.9"
+avif-serialize = "=0.8.2"
+base64ct = "=1.6.0"
+qrcode = { version = "0.14", default-features = false }

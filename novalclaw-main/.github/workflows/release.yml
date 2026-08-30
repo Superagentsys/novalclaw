@@ -1,0 +1,565 @@
+name: Release Build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - "v*"
+    paths:
+      - "apps/omninova-tauri/**"
+      - "apps/omninova-ios/**"
+      - "apps/omninova-android/**"
+      - "crates/omninova-core/**"
+      - "skills/**"
+      - ".github/workflows/release.yml"
+  pull_request:
+    paths:
+      - "apps/omninova-tauri/**"
+      - "apps/omninova-ios/**"
+      - "apps/omninova-android/**"
+      - "crates/omninova-core/**"
+      - "skills/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  desktop:
+    name: Desktop ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            script: build:linux
+            check: linux
+            target: x86_64-unknown-linux-gnu
+            asset_platform: linux-x64
+          - name: macOS (Intel)
+            os: macos-latest
+            script: build:macos:intel
+            check: macos
+            target: x86_64-apple-darwin
+            asset_platform: macos-intel
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            script: build:macos:apple
+            check: macos
+            target: aarch64-apple-darwin
+            asset_platform: macos-arm64
+          - name: Windows
+            os: windows-latest
+            script: build:windows
+            check: windows
+            target: x86_64-pc-windows-msvc
+            asset_platform: windows-x64
+
+    defaults:
+      run:
+        working-directory: apps/omninova-tauri
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fix Windows link.exe conflict
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $paths = @(
+            "C:\Program Files\Git\usr\bin\link.exe",
+            "C:\Program Files\Git\mingw64\bin\link.exe"
+          )
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "Renaming conflict: $path"
+              Move-Item -Path $path -Destination "$path.bak" -Force
+            }
+          }
+          
+          # Verify link.exe resolution
+          try {
+            $linkPath = (Get-Command link).Source
+            Write-Host "link.exe resolves to: $linkPath"
+          } catch {
+            Write-Host "link.exe not found in PATH (this is okay if MSVC sets it up later, but usually it should be there)"
+          }
+
+      - name: Install create-dmg
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/omninova-tauri/package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/omninova-tauri/src-tauri -> target
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            build-essential
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Apple code signing & notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          chmod +x ./scripts/setup-apple-signing.sh ./scripts/verify-macos-signature.sh ./scripts/codesign-macos-fallback.sh
+          bash ./scripts/setup-apple-signing.sh
+
+      - name: Prepare release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BRANCH_NAME="${GITHUB_REF_NAME:-branch}"
+            SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
+            VERSION="${SANITIZED_BRANCH}-sha-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check build environment
+        run: node ./scripts/check-build-env.mjs ${{ matrix.check }}
+
+      - name: Build Tauri app
+        shell: bash
+        run: npm run ${{ matrix.script }}
+
+      - name: Resolve bundle path
+        id: resolve_path
+        shell: bash
+        run: |
+          # Check workspace root target (standard for workspace members)
+          WS_TARGET_PATH="../../target/${{ matrix.target }}/release/bundle"
+          WS_FLAT_PATH="../../target/release/bundle"
+          
+          # Check package local target (if configured or standalone)
+          PKG_TARGET_PATH="./src-tauri/target/${{ matrix.target }}/release/bundle"
+          PKG_FLAT_PATH="./src-tauri/target/release/bundle"
+
+          if [ -d "$WS_TARGET_PATH" ]; then
+            echo "Found bundle at workspace target path: $WS_TARGET_PATH"
+            echo "bundle_path=$WS_TARGET_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$WS_FLAT_PATH" ]; then
+            echo "Found bundle at workspace flat path: $WS_FLAT_PATH"
+            echo "bundle_path=$WS_FLAT_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$PKG_TARGET_PATH" ]; then
+            echo "Found bundle at package target path: $PKG_TARGET_PATH"
+            echo "bundle_path=$PKG_TARGET_PATH" >> "$GITHUB_OUTPUT"
+          elif [ -d "$PKG_FLAT_PATH" ]; then
+            echo "Found bundle at package flat path: $PKG_FLAT_PATH"
+            echo "bundle_path=$PKG_FLAT_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: Bundle directory not found."
+            echo "Searched locations:"
+            echo "- $WS_TARGET_PATH"
+            echo "- $WS_FLAT_PATH"
+            echo "- $PKG_TARGET_PATH"
+            echo "- $PKG_FLAT_PATH"
+            echo "Listing workspace target directory:"
+            ls -F ../../target/release || echo "workspace target/release not found"
+            ls -F ../../target/${{ matrix.target }}/release || echo "workspace target/${{ matrix.target }}/release not found"
+            exit 1
+          fi
+
+      - name: Ad-hoc codesign macOS bundles (fallback)
+        if: runner.os == 'macOS'
+        run: |
+          bash ./scripts/codesign-macos-fallback.sh "${{ steps.resolve_path.outputs.bundle_path }}"
+
+      - name: Verify macOS code signature
+        if: runner.os == 'macOS'
+        env:
+          STRICT_MACOS_SIGNING: ${{ github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE != '' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ steps.resolve_path.outputs.bundle_path }}"
+          found=0
+          while IFS= read -r artifact; do
+            [[ -e "$artifact" ]] || continue
+            found=1
+            bash ./scripts/verify-macos-signature.sh "$artifact"
+          done <<EOF
+          $(find "$BUNDLE" \( -type d -name '*.app' -o -type f -name '*.dmg' \))
+          EOF
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::No .app/.dmg under $BUNDLE — skip signature verify"
+          fi
+
+      - name: Stage desktop release assets
+        run: >
+          node ./scripts/stage-release-assets.mjs
+          ${{ steps.resolve_path.outputs.bundle_path }}
+          ./release-assets
+          ${{ matrix.asset_platform }}
+          ${{ steps.meta.outputs.version }}
+
+      - name: Attach macOS Gatekeeper install guide
+        if: runner.os == 'macOS'
+        run: cp ../../docs/macOS-安装与修复.txt ./release-assets/
+
+      - name: Upload desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset_platform }}
+          path: apps/omninova-tauri/release-assets/**
+          if-no-files-found: warn
+
+  android:
+    name: Mobile (Android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: apps/omninova-android
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('apps/omninova-android/**/*.gradle*', 'apps/omninova-android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Build debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Build release APK (if signing configured)
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          cat >> app/build.gradle.kts <<EOF
+
+          android {
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("../keystore.jks")
+                      storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                      keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+          }
+          EOF
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Stage APK artifacts
+        run: |
+          mkdir -p release-assets
+          find app/build/outputs/apk -type f -name "*.apk" -print -exec cp {} release-assets/ \;
+
+      - name: Upload Android APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: apps/omninova-android/release-assets/**
+          if-no-files-found: warn
+
+  ios:
+    name: Mobile (iOS)
+    runs-on: macos-14
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: apps/omninova-ios
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen and xcbeautify
+        run: brew install xcodegen xcbeautify
+
+      - name: Select Xcode
+        run: |
+          set -euxo pipefail
+          ls /Applications | grep -i Xcode || true
+          sudo xcode-select -s "/Applications/Xcode_15.4.app" \
+            || sudo xcode-select -s "/Applications/Xcode_15.3.app" \
+            || sudo xcode-select -s "/Applications/Xcode_15.2.app" \
+            || sudo xcode-select -s "/Applications/Xcode.app"
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Show toolchain versions
+        run: |
+          set -euxo pipefail
+          xcodegen --version
+          xcbeautify --version
+          xcrun simctl list runtimes | head -20
+
+      - name: Generate Xcode project
+        run: |
+          set -euxo pipefail
+          pwd
+          ls -la
+          rm -rf OmniNovaPhoneAgent.xcodeproj
+          xcodegen generate --spec project.yml 2>&1 | tee xcodegen.log
+          echo "----- after xcodegen -----"
+          ls -la
+          test -d OmniNovaPhoneAgent.xcodeproj || {
+            echo "::error::xcodegen did not produce OmniNovaPhoneAgent.xcodeproj"
+            cat xcodegen.log
+            exit 1
+          }
+          ls -la OmniNovaPhoneAgent.xcodeproj
+          xcodebuild -list -project OmniNovaPhoneAgent.xcodeproj
+
+      - name: Build for iOS Simulator (unsigned)
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project OmniNovaPhoneAgent.xcodeproj \
+            -scheme OmniNovaPhoneAgent \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 \
+            | tee xcodebuild-sim.log \
+            | xcbeautify --renderer github-actions
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Build for iOS Device (unsigned, for IPA)
+        run: |
+          set -euxo pipefail
+          # Device build (iphoneos). No Apple Developer secrets in CI: produce an
+          # unsigned .ipa for sideload / re-sign pipelines (AltStore, Sideloadly,
+          # Xcode with your own team, etc.). Not App Store / TestFlight ready.
+          xcodebuild \
+            -project OmniNovaPhoneAgent.xcodeproj \
+            -scheme OmniNovaPhoneAgent \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO \
+            VALIDATE_PRODUCT=NO \
+            build 2>&1 \
+            | tee xcodebuild-device.log \
+            | xcbeautify --renderer github-actions
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Stage iOS artifacts (Simulator tar.gz + Device unsigned IPA)
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${GITHUB_SHA::7}"
+          fi
+
+          # ---- Simulator .app -> .tar.gz (xcrun simctl install / Xcode Simulator) ----
+          SIM_APP="build-sim/Build/Products/Release-iphonesimulator/OmniNovaPhoneAgent.app"
+          if [ ! -d "$SIM_APP" ]; then
+            echo "::error::Expected simulator app at $SIM_APP was not produced" >&2
+            ls -R build-sim/Build/Products || true
+            exit 1
+          fi
+          tar -czf "release-assets/OmniNovaPhoneAgent-${VERSION}-simulator.tar.gz" \
+              -C "$(dirname "$SIM_APP")" "$(basename "$SIM_APP")"
+
+          # ---- Device .app -> Payload/.app -> .ipa (unsigned, sideload / re-sign) ----
+          DEVICE_APP="build-device/Build/Products/Release-iphoneos/OmniNovaPhoneAgent.app"
+          if [ ! -d "$DEVICE_APP" ]; then
+            echo "::error::Expected device app at $DEVICE_APP was not produced" >&2
+            ls -R build-device/Build/Products || true
+            exit 1
+          fi
+          STAGING="ipa-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING/Payload"
+          cp -R "$DEVICE_APP" "$STAGING/Payload/"
+          (
+            cd "$STAGING"
+            zip -ry "../release-assets/OmniNovaPhoneAgent-${VERSION}-unsigned.ipa" Payload
+          )
+          rm -rf "$STAGING"
+
+          cat > release-assets/IOS_INSTALL.txt <<EOF
+          OmniNova Phone Agent — iOS 安装说明
+          =====================================
+
+          本 Release 包含两类 iOS 产物：
+
+          1) OmniNovaPhoneAgent-${VERSION}-unsigned.ipa
+             - 真机安装包（未签名）。不能直接双击安装。
+             - 请使用 AltStore / Sideloadly / 自有 Apple 开发者证书重签名后安装，
+               或在 Xcode 中 Archive 并使用你的 Team 重新导出。
+
+          2) OmniNovaPhoneAgent-${VERSION}-simulator.tar.gz
+             - 仅适用于 iOS 模拟器，解压后：
+               xcrun simctl install booted OmniNovaPhoneAgent.app
+
+          如需 App Store / TestFlight 分发，请在 Apple Developer 账号下
+          配置签名与 Provisioning Profile 后重新构建。
+          EOF
+
+          ls -lh release-assets/
+
+      - name: Upload xcodebuild logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            apps/omninova-ios/xcodebuild-sim.log
+            apps/omninova-ios/xcodebuild-device.log
+            apps/omninova-ios/xcodegen.log
+          if-no-files-found: warn
+
+      - name: Upload iOS bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-ios
+          path: apps/omninova-ios/release-assets/**
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - desktop
+      - android
+      - ios
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Collect and deduplicate artifacts
+        working-directory: release-assets
+        run: |
+          rm -f SHA256SUMS.txt
+          find . -mindepth 2 -name "SHA256SUMS.txt" -type f -delete
+          mapfile -t release_files < <(
+            find . -type f \
+              \( -name "*.dmg" -o -name "*.deb" -o -name "*.appimage" -o -name "*.rpm" -o -name "*.exe" -o -name "*.msi" -o -name "*.tar.gz" -o -name "*.apk" -o -name "*.aab" -o -name "*.ipa" \) \
+              -print | sort
+          )
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No release artifacts found after download."
+            exit 1
+          fi
+          sha256sum "${release_files[@]}" > SHA256SUMS.txt
+          if [ ! -s SHA256SUMS.txt ]; then
+            echo "Generated SHA256SUMS.txt is empty."
+            exit 1
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          overwrite_files: true
+          files: |
+            release-assets/**/*.dmg
+            release-assets/**/*.deb
+            release-assets/**/*.appimage
+            release-assets/**/*.rpm
+            release-assets/**/*.exe
+            release-assets/**/*.msi
+            release-assets/**/*.tar.gz
+            release-assets/**/*.apk
+            release-assets/**/*.aab
+            release-assets/**/*.ipa
+            release-assets/**/IOS_INSTALL.txt
+            release-assets/**/macOS-安装与修复.txt
+            release-assets/SHA256SUMS.txt

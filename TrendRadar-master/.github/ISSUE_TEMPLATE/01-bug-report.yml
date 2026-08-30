@@ -1,0 +1,122 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-issue-forms.json
+
+name: 🐛 遇到问题了
+description: 程序运行不正常、报错或功能失效（含 AI 分析问题）
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### ⚠️ 提交前必读
+        **请确保你正在使用 TrendRadar 的最新版本。**
+        很多问题在最新代码中可能已经修复。如果你使用的是旧版本，我将无法处理，请先更新后再试。
+
+        **简单的描述 + 关键截图** 是最有效的沟通方式。
+
+        ---
+        ### 📌 如何查看版本号？
+
+        | 部署方式 | 查看方法 |
+        |---------|---------|
+        | **Docker** | 查看容器启动日志，版本号显示在日志开头 |
+        | **GitHub Actions** | 查看 [README 文档](https://github.com/sansan0/TrendRadar) 顶部的 ![version](https://img.shields.io/badge/version-blue) 徽章 |
+        | **本地 Python** | 查看项目根目录的 `version` 文件 |
+
+  - type: input
+    id: version
+    attributes:
+      label: 📦 TrendRadar 版本
+      description: |
+        请务必提供版本号（如：v5.2.0 或 git commit id）
+        💡 Docker 用户：查看容器启动日志 | GitHub Actions 用户：查看文档顶部 version 徽章
+      placeholder: v5.2.0 或 commit hash
+    validations:
+      required: true
+
+  - type: input
+    id: mcp-version
+    attributes:
+      label: 🔌 MCP Server 版本 (可选)
+      description: 如果你是通过 MCP 使用，请填写 MCP Server 的版本。
+      placeholder: v3.1.6 (非 MCP 用户留空)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: bug-category
+    attributes:
+      label: 🏷️ 问题类别
+      options:
+        - AI 分析相关（报错、内容异常、提示词失效等）
+        - 数据获取相关（爬不到新闻、平台失效等）
+        - 通知推送相关（收不到消息、推送报错等）
+        - 部署运行相关（Docker、Actions、Python 报错）
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: ai-model
+    attributes:
+      label: 🤖 AI 模型名称（AI 问题必填）
+      description: |
+        如果是 AI 分析相关问题，请提供你使用的具体模型名称。
+        AI 问题与模型能力密切相关，不同模型表现差异很大。
+      placeholder: "例如：deepseek/deepseek-chat、openai/gpt-4o、gemini/gemini-2.5-flash"
+    validations:
+      required: false
+
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: 📝 描述发生了什么
+      placeholder: |
+        请描述：
+        1. 你在做什么？
+        2. 出现了什么错误？（如果是 AI 问题，请贴出分析失败的错误提示）
+        3. 建议上传一张截图，这比文字更有力！
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-logs
+    attributes:
+      label: 📋 错误日志/配置（可选）
+      description: |
+        贴出相关的错误日志或 config.yaml 片段（记得隐藏 API Key 等敏感信息）
+        💡 Docker 用户：使用 `docker logs trendradar` 查看日志
+      placeholder: |
+        贴出相关的错误日志或 config.yaml 片段：
+        ```
+        在这里贴内容...
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 📷 截图（强烈建议）
+      description: |
+        ⚠️ **重要提示**：请提供**完整截图**，不要只截取局部！
+        - 错误截图应包含完整的错误信息和上下文
+        - 推送截图应包含完整的消息内容
+        - 配置截图应包含相关配置段的完整内容
+
+        局部截图往往缺少关键信息，会导致问题难以定位。
+      placeholder: 拖拽截图到这里，请确保截图完整，包含足够的上下文信息。
+    validations:
+      required: false
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: 🖥️ 使用环境
+      options:
+        - Docker (本地/NAS)
+        - GitHub Actions
+        - 本地 Python 运行
+        - MCP Server 客户端 (Cherry Studio等)
+    validations:
+      required: true
