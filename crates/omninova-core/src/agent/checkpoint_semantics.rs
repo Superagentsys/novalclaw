@@ -53,7 +53,12 @@ pub fn extract_semantic_checkpoint(
             continue;
         }
         if message.role == "system" && message.content.starts_with(CHECKPOINT_MARKER) {
-            merge_previous_checkpoint(&mut state, &mut keyed, &message.content);
+            merge_previous_checkpoint(
+                &mut state,
+                &mut keyed,
+                &mut constraint_keys,
+                &message.content,
+            );
             continue;
         }
         if message.role == "user" {
@@ -215,7 +220,7 @@ fn absorb_tool(state: &mut SemanticCheckpoint, keyed: &mut Vec<(String, String)>
             .retain(|item| !item.to_ascii_lowercase().starts_with("test:"));
         push_unique(&mut state.references, format!("test: {status}"));
         let lower = status.to_ascii_lowercase();
-        if lower.contains("fail") || lower.contains("blocked") {
+        if status_is_failure(&lower) {
             state
                 .failures
                 .retain(|item| !item.to_ascii_lowercase().contains("fail"));
@@ -362,6 +367,7 @@ fn contradicts_keyed(line: &str, keyed: &[(String, String)]) -> bool {
 fn merge_previous_checkpoint(
     state: &mut SemanticCheckpoint,
     keyed: &mut Vec<(String, String)>,
+    constraint_keys: &mut Vec<(String, String)>,
     content: &str,
 ) {
     let body = content.trim_start_matches(CHECKPOINT_MARKER).trim();
@@ -370,10 +376,17 @@ fn merge_previous_checkpoint(
             state.goal = parsed.goal.clone();
         }
         merge_parsed(state, &parsed, true);
+        for item in &parsed.constraints {
+            if let Some(key) = constraint_subject(item) {
+                upsert(constraint_keys, key, item.clone());
+            }
+        }
         for item in parsed
             .current
             .iter()
             .chain(parsed.decisions.iter())
+            .chain(parsed.completed.iter())
+            .chain(parsed.pending.iter())
             .chain(parsed.references.iter())
         {
             if let Some((key, value)) = keyed_config_value(item) {
@@ -534,6 +547,36 @@ fn apply_keyed_current(state: &mut SemanticCheckpoint, keyed: &[(String, String)
                 push_unique(&mut state.current, format!("test: {value}"));
             }
             "approval_scope" => push_unique(&mut state.current, value.clone()),
+            "files_already_inspected" => {
+                state
+                    .references
+                    .retain(|item| !item.starts_with("files already inspected:"));
+                push_unique(
+                    &mut state.references,
+                    format!("files already inspected: {value}"),
+                );
+            }
+            "current_root_cause" => {
+                state
+                    .current
+                    .retain(|item| !item.starts_with("current root cause:"));
+                push_unique(&mut state.current, format!("current root cause: {value}"));
+            }
+            "work_already_completed" => {
+                state
+                    .completed
+                    .retain(|item| !item.starts_with("work already completed:"));
+                push_unique(
+                    &mut state.completed,
+                    format!("work already completed: {value}"),
+                );
+            }
+            "next_pending_action" => {
+                state
+                    .pending
+                    .retain(|item| !item.starts_with("next pending action:"));
+                push_unique(&mut state.pending, format!("next pending action: {value}"));
+            }
             _ => {}
         }
     }
@@ -557,6 +600,7 @@ fn still_restrictive(text: &str) -> bool {
         || lower.contains("only change")
         || lower.contains("preserve")
         || lower.contains("no provider")
+        || lower.contains("keep provider calls off")
         || lower.contains("must not")
 }
 
@@ -617,6 +661,47 @@ fn capture_identifiers(keyed: &mut Vec<(String, String)>, text: &str) {
     if text.contains("deepseek-v4-flash") {
         upsert(keyed, "model", "deepseek-v4-flash".to_string());
     }
+    for (key, labels) in [
+        (
+            "files_already_inspected",
+            ["FILES_ALREADY_INSPECTED", "files already inspected"],
+        ),
+        (
+            "current_root_cause",
+            ["CURRENT_ROOT_CAUSE", "current root cause"],
+        ),
+        (
+            "work_already_completed",
+            ["WORK_ALREADY_COMPLETED", "work already completed"],
+        ),
+        (
+            "next_pending_action",
+            ["NEXT_PENDING_ACTION", "next pending action"],
+        ),
+    ] {
+        if let Some(value) = labels
+            .iter()
+            .find_map(|label| capture_labeled_line_value(text, label))
+        {
+            upsert(keyed, key, value);
+        }
+    }
+}
+
+fn capture_labeled_line_value(text: &str, label: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((candidate, value)) = line.split_once('=').or_else(|| line.split_once(':')) else {
+            continue;
+        };
+        if candidate.trim().eq_ignore_ascii_case(label) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(clip(value));
+            }
+        }
+    }
+    None
 }
 
 fn looks_like_limit(value: &str) -> bool {
@@ -658,6 +743,12 @@ fn capture_test_status(text: &str) -> Option<String> {
     if lower.contains("skipped") {
         return Some(clip_status(text, "SKIPPED"));
     }
+    if lower.contains("passed") && (lower.contains("0 failed") || lower.contains("0 failures")) {
+        if let Some(line) = first_line_containing(text, "passed") {
+            return Some(clip(line));
+        }
+        return Some("PASS".to_string());
+    }
     if lower.contains("failed") || (lower.contains("fail") && lower.contains("test")) {
         if let Some(line) = first_line_containing(text, "fail") {
             return Some(clip(line));
@@ -671,6 +762,13 @@ fn capture_test_status(text: &str) -> Option<String> {
         return Some("PASS".to_string());
     }
     None
+}
+
+fn status_is_failure(lower: &str) -> bool {
+    lower.contains("blocked")
+        || ((lower.contains("fail") || lower.contains("failed"))
+            && !lower.contains("0 failed")
+            && !lower.contains("0 failures"))
 }
 
 fn clip_status(text: &str, fallback: &str) -> String {
@@ -777,7 +875,9 @@ fn reconcile_plan(state: &mut SemanticCheckpoint) {
 }
 
 fn drop_unverified_completions(state: &mut SemanticCheckpoint, messages: &[ChatMessage]) {
-    let tool_backed = messages.iter().any(|m| m.role == "tool");
+    let tool_backed = messages.iter().any(|m| {
+        m.role == "tool" || (m.role == "system" && m.content.starts_with(CHECKPOINT_MARKER))
+    });
     if tool_backed {
         return;
     }

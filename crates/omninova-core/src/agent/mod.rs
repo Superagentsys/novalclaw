@@ -15,6 +15,8 @@ pub mod tool_runner;
 mod r3_e2e;
 #[cfg(test)]
 mod r4_semantic;
+#[cfg(test)]
+mod r5_acceptance;
 
 pub use agent::Agent;
 pub use prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
