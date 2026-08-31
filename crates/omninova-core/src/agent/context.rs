@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_shrinking_compaction_emits_failed_not_completed() {
+    async fn oversized_summarizer_output_is_clipped_not_installed_verbatim() {
         let provider = NonShrinkingSummarizer {
             budget: ContextBudget::new(
                 50_000,
@@ -1126,7 +1126,7 @@ mod tests {
             ),
         };
         let messages = pressure_messages();
-        let (sink, _out) = with_recorded_telemetry(|| async {
+        let (sink, out) = with_recorded_telemetry(|| async {
             maintain_context(&provider, messages, &[], 10, true, None).await
         })
         .await;
@@ -1135,23 +1135,23 @@ mod tests {
             .iter()
             .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionStarted { .. }))
             .expect("compaction started");
-        let failed = events
+        let completed = events
             .iter()
-            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionFailed { .. }))
-            .expect("compaction failed");
-        assert_eq!(started.operation_id, failed.operation_id);
+            .find(|e| matches!(e.kind, ContextLifecycleEventKind::ContextCompactionCompleted { .. }))
+            .expect("clipped summary must be allowed to complete");
+        assert_eq!(started.operation_id, completed.operation_id);
         assert!(!events.iter().any(|e| {
             matches!(
                 e.kind,
-                ContextLifecycleEventKind::ContextCompactionCompleted { .. }
+                ContextLifecycleEventKind::ContextCompactionFailed { .. }
             )
         }));
-        match &failed.kind {
-            ContextLifecycleEventKind::ContextCompactionFailed { reason, .. } => {
-                assert_eq!(reason, "non_shrinking");
-            }
-            _ => unreachable!(),
-        }
+        let checkpoint = out
+            .iter()
+            .find(|message| message.content.starts_with(CHECKPOINT_MARKER))
+            .expect("checkpoint");
+        assert!(checkpoint.content.chars().count() < 8_000);
+        assert!(!checkpoint.content.contains(&"Z".repeat(1_000)));
     }
 
     #[tokio::test]

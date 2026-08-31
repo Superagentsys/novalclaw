@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_event;
 pub mod budget;
+mod checkpoint_semantics;
 pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
@@ -12,6 +13,8 @@ pub mod tool_runner;
 
 #[cfg(test)]
 mod r3_e2e;
+#[cfg(test)]
+mod r4_semantic;
 
 pub use agent::Agent;
 pub use prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};

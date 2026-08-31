@@ -350,32 +350,7 @@ fn prune_tool_content(content: &str) -> Option<String> {
 /// a compact summary. This is intentionally deterministic: it preserves what
 /// source history provides and does not invent missing fields.
 pub fn build_structured_checkpoint(messages: &[ChatMessage], summary: &str) -> ChatMessage {
-    let mut task_lines = Vec::new();
-    let mut checkpoint_lines = Vec::new();
-    for message in messages {
-        if message.content.starts_with(TASK_MARKER) {
-            task_lines.push(message.content.trim_start_matches(TASK_MARKER).trim().to_string());
-        } else if message.content.starts_with(CHECKPOINT_MARKER) {
-            checkpoint_lines.push(
-                message
-                    .content
-                    .trim_start_matches(CHECKPOINT_MARKER)
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-
-    let body = format!(
-        "## Primary Goal\n{}\n\n## Current Task State\n{}\n\n## Important Facts\n{}",
-        task_lines.join("\n"),
-        checkpoint_lines
-            .last()
-            .cloned()
-            .unwrap_or_else(|| summary.to_string()),
-        task_lines.join("\n"),
-    );
-    ChatMessage::system(format!("{CHECKPOINT_MARKER} structured checkpoint\n{body}"))
+    crate::agent::checkpoint_semantics::build_structured_checkpoint(messages, summary)
 }
 
 /// Keeps only the newest structured checkpoint after a compaction rebuild.
