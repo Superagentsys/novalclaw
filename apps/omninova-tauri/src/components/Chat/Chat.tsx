@@ -105,8 +105,11 @@ interface DesktopScreenshotPayload {
 
 /** 单个文本附件最大字节（UTF-8），防止拖入巨型日志拖垮前端 */
 const DROP_TEXT_FILE_MAX_BYTES = 512 * 1024;
-/** 嵌入为 Markdown 图片的最大字节（base64 后更大，勿调高过多） */
-const DROP_IMAGE_INLINE_MAX_BYTES = 256 * 1024;
+/** 原始照片允许读入的上限（手机拍照常见 2–8MB，先读入再压缩嵌入） */
+const DROP_IMAGE_SOURCE_MAX_BYTES = 25 * 1024 * 1024;
+/** 压缩后嵌入 Markdown 的目标上限（base64 后更大） */
+const DROP_IMAGE_INLINE_MAX_BYTES = 400 * 1024;
+const IMAGE_VISION_MAX_DIMENSION = 1600;
 /** 与隐藏 file input 关联，用于 label 触发（避免 Tauri/WebKit 拦截程序化 click） */
 const CHAT_ATTACHMENT_INPUT_ID = "chat-composer-file-input";
 /** 单次拖放最多处理的文件数 */
@@ -334,6 +337,99 @@ function readFileAsDataURL(file: File): Promise<string> {
   });
 }
 
+function loadImageElement(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("无法解码图片"));
+    };
+    img.src = url;
+  });
+}
+
+function canvasToJpegBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error("图片压缩失败"));
+      },
+      "image/jpeg",
+      quality,
+    );
+  });
+}
+
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  return readFileAsDataURL(new File([blob], "image.jpg", { type: blob.type || "image/jpeg" }));
+}
+
+/** 大图缩放到视觉可用尺寸并压成 JPEG，避免手机照片被过小的字节门槛直接丢掉。 */
+async function compressImageForInline(
+  file: File,
+): Promise<{ dataUrl: string; noteSizeKb: number; compressed: boolean }> {
+  if (file.size <= DROP_IMAGE_INLINE_MAX_BYTES) {
+    return {
+      dataUrl: await readFileAsDataURL(file),
+      noteSizeKb: Math.round(file.size / 1024),
+      compressed: false,
+    };
+  }
+
+  const image = await loadImageElement(file);
+  let width = image.naturalWidth || image.width;
+  let height = image.naturalHeight || image.height;
+  if (width < 1 || height < 1) {
+    throw new Error("图片尺寸无效");
+  }
+
+  const longest = Math.max(width, height);
+  if (longest > IMAGE_VISION_MAX_DIMENSION) {
+    const scale = IMAGE_VISION_MAX_DIMENSION / longest;
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+  }
+
+  const qualities = [0.84, 0.72, 0.6, 0.48];
+  let best: Blob | null = null;
+  for (let pass = 0; pass < 3; pass += 1) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("无法压缩图片");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0, width, height);
+    for (const quality of qualities) {
+      const blob = await canvasToJpegBlob(canvas, quality);
+      best = blob;
+      if (blob.size <= DROP_IMAGE_INLINE_MAX_BYTES) {
+        return {
+          dataUrl: await blobToDataUrl(blob),
+          noteSizeKb: Math.round(blob.size / 1024),
+          compressed: true,
+        };
+      }
+    }
+    width = Math.max(1, Math.round(width * 0.75));
+    height = Math.max(1, Math.round(height * 0.75));
+  }
+
+  if (!best) throw new Error("图片压缩失败");
+  return {
+    dataUrl: await blobToDataUrl(best),
+    noteSizeKb: Math.round(best.size / 1024),
+    compressed: true,
+  };
+}
+
 /**
  * 输入框附件（bug#1/#2）：拖入/选择/粘贴的文件先以「芯片」形式展示在
  * 输入框上方，发送时才把 content 拼接进消息正文。
@@ -426,24 +522,26 @@ async function buildAttachmentsFromFiles(
     }
 
     if (file.type.startsWith("image/")) {
-      if (file.size > DROP_IMAGE_INLINE_MAX_BYTES) {
+      if (file.size > DROP_IMAGE_SOURCE_MAX_BYTES) {
         items.push({
           id: nextAttachmentId(),
           name: displayName,
           kind: "image",
-          content: `[图片: ${displayName} · ${sizeKb} KB — 超过 ${Math.round(DROP_IMAGE_INLINE_MAX_BYTES / 1024)} KB 上限未嵌入；请缩小后再添加或改用文字描述。]`,
-          note: `${sizeKb} KB · 超限未嵌入`,
+          content: `[图片: ${displayName} · ${sizeKb} KB — 超过 ${Math.round(DROP_IMAGE_SOURCE_MAX_BYTES / 1024 / 1024)} MB 读取上限。]`,
+          note: `${sizeKb} KB · 过大未读取`,
         });
         continue;
       }
       try {
-        const dataUrl = await readFileAsDataURL(file);
+        const inline = await compressImageForInline(file);
         items.push({
           id: nextAttachmentId(),
           name: displayName,
           kind: "image",
-          content: `![${escapeMarkdownImageAlt(displayName)}](${dataUrl})`,
-          note: `${sizeKb} KB`,
+          content: `![${escapeMarkdownImageAlt(displayName)}](${inline.dataUrl})`,
+          note: inline.compressed
+            ? `${sizeKb} KB → ${inline.noteSizeKb} KB · 已压缩嵌入`
+            : `${inline.noteSizeKb} KB`,
         });
       } catch {
         items.push({

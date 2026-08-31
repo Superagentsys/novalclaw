@@ -46,6 +46,16 @@ pub async fn save_messages(
     write_events(&path, &events).await
 }
 
+pub async fn delete_messages(workspace_dir: &Path, session_key: &str) -> Result<bool> {
+    let path = session_log_path(workspace_dir, session_key);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to delete session log {}", path.display())),
+    }
+}
+
 async fn write_events(path: &Path, events: &[SessionEvent]) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -85,6 +95,30 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].content, "ping");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn delete_messages_removes_jsonl() {
+        let dir = std::env::temp_dir().join(format!("omninova-session-{}", uuid::Uuid::new_v4()));
+        let messages = vec![ChatMessage::user("keep-me-out")];
+        save_messages(&dir, "web:omninova-chat-session", &messages)
+            .await
+            .expect("save");
+        assert!(
+            delete_messages(&dir, "web:omninova-chat-session")
+                .await
+                .expect("delete")
+        );
+        let loaded = load_messages(&dir, "web:omninova-chat-session")
+            .await
+            .expect("load after delete");
+        assert!(loaded.is_none());
+        assert!(
+            !delete_messages(&dir, "web:omninova-chat-session")
+                .await
+                .expect("delete missing")
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

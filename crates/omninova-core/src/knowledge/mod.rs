@@ -27,6 +27,50 @@ mod tests {
             .any(|c| c.heading.as_deref() == Some("Details")));
     }
 
+    #[test]
+    fn keeps_hash_prefix_lines_in_searchable_body() {
+        let text = [
+            "# Guide",
+            "",
+            "#include <stdio.h>",
+            "#define MAX 8",
+            "#!/usr/bin/env bash",
+            "# 这是紧挨着代码的脚本注释",
+            "echo hi",
+            "#话题标签不要当标题",
+            "# include still looks like C",
+        ]
+        .join("\n");
+        let chunks = chunk_text(&text);
+        let blob: String = chunks
+            .iter()
+            .map(|chunk| {
+                format!(
+                    "{} {}",
+                    chunk.heading.clone().unwrap_or_default(),
+                    chunk.text
+                )
+            })
+            .collect();
+        assert!(chunks.iter().any(|c| c.heading.as_deref() == Some("Guide")));
+        assert!(blob.contains("#include <stdio.h>"));
+        assert!(blob.contains("#define MAX 8"));
+        assert!(blob.contains("#!/usr/bin/env bash"));
+        assert!(blob.contains("#话题标签不要当标题"));
+        assert!(blob.contains("# 这是紧挨着代码的脚本注释"));
+        assert!(blob.contains("echo hi"));
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("include <stdio.h>"))
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("话题标签不要当标题"))
+        );
+    }
+
     #[tokio::test]
     async fn stores_and_searches_a_note() {
         let dir = std::env::temp_dir().join(format!(

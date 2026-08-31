@@ -1,6 +1,10 @@
-import React, { useMemo, useCallback } from "react";
+import React, { useMemo, useCallback, useEffect, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { type AgentPersonaConfig, MBTI_TYPES } from "../../types/config";
+import {
+  type AgentPersonaConfig,
+  applyMbtiPersonaPrompt,
+  MBTI_TYPES,
+} from "../../types/config";
 import { UiIcon } from "../UiIcon";
 
 interface Props {
@@ -14,6 +18,21 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
       ? MBTI_TYPES[config.mbti_type]
       : null;
   }, [config.mbti_type]);
+
+  const stackedPersonaCleaned = useRef(false);
+  useEffect(() => {
+    if (stackedPersonaCleaned.current) return;
+    const prompt = config.system_prompt || "";
+    const stacked = Object.keys(MBTI_TYPES).filter((code) =>
+      new RegExp(`You are an ${code}\\b`).test(prompt),
+    );
+    if (stacked.length <= 1) return;
+    stackedPersonaCleaned.current = true;
+    onChange({
+      ...config,
+      system_prompt: applyMbtiPersonaPrompt(prompt, config.mbti_type) || undefined,
+    });
+  }, [config, onChange]);
 
   const handlePickWorkspaceDir = useCallback(async () => {
     try {
@@ -36,29 +55,28 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
 
   const handleMBTIChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const code = e.target.value;
+    const nextPrompt = applyMbtiPersonaPrompt(config.system_prompt || "", code || undefined);
     if (!code) {
-      onChange({ ...config, mbti_type: undefined });
+      onChange({
+        ...config,
+        mbti_type: undefined,
+        system_prompt: nextPrompt || undefined,
+      });
       return;
     }
 
-    const mbti = MBTI_TYPES[code];
-    if (mbti) {
-      // If there's already a system prompt, we might want to append or confirm replacement
-      // For now, let's just append if it's not already there, or replace if empty
-      let newPrompt = config.system_prompt || "";
-      
-      // Simple check to avoid duplicating the template if it's already somewhat present
-      if (!newPrompt.includes(mbti.name)) {
-        newPrompt = mbti.system_prompt_template + "\n\n" + newPrompt;
-      }
-      
+    if (MBTI_TYPES[code]) {
       onChange({
         ...config,
         mbti_type: code,
-        system_prompt: newPrompt.trim(),
+        system_prompt: nextPrompt,
       });
     } else {
-      onChange({ ...config, mbti_type: undefined });
+      onChange({
+        ...config,
+        mbti_type: undefined,
+        system_prompt: nextPrompt || undefined,
+      });
     }
   };
 
@@ -223,7 +241,7 @@ export const PersonaConfigForm: React.FC<Props> = ({ config, onChange }) => {
           aria-describedby="persona-system-prompt-help"
         />
         <p className="persona-help" id="persona-system-prompt-help">
-          定义 Agent 的行为、语气和核心指令。选择 MBTI 类型会自动填充建议的 Prompt。
+          定义 Agent 的行为、语气和核心指令。切换 MBTI 会替换上一套人格提示词，并保留你自己写的内容。
         </p>
       </div>
 

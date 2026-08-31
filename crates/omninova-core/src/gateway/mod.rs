@@ -2728,8 +2728,9 @@ impl GatewayRuntime {
         }
     }
 
-    /// ????????????????????????????
-    /// ????????????
+    /// Remove the session from memory, the sessions.json index, and the JSONL log.
+    /// The log is the source of truth for history replay; leaving it behind would
+    /// resurrect a deleted chat on the next load.
     pub async fn delete_session(
         &self,
         channel: &ChannelKind,
@@ -2738,21 +2739,20 @@ impl GatewayRuntime {
         let cfg = self.config.read().await.clone();
         let key = session_key(channel, session_id);
 
-        // ?????
         {
             let mut tree = self.session_tree.write().await;
             tree.remove(&key);
         }
 
-        // ?????
         let path = session_store_path(&cfg);
         let mut store = load_session_store(&path).await?.store;
-        let removed = store.sessions.remove(&key).is_some();
-        if removed {
+        let removed_index = store.sessions.remove(&key).is_some();
+        if removed_index {
             let serialized = serde_json::to_string_pretty(&store)?;
             atomic_write_string(&path, &serialized).await?;
         }
-        Ok(removed)
+        let removed_log = crate::session::delete_messages(&cfg.workspace_dir, &key).await?;
+        Ok(removed_index || removed_log)
     }
 
     pub async fn session_tree_snapshot_filtered(

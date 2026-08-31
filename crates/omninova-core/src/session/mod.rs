@@ -9,7 +9,7 @@ mod store;
 mod types;
 
 pub use log::{derive_messages, events_from_messages, repair_unclosed_tools};
-pub use store::{load_messages, save_messages, session_log_path};
+pub use store::{delete_messages, load_messages, save_messages, session_log_path};
 pub use types::{SessionEvent, SessionEventKind};
 
 use crate::agent::history::{CHECKPOINT_MARKER, SUMMARY_MARKER, TASK_MARKER};

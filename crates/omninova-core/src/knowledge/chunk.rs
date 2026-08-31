@@ -43,16 +43,18 @@ fn split_markdown_sections(text: &str) -> Vec<(Option<String>, String)> {
     let mut sections = Vec::new();
     let mut heading: Option<String> = None;
     let mut body = String::new();
-    for line in text.lines() {
-        let stripped = line.trim_start();
-        if let Some(rest) = stripped.strip_prefix('#') {
-            let hashes = rest.chars().take_while(|c| *c == '#').count() + 1;
-            let title = rest[hashes.saturating_sub(1)..].trim();
-            if hashes <= 6 && !title.is_empty() && stripped.starts_with('#') {
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let followed_by_blank_or_end = match lines.get(index + 1) {
+            None => true,
+            Some(next) => next.trim().is_empty(),
+        };
+        if followed_by_blank_or_end {
+            if let Some(title) = atx_heading_title(line) {
                 if !body.trim().is_empty() || heading.is_some() {
                     sections.push((heading.take(), std::mem::take(&mut body)));
                 }
-                heading = Some(title.trim_start_matches('#').trim().to_string());
+                heading = Some(title);
                 continue;
             }
         }
@@ -66,6 +68,53 @@ fn split_markdown_sections(text: &str) -> Vec<(Option<String>, String)> {
         sections.push((None, text.to_string()));
     }
     sections
+}
+
+/// CommonMark ATX heading only: 0–3 space indent, 1–6 `#`, then space/tab
+/// (or end of line). `#include`, `#!/bin/sh`, `#话题` stay in the body.
+fn atx_heading_title(line: &str) -> Option<String> {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let stripped = line.trim_start_matches(' ');
+    if stripped.starts_with('\t') {
+        return None;
+    }
+    let rest = stripped.strip_prefix('#')?;
+    let extra = rest.chars().take_while(|c| *c == '#').count();
+    let hashes = extra + 1;
+    if hashes > 6 {
+        return None;
+    }
+    let after: String = rest.chars().skip(extra).collect();
+    if !after.is_empty() {
+        let first = after.chars().next()?;
+        if first != ' ' && first != '\t' {
+            return None;
+        }
+    }
+    let mut title = after.trim_matches([' ', '\t']).to_string();
+    if let Some((plain, closing)) = title.rsplit_once(" #") {
+        if closing.chars().all(|c| c == '#' || c == ' ' || c == '\t') {
+            title = plain.trim_end().to_string();
+        }
+    }
+    if title.is_empty() {
+        return None;
+    }
+    let first_word = title.split_whitespace().next().unwrap_or("");
+    const PREPROCESSOR: &[&str] = &[
+        "include", "define", "ifdef", "ifndef", "endif", "pragma", "undef", "elif", "error",
+        "warning", "line",
+    ];
+    if PREPROCESSOR
+        .iter()
+        .any(|word| first_word.eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    Some(title)
 }
 
 fn window_paragraphs(heading: Option<String>, body: &str) -> Vec<Chunk> {

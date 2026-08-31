@@ -1149,3 +1149,41 @@ Your thinking is enthusiastic, social, and spontaneous.
 - Your goal is to entertain and bring joy to the interaction.`
   }
 };
+
+/** Remove every built-in MBTI persona block so switching types cannot stack personalities. */
+export function stripMbtiPersonaFromPrompt(prompt: string): string {
+  let remaining = prompt;
+  remaining = remaining.replace(
+    /<!--\s*omninova-mbti:[A-Z]{4}\s*-->[\s\S]*?<!--\s*\/omninova-mbti\s*-->/gi,
+    "",
+  );
+  const templates = Object.values(MBTI_TYPES)
+    .map((item) => item.system_prompt_template.trim())
+    .sort((a, b) => b.length - a.length);
+  for (const template of templates) {
+    remaining = remaining.split(template).join("");
+  }
+  const codes = Object.keys(MBTI_TYPES).join("|");
+  const leftoverBlock = new RegExp(
+    String.raw`(?:^|\n+)You are an (?:${codes}) \([^)]+\)\.\nYour thinking is [^\n]+\n(?:- [^\n]+\n){3,8}(?:Your goal is [^\n]+\n?)?`,
+    "g",
+  );
+  remaining = remaining.replace(leftoverBlock, "\n");
+  return remaining.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** Replace (not append) the MBTI template; keep the user's custom instructions. */
+export function applyMbtiPersonaPrompt(
+  currentPrompt: string,
+  nextCode: string | undefined,
+): string {
+  const custom = stripMbtiPersonaFromPrompt(currentPrompt);
+  if (!nextCode) {
+    return custom;
+  }
+  const mbti = MBTI_TYPES[nextCode];
+  if (!mbti) {
+    return custom;
+  }
+  return custom ? `${mbti.system_prompt_template}\n\n${custom}` : mbti.system_prompt_template;
+}

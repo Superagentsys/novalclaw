@@ -1,6 +1,9 @@
 //! 聊天输入框附件：按本地路径读取内容（Tauri 拖放 / 系统文件对话框）。
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, ExtendedColorType, GenericImageView};
 use serde::Serialize;
 use std::{
     fs::File,
@@ -12,7 +15,9 @@ use zip::ZipArchive;
 
 const MAX_FILES: usize = 16;
 const MAX_TEXT_BYTES: u64 = 512 * 1024;
-const MAX_IMAGE_BYTES: u64 = 256 * 1024;
+const MAX_IMAGE_SOURCE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_IMAGE_INLINE_BYTES: usize = 400 * 1024;
+const MAX_IMAGE_DIMENSION_PX: u32 = 1600;
 const MAX_OFFICE_TEXT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -115,6 +120,90 @@ fn image_mime(ext: &str) -> &'static str {
         "heif" => "image/heif",
         _ => "application/octet-stream",
     }
+}
+
+fn resize_max_dimension(image: DynamicImage, max_dimension_px: u32) -> DynamicImage {
+    let max_dimension_px = max_dimension_px.max(320);
+    let (width, height) = image.dimensions();
+    let longest = width.max(height);
+    if longest <= max_dimension_px {
+        return image;
+    }
+    let scale = max_dimension_px as f32 / longest as f32;
+    let target_w = ((width as f32) * scale).round().max(1.0) as u32;
+    let target_h = ((height as f32) * scale).round().max(1.0) as u32;
+    image.resize(target_w, target_h, FilterType::Triangle)
+}
+
+fn encode_jpeg_bytes(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
+    let rgb = image.to_rgb8();
+    let mut buffer = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| format!("JPEG 编码失败: {error}"))?;
+    Ok(buffer)
+}
+
+struct InlineImage {
+    data_url: String,
+    compressed: bool,
+    encoded_bytes: usize,
+}
+
+fn embed_image_bytes(bytes: &[u8], ext: &str) -> Result<InlineImage, String> {
+    if bytes.len() <= MAX_IMAGE_INLINE_BYTES {
+        return Ok(InlineImage {
+            data_url: format!("data:{};base64,{}", image_mime(ext), STANDARD.encode(bytes)),
+            compressed: false,
+            encoded_bytes: bytes.len(),
+        });
+    }
+
+    let decoded = image::load_from_memory(bytes).map_err(|error| {
+        format!("图片无法解码为可压缩格式（支持 JPEG/PNG）：{error}")
+    })?;
+    let mut current = resize_max_dimension(decoded, MAX_IMAGE_DIMENSION_PX);
+    let qualities = [82_u8, 70, 58, 45];
+    let mut best: Option<Vec<u8>> = None;
+    for _ in 0..3 {
+        for quality in qualities {
+            let encoded = encode_jpeg_bytes(&current, quality)?;
+            let small_enough = encoded.len() <= MAX_IMAGE_INLINE_BYTES;
+            best = Some(encoded);
+            if small_enough {
+                let encoded = best.expect("JPEG just encoded");
+                let encoded_bytes = encoded.len();
+                return Ok(InlineImage {
+                    data_url: format!("data:image/jpeg;base64,{}", STANDARD.encode(encoded)),
+                    compressed: true,
+                    encoded_bytes,
+                });
+            }
+        }
+        let (width, height) = current.dimensions();
+        current = current.resize(
+            (width as f32 * 0.75).round().max(1.0) as u32,
+            (height as f32 * 0.75).round().max(1.0) as u32,
+            FilterType::Triangle,
+        );
+    }
+    let encoded = best.ok_or_else(|| "图片压缩失败".to_string())?;
+    let encoded_bytes = encoded.len();
+    Ok(InlineImage {
+        data_url: format!("data:image/jpeg;base64,{}", STANDARD.encode(encoded)),
+        compressed: true,
+        encoded_bytes,
+    })
+}
+
+fn markdown_image(name: &str, data_url: &str) -> String {
+    format!("![{}]({data_url})", escape_markdown_alt(name))
 }
 
 fn escape_markdown_alt(text: &str) -> String {
@@ -326,17 +415,39 @@ async fn prepare_path_attachment(
         size
     );
     let note;
-    if is_image_extension(&ext) && size <= MAX_IMAGE_BYTES {
-        let bytes = tokio::fs::read(&source)
-            .await
-            .map_err(|error| error.to_string())?;
-        content.push_str(&format!(
-            "\n\n![{}](data:{};base64,{})",
-            escape_markdown_alt(&name),
-            image_mime(&ext),
-            STANDARD.encode(bytes)
-        ));
-        note = format!("已挂载 · {} KB · 图片已嵌入", size.div_ceil(1024));
+    if is_image_extension(&ext) {
+        if size > MAX_IMAGE_SOURCE_BYTES {
+            content.push_str("\n\n内容未内嵌（超过 25MB），请使用工作区文件工具读取上面的已挂载路径。");
+            note = format!("已挂载 · {} KB · 过大未嵌入", size.div_ceil(1024));
+        } else {
+            match tokio::fs::read(&source).await {
+                Ok(bytes) => match embed_image_bytes(&bytes, &ext) {
+                    Ok(inline) => {
+                        content.push_str("\n\n");
+                        content.push_str(&markdown_image(&name, &inline.data_url));
+                        note = if inline.compressed {
+                            format!(
+                                "已挂载 · {} KB → {} KB · 已压缩嵌入",
+                                size.div_ceil(1024),
+                                inline.encoded_bytes.div_ceil(1024)
+                            )
+                        } else {
+                            format!("已挂载 · {} KB · 图片已嵌入", size.div_ceil(1024))
+                        };
+                    }
+                    Err(reason) => {
+                        content.push_str(&format!(
+                            "\n\n图片未能嵌入：{reason}；仍可通过 Workspace 路径使用工具读取原文件。"
+                        ));
+                        note = format!("已挂载 · {} KB · 可由工具读取", size.div_ceil(1024));
+                    }
+                },
+                Err(error) => {
+                    content.push_str(&format!("\n\n图片读取失败：{error}"));
+                    note = format!("已挂载 · {} KB · 读取失败", size.div_ceil(1024));
+                }
+            }
+        }
     } else if is_text_extension(&ext) && size <= MAX_TEXT_BYTES {
         let bytes = tokio::fs::read(&source)
             .await
@@ -401,19 +512,17 @@ async fn format_path_attachment(path: PathBuf) -> String {
     }
 
     if is_image_extension(&ext) {
-        if size > MAX_IMAGE_BYTES {
+        if size > MAX_IMAGE_SOURCE_BYTES {
             return format!(
-                "\n\n[图片: {name} · {} KB — 超过 {} KB 上限未嵌入；请缩小后再添加。]",
-                size / 1024,
-                MAX_IMAGE_BYTES / 1024
+                "\n\n[图片: {name} · {} KB — 超过 25MB 读取上限未嵌入。]",
+                size / 1024
             );
         }
         match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                let mime = image_mime(&ext);
-                let data_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
-                format!("\n\n![{}]({data_url})", escape_markdown_alt(&name))
-            }
+            Ok(bytes) => match embed_image_bytes(&bytes, &ext) {
+                Ok(inline) => format!("\n\n{}", markdown_image(&name, &inline.data_url)),
+                Err(reason) => format!("\n\n[图片未能嵌入: {name} — {reason}]"),
+            },
             Err(e) => format!("\n\n[图片读取失败: {name} — {e}]"),
         }
     } else if is_text_extension(&ext) {
@@ -485,4 +594,50 @@ pub async fn prepare_composer_attachments(
         prepared.push(prepare_path_attachment(raw, workspace.clone(), &session_id, index).await?);
     }
     Ok(prepared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+
+    fn noisy_png(width: u32, height: u32) -> Vec<u8> {
+        let mut img = RgbImage::new(width, height);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = Rgb([
+                (x.wrapping_mul(37) % 256) as u8,
+                (y.wrapping_mul(91) % 256) as u8,
+                ((x + y).wrapping_mul(13) % 256) as u8,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        bytes
+    }
+
+    #[test]
+    fn small_images_stay_original() {
+        let bytes = noisy_png(24, 16);
+        assert!(bytes.len() <= MAX_IMAGE_INLINE_BYTES);
+        let inline = embed_image_bytes(&bytes, "png").expect("embed");
+        assert!(!inline.compressed);
+        assert!(inline.data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn large_images_are_compressed_instead_of_dropped() {
+        let bytes = noisy_png(1400, 1000);
+        assert!(
+            bytes.len() > MAX_IMAGE_INLINE_BYTES,
+            "fixture should exceed inline cap, got {}",
+            bytes.len()
+        );
+        let inline = embed_image_bytes(&bytes, "png").expect("compress");
+        assert!(inline.compressed);
+        assert!(inline.data_url.starts_with("data:image/jpeg;base64,"));
+        assert!(inline.encoded_bytes <= MAX_IMAGE_INLINE_BYTES);
+    }
 }
