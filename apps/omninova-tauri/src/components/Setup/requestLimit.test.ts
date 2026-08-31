@@ -84,7 +84,7 @@ describe("R2.3.1 request output limit validation", () => {
 
   it("requestLimitError returns concise messages", () => {
     assert.equal(requestLimitError("abc", 384000), "请输入正整数 Token 数。");
-    assert.equal(requestLimitError("0", 384000), "请输入大于 0 的 Token 数；留空表示自动 / 未限制。");
+    assert.equal(requestLimitError("0", 384000), "请输入大于 0 的 Token 数；留空表示使用 OmniNova 默认策略。");
     assert.equal(requestLimitError("384001", 384000), "不能超过模型最大输出上限 384K。");
     assert.equal(requestLimitError("", 384000), null);
   });

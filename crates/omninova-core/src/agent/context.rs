@@ -72,6 +72,7 @@ pub async fn maintain_context(
     tool_specs: &[ToolSpec],
     max_history_messages: usize,
     compact_context: bool,
+    request_max_output_tokens: Option<u32>,
 ) -> Vec<ChatMessage> {
     maintain_context_with_mode(
         provider,
@@ -80,6 +81,7 @@ pub async fn maintain_context(
         max_history_messages,
         compact_context,
         ContextMaintenanceMode::Normal,
+        request_max_output_tokens,
     )
     .await
 }
@@ -95,6 +97,7 @@ pub async fn force_context_recovery(
     messages: Vec<ChatMessage>,
     tool_specs: &[ToolSpec],
     max_history_messages: usize,
+    request_max_output_tokens: Option<u32>,
 ) -> Vec<ChatMessage> {
     maintain_context_with_mode(
         provider,
@@ -103,6 +106,7 @@ pub async fn force_context_recovery(
         max_history_messages,
         true,
         ContextMaintenanceMode::ForcedOverflowRecovery,
+        request_max_output_tokens,
     )
     .await
 }
@@ -114,9 +118,13 @@ async fn maintain_context_with_mode(
     max_history_messages: usize,
     compact_context: bool,
     mode: ContextMaintenanceMode,
+    request_max_output_tokens: Option<u32>,
 ) -> Vec<ChatMessage> {
     let forced = mode == ContextMaintenanceMode::ForcedOverflowRecovery;
-    let Some(budget) = provider.context_budget() else {
+    let request_budget = provider
+        .context_budget()
+        .map(|budget| budget.with_request_generation_override(request_max_output_tokens));
+    let Some(budget) = request_budget else {
         let estimator = TokenEstimator::new();
         let mut messages = normalize_transient_system_messages(messages);
         let before = estimator.estimate_messages_with_tools(&messages, tool_specs);
@@ -179,7 +187,7 @@ async fn maintain_context_with_mode(
             crate::observability::emit_candidate_usage(
                 &current,
                 tool_specs,
-                provider.context_budget().as_ref(),
+                None,
             );
             if pruned_count > 0 {
                 tracing::info!(
@@ -235,6 +243,7 @@ async fn maintain_context_with_mode(
                 .chat(ChatRequest {
                     messages: &request_messages,
                     tools: None,
+                    request_max_output_tokens,
                 })
                 .await
             {
@@ -269,7 +278,7 @@ async fn maintain_context_with_mode(
         crate::observability::emit_candidate_usage(
             &compacted,
             tool_specs,
-            provider.context_budget().as_ref(),
+            None,
         );
         return compacted;
     };
@@ -338,7 +347,7 @@ async fn maintain_context_with_mode(
     crate::observability::emit_candidate_usage(
         &current,
         tool_specs,
-        provider.context_budget().as_ref(),
+        Some(&budget),
     );
     if pruned_count > 0 {
         tracing::info!(
@@ -405,10 +414,11 @@ async fn maintain_context_with_mode(
             let summary = {
                 let _pause_snapshots = pause_usage_snapshots();
                 match provider
-                    .chat(ChatRequest {
-                        messages: &request_messages,
-                        tools: None,
-                    })
+                .chat(ChatRequest {
+                    messages: &request_messages,
+                    tools: None,
+                    request_max_output_tokens,
+                })
                     .await
                 {
                     Ok(response) => response.text.unwrap_or_default(),
@@ -492,7 +502,7 @@ async fn maintain_context_with_mode(
             crate::observability::emit_candidate_usage(
                 &current,
                 tool_specs,
-                provider.context_budget().as_ref(),
+                Some(&budget),
             );
             if after_compact <= budget.target_after_compaction() {
                 break;
@@ -780,6 +790,7 @@ mod tests {
             &[],
             10,
             true,
+            None,
         ).await;
         let pruned = out.iter().any(|m| m.content.contains("[Tool output pruned from model context]"));
         let has_checkpoint = out.iter().any(|m| m.content.starts_with("[检查点]"));
@@ -806,7 +817,7 @@ mod tests {
         assert!(messages.len() <= 50);
         let estimator = TokenEstimator::new();
         let before = estimator.estimate_messages_with_tools(&messages, &[]);
-        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let out = maintain_context(&provider, messages, &[], 50, true, None).await;
         let after = estimator.estimate_messages_with_tools(&out, &[]);
         assert!(out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
         assert!(after < before);
@@ -823,7 +834,7 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"call-1","content":"small result"}"#.to_string()),
             ChatMessage::assistant("continue"),
         ];
-        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let out = maintain_context(&provider, messages, &[], 50, true, None).await;
         assert!(!out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
         assert!(summaries.lock().unwrap().is_empty());
     }
@@ -837,7 +848,7 @@ mod tests {
             messages.push(ChatMessage::assistant(format!("a{i}")));
         }
         assert!(messages.len() > 50);
-        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let out = maintain_context(&provider, messages, &[], 50, true, None).await;
         assert!(out.len() < 122, "count-based compaction should shrink history");
         assert!(summaries.lock().unwrap().len() >= 1);
     }
@@ -856,7 +867,7 @@ mod tests {
             ChatMessage::assistant("continue"),
         ];
         let before_content = messages[2].content.clone();
-        let out = maintain_context(&provider, messages, &[], 50, true).await;
+        let out = maintain_context(&provider, messages, &[], 50, true, None).await;
         let out_tool = out.iter().find(|m| m.role == "tool").expect("tool remains");
         assert_eq!(out_tool.content, before_content);
         assert_eq!(out_tool.original_tool_content.as_deref(), Some(huge.as_str()));
@@ -874,7 +885,7 @@ mod tests {
         messages.push(ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-1","name":"big_tool","arguments":"{}"}]}"#));
         messages.push(ChatMessage::tool(format!(r#"{{"tool_call_id":"call-1","content":"{huge}"}}"#)));
         messages.push(ChatMessage::assistant("continue"));
-        let out = force_context_recovery(&provider, messages, &[], 50).await;
+        let out = force_context_recovery(&provider, messages, &[], 50, None).await;
         assert!(out.iter().any(|m| m.content.contains("[Tool output pruned from model context]")));
         assert!(summaries.lock().unwrap().len() >= 1, "forced recovery should run structured compaction");
     }
@@ -889,7 +900,7 @@ mod tests {
         }
         let estimator = TokenEstimator::new();
         let before = estimator.estimate_messages_with_tools(&messages, &[]);
-        let out = force_context_recovery(&provider, messages, &[], 50).await;
+        let out = force_context_recovery(&provider, messages, &[], 50, None).await;
         let after = estimator.estimate_messages_with_tools(&out, &[]);
         assert!(summaries.lock().unwrap().len() >= 1);
         assert!(after < before);
@@ -946,7 +957,7 @@ mod tests {
         )));
         messages.push(ChatMessage::assistant("continue"));
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 50, true).await
+            maintain_context(&provider, messages, &[], 50, true, None).await
         })
         .await;
         let names: Vec<_> = sink.events().iter().map(kind_name).collect();
@@ -979,7 +990,7 @@ mod tests {
             messages.push(ChatMessage::assistant(format!("a{i}")));
         }
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 50, true).await
+            maintain_context(&provider, messages, &[], 50, true, None).await
         })
         .await;
         assert!(summaries.lock().unwrap().len() >= 1);
@@ -1112,7 +1123,7 @@ mod tests {
         };
         let messages = pressure_messages();
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 10, true).await
+            maintain_context(&provider, messages, &[], 10, true, None).await
         })
         .await;
         let events = sink.events();
@@ -1150,7 +1161,7 @@ mod tests {
         };
         let messages = pressure_messages();
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 10, true).await
+            maintain_context(&provider, messages, &[], 10, true, None).await
         })
         .await;
         let events = sink.events();
@@ -1195,7 +1206,7 @@ mod tests {
         messages.push(ChatMessage::assistant("continue"));
         let before = TokenEstimator::new().estimate_messages_with_tools(&messages, &[]);
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 50, true).await
+            maintain_context(&provider, messages, &[], 50, true, None).await
         })
         .await;
         let candidates: Vec<_> = sink
@@ -1226,7 +1237,7 @@ mod tests {
         }
         let before = TokenEstimator::new().estimate_messages_with_tools(&messages, &[]);
         let (sink, _out) = with_recorded_telemetry(|| async {
-            maintain_context(&provider, messages, &[], 50, true).await
+            maintain_context(&provider, messages, &[], 50, true, None).await
         })
         .await;
         let candidates: Vec<_> = sink

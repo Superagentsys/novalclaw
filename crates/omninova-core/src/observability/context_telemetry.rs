@@ -80,6 +80,8 @@ pub struct ContextUsageSnapshot {
     pub model_max_output_tokens: Option<u64>,
     #[serde(default)]
     pub request_output_reserve_tokens: Option<u64>,
+    #[serde(default)]
+    pub request_generation_limit_source: Option<String>,
     pub safety_reserve_tokens: Option<u64>,
     pub pressure_threshold_tokens: Option<u64>,
     pub budget_source: Option<String>,
@@ -149,6 +151,8 @@ pub fn build_snapshot(
     let output_reserve_tokens = budget.map(|b| b.output_reserve_tokens);
     let model_max_output_tokens = budget.and_then(|b| b.model_max_output_tokens);
     let request_output_reserve_tokens = budget.map(|b| b.request_output_reserve_tokens);
+    let request_generation_limit_source =
+        budget.map(|b| b.request_generation_limit_source.as_str().to_string());
     let safety_reserve_tokens = budget.map(|b| b.safety_reserve_tokens);
     let pressure_threshold_tokens = budget.map(|b| b.pressure_threshold());
     let budget_source = budget.map(|b| b.source.as_str().to_string());
@@ -182,6 +186,7 @@ pub fn build_snapshot(
         output_reserve_tokens,
         model_max_output_tokens,
         request_output_reserve_tokens,
+        request_generation_limit_source,
         safety_reserve_tokens,
         pressure_threshold_tokens,
         budget_source,

@@ -1,5 +1,8 @@
 use crate::config::{Config, ModelProviderConfig, ProviderConfig};
 use crate::providers::context_budget::resolve_context_budget;
+use crate::providers::generation_limit::{
+    resolve_generation_limit, ResolvedGenerationLimit,
+};
 use crate::providers::model_capabilities::{
     resolve_model_capabilities_with_endpoint, ProviderCountApiKind, TokenStrategy,
 };
@@ -44,25 +47,20 @@ const OPENAI_COMPATIBLE: &[&str] = &[
     "custom",
 ];
 
-/// Resolves the per-request generation cap from profile config.
-///
-/// `None` or `0` means no request limit is configured. A known cap is clamped
-/// to the model maximum when that capability is known. This never invents a
-/// default merely to enlarge the input budget.
+/// Resolves the per-request generation cap from profile config, then the
+/// OmniNova product default, clamped to the model maximum when known.
 pub fn resolve_request_generation_limit(
     profile: Option<&ModelProviderConfig>,
     model_max_output_tokens: Option<u64>,
 ) -> Option<u32> {
-    let configured = profile
-        .and_then(|item| item.request_max_output_tokens)
-        .filter(|value| *value > 0)?;
-    let effective = match model_max_output_tokens.filter(|value| *value > 0) {
-        Some(model_max) => configured.min(model_max),
-        None => configured,
-    };
-    u32::try_from(effective.min(u64::from(u32::MAX)))
-        .ok()
-        .filter(|value| *value > 0)
+    resolve_generation_limit(profile, model_max_output_tokens).native_max_tokens()
+}
+
+fn resolve_runtime_generation_limit(
+    profile: Option<&ModelProviderConfig>,
+    model_max_output_tokens: Option<u64>,
+) -> ResolvedGenerationLimit {
+    resolve_generation_limit(profile, model_max_output_tokens)
 }
 
 pub fn build_provider_from_config(config: &Config) -> Box<dyn Provider> {
@@ -128,12 +126,13 @@ pub fn build_provider_with_selection(
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
     let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
     let context_budget = resolve_context_budget(config, &model, profile);
-    let request_max_tokens = resolve_request_generation_limit(
+    let generation_limit = resolve_runtime_generation_limit(
         profile,
         context_budget
             .as_ref()
             .and_then(|budget| budget.model_max_output_tokens),
     );
+    let request_max_tokens = generation_limit.native_max_tokens();
     let exact_tokenizer =
         resolve_exact_tokenizer_name(&model, profile, base_url.as_deref()).map(str::to_string);
     let anthropic_count_trusted = matches!(
@@ -154,6 +153,7 @@ pub fn build_provider_with_selection(
             )
             .with_transport_mode(transport_mode)
             .with_context_budget(context_budget)
+            .with_generation_limit_source(generation_limit.source)
             .with_exact_tokenizer(exact_tokenizer)
             .with_anthropic_count_trusted(anthropic_count_trusted),
         ),
@@ -168,6 +168,7 @@ pub fn build_provider_with_selection(
             )
             .with_transport_mode(transport_mode)
             .with_context_budget(context_budget)
+            .with_generation_limit_source(generation_limit.source)
             .with_exact_tokenizer(exact_tokenizer),
         ),
         "mock" => Box::new(MockProvider::new("mock-provider")),
@@ -187,6 +188,7 @@ pub fn build_provider_with_selection(
                 )
                 .with_transport_mode(transport_mode)
                 .with_context_budget(context_budget)
+                .with_generation_limit_source(generation_limit.source)
                 .with_exact_tokenizer(exact_tokenizer),
             )
         }
@@ -201,6 +203,7 @@ pub fn build_provider_with_selection(
             )
             .with_transport_mode(transport_mode)
             .with_context_budget(context_budget)
+            .with_generation_limit_source(generation_limit.source)
             .with_exact_tokenizer(exact_tokenizer),
         ),
         _ => Box::new(MockProvider::new(format!("unknown-provider:{provider_name}"))),
@@ -516,6 +519,7 @@ mod tests {
             .chat(crate::providers::ChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             })
             .await
             .expect_err("blocked selection must fail locally without HTTP");
@@ -666,7 +670,11 @@ mod tests {
         let budget = provider.context_budget().expect("flash budget");
         assert_eq!(budget.context_window_tokens, 1_000_000);
         assert_eq!(budget.model_max_output_tokens, Some(384_000));
-        assert_eq!(budget.output_reserve_tokens, 384_000);
+        assert_eq!(budget.output_reserve_tokens, 32_000);
+        assert_eq!(
+            budget.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
     }
 
     #[test]
@@ -757,6 +765,10 @@ mod tests {
         let budget = provider.context_budget().expect("flash budget");
         assert_eq!(budget.request_output_reserve_tokens, 32_000);
         assert_eq!(budget.output_reserve_tokens, 32_000);
+        assert_eq!(
+            budget.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProfileOverride
+        );
     }
 
     #[test]
@@ -805,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn r21_e_missing_request_limit_stays_uncapped_and_conservative() {
+    fn r21_e_missing_request_limit_uses_product_default() {
         let provider = build_provider_with_selection(
             &flash_config_with_request_limit(None),
             &ProviderSelection {
@@ -816,22 +828,26 @@ mod tests {
         let profile = ModelProviderConfig::default();
         assert_eq!(
             resolve_request_generation_limit(Some(&profile), Some(384_000)),
-            None
+            Some(32_000)
         );
         let native = crate::providers::native_request::NativeChatRequest {
             model: "deepseek-v4-flash".into(),
             messages: Vec::new(),
             temperature: 0.0,
-            max_tokens: None,
+            max_tokens: Some(32_000),
             tools: None,
             tool_choice: None,
             stream: None,
         };
         let body = serde_json::to_string(&native).unwrap();
-        assert!(!body.contains("max_tokens"));
+        assert!(body.contains("\"max_tokens\":32000"));
         let budget = provider.context_budget().expect("flash budget");
-        assert_eq!(budget.request_output_reserve_tokens, 384_000);
-        assert_eq!(budget.max_input_tokens, 583_232);
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.max_input_tokens, 935_232);
+        assert_eq!(
+            budget.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
     }
 
     #[test]
@@ -859,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn r21_zero_request_limit_is_treated_as_missing() {
+    fn r21_zero_request_limit_is_treated_as_unset_product_default() {
         assert_eq!(
             resolve_request_generation_limit(
                 Some(&ModelProviderConfig {
@@ -868,7 +884,7 @@ mod tests {
                 }),
                 Some(384_000),
             ),
-            None
+            Some(32_000)
         );
         let provider = build_provider_with_selection(
             &flash_config_with_request_limit(Some(0)),
@@ -879,7 +895,11 @@ mod tests {
         );
         assert_eq!(
             provider.context_budget().unwrap().request_output_reserve_tokens,
-            384_000
+            32_000
+        );
+        assert_eq!(
+            provider.context_budget().unwrap().request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
         );
     }
 
@@ -944,6 +964,92 @@ mod tests {
         assert_eq!(gpt.model_max_output_tokens, Some(16_384));
         assert_eq!(gpt.request_output_reserve_tokens, 16_384);
         assert_ne!(flash.max_input_tokens, gpt.max_input_tokens);
+    }
+
+    #[test]
+    fn r24_f_native_request_cap_equals_context_budget_reserve() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(None),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = provider.context_budget().unwrap();
+        let cap = resolve_request_generation_limit(
+            Some(&ModelProviderConfig::default()),
+            Some(384_000),
+        );
+        assert_eq!(cap.map(u64::from), Some(budget.request_output_reserve_tokens));
+        let native = crate::providers::native_request::NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: cap,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        assert_eq!(
+            crate::providers::context_budget::native_request_output_limit_from_json(&body),
+            Some(budget.request_output_reserve_tokens)
+        );
+        assert_eq!(
+            budget.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
+    }
+
+    #[test]
+    fn r24_j_session_open_resolves_product_default_without_profile() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(None),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = provider.context_budget().unwrap();
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.max_input_tokens, 935_232);
+        assert_eq!(
+            budget.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
+    }
+
+    #[test]
+    fn r24_k_model_switch_recomputes_product_default_clamp() {
+        let config = flash_config_with_request_limit(None);
+        let flash = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        )
+        .context_budget()
+        .unwrap();
+        let gpt = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("gpt-4o".into()),
+            },
+        )
+        .context_budget()
+        .unwrap();
+        assert_eq!(flash.request_output_reserve_tokens, 32_000);
+        assert_eq!(
+            flash.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
+        assert_eq!(gpt.request_output_reserve_tokens, 16_384);
+        assert_eq!(
+            gpt.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault
+        );
     }
 }
 

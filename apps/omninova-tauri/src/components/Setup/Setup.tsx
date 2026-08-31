@@ -627,7 +627,7 @@ export function Setup({
         return `${provider.name} 的单次请求最大输出必须是有效的非负整数。`;
       }
       if (value === 0) {
-        return `${provider.name} 的单次请求最大输出不能为 0，请留空表示未限制。`;
+        return `${provider.name} 的单次请求最大输出不能为 0，请留空表示使用 OmniNova 默认策略。`;
       }
       if (provider.max_output_tokens && value > provider.max_output_tokens) {
         return `${provider.name} 的单次请求最大输出不能超过该模型的最大输出上限 ${formatTokenCount(provider.max_output_tokens)}。`;

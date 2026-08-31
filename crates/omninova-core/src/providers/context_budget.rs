@@ -6,6 +6,9 @@
 //! send. This module intentionally does NOT implement compaction or recovery.
 
 use crate::config::{Config, ModelProviderConfig};
+use crate::providers::generation_limit::{
+    GenerationLimitSource, ResolvedGenerationLimit,
+};
 use crate::providers::ChatMessage;
 use crate::tools::ToolSpec;
 
@@ -180,6 +183,7 @@ pub struct ContextBudget {
     pub safety_reserve_tokens: u64,
     pub max_input_tokens: u64,
     pub source: ContextBudgetSource,
+    pub request_generation_limit_source: GenerationLimitSource,
 }
 
 impl ContextBudget {
@@ -202,13 +206,48 @@ impl ContextBudget {
     /// `None` or `0` falls back to the model maximum (conservative). A known
     /// request cap is clamped to the model maximum when that capability is known.
     pub fn with_request_output_cap(self, request_output_cap: Option<u64>) -> Self {
-        Self::from_parts(
+        let source = if request_output_cap.filter(|value| *value > 0).is_some() {
+            match self.request_generation_limit_source {
+                GenerationLimitSource::ModelMaximumFallback => {
+                    GenerationLimitSource::ProfileOverride
+                }
+                other => other,
+            }
+        } else {
+            GenerationLimitSource::ModelMaximumFallback
+        };
+        self.with_resolved_generation_limit(ResolvedGenerationLimit {
+            effective_tokens: request_output_cap.filter(|value| *value > 0),
+            source,
+        })
+    }
+
+    /// Applies an ephemeral request-scoped generation override when present.
+    /// `None` or `0` leaves the existing profile/product policy unchanged.
+    pub fn with_request_generation_override(self, request_override: Option<u32>) -> Self {
+        let Some(tokens) = request_override.map(u64::from).filter(|value| *value > 0) else {
+            return self;
+        };
+        self.with_resolved_generation_limit(
+            crate::providers::generation_limit::resolve_effective_request_generation_limit(
+                Some(tokens),
+                None,
+                None,
+                self.model_max_output_tokens,
+            ),
+        )
+    }
+
+    pub fn with_resolved_generation_limit(self, resolved: ResolvedGenerationLimit) -> Self {
+        let mut next = Self::from_parts(
             self.context_window_tokens,
             self.model_max_output_tokens,
-            request_output_cap,
+            resolved.effective_tokens,
             self.safety_reserve_tokens,
             self.source,
-        )
+        );
+        next.request_generation_limit_source = resolved.source;
+        next
     }
 
     fn from_parts(
@@ -230,6 +269,12 @@ impl ContextBudget {
             safety_reserve_tokens,
             max_input_tokens,
             source,
+            request_generation_limit_source: if request_output_cap.filter(|value| *value > 0).is_some()
+            {
+                GenerationLimitSource::ProfileOverride
+            } else {
+                GenerationLimitSource::ModelMaximumFallback
+            },
         }
     }
 
@@ -569,6 +614,37 @@ mod tests {
             ratio_tokens(dynamic.max_input_tokens, PRESSURE_THRESHOLD_RATIO)
         );
         assert!(dynamic.pressure_threshold() > conservative.pressure_threshold());
+    }
+
+    #[test]
+    fn r241_g_c2_request_override_updates_reserve_and_pressure() {
+        let product = flash_budget().with_resolved_generation_limit(
+            crate::providers::generation_limit::resolve_generation_limit(None, Some(384_000)),
+        );
+        assert_eq!(product.request_output_reserve_tokens, 32_000);
+        assert_eq!(
+            product.request_generation_limit_source,
+            GenerationLimitSource::ProductDefault
+        );
+        let overridden = product.with_request_generation_override(Some(64_000));
+        assert_eq!(overridden.request_output_reserve_tokens, 64_000);
+        assert_eq!(overridden.output_reserve_tokens, 64_000);
+        assert_eq!(overridden.max_input_tokens, 1_000_000 - 64_000 - 32_768);
+        assert_eq!(
+            overridden.request_generation_limit_source,
+            GenerationLimitSource::RequestOverride
+        );
+        assert_eq!(
+            overridden.pressure_threshold(),
+            ratio_tokens(overridden.max_input_tokens, PRESSURE_THRESHOLD_RATIO)
+        );
+        assert!(overridden.pressure_threshold() < product.pressure_threshold());
+        let unchanged = product.with_request_generation_override(None);
+        assert_eq!(unchanged.request_output_reserve_tokens, 32_000);
+        assert_eq!(
+            unchanged.request_generation_limit_source,
+            GenerationLimitSource::ProductDefault
+        );
     }
 
     #[test]

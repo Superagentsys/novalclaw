@@ -30,7 +30,7 @@ export function parseRequestLimitInput(raw: string, modelMax?: number | null): R
   }
   const parsed = Number(trimmed);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    return { status: "invalid", error: "请输入大于 0 的 Token 数；留空表示自动 / 未限制。" };
+    return { status: "invalid", error: "请输入大于 0 的 Token 数；留空表示使用 OmniNova 默认策略。" };
   }
   if (modelMax != null && modelMax > 0 && parsed > modelMax) {
     return {

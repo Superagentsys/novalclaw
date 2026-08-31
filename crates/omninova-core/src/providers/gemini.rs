@@ -32,6 +32,14 @@ impl GeminiProvider {
         self
     }
 
+    pub fn with_generation_limit_source(
+        mut self,
+        source: crate::providers::generation_limit::GenerationLimitSource,
+    ) -> Self {
+        self.inner = self.inner.with_generation_limit_source(source);
+        self
+    }
+
     pub fn with_exact_tokenizer(mut self, name: Option<String>) -> Self {
         self.inner = self.inner.with_exact_tokenizer(name);
         self

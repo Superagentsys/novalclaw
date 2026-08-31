@@ -397,6 +397,51 @@ mod tests {
         assert_eq!(snapshot.request_output_reserve_tokens, Some(32_000));
         assert_eq!(snapshot.max_input_tokens, Some(935_232));
         assert_eq!(snapshot.model_max_output_tokens, Some(384_000));
+        assert_eq!(
+            snapshot.request_generation_limit_source.as_deref(),
+            Some("profile_override")
+        );
+    }
+
+    #[tokio::test]
+    async fn r24_j_projection_uses_product_default_without_provider_call() {
+        let mut config = crate::config::Config::default();
+        config.model_providers.insert(
+            "deepseek".into(),
+            crate::config::ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                default_model: Some("deepseek-v4-flash".into()),
+                models: vec!["deepseek-v4-flash".into()],
+                ..crate::config::ModelProviderConfig::default()
+            },
+        );
+        let factory_provider = crate::providers::factory::build_provider_with_selection(
+            &config,
+            &crate::providers::factory::ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = factory_provider.context_budget();
+        let counting = CountingProvider::new();
+        let snapshot = measure_projected_context(
+            Some("session-r24-j".into()),
+            counting.name(),
+            "deepseek-v4-flash",
+            None,
+            budget.as_ref(),
+            &[ChatMessage::user("hello")],
+            &[],
+        )
+        .await;
+        assert_eq!(counting.chats.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot.request_output_reserve_tokens, Some(32_000));
+        assert_eq!(snapshot.max_input_tokens, Some(935_232));
+        assert_eq!(
+            snapshot.request_generation_limit_source.as_deref(),
+            Some("product_default")
+        );
     }
 
     #[tokio::test]
@@ -460,6 +505,7 @@ mod tests {
             output_reserve_tokens: None,
             model_max_output_tokens: None,
             request_output_reserve_tokens: None,
+            request_generation_limit_source: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: Some(466_400),
             budget_source: None,
@@ -579,6 +625,7 @@ mod tests {
             output_reserve_tokens: None,
             model_max_output_tokens: None,
             request_output_reserve_tokens: None,
+            request_generation_limit_source: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: None,
             budget_source: None,
@@ -637,6 +684,7 @@ mod tests {
             output_reserve_tokens: None,
             model_max_output_tokens: None,
             request_output_reserve_tokens: None,
+            request_generation_limit_source: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: None,
             budget_source: None,

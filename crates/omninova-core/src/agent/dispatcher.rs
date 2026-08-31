@@ -195,6 +195,8 @@ pub struct AgentDispatcher<'a> {
     /// Optional EventBus for real-time structured events.
     event_bus: Option<EventBus>,
     cancel_token: Option<AgentCancellationToken>,
+    /// Ephemeral run-scoped generation cap. Not profile configuration.
+    request_max_output_tokens: Option<u32>,
 }
 
 impl<'a> Clone for AgentDispatcher<'a> {
@@ -210,6 +212,7 @@ impl<'a> Clone for AgentDispatcher<'a> {
             compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
+            request_max_output_tokens: self.request_max_output_tokens,
         }
     }
 }
@@ -236,7 +239,28 @@ impl<'a> AgentDispatcher<'a> {
             compact_context,
             event_bus: None,
             cancel_token: None,
+            request_max_output_tokens: None,
         }
+    }
+
+    pub fn with_request_max_output_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.request_max_output_tokens = tokens.filter(|value| *value > 0);
+        self
+    }
+
+    fn chat_request<'b>(
+        &self,
+        messages: &'b [ChatMessage],
+        tools: Option<&'b [ToolSpec]>,
+    ) -> ChatRequest<'b> {
+        ChatRequest::new(messages, tools)
+            .with_request_max_output_tokens(self.request_max_output_tokens)
+    }
+
+    fn request_context_budget(&self) -> Option<crate::providers::context_budget::ContextBudget> {
+        self.provider
+            .context_budget()
+            .map(|budget| budget.with_request_generation_override(self.request_max_output_tokens))
     }
 
     /// Sets the EventBus for real-time structured events.
@@ -254,7 +278,7 @@ impl<'a> AgentDispatcher<'a> {
         crate::observability::emit_candidate_usage(
             messages,
             self.tool_specs,
-            self.provider.context_budget().as_ref(),
+            self.request_context_budget().as_ref(),
         );
     }
 
@@ -302,6 +326,7 @@ impl<'a> AgentDispatcher<'a> {
                 self.tool_specs,
                 self.max_history_messages,
                 self.compact_context,
+                self.request_max_output_tokens,
             )
             .await;
 
@@ -315,14 +340,14 @@ impl<'a> AgentDispatcher<'a> {
 
             let chat_result = self
                 .provider
-                .chat(ChatRequest {
+                .chat(self.chat_request(
                     messages,
-                    tools: if self.tool_specs.is_empty() {
+                    if self.tool_specs.is_empty() {
                         None
                     } else {
                         Some(self.tool_specs)
                     },
-                })
+                ))
                 .await;
 
             if let Ok(response) = &chat_result {
@@ -409,14 +434,14 @@ impl<'a> AgentDispatcher<'a> {
         with_tools: bool,
         tok_tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<ChatResponse> {
-        let request = ChatRequest {
+        let request = self.chat_request(
             messages,
-            tools: if with_tools && !self.tool_specs.is_empty() {
+            if with_tools && !self.tool_specs.is_empty() {
                 Some(self.tool_specs)
             } else {
                 None
             },
-        };
+        );
         self.provider.chat_stream(request, tok_tx).await
     }
 
@@ -460,6 +485,7 @@ impl<'a> AgentDispatcher<'a> {
                 self.tool_specs,
                 self.max_history_messages,
                 self.compact_context,
+                self.request_max_output_tokens,
             )
             .await;
 
@@ -674,6 +700,7 @@ impl<'a> AgentDispatcher<'a> {
                 self.tool_specs,
                 self.max_history_messages,
                 self.compact_context,
+                self.request_max_output_tokens,
             )
             .await;
 
@@ -806,6 +833,7 @@ impl<'a> AgentDispatcher<'a> {
                 self.tool_specs,
                 self.max_history_messages,
                 self.compact_context,
+                self.request_max_output_tokens,
             )
             .await;
 
@@ -917,6 +945,7 @@ impl<'a> AgentDispatcher<'a> {
             compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
+            request_max_output_tokens: self.request_max_output_tokens,
         };
         let reply = dispatcher.run_streaming_no_tokens(messages).await?;
         let events = Arc::try_unwrap(collected)

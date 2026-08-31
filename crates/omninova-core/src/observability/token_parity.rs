@@ -305,6 +305,7 @@ fn snapshot(
         output_reserve_tokens: None,
         model_max_output_tokens: None,
         request_output_reserve_tokens: None,
+        request_generation_limit_source: None,
         safety_reserve_tokens: None,
         pressure_threshold_tokens: None,
         budget_source: None,

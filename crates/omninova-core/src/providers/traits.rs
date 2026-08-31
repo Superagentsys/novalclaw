@@ -152,6 +152,24 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Ephemeral per-request generation cap. `None` or `0` means absent.
+    /// Lifetime is one logical request/run; it is not profile configuration.
+    pub request_max_output_tokens: Option<u32>,
+}
+
+impl<'a> ChatRequest<'a> {
+    pub fn new(messages: &'a [ChatMessage], tools: Option<&'a [ToolSpec]>) -> Self {
+        Self {
+            messages,
+            tools,
+            request_max_output_tokens: None,
+        }
+    }
+
+    pub fn with_request_max_output_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.request_max_output_tokens = tokens.filter(|value| *value > 0);
+        self
+    }
 }
 
 /// A tool result to feed back to the LLM.

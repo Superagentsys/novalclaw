@@ -44,6 +44,22 @@ const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对�
 省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
 不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
 
+macro_rules! agent_dispatcher {
+    ($agent:expr, $budget:expr, $override:expr) => {
+        AgentDispatcher::new(
+            $agent.provider.as_ref(),
+            &$agent.tools,
+            &$agent.tool_specs,
+            $agent.config.max_tool_iterations,
+            &$agent.security,
+            $budget,
+            $agent.config.max_history_messages,
+            $agent.config.compact_context,
+        )
+        .with_request_max_output_tokens($override)
+    };
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -52,6 +68,8 @@ pub struct Agent {
     config: AgentConfig,
     security: SecurityContext,
     messages: Vec<ChatMessage>,
+    /// Consumed by the next logical `process_message*` run. Not persisted.
+    run_generation_limit_override: Option<u32>,
 }
 
 impl Agent {
@@ -71,8 +89,20 @@ impl Agent {
             config,
             security,
             messages: Vec::new(),
+            run_generation_limit_override: None,
         }
     }
+
+    /// Sets an ephemeral generation-limit override for the next logical run.
+    /// `None` or `0` means absent. Consumed when the run starts.
+    pub fn set_request_max_output_tokens(&mut self, tokens: Option<u32>) {
+        self.run_generation_limit_override = tokens.filter(|value| *value > 0);
+    }
+
+    fn take_request_generation_limit(&mut self) -> Option<u32> {
+        self.run_generation_limit_override.take().filter(|value| *value > 0)
+    }
+
 
     pub async fn process_message(&mut self, message: &str) -> Result<String> {
         self.process_message_with_images(message, &[]).await
@@ -84,6 +114,7 @@ impl Agent {
         images: &[String],
     ) -> Result<String> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -95,7 +126,7 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
+        self.compact_context_if_needed(request_max_output_tokens).await;
 
         if images.is_empty() {
             self.messages.push(ChatMessage::user(message));
@@ -103,26 +134,19 @@ impl Agent {
             self.messages
                 .push(ChatMessage::user_with_images(message, images.to_vec()));
         }
-        self.refresh_candidate();
+        self.refresh_candidate(request_max_output_tokens);
 
         // One budget spans the whole request: planner, executor and reflector
         // calls all draw from it.
         let budget = BudgetTracker::new(self.config.budget.clone());
 
         if self.config.planning.enabled {
-            self.run_plan_execute_reflect(message, &budget).await
+            self.run_plan_execute_reflect(message, &budget, request_max_output_tokens)
+                .await
         } else {
-            let dispatcher = AgentDispatcher::new(
-                                 self.provider.as_ref(),
-                                 &self.tools,
-                                 &self.tool_specs,
-                                 self.config.max_tool_iterations,
-                                 &self.security,
-                                 &budget,
-                                 self.config.max_history_messages,
-                                 self.config.compact_context,
-                             );
-            dispatcher.run(&mut self.messages).await
+            agent_dispatcher!(self, &budget, request_max_output_tokens)
+                .run(&mut self.messages)
+                .await
         }
     }
 
@@ -133,6 +157,7 @@ impl Agent {
         message: &str,
     ) -> Result<(String, Vec<ToolExecutionEvent>)> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -144,23 +169,14 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
+        self.compact_context_if_needed(request_max_output_tokens).await;
         self.messages.push(ChatMessage::user(message));
-        self.refresh_candidate();
+        self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
-        let dispatcher = AgentDispatcher::new(
-                             self.provider.as_ref(),
-                             &self.tools,
-                             &self.tool_specs,
-                             self.config.max_tool_iterations,
-                             &self.security,
-                             &budget,
-                             self.config.max_history_messages,
-                             self.config.compact_context,
-                         );
-
-        let (reply, events) = dispatcher.run_with_events(&mut self.messages).await?;
+        let (reply, events) = agent_dispatcher!(self, &budget, request_max_output_tokens)
+            .run_with_events(&mut self.messages)
+            .await?;
 
         Ok((reply, events))
     }
@@ -184,6 +200,7 @@ impl Agent {
         cancel_token: AgentCancellationToken,
     ) -> Result<(String, Vec<AgentRunEvent>)> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -243,26 +260,22 @@ impl Agent {
                 crate::observability::set_exact_tokenizer(
                     self.provider.exact_tokenizer().map(str::to_string),
                 );
-                self.compact_context_if_needed().await;
+                self.compact_context_if_needed(request_max_output_tokens).await;
                 self.messages.push(ChatMessage::user(message));
-                self.refresh_candidate();
+                self.refresh_candidate(request_max_output_tokens);
                 crate::observability::emit_candidate_usage(
                     &self.messages,
                     &self.tool_specs,
-                    self.provider.context_budget().as_ref(),
+                    self.provider
+                        .context_budget()
+                        .map(|budget| {
+                            budget.with_request_generation_override(request_max_output_tokens)
+                        })
+                        .as_ref(),
                 );
-                let dispatcher = AgentDispatcher::new(
-                    self.provider.as_ref(),
-                    &self.tools,
-                    &self.tool_specs,
-                    self.config.max_tool_iterations,
-                    &self.security,
-                    &budget,
-                    self.config.max_history_messages,
-                    self.config.compact_context,
-                )
-                .with_event_bus(Some(bus.clone()))
-                .with_cancel_token(Some(cancel_token.clone()));
+                let dispatcher = agent_dispatcher!(self, &budget, request_max_output_tokens)
+                    .with_event_bus(Some(bus.clone()))
+                    .with_cancel_token(Some(cancel_token.clone()));
                 tokio::select! {
                     result = dispatcher.run_streaming_with_bus(&mut self.messages) => result,
                     _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
@@ -314,6 +327,7 @@ impl Agent {
         events: &tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
     ) -> Result<String> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -325,22 +339,14 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
+        self.compact_context_if_needed(request_max_output_tokens).await;
         self.messages.push(ChatMessage::user(message));
-        self.refresh_candidate();
+        self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
-        let dispatcher = AgentDispatcher::new(
-                             self.provider.as_ref(),
-                             &self.tools,
-                             &self.tool_specs,
-                             self.config.max_tool_iterations,
-                             &self.security,
-                             &budget,
-                             self.config.max_history_messages,
-                             self.config.compact_context,
-                         );
-        dispatcher.run_streaming(&mut self.messages, events).await
+        agent_dispatcher!(self, &budget, request_max_output_tokens)
+            .run_streaming(&mut self.messages, events)
+            .await
     }
 
     /// Plan-Execute-Reflect loop: a planner decomposes the task, the executor
@@ -350,6 +356,7 @@ impl Agent {
         &mut self,
         task: &str,
         budget: &BudgetTracker,
+        request_max_output_tokens: Option<u32>,
     ) -> Result<String> {
         let max_plan_steps = self.config.planning.max_plan_steps.max(1);
         let max_replans = self.config.planning.max_replans;
@@ -359,6 +366,7 @@ impl Agent {
             task,
             max_plan_steps,
             None,
+            request_max_output_tokens,
         )
         .await
         {
@@ -370,17 +378,9 @@ impl Agent {
                 // Planner unavailable: degrade to the plain ReAct loop rather
                 // than failing the request.
                 warn!("planner failed, falling back to ReAct: {e}");
-                let dispatcher = AgentDispatcher::new(
-                                     self.provider.as_ref(),
-                                     &self.tools,
-                                     &self.tool_specs,
-                                     self.config.max_tool_iterations,
-                                     &self.security,
-                                     budget,
-                                     self.config.max_history_messages,
-                                     self.config.compact_context,
-                                 );
-                return dispatcher.run(&mut self.messages).await;
+                return agent_dispatcher!(self, budget, request_max_output_tokens)
+                    .run(&mut self.messages)
+                    .await;
             }
         };
 
@@ -402,18 +402,10 @@ impl Agent {
                     step,
                     task
                 )));
-                self.refresh_candidate();
-                let dispatcher = AgentDispatcher::new(
-                                     self.provider.as_ref(),
-                                     &self.tools,
-                                     &self.tool_specs,
-                                     self.config.max_tool_iterations,
-                                     &self.security,
-                                     budget,
-                                     self.config.max_history_messages,
-                                     self.config.compact_context,
-                                 );
-                let step_result = dispatcher.run(&mut self.messages).await?;
+                self.refresh_candidate(request_max_output_tokens);
+                let step_result = agent_dispatcher!(self, budget, request_max_output_tokens)
+                    .run(&mut self.messages)
+                    .await?;
                 executed.push((step.clone(), step_result));
 
                 if let Some(reason) = budget.check() {
@@ -422,14 +414,21 @@ impl Agent {
 
                 let transcript = render_transcript(&executed);
                 let remaining = current_plan.len() - idx - 1;
-                match planner::reflect(self.provider.as_ref(), task, &transcript, remaining).await
+                match planner::reflect(
+                    self.provider.as_ref(),
+                    task,
+                    &transcript,
+                    remaining,
+                    request_max_output_tokens,
+                )
+                .await
                 {
                     Ok((verdict, response)) => {
                         budget.record_call(response.usage.as_ref());
                         match verdict {
                             Reflection::Complete { final_answer } => {
                                 self.messages.push(ChatMessage::assistant(&final_answer));
-                                self.refresh_candidate();
+                                self.refresh_candidate(request_max_output_tokens);
                                 return Ok(final_answer);
                             }
                             Reflection::Continue => {}
@@ -444,6 +443,7 @@ impl Agent {
                                     task,
                                     max_plan_steps,
                                     Some(&feedback),
+                                    request_max_output_tokens,
                                 )
                                 .await
                                 {
@@ -472,18 +472,10 @@ impl Agent {
             "All planned steps have been executed. Based on the results above, provide the \
              final answer to the original task now. Original task: {task}"
         )));
-        self.refresh_candidate();
-        let dispatcher = AgentDispatcher::new(
-                             self.provider.as_ref(),
-                             &self.tools,
-                             &self.tool_specs,
-                             self.config.max_tool_iterations,
-                             &self.security,
-                             budget,
-                             self.config.max_history_messages,
-                             self.config.compact_context,
-                         );
-        dispatcher.run(&mut self.messages).await
+        self.refresh_candidate(request_max_output_tokens);
+        agent_dispatcher!(self, budget, request_max_output_tokens)
+            .run(&mut self.messages)
+            .await
     }
 
     /// Budget exhausted mid-plan: report partial progress instead of failing.
@@ -506,15 +498,18 @@ impl Agent {
             render_transcript(executed)
         );
         self.messages.push(ChatMessage::assistant(&text));
-        self.refresh_candidate();
+        self.refresh_candidate(None);
         Ok(text)
     }
 
-    fn refresh_candidate(&self) {
+    fn refresh_candidate(&self, request_max_output_tokens: Option<u32>) {
+        let budget = self.provider.context_budget().map(|budget| {
+            budget.with_request_generation_override(request_max_output_tokens)
+        });
         crate::observability::emit_candidate_usage(
             &self.messages,
             &self.tool_specs,
-            self.provider.context_budget().as_ref(),
+            budget.as_ref(),
         );
     }
 
@@ -523,7 +518,7 @@ impl Agent {
     ///
     /// A failed summarizer call degrades to truncation that still preserves the
     /// leading system messages, so a provider hiccup never blocks the turn.
-    async fn compact_context_if_needed(&mut self) {
+    async fn compact_context_if_needed(&mut self, request_max_output_tokens: Option<u32>) {
         if !self.config.compact_context {
             return;
         }
@@ -533,6 +528,7 @@ impl Agent {
             &self.tool_specs,
             self.config.max_history_messages,
             true,
+            request_max_output_tokens,
         )
         .await;
     }
@@ -655,6 +651,7 @@ mod tests {
     struct SequenceProvider {
         responses: Mutex<VecDeque<ChatResponse>>,
         requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        generation_limits: Arc<Mutex<Vec<Option<u32>>>>,
     }
 
     impl SequenceProvider {
@@ -664,8 +661,25 @@ mod tests {
                 Self {
                     responses: Mutex::new(responses.into()),
                     requests: requests.clone(),
+                    generation_limits: Arc::new(Mutex::new(Vec::new())),
                 },
                 requests,
+            )
+        }
+
+        fn with_limit_log(
+            responses: Vec<ChatResponse>,
+        ) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>, Arc<Mutex<Vec<Option<u32>>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let generation_limits = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: requests.clone(),
+                    generation_limits: generation_limits.clone(),
+                },
+                requests,
+                generation_limits,
             )
         }
     }
@@ -682,6 +696,10 @@ mod tests {
 
         async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
             self.requests.lock().unwrap().push(request.messages.to_vec());
+            self.generation_limits
+                .lock()
+                .unwrap()
+                .push(request.request_max_output_tokens);
             self.responses
                 .lock()
                 .unwrap()
@@ -1141,6 +1159,55 @@ mod tests {
         assert!(
             !requests.lock().unwrap().is_empty(),
             "provider still runs after the restored candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn r241_k_next_unrelated_request_clears_override() {
+        let (provider, _requests, limits) = SequenceProvider::with_limit_log(vec![
+            response(Some("first"), Vec::new(), "stop"),
+            response(Some("second"), Vec::new(), "stop"),
+        ]);
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), AgentConfig::default());
+        agent.set_request_max_output_tokens(Some(64_000));
+        let first = agent.process_message("long form").await.expect("first");
+        assert_eq!(first, "first");
+        let second = agent.process_message("follow up").await.expect("second");
+        assert_eq!(second, "second");
+        let captured = limits.lock().unwrap().clone();
+        assert_eq!(captured, vec![Some(64_000), None]);
+    }
+
+    #[tokio::test]
+    async fn r241_m_tool_loop_preserves_run_scoped_override() {
+        let (provider, _requests, limits) = SequenceProvider::with_limit_log(vec![
+            response(
+                None,
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "use_skill".into(),
+                    arguments: r#"{"skill_id":"skill:test"}"#.into(),
+                }],
+                "tool_calls",
+            ),
+            response(Some("done after tool"), Vec::new(), "stop"),
+        ]);
+        let mut agent = agent_with_provider(
+            Box::new(provider),
+            vec![Box::new(AlreadyActiveUseSkillTool)],
+            AgentConfig::default(),
+        );
+        agent.set_request_max_output_tokens(Some(64_000));
+        let reply = agent.process_message("use a skill").await.expect("run");
+        assert_eq!(reply, "done after tool");
+        let captured = limits.lock().unwrap().clone();
+        assert!(
+            captured.len() >= 2,
+            "tool loop must make at least two model turns: {captured:?}"
+        );
+        assert!(
+            captured.iter().all(|limit| *limit == Some(64_000)),
+            "every turn in the run must keep the override: {captured:?}"
         );
     }
 }

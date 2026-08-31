@@ -55,6 +55,14 @@ impl AnthropicProvider {
         self
     }
 
+    pub fn with_generation_limit_source(
+        mut self,
+        source: crate::providers::generation_limit::GenerationLimitSource,
+    ) -> Self {
+        self.inner = self.inner.with_generation_limit_source(source);
+        self
+    }
+
     pub fn with_exact_tokenizer(mut self, name: Option<String>) -> Self {
         self.inner = self.inner.with_exact_tokenizer(name);
         self
@@ -328,6 +336,7 @@ Connection: close
             provider.chat(ChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             }),
         )
         .await
@@ -375,6 +384,7 @@ Connection: close
             .chat(ChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             })
             .await
             .expect("normal chat succeeds");
@@ -409,6 +419,7 @@ Connection: close
             provider.chat(ChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             }),
         )
         .await
@@ -451,6 +462,7 @@ Connection: close
             provider.chat(ChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             }),
         )
         .await
@@ -492,6 +504,7 @@ Connection: close
                     .chat(ChatRequest {
                         messages: &messages,
                         tools: None,
+                        request_max_output_tokens: None,
                     })
                     .await?;
                 current_context()

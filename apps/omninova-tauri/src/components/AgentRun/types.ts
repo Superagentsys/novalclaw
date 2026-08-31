@@ -313,6 +313,7 @@ export interface ContextUsageSnapshot {
   output_reserve_tokens?: number | null;
   model_max_output_tokens?: number | null;
   request_output_reserve_tokens?: number | null;
+  request_generation_limit_source?: string | null;
   safety_reserve_tokens?: number | null;
   pressure_threshold_tokens?: number | null;
   budget_source?: string | null;

@@ -50,6 +50,21 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function generationLimitSourceLabel(source: string): string {
+  switch (source) {
+    case "request_override":
+      return "本次请求指定";
+    case "profile_override":
+      return "模型配置";
+    case "product_default":
+      return "OmniNova 默认策略";
+    case "model_maximum_fallback":
+      return "保守回退：模型最大输出上限";
+    default:
+      return source;
+  }
+}
+
 export function measureContextUsagePopoverWidth(viewportWidth: number): number {
   return Math.max(0, Math.min(CONTEXT_USAGE_PREFERRED_WIDTH, viewportWidth - CONTEXT_USAGE_VIEWPORT_MARGIN * 2));
 }
@@ -351,12 +366,18 @@ export function ContextUsageBadgeContent({
                 {view.requestOutputReserveTokens != null ? (
                   <div className="context-usage-row">
                     <dt>本次输出预留</dt>
-                    <dd>
-                      {formatTokenCount(view.requestOutputReserveTokens, "exact")}
-                      {view.requestReserveIsConservativeFallback
-                        ? "（保守回退：模型最大输出上限）"
-                        : ""}
-                    </dd>
+                    <dd>{formatTokenCount(view.requestOutputReserveTokens, "exact")}</dd>
+                  </div>
+                ) : null}
+                {view.requestGenerationLimitSource ? (
+                  <div className="context-usage-row">
+                    <dt>来源</dt>
+                    <dd>{generationLimitSourceLabel(view.requestGenerationLimitSource)}</dd>
+                  </div>
+                ) : view.requestReserveIsConservativeFallback ? (
+                  <div className="context-usage-row">
+                    <dt>来源</dt>
+                    <dd>保守回退：模型最大输出上限</dd>
                   </div>
                 ) : null}
                 {view.safetyReserveTokens != null ? (

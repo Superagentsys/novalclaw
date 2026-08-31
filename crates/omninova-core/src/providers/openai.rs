@@ -8,6 +8,7 @@ use crate::providers::context_budget::{
     context_window_exceeded_info, native_request_output_limit_from_json, ContextBudget,
     ProviderOverflowInfo, TokenEstimator, CONTEXT_BUDGET_EXCEEDED_MARKER,
 };
+use crate::providers::generation_limit::{GenerationLimitSource, ResolvedGenerationLimit};
 use crate::providers::anthropic_count::{count_anthropic_tokens, AnthropicCountConfig};
 use crate::providers::native_request::{
     convert_messages as convert_native_messages, convert_tools as convert_native_tools,
@@ -448,6 +449,7 @@ pub struct OpenAiProvider {
     model: String,
     temperature: f64,
     max_tokens: Option<u32>,
+    generation_limit_source: GenerationLimitSource,
     timeouts: ProviderTimeouts,
     retry_backoff: Duration,
     transport_mode: TransportMode,
@@ -925,6 +927,11 @@ impl OpenAiProvider {
             model: model.into(),
             temperature,
             max_tokens: max_tokens.filter(|v| *v > 0),
+            generation_limit_source: if max_tokens.filter(|v| *v > 0).is_some() {
+                GenerationLimitSource::ProfileOverride
+            } else {
+                GenerationLimitSource::ModelMaximumFallback
+            },
             timeouts,
             retry_backoff: PROVIDER_RETRY_BACKOFF,
             transport_mode,
@@ -939,6 +946,11 @@ impl OpenAiProvider {
     /// Sets an optional authoritative context budget for final preflight.
     pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
         self.context_budget = budget;
+        self
+    }
+
+    pub fn with_generation_limit_source(mut self, source: GenerationLimitSource) -> Self {
+        self.generation_limit_source = source;
         self
     }
 
@@ -976,7 +988,15 @@ impl OpenAiProvider {
     /// C1 hard preflight: conservative TokenEstimator only. Display metering
     /// (exact tokenizer / ProviderActual) must not be used here.
     fn preflight_context(&self, request_body: &str) -> anyhow::Result<()> {
-        let Some(budget) = self.budget_for_request_body(request_body) else {
+        self.preflight_context_with_source(request_body, self.generation_limit_source)
+    }
+
+    fn preflight_context_with_source(
+        &self,
+        request_body: &str,
+        source: GenerationLimitSource,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = self.budget_for_request_body_with_source(request_body, source) else {
             return Ok(());
         };
         budget.ensure_usable()?;
@@ -1025,25 +1045,71 @@ impl OpenAiProvider {
     }
 
     fn budget_for_request_body(&self, request_body: &str) -> Option<ContextBudget> {
+        self.budget_for_request_body_with_source(request_body, self.generation_limit_source)
+    }
+
+    fn budget_for_request_body_with_source(
+        &self,
+        request_body: &str,
+        source: GenerationLimitSource,
+    ) -> Option<ContextBudget> {
         let base = self.context_budget?;
-        Some(base.with_request_output_cap(native_request_output_limit_from_json(request_body)))
+        match native_request_output_limit_from_json(request_body) {
+            Some(cap) => Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+                effective_tokens: Some(cap),
+                source,
+            })),
+            None => Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+                effective_tokens: None,
+                source: GenerationLimitSource::ModelMaximumFallback,
+            })),
+        }
+    }
+
+    fn resolved_generation_limit_for_request(
+        &self,
+        request_override: Option<u32>,
+    ) -> ResolvedGenerationLimit {
+        let model_max = self
+            .context_budget
+            .and_then(|budget| budget.model_max_output_tokens);
+        let request = request_override.map(u64::from).filter(|value| *value > 0);
+        if request.is_some() {
+            return crate::providers::generation_limit::resolve_effective_request_generation_limit(
+                request,
+                None,
+                None,
+                model_max,
+            );
+        }
+        let raw = self.max_tokens.map(u64::from).filter(|value| *value > 0);
+        let effective = match (raw, model_max.filter(|value| *value > 0)) {
+            (Some(value), Some(max)) => Some(value.min(max)).filter(|value| *value > 0),
+            (Some(value), None) => Some(value),
+            (None, _) => None,
+        };
+        ResolvedGenerationLimit {
+            effective_tokens: effective,
+            source: self.generation_limit_source,
+        }
     }
 
     fn finalized_max_tokens(&self) -> Option<u32> {
-        let raw = self.max_tokens.filter(|value| *value > 0)?;
-        match self
-            .context_budget
-            .and_then(|budget| budget.model_max_output_tokens)
-            .filter(|value| *value > 0)
-        {
-            Some(model_max) => u32::try_from((raw as u64).min(model_max)).ok().filter(|v| *v > 0),
-            None => Some(raw),
-        }
+        self.resolved_generation_limit_for_request(None)
+            .native_max_tokens()
+    }
+
+    fn finalized_max_tokens_for(&self, request_override: Option<u32>) -> Option<u32> {
+        self.resolved_generation_limit_for_request(request_override)
+            .native_max_tokens()
     }
 
     fn runtime_request_budget(&self) -> Option<ContextBudget> {
         let base = self.context_budget?;
-        Some(base.with_request_output_cap(self.max_tokens.map(u64::from).filter(|v| *v > 0)))
+        Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+            effective_tokens: self.max_tokens.map(u64::from).filter(|v| *v > 0),
+            source: self.generation_limit_source,
+        }))
     }
 
     fn observe_preflight(
@@ -1051,6 +1117,7 @@ impl OpenAiProvider {
         request_body: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
+        source: GenerationLimitSource,
     ) -> Option<ContextRequestIdentity> {
         let ctx = current_context()?;
         if !ctx.snapshots_enabled() {
@@ -1072,7 +1139,8 @@ impl OpenAiProvider {
             MeasurementKind::FinalRequestEstimate,
             messages,
             tools,
-            self.budget_for_request_body(request_body).as_ref(),
+            self.budget_for_request_body_with_source(request_body, source)
+                .as_ref(),
             Some(request_body),
         );
         emit_snapshot(snapshot);
@@ -1086,6 +1154,7 @@ impl OpenAiProvider {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
         usage: Option<&TokenUsage>,
+        source: GenerationLimitSource,
     ) {
         let Some(actual) = usage.and_then(|u| u.input_tokens) else {
             return;
@@ -1102,7 +1171,8 @@ impl OpenAiProvider {
             MeasurementKind::ProviderActual,
             messages,
             tools,
-            self.budget_for_request_body(request_body).as_ref(),
+            self.budget_for_request_body_with_source(request_body, source)
+                .as_ref(),
             Some(request_body),
         )
         .with_provider_actual(actual);
@@ -1429,6 +1499,7 @@ impl Provider for OpenAiProvider {
                     request.messages.to_vec(),
                     tools,
                     usize::MAX,
+                    request.request_max_output_tokens,
                 )
                 .await;
                 let estimator = TokenEstimator::new();
@@ -1438,6 +1509,7 @@ impl Provider for OpenAiProvider {
                     let recovered_request = ProviderChatRequest {
                         messages: &recovered,
                         tools: Some(tools),
+                        request_max_output_tokens: request.request_max_output_tokens,
                     };
                     let attempts2 = AtomicU32::new(0);
                     let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
@@ -1652,6 +1724,7 @@ impl OpenAiProvider {
                     request.messages.to_vec(),
                     tools,
                     usize::MAX,
+                    request.request_max_output_tokens,
                 )
                 .await;
                 let estimator = TokenEstimator::new();
@@ -1661,6 +1734,7 @@ impl OpenAiProvider {
                     request = ProviderChatRequest {
                         messages: &recovered,
                         tools: Some(tools),
+                        request_max_output_tokens: request.request_max_output_tokens,
                     };
                     let attempts2 = AtomicU32::new(0);
                     let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
@@ -1707,11 +1781,12 @@ impl OpenAiProvider {
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = convert_native_tools(request.tools);
+        let resolved = self.resolved_generation_limit_for_request(request.request_max_output_tokens);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
             messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.finalized_max_tokens(),
+            max_tokens: resolved.native_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: None,
@@ -1726,8 +1801,13 @@ impl OpenAiProvider {
                 )
             })?;
         let tool_specs = request.tools.unwrap_or(&[]);
-        let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
-        self.preflight_context(&request_body)
+        let request_identity = self.observe_preflight(
+            &request_body,
+            request.messages,
+            tool_specs,
+            resolved.source,
+        );
+        self.preflight_context_with_source(&request_body, resolved.source)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
         self.measure_provider_count_tokens(
             request_identity.clone(),
@@ -1780,6 +1860,7 @@ impl OpenAiProvider {
             request.messages,
             tool_specs,
             result.usage.as_ref(),
+            resolved.source,
         );
         Ok(result)
     }
@@ -1794,11 +1875,12 @@ impl OpenAiProvider {
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
         let tools = convert_native_tools(request.tools);
+        let resolved = self.resolved_generation_limit_for_request(request.request_max_output_tokens);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
             messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.finalized_max_tokens(),
+            max_tokens: resolved.native_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: Some(true),
@@ -1813,8 +1895,13 @@ impl OpenAiProvider {
                 )
             })?;
         let tool_specs = request.tools.unwrap_or(&[]);
-        let request_identity = self.observe_preflight(&request_body, request.messages, tool_specs);
-        self.preflight_context(&request_body)
+        let request_identity = self.observe_preflight(
+            &request_body,
+            request.messages,
+            tool_specs,
+            resolved.source,
+        );
+        self.preflight_context_with_source(&request_body, resolved.source)
             .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
         self.measure_provider_count_tokens(
             request_identity.clone(),
@@ -1935,6 +2022,7 @@ impl OpenAiProvider {
             request.messages,
             tool_specs,
             usage.as_ref(),
+            resolved.source,
         );
         Ok(ProviderChatResponse {
             text: final_text,
@@ -2250,6 +2338,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let response = provider
@@ -2306,6 +2395,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let result = provider.chat_stream(request, token_tx).await;
@@ -2755,6 +2845,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let result = provider.chat_stream(request, token_tx).await;
@@ -2827,6 +2918,7 @@ mod tests {
             .chat(ProviderChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             })
             .await
             .expect("the replay must succeed");
@@ -3033,6 +3125,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    request_max_output_tokens: None,
                 },
                 token_tx,
             )
@@ -3493,6 +3586,75 @@ mod tests {
     }
 
     #[test]
+    fn r241_f_g_h_l_request_override_native_budget_and_retry_copy() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )))
+        .with_generation_limit_source(
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault,
+        );
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
+        let resolved = provider.resolved_generation_limit_for_request(Some(64_000));
+        assert_eq!(resolved.effective_tokens, Some(64_000));
+        assert_eq!(
+            resolved.source,
+            crate::providers::generation_limit::GenerationLimitSource::RequestOverride
+        );
+        assert_eq!(provider.finalized_max_tokens_for(Some(64_000)), Some(64_000));
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
+
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: provider.finalized_max_tokens_for(Some(64_000)),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        assert_eq!(native_request_output_limit_from_json(&body), Some(64_000));
+        let c1 = provider
+            .budget_for_request_body_with_source(&body, resolved.source)
+            .unwrap();
+        assert_eq!(c1.request_output_reserve_tokens, 64_000);
+        assert_eq!(c1.output_reserve_tokens, 64_000);
+        assert_eq!(c1.max_input_tokens, 1_000_000 - 64_000 - 32_768);
+        assert_eq!(
+            c1.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::RequestOverride
+        );
+
+        let request = ProviderChatRequest {
+            messages: &[],
+            tools: None,
+            request_max_output_tokens: Some(64_000),
+        };
+        let recovered = ProviderChatRequest {
+            messages: &[],
+            tools: Some(&[]),
+            request_max_output_tokens: request.request_max_output_tokens,
+        };
+        assert_eq!(recovered.request_max_output_tokens, Some(64_000));
+        assert_eq!(
+            provider
+                .resolved_generation_limit_for_request(recovered.request_max_output_tokens)
+                .effective_tokens,
+            Some(64_000)
+        );
+    }
+
+    #[test]
     fn unknown_budget_does_not_block() {
         let provider = OpenAiProvider::new(
             Some("https://example.invalid/v1"),
@@ -3560,6 +3722,7 @@ mod tests {
                     .chat(ProviderChatRequest {
                         messages: &messages,
                         tools: None,
+                        request_max_output_tokens: None,
                     })
                     .await
             },

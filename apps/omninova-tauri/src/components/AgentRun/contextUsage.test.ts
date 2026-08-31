@@ -96,6 +96,7 @@ describe("O3 context usage visualization", () => {
       context_window_tokens: 1_000_000,
       model_max_output_tokens: 384_000,
       request_output_reserve_tokens: 32_000,
+      request_generation_limit_source: "profile_override",
       output_reserve_tokens: 32_000,
       safety_reserve_tokens: 32_768,
       max_input_tokens: 935_232,
@@ -105,6 +106,7 @@ describe("O3 context usage visualization", () => {
     assert.equal(view.contextWindowTokens, 1_000_000);
     assert.equal(view.modelMaxOutputTokens, 384_000);
     assert.equal(view.requestOutputReserveTokens, 32_000);
+    assert.equal(view.requestGenerationLimitSource, "profile_override");
     assert.equal(view.requestReserveIsConservativeFallback, false);
     assert.equal(view.safetyReserveTokens, 32_768);
     assert.equal(view.maxInputTokens, 935_232);
@@ -120,6 +122,7 @@ describe("O3 context usage visualization", () => {
       context_window_tokens: 1_000_000,
       model_max_output_tokens: 384_000,
       request_output_reserve_tokens: 384_000,
+      request_generation_limit_source: "model_maximum_fallback",
       output_reserve_tokens: 384_000,
       safety_reserve_tokens: 32_768,
       max_input_tokens: 583_232,
@@ -127,7 +130,50 @@ describe("O3 context usage visualization", () => {
     const view = selectContextUsageView(state);
     assert.equal(view.requestOutputReserveTokens, 384_000);
     assert.equal(view.requestReserveIsConservativeFallback, true);
+    assert.equal(view.requestGenerationLimitSource, "model_maximum_fallback");
     assert.equal(view.maxInputTokens, 583_232);
+  });
+
+  it("R2.4 product default provenance is displayed from backend", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 18_000,
+      request_revision: 1,
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 32_000,
+      request_generation_limit_source: "product_default",
+      output_reserve_tokens: 32_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 935_232,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.requestOutputReserveTokens, 32_000);
+    assert.equal(view.requestGenerationLimitSource, "product_default");
+    assert.equal(view.requestReserveIsConservativeFallback, false);
+    assert.equal(view.maxInputTokens, 935_232);
+  });
+
+  it("R2.4.1 request override provenance is displayed from backend", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 18_000,
+      request_revision: 1,
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 64_000,
+      request_generation_limit_source: "request_override",
+      output_reserve_tokens: 64_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 903_232,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.requestOutputReserveTokens, 64_000);
+    assert.equal(view.requestGenerationLimitSource, "request_override");
+    assert.equal(view.requestReserveIsConservativeFallback, false);
+    assert.equal(view.maxInputTokens, 903_232);
   });
 
   it("B. 600K of 664K is about 90 percent not 60", () => {

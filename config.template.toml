@@ -38,9 +38,9 @@
 # enabled = true
 # timeout_secs = 120
 # Optional per-request generation cap (not the model's theoretical max output).
-# Omit to leave the native request uncapped; ContextBudget then reserves the
-# model maximum conservatively. Example for DeepSeek V4 Flash: 32000 → ~935K input.
-# request_max_output_tokens = 32000
+# Leave unset to use OmniNova's default request generation policy (32000),
+# clamped to the model maximum when known.
+# request_max_output_tokens = 64000
 #
 # [model_providers.qwen]
 # api_key_env = "DASHSCOPE_API_KEY"

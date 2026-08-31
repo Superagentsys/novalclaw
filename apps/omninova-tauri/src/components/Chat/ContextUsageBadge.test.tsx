@@ -111,6 +111,7 @@ describe("ContextUsageBadge compact presentation", () => {
       context_window_tokens: 1_000_000,
       model_max_output_tokens: 384_000,
       request_output_reserve_tokens: 32_000,
+      request_generation_limit_source: "profile_override",
       output_reserve_tokens: 32_000,
       safety_reserve_tokens: 32_768,
       max_input_tokens: 935_232,
@@ -127,8 +128,43 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /384K/);
     assert.match(html, /32K/);
     assert.match(html, /935K/);
+    assert.match(html, /来源/);
+    assert.match(html, /模型配置/);
     assert.doesNotMatch(html, /<dt>最大输入预算<\/dt>/);
     assert.doesNotMatch(html, /保守回退/);
+  });
+
+  it("R2.4 product default provenance is shown without changing the compact badge", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 32_000,
+      request_generation_limit_source: "product_default",
+      output_reserve_tokens: 32_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 935_232,
+      estimated_input_tokens: 18_000,
+    }, true);
+    assert.match(html, /来源/);
+    assert.match(html, /OmniNova 默认策略/);
+    assert.doesNotMatch(html, /context-usage-label-word/);
+  });
+
+  it("R2.4.1 request override provenance is shown from backend without inferring", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 64_000,
+      request_generation_limit_source: "request_override",
+      output_reserve_tokens: 64_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 903_232,
+      estimated_input_tokens: 18_000,
+    }, true);
+    assert.match(html, /来源/);
+    assert.match(html, /本次请求指定/);
+    assert.doesNotMatch(html, /OmniNova 默认策略/);
+    assert.doesNotMatch(html, /context-usage-label-word/);
   });
 
   it("R2.1. unknown request cap popover marks conservative model-max fallback", () => {
@@ -136,12 +172,14 @@ describe("ContextUsageBadge compact presentation", () => {
       context_window_tokens: 1_000_000,
       model_max_output_tokens: 384_000,
       request_output_reserve_tokens: 384_000,
+      request_generation_limit_source: "model_maximum_fallback",
       output_reserve_tokens: 384_000,
       safety_reserve_tokens: 32_768,
       max_input_tokens: 583_232,
       estimated_input_tokens: 18_000,
     }, true);
     assert.match(html, /本次输出预留/);
+    assert.match(html, /来源/);
     assert.match(html, /保守回退：模型最大输出上限/);
     assert.match(html, /384K/);
   });

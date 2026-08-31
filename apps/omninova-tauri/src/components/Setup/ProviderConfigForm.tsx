@@ -457,7 +457,7 @@ export function ProviderConfigForm({
                         type="text"
                         inputMode="numeric"
                         value={requestLimitInputValue(provider)}
-                        placeholder="自动 / 未限制"
+                        placeholder="使用 OmniNova 默认策略"
                         onChange={(event) => handleRequestLimitChange(provider, event.target.value)}
                       />
                       {requestLimitError(
@@ -478,7 +478,7 @@ export function ProviderConfigForm({
                       )}
                       <small>
                         限制一次模型请求最多生成的 Token 数量。该值不会改变模型本身的最大输出能力。
-                        未设置时 OmniNova 不向 Provider 指定单次输出上限，Context Budget 将使用模型最大输出能力进行保守预留。
+                        留空则使用 OmniNova 默认策略（32K，且不超过模型最大输出上限）。
                       </small>
                     </label>
                   </div>

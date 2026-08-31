@@ -304,8 +304,8 @@ pub struct ModelProviderConfig {
     pub max_output_tokens: Option<u64>,
     /// Optional per-request generation cap sent on outgoing Provider calls.
     /// Distinct from `max_output_tokens` (model capability). `None` or `0`
-    /// leaves the native request uncapped; ContextBudget then falls back to
-    /// the conservative model maximum.
+    /// means the OmniNova product default request policy applies, clamped to
+    /// the model maximum when known.
     #[serde(default)]
     pub request_max_output_tokens: Option<u64>,
     /// Optional trusted display tokenizer implementation name. Unknown names
