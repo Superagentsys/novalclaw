@@ -2467,8 +2467,14 @@ impl GatewayRuntime {
                         anyhow::bail!("session parent agent mismatch for '{}'", session_id);
                     }
                 }
-                if existing.agent_name.as_deref() != Some(route_agent_name) {
-                    anyhow::bail!("session agent mismatch for '{}'", session_id);
+                if let Some(stored_agent) = existing.agent_name.as_deref() {
+                    if stored_agent != route_agent_name {
+                        anyhow::bail!("session agent mismatch for '{}'", session_id);
+                    }
+                } else {
+                    // Unbound sidecar is not an agent identity. First real send
+                    // may claim it; this is not a silent A→B rebind.
+                    existing.agent_name = Some(route_agent_name.to_string());
                 }
                 existing.updated_at = now_unix_ts();
                 return Ok(existing.clone());
@@ -2476,7 +2482,7 @@ impl GatewayRuntime {
         }
 
         if let Some(record) = load_session_record(cfg, &inbound.channel, session_id).await? {
-            let resolved = SessionLineageMeta {
+            let mut resolved = SessionLineageMeta {
                 parent_session_key: record.parent_session_key,
                 parent_agent_id: record.parent_agent_id,
                 agent_name: record.agent_name,
@@ -2498,8 +2504,12 @@ impl GatewayRuntime {
                     anyhow::bail!("session parent agent mismatch for '{}'", session_id);
                 }
             }
-            if resolved.agent_name.as_deref() != Some(route_agent_name) {
-                anyhow::bail!("session agent mismatch for '{}'", session_id);
+            if let Some(stored_agent) = resolved.agent_name.as_deref() {
+                if stored_agent != route_agent_name {
+                    anyhow::bail!("session agent mismatch for '{}'", session_id);
+                }
+            } else {
+                resolved.agent_name = Some(route_agent_name.to_string());
             }
             let mut tree = self.session_tree.write().await;
             tree.insert(key, resolved.clone());
