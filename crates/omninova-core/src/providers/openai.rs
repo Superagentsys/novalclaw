@@ -3898,4 +3898,135 @@ mod tests {
             )
         }));
     }
+
+    const OK_SHOULD_NOT_REPLAY: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"SHOULD_NOT_REPLAY"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+    #[tokio::test]
+    async fn r3_h_c1_blocks_oversized_flash_before_http() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(200, OK_FINAL)]).await;
+        let budget = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )
+        .with_resolved_generation_limit(
+            crate::providers::generation_limit::resolve_generation_limit(None, Some(384_000)),
+        );
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts {
+                connect: Duration::from_millis(250),
+                stream_idle: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        )
+        .with_context_budget(Some(budget))
+        .with_generation_limit_source(GenerationLimitSource::ProductDefault);
+
+        let small = vec![ChatMessage::user("hi")];
+        let ok = provider
+            .chat(ProviderChatRequest {
+                messages: &small,
+                tools: None,
+                request_max_output_tokens: None,
+            })
+            .await
+            .expect("under-budget Flash request must reach the Provider");
+        assert_eq!(ok.text.as_deref(), Some("Hello"));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(200, OK_FINAL)]).await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts {
+                connect: Duration::from_millis(250),
+                stream_idle: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        )
+        .with_context_budget(Some(budget))
+        .with_generation_limit_source(GenerationLimitSource::ProductDefault);
+        let huge = vec![ChatMessage::user("x".repeat(800_000))];
+        let err = provider
+            .chat(ProviderChatRequest {
+                messages: &huge,
+                tools: None,
+                request_max_output_tokens: None,
+            })
+            .await
+            .expect_err("oversized request must die at C1");
+        assert!(
+            err.to_string().contains(CONTEXT_BUDGET_EXCEEDED_MARKER),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            0,
+            "C1 must not send an oversized HTTP body"
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_i_c3_retries_exactly_once_even_if_a_third_would_succeed() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SHOULD_NOT_REPLAY),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        let err = result.expect_err("second overflow must fail after one recovery");
+        assert!(
+            !err.to_string().contains("SHOULD_NOT_REPLAY"),
+            "must not take a third logical attempt: {err}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            3,
+            "overflow + summary + one retry, not a third logical send"
+        );
+        let names = overflow_kind_names(&sink);
+        assert_eq!(names.first().copied(), Some("overflow_started"));
+        assert!(names.contains(&"overflow_failed"));
+        assert!(!names.contains(&"overflow_completed"));
+    }
+
+    #[tokio::test]
+    async fn r3_j_partial_output_does_not_replay_logical_request() {
+        let (result, deltas, attempts) = stream_against_script(
+            vec![
+                Scripted::SseTruncated(vec![delta_chunk("部分"), tool_call_chunk()]),
+                Scripted::Sse(vec![delta_chunk("REPLAYED"), sse_line("[DONE]")]),
+            ],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        assert_eq!(attempts, 1, "partial output must veto a replay");
+        assert_eq!(deltas, vec!["部分"]);
+        let message = result
+            .expect_err("a truncated stream must fail")
+            .to_string();
+        assert!(
+            !message.contains("REPLAYED"),
+            "unexpected message: {message}"
+        );
+    }
 }

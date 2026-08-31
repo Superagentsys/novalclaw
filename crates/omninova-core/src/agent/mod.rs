@@ -10,6 +10,9 @@ pub mod prompt;
 pub mod run_control;
 pub mod tool_runner;
 
+#[cfg(test)]
+mod r3_e2e;
+
 pub use agent::Agent;
 pub use prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
 pub use agent_event::{AgentRunEvent, DiffStats, StepStatus, ChangeType};

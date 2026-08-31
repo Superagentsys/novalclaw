@@ -378,6 +378,32 @@ pub fn build_structured_checkpoint(messages: &[ChatMessage], summary: &str) -> C
     ChatMessage::system(format!("{CHECKPOINT_MARKER} structured checkpoint\n{body}"))
 }
 
+/// Keeps only the newest structured checkpoint after a compaction rebuild.
+///
+/// Older checkpoint messages are already folded into the new checkpoint body
+/// by [`build_structured_checkpoint`]. Leaving them pinned in head would
+/// stack markers across maintenance cycles.
+pub fn retain_latest_checkpoint(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let last = messages.iter().rposition(|message| {
+        message.role == "system" && message.content.starts_with(CHECKPOINT_MARKER)
+    });
+    let Some(last) = last else {
+        return messages;
+    };
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            if message.role == "system" && message.content.starts_with(CHECKPOINT_MARKER) {
+                *index == last
+            } else {
+                true
+            }
+        })
+        .map(|(_, message)| message)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +595,24 @@ mod tests {
         let after = estimator.estimate_messages_with_tools(&out, &[]);
         let before = estimator.estimate_messages_with_tools(&out, &[]);
         assert!(after <= before + 8);
+    }
+
+    #[test]
+    fn retain_latest_checkpoint_drops_superseded_markers() {
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::system(format!("{CHECKPOINT_MARKER} old state")),
+            ChatMessage::system(format!("{CHECKPOINT_MARKER} new state")),
+            ChatMessage::user("hi"),
+        ];
+        let out = retain_latest_checkpoint(messages);
+        let checkpoints: Vec<_> = out
+            .iter()
+            .filter(|message| message.content.starts_with(CHECKPOINT_MARKER))
+            .collect();
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints[0].content.contains("new state"));
+        assert!(!out.iter().any(|message| message.content.contains("old state")));
     }
 
     #[test]

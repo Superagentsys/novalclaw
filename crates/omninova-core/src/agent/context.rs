@@ -1,7 +1,8 @@
 use crate::agent::history::{
     apply_compaction, build_structured_checkpoint, normalize_transient_system_messages,
     plan_compaction, plan_compaction_with_tail_tokens, prune_oversized_tool_results,
-    render_for_summary, truncate_history_preserving_system, CHECKPOINT_MARKER, SUMMARY_MARKER,
+    render_for_summary, retain_latest_checkpoint, truncate_history_preserving_system,
+    CHECKPOINT_MARKER, SUMMARY_MARKER,
 };
 use crate::observability::{
     emit_lifecycle, new_operation_id, pause_usage_snapshots, ContextLifecycleEventKind,
@@ -450,16 +451,19 @@ async fn maintain_context_with_mode(
                 break;
             }
             let checkpoint = build_structured_checkpoint(&current, &summary);
-            let compacted = apply_compaction(plan, &summary)
-                .into_iter()
-                .map(|message| {
-                    if message.role == "system" && message.content.starts_with(SUMMARY_MARKER) {
-                        checkpoint.clone()
-                    } else {
-                        message
-                    }
-                })
-                .collect::<Vec<_>>();
+            let compacted = retain_latest_checkpoint(
+                apply_compaction(plan, &summary)
+                    .into_iter()
+                    .map(|message| {
+                        if message.role == "system" && message.content.starts_with(SUMMARY_MARKER)
+                        {
+                            checkpoint.clone()
+                        } else {
+                            message
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
             let after_compact = estimator.estimate_messages_with_tools(&compacted, tool_specs);
             if after_compact >= last_estimate {
                 tracing::warn!(
