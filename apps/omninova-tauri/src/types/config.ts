@@ -62,6 +62,11 @@ export interface ProviderConfig {
   models: string[];
   enabled: boolean;
   transport?: ProviderTransportConfig;
+  /** Model capability metadata surfaced read-only from backend/builtin registry. */
+  context_window_tokens?: number | null;
+  max_output_tokens?: number | null;
+  /** Optional per-request generation cap. Blank/unset means no OmniNova-specified cap. */
+  request_max_output_tokens?: number | null;
 }
 
 export interface ProviderPreset extends ProviderConfig {

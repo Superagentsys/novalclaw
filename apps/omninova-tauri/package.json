@@ -39,7 +39,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "npx --yes tsx --test src/components/AgentRun/contextLifecycle.test.ts src/components/AgentRun/contextUsage.test.ts src/components/Chat/ContextUsageBadge.test.tsx"
+    "test": "npx --yes tsx --test src/components/AgentRun/contextLifecycle.test.ts src/components/Setup/requestLimit.test.ts src/components/AgentRun/contextUsage.test.ts src/components/Chat/ContextUsageBadge.test.tsx"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",

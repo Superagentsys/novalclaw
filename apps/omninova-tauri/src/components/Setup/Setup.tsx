@@ -359,6 +359,7 @@ export function Setup({
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
+  const [providerValidationError, setProviderValidationError] = useState<string | null>(null);
   const [activeChannelId, setActiveChannelIdState] = useState("");
   const dirtyChannelIdsRef = useRef<Set<string>>(new Set());
   const [localHealthStatus, setLocalHealthStatus] = useState<HealthUiStatus>("not_ready");
@@ -612,6 +613,29 @@ export function Setup({
     }
   };
 
+  const formatTokenCount = (value: number): string => {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+    if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+    return String(value);
+  };
+
+  const validateProviderRequestLimits = (providers: Config["providers"]): string | null => {
+    for (const provider of providers) {
+      const value = provider.request_max_output_tokens;
+      if (value == null) continue;
+      if (!Number.isSafeInteger(value) || value < 0) {
+        return `${provider.name} 的单次请求最大输出必须是有效的非负整数。`;
+      }
+      if (value === 0) {
+        return `${provider.name} 的单次请求最大输出不能为 0，请留空表示未限制。`;
+      }
+      if (provider.max_output_tokens && value > provider.max_output_tokens) {
+        return `${provider.name} 的单次请求最大输出不能超过该模型的最大输出上限 ${formatTokenCount(provider.max_output_tokens)}。`;
+      }
+    }
+    return null;
+  };
+
   const saveSetupConfig = async (
     validateAllChannels: boolean,
     configToSave = config,
@@ -636,6 +660,15 @@ export function Setup({
       setActionMessage(`配置验证失败：${channelValidationError}`);
       return;
     }
+    if (providerValidationError) {
+      setActionMessage(`配置验证失败：${providerValidationError}`);
+      return;
+    }
+    const providerLimitError = validateProviderRequestLimits(config.providers);
+    if (providerLimitError) {
+      setActionMessage(`配置验证失败：${providerLimitError}`);
+      return;
+    }
     setBusyAction("save");
     try {
       const restarted = await saveSetupConfig(false);
@@ -657,6 +690,15 @@ export function Setup({
   const handleSaveAndStartGateway = async () => {
     if (channelValidationError) {
       setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
+    if (providerValidationError) {
+      setActionMessage(`配置验证失败：${providerValidationError}`);
+      return;
+    }
+    const providerLimitError = validateProviderRequestLimits(config.providers);
+    if (providerLimitError) {
+      setActionMessage(`配置验证失败：${providerLimitError}`);
       return;
     }
     setBusyAction("start");
@@ -1324,6 +1366,7 @@ export function Setup({
                 default_model: model,
               })
             }
+            onValidationChange={(error) => setProviderValidationError(error)}
           />
         );
       case "channels":

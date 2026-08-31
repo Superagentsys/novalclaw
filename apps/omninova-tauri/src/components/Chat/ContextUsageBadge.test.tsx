@@ -23,7 +23,13 @@ import {
   ContextUsageBadgeContent,
   isOutsideContextUsageClick,
   measureContextUsagePopoverWidth,
+  resolveContextProgressRingState,
+  resolveContextProgressRingTone,
 } from "./ContextUsageBadge.tsx";
+import {
+  ContextProgressRing,
+  normalizeContextProgressPercentage,
+} from "./ContextProgressRing.tsx";
 
 const identity: ContextUsageIdentity = {
   sessionId: "session-ui",
@@ -78,6 +84,8 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /上下文/);
     assert.match(html, /63% · ~421K \/ 664K/);
     assert.match(html, /上下文输入 63%/);
+    assert.match(html, /data-context-ring-determinate="true"/);
+    assert.match(html, /data-context-ring-progress="63"/);
     assert.match(html, /role="progressbar"/);
     assert.match(html, /系统与规则/);
     assert.match(html, /~18K/);
@@ -85,6 +93,17 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /~214K/);
     assert.match(html, /估算构成/);
     assert.match(html, /发送前保守估算/);
+  });
+
+  it("mini polish removes the visible leading label and uses the smaller ring", () => {
+    const html = renderSnapshot({
+      estimated_input_tokens: 27_000,
+      max_input_tokens: 583_232,
+    }, false);
+    assert.doesNotMatch(html, /context-usage-label-word/);
+    assert.match(html, /style="width:20px;height:20px"/);
+    assert.match(html, />5%<\/span>/);
+    assert.match(html, /~27K/);
   });
 
   it("R2. budget popover distinguishes window, model max, request reserve, and safety", () => {
@@ -108,7 +127,7 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /384K/);
     assert.match(html, /32K/);
     assert.match(html, /935K/);
-    assert.doesNotMatch(html, /最大输入预算/);
+    assert.doesNotMatch(html, /<dt>最大输入预算<\/dt>/);
     assert.doesNotMatch(html, /保守回退/);
   });
 
@@ -127,6 +146,58 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /384K/);
   });
 
+  it("R2.2. configured 32K request reserve shows the authoritative 935K compact denominator", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 32_000,
+      output_reserve_tokens: 32_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 935_232,
+      pressure_threshold_tokens: 748_185,
+      estimated_input_tokens: 27_000,
+    }, false);
+    assert.match(html, /3% · ~27K \/ 935K/);
+    assert.match(html, /data-context-ring-progress="3"/);
+  });
+
+  it("R2.2. model-max fallback reserve shows the authoritative 583K compact denominator", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 384_000,
+      output_reserve_tokens: 384_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 583_232,
+      pressure_threshold_tokens: 466_585,
+      estimated_input_tokens: 27_000,
+    }, false);
+    assert.match(html, /5% · ~27K \/ 583K/);
+    assert.match(html, /data-context-ring-progress="5"/);
+  });
+
+  it("R2.2. estimated measurement preserves the approximation marker", () => {
+    const html = renderSnapshot({
+      estimated_input_tokens: 27_000,
+      max_input_tokens: 583_232,
+      measurement_exact: false,
+    }, false);
+    assert.match(html, /~27K/);
+    assert.match(html, /当前约 27K Token/);
+  });
+
+  it("R2.2. exact measurement does not invent an approximation marker", () => {
+    const html = renderSnapshot({
+      estimated_input_tokens: 27_000,
+      max_input_tokens: 583_232,
+      measurement_exact: true,
+      measurement_provenance: "exact_tokenizer",
+    }, false);
+    assert.match(html, /当前 27K Token/);
+    assert.doesNotMatch(html, /~27K/);
+    assert.doesNotMatch(html, /当前约 27K Token/);
+  });
+
   it("B. unknown budget has no percentage, progressbar, or fake denominator", () => {
     const html = renderSnapshot({
       context_window_tokens: null,
@@ -139,6 +210,8 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.doesNotMatch(html, /role="progressbar"/);
     assert.doesNotMatch(html, /63%/);
     assert.doesNotMatch(html, /664K/);
+    assert.match(html, /data-context-ring-state="unknown"/);
+    assert.match(html, /data-context-ring-determinate="false"/);
   });
 
   it("C. closed and open output follow the popover controller state", () => {
@@ -189,8 +262,48 @@ describe("ContextUsageBadge compact presentation", () => {
       />
     );
     assert.match(after, /82% · ~545K \/ 664K/);
-    assert.match(after, /压缩中/);
+    assert.match(after, /正在压缩/);
     assert.match(after, /正在压缩上下文/);
+    assert.match(after, /data-context-ring-state="compaction"/);
+  });
+
+  it("R2.2. normal state does not claim a compaction lifecycle", () => {
+    const html = renderSnapshot({ estimated_input_tokens: 27_000 }, false);
+    assert.match(html, /data-context-ring-state="normal"/);
+    assert.doesNotMatch(html, /data-context-ring-state="compaction"/);
+    assert.doesNotMatch(html, /正在压缩/);
+  });
+
+  it("R2.2. pressure tone compares usage with the supplied threshold", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      estimated_input_tokens: 440_000,
+      max_input_tokens: 664_000,
+      pressure_threshold_tokens: 500_000,
+    }));
+    let view = selectContextUsageView(state);
+    assert.equal(resolveContextProgressRingTone(view), "warning");
+
+    state = applyContextUsageSnapshot(state, snapshot({
+      estimated_input_tokens: 510_000,
+      max_input_tokens: 664_000,
+      pressure_threshold_tokens: 500_000,
+      request_revision: 13,
+      measured_at: 2,
+    }));
+    view = selectContextUsageView(state);
+    assert.equal(resolveContextProgressRingTone(view), "critical");
+  });
+
+  it("R2.2. ring rendering clamps only presentation input", () => {
+    assert.equal(normalizeContextProgressPercentage(-10), 0);
+    assert.equal(normalizeContextProgressPercentage(120), 100);
+    assert.equal(normalizeContextProgressPercentage(null), null);
+    const html = renderToStaticMarkup(
+      <ContextProgressRing percentage={5} state="normal" tone="normal" />
+    );
+    assert.match(html, /data-context-ring-progress="5"/);
+    assert.match(html, /stroke-dasharray="5 95"/);
   });
 });
 
@@ -287,6 +400,37 @@ describe("ContextUsageBadge popover layout", () => {
     assert.match(badgeSource, /isOutsideContextUsageClick\(event\.target, \[triggerRef\.current, panelRef\.current\]\)/);
   });
 
+  it("R2.2. native button preserves click, Enter, and Space activation semantics", () => {
+    const html = renderSnapshot({ estimated_input_tokens: 27_000 }, false);
+    assert.match(html, /<button[^>]*type="button"/);
+    assert.match(html, /aria-haspopup="dialog"/);
+    assert.match(html, /aria-expanded="false"/);
+    assert.doesNotMatch(badgeSource, /onKeyDown=.*preventDefault/);
+  });
+
+  it("R2.2. aria label describes current and maximum input without fake precision", () => {
+    const html = renderSnapshot({
+      estimated_input_tokens: 27_000,
+      max_input_tokens: 583_232,
+      measurement_exact: false,
+    }, false);
+    assert.match(html, /aria-label="上下文输入 5%，当前约 27K Token，最大输入预算 583K Token"/);
+  });
+
+  it("R2.2. responsive tiers retain the button trigger and avoid toolbar overflow", () => {
+    assert.match(badgeCss, /@media \(max-width: 900px\)/);
+    assert.match(badgeCss, /@media \(max-width: 620px\)/);
+    assert.match(badgeCss, /@media \(max-width: 480px\)/);
+    assert.match(badgeCss, /\.context-usage-summary[\s\S]*display:\s*none/);
+    assert.match(badgeCss, /\.context-usage-compact[\s\S]*display:\s*none/);
+  });
+
+  it("R2.2. reduced motion disables continuous ring animation", () => {
+    assert.match(badgeCss, /@media \(prefers-reduced-motion: reduce\)/);
+    assert.match(badgeCss, /\.context-progress-ring__motion[\s\S]*animation:\s*none/);
+    assert.match(badgeCss, /\.context-progress-ring__activity[\s\S]*animation:\s*none/);
+  });
+
   it("I. Unknown budget still has no percentage, progress bar, or fake denominator", () => {
     const html = renderSnapshot({
       context_window_tokens: null,
@@ -358,6 +502,7 @@ describe("R1 session restore badge states", () => {
     assert.match(html, /11\.3K|~11K|11,300|11K/);
     assert.match(html, /正在刷新/);
     assert.doesNotMatch(html, />正在计算…</);
+    assert.match(html, /data-context-ring-state="refreshing"/);
   });
 
   it("O. unavailable replaces infinite calculating", () => {
@@ -373,5 +518,7 @@ describe("R1 session restore badge states", () => {
     );
     assert.match(html, /上下文暂不可用/);
     assert.doesNotMatch(html, /正在计算…/);
+    assert.match(html, /data-context-ring-state="unavailable"/);
+    assert.match(html, /data-context-ring-tone="error"/);
   });
 });

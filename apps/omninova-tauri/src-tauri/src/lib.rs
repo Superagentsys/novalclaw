@@ -477,6 +477,12 @@ struct SetupProviderConfig {
     enabled: bool,
     #[serde(default)]
     transport: ProviderTransportConfig,
+    #[serde(default)]
+    context_window_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    request_max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3174,6 +3180,9 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 models: with_default_model(provider.models.clone(), provider.default_model.clone()),
                 enabled: provider.enabled,
                 transport: provider.transport,
+                context_window_tokens: provider.context_window_tokens,
+                max_output_tokens: provider.max_output_tokens,
+                request_max_output_tokens: provider.request_max_output_tokens,
             })
             .collect::<Vec<_>>()
     } else {
@@ -3189,6 +3198,9 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 models: provider.models.clone(),
                 enabled: provider.enabled,
                 transport: ProviderTransportConfig::default(),
+                context_window_tokens: None,
+                max_output_tokens: None,
+                request_max_output_tokens: None,
             })
             .collect::<Vec<_>>()
     };
@@ -3494,18 +3506,24 @@ fn setup_config_to_core(
                     enabled: provider.enabled,
                     timeout_secs: None,
                     transport: provider.transport,
-                    context_window_tokens: current
-                        .model_providers
-                        .get(&provider.id)
-                        .and_then(|p| p.context_window_tokens),
-                    max_output_tokens: current
-                        .model_providers
-                        .get(&provider.id)
-                        .and_then(|p| p.max_output_tokens),
-                    request_max_output_tokens: current
-                        .model_providers
-                        .get(&provider.id)
-                        .and_then(|p| p.request_max_output_tokens),
+                    context_window_tokens: provider.context_window_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.context_window_tokens)
+                    }),
+                    max_output_tokens: provider.max_output_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.max_output_tokens)
+                    }),
+                    request_max_output_tokens: provider.request_max_output_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.request_max_output_tokens)
+                    }),
                     exact_tokenizer: current
                         .model_providers
                         .get(&provider.id)

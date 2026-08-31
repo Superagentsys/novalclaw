@@ -18,6 +18,11 @@ import {
   type ContextUsageView,
 } from "../AgentRun/contextUsageState";
 import { formatTokenCount } from "../AgentRun/contextTokens";
+import {
+  ContextProgressRing,
+  type ContextProgressRingState,
+  type ContextProgressRingTone,
+} from "./ContextProgressRing";
 
 export const CONTEXT_USAGE_VIEWPORT_MARGIN = 12;
 export const CONTEXT_USAGE_PREFERRED_WIDTH = 360;
@@ -102,9 +107,10 @@ const BREAKDOWN_MARKER_CLASS: Record<string, string> = {
 };
 
 function compactStatusLabel(view: ContextUsageView): string | null {
-  if (view.activeStatus === "compaction") return "压缩中";
-  if (view.activeStatus === "pruning") return "裁剪中";
-  if (view.activeStatus === "recovery") return "恢复中";
+  if (view.activeStatus === "compaction") return "正在压缩…";
+  if (view.activeStatus === "pruning") return "正在裁剪工具结果…";
+  if (view.activeStatus === "recovery") return "正在恢复…";
+  if (view.refreshing) return "正在刷新…";
   return null;
 }
 
@@ -118,6 +124,46 @@ function badgeSummary(view: ContextUsageView): string {
     return `${total} · 窗口未知${refresh}`;
   }
   return `${view.percent}% · ${total} / ${formatTokenCount(view.maxInputTokens, "exact")}${refresh}`;
+}
+
+export function resolveContextProgressRingState(view: ContextUsageView): ContextProgressRingState {
+  if (view.unavailable && view.estimatedTokens == null) return "unavailable";
+  if (view.activeStatus === "compaction") return "compaction";
+  if (view.refreshing) return "refreshing";
+  if (view.placeholder) return "calculating";
+  if (!view.knownBudget || view.percent == null) return "unknown";
+  return "normal";
+}
+
+export function resolveContextProgressRingTone(view: ContextUsageView): ContextProgressRingTone {
+  if (view.unavailable && view.estimatedTokens == null) return "error";
+  if (!view.knownBudget || view.estimatedTokens == null) return "neutral";
+  if (view.pressureThresholdTokens == null || view.pressureThresholdTokens <= 0) return "normal";
+  if (view.estimatedTokens >= view.pressureThresholdTokens) return "critical";
+  if (view.estimatedTokens >= view.pressureThresholdTokens * 0.85) return "warning";
+  return "normal";
+}
+
+function badgeAriaLabel(view: ContextUsageView): string {
+  if (view.unavailable && view.estimatedTokens == null) return "上下文暂不可用";
+  if (view.placeholder && view.estimatedTokens == null) return "正在计算上下文输入";
+
+  const estimate = view.estimatedTokens == null
+    ? null
+    : formatTokenCount(view.estimatedTokens, "exact");
+  const estimateQualifier = view.measurementExact ? "" : "约";
+  let label: string;
+
+  if (estimate == null) {
+    label = "当前上下文输入未知";
+  } else if (view.knownBudget && view.maxInputTokens != null && view.percent != null) {
+    label = `上下文输入 ${view.percent}%，当前${estimateQualifier} ${estimate} Token，最大输入预算 ${formatTokenCount(view.maxInputTokens, "exact")} Token`;
+  } else {
+    label = `当前上下文${estimateQualifier} ${estimate} Token，模型输入预算未知`;
+  }
+
+  const transient = compactStatusLabel(view);
+  return transient ? `${label}，${transient.replace(/…$/, "")}` : label;
 }
 
 interface ContextUsageBadgeContentProps {
@@ -152,10 +198,14 @@ export function ContextUsageBadgeContent({
     view.knownBudget && view.maxInputTokens != null
       ? formatTokenCount(view.maxInputTokens, "exact")
       : null;
-  const statusLabel = compactStatusLabel(view);
   const visibleBreakdown = view.breakdown
     ? BREAKDOWN_LABELS.filter((item) => view.breakdown![item.key] > 0)
     : [];
+  const ringState = resolveContextProgressRingState(view);
+  const ringTone = resolveContextProgressRingTone(view);
+  const triggerStatus = compactStatusLabel(view);
+  const summary = badgeSummary(view);
+  const triggerTitle = `${summary}${triggerStatus && !summary.includes(triggerStatus) ? ` · ${triggerStatus}` : ""}\n点击查看详情`;
 
   const panel = open ? (
         <div
@@ -404,18 +454,52 @@ export function ContextUsageBadgeContent({
       <button
         ref={triggerRef}
         type="button"
-        className="context-usage-trigger"
+        className={`context-usage-trigger is-${ringState} tone-${ringTone}`}
+        data-context-state={ringState}
+        data-pressure-tone={ringTone}
         aria-expanded={open}
         aria-haspopup="dialog"
         aria-controls={panelId}
-        aria-label={`${view.compactText}${view.activeStatusLabel ? `，${view.activeStatusLabel}` : ""}`}
+        aria-label={badgeAriaLabel(view)}
+        title={triggerTitle}
         onClick={onToggle}
       >
-        <span className="context-usage-kicker">上下文</span>
-        <span className={`context-usage-value${view.placeholder ? " is-placeholder" : ""}`}>
-          {badgeSummary(view)}
+        <ContextProgressRing
+          percentage={view.knownBudget ? view.barPercent : null}
+          state={ringState}
+          tone={ringTone}
+        />
+        <span className={`context-usage-compact${view.placeholder ? " is-placeholder" : ""}`}>
+          {view.knownBudget && view.percent != null ? (
+            <span className="context-usage-primary">
+              <span className="context-usage-percent">{view.percent}%</span>
+            </span>
+          ) : view.unavailable && view.estimatedTokens == null ? (
+            <span className="context-usage-primary">
+              <span className="context-usage-state-text">暂不可用</span>
+            </span>
+          ) : view.placeholder ? (
+            <span className="context-usage-primary">
+              <span className="context-usage-state-text">计算中</span>
+            </span>
+          ) : null}
+          {estimateText ? (
+            <span className="context-usage-summary">
+              <span className="context-usage-separator" aria-hidden="true">·</span>
+              <span className="context-usage-current">{estimateText}</span>
+              {maxText ? (
+                <span className="context-usage-denominator"> / {maxText}</span>
+              ) : (
+                <span className="context-usage-unknown-label"> · 窗口未知</span>
+              )}
+            </span>
+          ) : null}
+          {triggerStatus ? (
+            <span className="context-usage-transient" role="status" aria-live="polite">
+              {triggerStatus}
+            </span>
+          ) : null}
         </span>
-        {statusLabel ? <span className="context-usage-status">{statusLabel}</span> : null}
       </button>
       {portaled}
     </React.Fragment>
