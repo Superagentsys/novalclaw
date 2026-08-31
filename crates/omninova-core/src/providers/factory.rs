@@ -44,6 +44,27 @@ const OPENAI_COMPATIBLE: &[&str] = &[
     "custom",
 ];
 
+/// Resolves the per-request generation cap from profile config.
+///
+/// `None` or `0` means no request limit is configured. A known cap is clamped
+/// to the model maximum when that capability is known. This never invents a
+/// default merely to enlarge the input budget.
+pub fn resolve_request_generation_limit(
+    profile: Option<&ModelProviderConfig>,
+    model_max_output_tokens: Option<u64>,
+) -> Option<u32> {
+    let configured = profile
+        .and_then(|item| item.request_max_output_tokens)
+        .filter(|value| *value > 0)?;
+    let effective = match model_max_output_tokens.filter(|value| *value > 0) {
+        Some(model_max) => configured.min(model_max),
+        None => configured,
+    };
+    u32::try_from(effective.min(u64::from(u32::MAX)))
+        .ok()
+        .filter(|value| *value > 0)
+}
+
 pub fn build_provider_from_config(config: &Config) -> Box<dyn Provider> {
     build_provider_with_selection(config, &ProviderSelection::default())
 }
@@ -107,6 +128,12 @@ pub fn build_provider_with_selection(
     let timeouts = crate::providers::ProviderTimeouts::from_config(&config.provider_runtime);
     let transport_mode = profile.map(|p| p.transport.mode).unwrap_or_default();
     let context_budget = resolve_context_budget(config, &model, profile);
+    let request_max_tokens = resolve_request_generation_limit(
+        profile,
+        context_budget
+            .as_ref()
+            .and_then(|budget| budget.model_max_output_tokens),
+    );
     let exact_tokenizer =
         resolve_exact_tokenizer_name(&model, profile, base_url.as_deref()).map(str::to_string);
     let anthropic_count_trusted = matches!(
@@ -122,7 +149,7 @@ pub fn build_provider_with_selection(
                 api_key.as_deref(),
                 model,
                 temp,
-                None,
+                request_max_tokens,
                 timeouts,
             )
             .with_transport_mode(transport_mode)
@@ -136,7 +163,7 @@ pub fn build_provider_with_selection(
                 api_key.as_deref(),
                 model,
                 temp,
-                None,
+                request_max_tokens,
                 timeouts,
             )
             .with_transport_mode(transport_mode)
@@ -155,7 +182,7 @@ pub fn build_provider_with_selection(
                     api_key.as_deref(),
                     model,
                     temp,
-                    None,
+                    request_max_tokens,
                     timeouts,
                 )
                 .with_transport_mode(transport_mode)
@@ -169,7 +196,7 @@ pub fn build_provider_with_selection(
                 api_key.as_deref(),
                 model,
                 temp,
-                None,
+                request_max_tokens,
                 timeouts,
             )
             .with_transport_mode(transport_mode)
@@ -638,6 +665,7 @@ mod tests {
         assert_eq!(provider.exact_tokenizer(), Some("deepseek_v4_flash_0731"));
         let budget = provider.context_budget().expect("flash budget");
         assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.model_max_output_tokens, Some(384_000));
         assert_eq!(budget.output_reserve_tokens, 384_000);
     }
 
@@ -691,6 +719,231 @@ mod tests {
             },
         );
         assert_eq!(provider.exact_tokenizer(), Some("deepseek_v4_flash_0731"));
+    }
+
+    fn flash_config_with_request_limit(limit: Option<u64>) -> Config {
+        let mut config = Config::default();
+        config.model_providers.insert(
+            "deepseek".into(),
+            ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                default_model: Some("deepseek-v4-flash".into()),
+                models: vec!["deepseek-v4-flash".into(), "gpt-4o".into()],
+                request_max_output_tokens: limit,
+                ..ModelProviderConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn r21_a_factory_receives_configured_32k_request_limit() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(Some(32_000)),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let profile = flash_config_with_request_limit(Some(32_000))
+            .model_providers
+            .remove("deepseek")
+            .unwrap();
+        assert_eq!(
+            resolve_request_generation_limit(Some(&profile), Some(384_000)),
+            Some(32_000)
+        );
+        let budget = provider.context_budget().expect("flash budget");
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.output_reserve_tokens, 32_000);
+    }
+
+    #[test]
+    fn r21_b_native_request_carries_configured_32k() {
+        let profile = ModelProviderConfig {
+            request_max_output_tokens: Some(32_000),
+            ..ModelProviderConfig::default()
+        };
+        let cap = resolve_request_generation_limit(Some(&profile), Some(384_000));
+        let native = crate::providers::native_request::NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: cap,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        assert!(body.contains("\"max_tokens\":32000"));
+        assert_eq!(
+            crate::providers::context_budget::native_request_output_limit_from_json(&body),
+            Some(32_000)
+        );
+    }
+
+    #[test]
+    fn r21_c_d_configured_32k_yields_935k_input_budget() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(Some(32_000)),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = provider.context_budget().expect("flash budget");
+        assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.model_max_output_tokens, Some(384_000));
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.safety_reserve_tokens, 32_768);
+        assert_eq!(budget.max_input_tokens, 935_232);
+        assert_eq!(
+            budget.pressure_threshold(),
+            ((935_232f64) * 0.80).floor() as u64
+        );
+    }
+
+    #[test]
+    fn r21_e_missing_request_limit_stays_uncapped_and_conservative() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(None),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let profile = ModelProviderConfig::default();
+        assert_eq!(
+            resolve_request_generation_limit(Some(&profile), Some(384_000)),
+            None
+        );
+        let native = crate::providers::native_request::NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        assert!(!body.contains("max_tokens"));
+        let budget = provider.context_budget().expect("flash budget");
+        assert_eq!(budget.request_output_reserve_tokens, 384_000);
+        assert_eq!(budget.max_input_tokens, 583_232);
+    }
+
+    #[test]
+    fn r21_f_request_limit_above_model_max_clamps() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(Some(500_000)),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        assert_eq!(
+            resolve_request_generation_limit(
+                Some(&ModelProviderConfig {
+                    request_max_output_tokens: Some(500_000),
+                    ..ModelProviderConfig::default()
+                }),
+                Some(384_000),
+            ),
+            Some(384_000)
+        );
+        let budget = provider.context_budget().expect("flash budget");
+        assert_eq!(budget.request_output_reserve_tokens, 384_000);
+        assert_eq!(budget.max_input_tokens, 583_232);
+    }
+
+    #[test]
+    fn r21_zero_request_limit_is_treated_as_missing() {
+        assert_eq!(
+            resolve_request_generation_limit(
+                Some(&ModelProviderConfig {
+                    request_max_output_tokens: Some(0),
+                    ..ModelProviderConfig::default()
+                }),
+                Some(384_000),
+            ),
+            None
+        );
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(Some(0)),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        assert_eq!(
+            provider.context_budget().unwrap().request_output_reserve_tokens,
+            384_000
+        );
+    }
+
+    #[test]
+    fn r21_g_session_open_budget_uses_configured_32k() {
+        let provider = build_provider_with_selection(
+            &flash_config_with_request_limit(Some(32_000)),
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = provider.context_budget().expect("projection budget");
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.max_input_tokens, 935_232);
+    }
+
+    #[test]
+    fn r21_h_config_reload_preserves_request_generation_limit() {
+        let original = flash_config_with_request_limit(Some(32_000));
+        let serialized = toml::to_string(&original).expect("serialize");
+        let restored: Config = toml::from_str(&serialized).expect("reload");
+        assert_eq!(
+            restored.model_providers["deepseek"].request_max_output_tokens,
+            Some(32_000)
+        );
+        let provider = build_provider_with_selection(
+            &restored,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        assert_eq!(
+            provider.context_budget().unwrap().request_output_reserve_tokens,
+            32_000
+        );
+    }
+
+    #[test]
+    fn r21_i_model_switch_recalculates_clamped_reserve() {
+        let config = flash_config_with_request_limit(Some(32_000));
+        let flash = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        )
+        .context_budget()
+        .unwrap();
+        let gpt = build_provider_with_selection(
+            &config,
+            &ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("gpt-4o".into()),
+            },
+        )
+        .context_budget()
+        .unwrap();
+        assert_eq!(flash.request_output_reserve_tokens, 32_000);
+        assert_eq!(gpt.model_max_output_tokens, Some(16_384));
+        assert_eq!(gpt.request_output_reserve_tokens, 16_384);
+        assert_ne!(flash.max_input_tokens, gpt.max_input_tokens);
     }
 }
 

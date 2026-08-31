@@ -87,6 +87,49 @@ describe("O3 context usage visualization", () => {
     assert.equal(view.contextWindowTokens, 1_000_000);
   });
 
+  it("R2. frontend displays backend budget fields and does not derive max_input", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 18_000,
+      request_revision: 1,
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 32_000,
+      output_reserve_tokens: 32_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 935_232,
+      pressure_threshold_tokens: 748_185,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.contextWindowTokens, 1_000_000);
+    assert.equal(view.modelMaxOutputTokens, 384_000);
+    assert.equal(view.requestOutputReserveTokens, 32_000);
+    assert.equal(view.requestReserveIsConservativeFallback, false);
+    assert.equal(view.safetyReserveTokens, 32_768);
+    assert.equal(view.maxInputTokens, 935_232);
+    assert.equal(view.pressureThresholdTokens, 748_185);
+  });
+
+  it("R2.1 conservative fallback is labeled when reserve equals model max", () => {
+    let state = emptyContextUsageState(identity);
+    state = applyContextUsageSnapshot(state, snapshot({
+      measurement_kind: "candidate_estimate",
+      estimated_input_tokens: 18_000,
+      request_revision: 1,
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 384_000,
+      output_reserve_tokens: 384_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 583_232,
+    }));
+    const view = selectContextUsageView(state);
+    assert.equal(view.requestOutputReserveTokens, 384_000);
+    assert.equal(view.requestReserveIsConservativeFallback, true);
+    assert.equal(view.maxInputTokens, 583_232);
+  });
+
   it("B. 600K of 664K is about 90 percent not 60", () => {
     let state = emptyContextUsageState(identity);
     state = applyContextUsageSnapshot(state, snapshot({

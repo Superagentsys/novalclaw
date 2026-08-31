@@ -331,6 +331,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r2_k_projection_reports_request_runtime_budget_without_provider_call() {
+        let provider = CountingProvider::new();
+        let budget = crate::providers::context_budget::ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )
+        .with_request_output_cap(Some(32_000));
+        let snapshot = measure_projected_context(
+            Some("session-k".into()),
+            provider.name(),
+            "deepseek-v4-flash",
+            None,
+            Some(&budget),
+            &[ChatMessage::user("hello")],
+            &[],
+        )
+        .await;
+        assert_eq!(provider.chats.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot.max_input_tokens, Some(1_000_000 - 32_000 - 32_768));
+        assert_eq!(snapshot.request_output_reserve_tokens, Some(32_000));
+        assert_eq!(snapshot.model_max_output_tokens, Some(384_000));
+        assert_eq!(snapshot.safety_reserve_tokens, Some(32_768));
+        assert_eq!(
+            snapshot.measurement_kind,
+            MeasurementKind::CandidateEstimate
+        );
+    }
+
+    #[tokio::test]
+    async fn r21_g_projection_uses_factory_request_limit_without_provider_call() {
+        let mut config = crate::config::Config::default();
+        config.model_providers.insert(
+            "deepseek".into(),
+            crate::config::ModelProviderConfig {
+                enabled: true,
+                api_key: Some("sk-test".into()),
+                default_model: Some("deepseek-v4-flash".into()),
+                models: vec!["deepseek-v4-flash".into()],
+                request_max_output_tokens: Some(32_000),
+                ..crate::config::ModelProviderConfig::default()
+            },
+        );
+        let factory_provider = crate::providers::factory::build_provider_with_selection(
+            &config,
+            &crate::providers::factory::ProviderSelection {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-v4-flash".into()),
+            },
+        );
+        let budget = factory_provider.context_budget();
+        let counting = CountingProvider::new();
+        let snapshot = measure_projected_context(
+            Some("session-r21-g".into()),
+            counting.name(),
+            "deepseek-v4-flash",
+            None,
+            budget.as_ref(),
+            &[ChatMessage::user("hello")],
+            &[],
+        )
+        .await;
+        assert_eq!(counting.chats.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot.request_output_reserve_tokens, Some(32_000));
+        assert_eq!(snapshot.max_input_tokens, Some(935_232));
+        assert_eq!(snapshot.model_max_output_tokens, Some(384_000));
+    }
+
+    #[tokio::test]
     async fn g_trusted_local_tokenizer_is_used_when_available() {
         let messages = vec![ChatMessage::system("sys"), ChatMessage::user("hello world")];
         let snapshot = measure_projected_context(
@@ -389,6 +458,8 @@ mod tests {
             context_window_tokens: Some(640_000),
             max_input_tokens: Some(583_000),
             output_reserve_tokens: None,
+            model_max_output_tokens: None,
+            request_output_reserve_tokens: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: Some(466_400),
             budget_source: None,
@@ -506,6 +577,8 @@ mod tests {
             context_window_tokens: None,
             max_input_tokens: None,
             output_reserve_tokens: None,
+            model_max_output_tokens: None,
+            request_output_reserve_tokens: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: None,
             budget_source: None,
@@ -562,6 +635,8 @@ mod tests {
             context_window_tokens: None,
             max_input_tokens: None,
             output_reserve_tokens: None,
+            model_max_output_tokens: None,
+            request_output_reserve_tokens: None,
             safety_reserve_tokens: None,
             pressure_threshold_tokens: None,
             budget_source: None,

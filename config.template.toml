@@ -37,6 +37,10 @@
 # models = ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"]
 # enabled = true
 # timeout_secs = 120
+# Optional per-request generation cap (not the model's theoretical max output).
+# Omit to leave the native request uncapped; ContextBudget then reserves the
+# model maximum conservatively. Example for DeepSeek V4 Flash: 32000 → ~935K input.
+# request_max_output_tokens = 32000
 #
 # [model_providers.qwen]
 # api_key_env = "DASHSCOPE_API_KEY"

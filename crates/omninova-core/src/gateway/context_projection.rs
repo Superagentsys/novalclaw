@@ -343,6 +343,8 @@ mod tests {
             context_window_tokens: Some(640_000),
             max_input_tokens: Some(583_000),
             output_reserve_tokens: Some(16_384),
+            model_max_output_tokens: Some(16_384),
+            request_output_reserve_tokens: Some(16_384),
             safety_reserve_tokens: Some(32_768),
             pressure_threshold_tokens: Some(466_400),
             budget_source: Some("test".into()),

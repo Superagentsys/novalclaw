@@ -87,6 +87,46 @@ describe("ContextUsageBadge compact presentation", () => {
     assert.match(html, /发送前保守估算/);
   });
 
+  it("R2. budget popover distinguishes window, model max, request reserve, and safety", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 32_000,
+      output_reserve_tokens: 32_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 935_232,
+      pressure_threshold_tokens: 748_185,
+      estimated_input_tokens: 18_000,
+    }, true);
+    assert.match(html, /模型上下文窗口/);
+    assert.match(html, /模型最大输出上限/);
+    assert.match(html, /本次输出预留/);
+    assert.match(html, /安全预留/);
+    assert.match(html, /当前输入预算/);
+    assert.match(html, /自动维护阈值/);
+    assert.match(html, /1\.0M/);
+    assert.match(html, /384K/);
+    assert.match(html, /32K/);
+    assert.match(html, /935K/);
+    assert.doesNotMatch(html, /最大输入预算/);
+    assert.doesNotMatch(html, /保守回退/);
+  });
+
+  it("R2.1. unknown request cap popover marks conservative model-max fallback", () => {
+    const html = renderSnapshot({
+      context_window_tokens: 1_000_000,
+      model_max_output_tokens: 384_000,
+      request_output_reserve_tokens: 384_000,
+      output_reserve_tokens: 384_000,
+      safety_reserve_tokens: 32_768,
+      max_input_tokens: 583_232,
+      estimated_input_tokens: 18_000,
+    }, true);
+    assert.match(html, /本次输出预留/);
+    assert.match(html, /保守回退：模型最大输出上限/);
+    assert.match(html, /384K/);
+  });
+
   it("B. unknown budget has no percentage, progressbar, or fake denominator", () => {
     const html = renderSnapshot({
       context_window_tokens: null,

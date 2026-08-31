@@ -292,16 +292,33 @@ export function ContextUsageBadgeContent({
                     <dd>{formatTokenCount(view.contextWindowTokens, "exact")}</dd>
                   </div>
                 ) : null}
-                {view.maxInputTokens != null ? (
+                {view.modelMaxOutputTokens != null ? (
                   <div className="context-usage-row">
-                    <dt>最大输入预算</dt>
-                    <dd>{formatTokenCount(view.maxInputTokens, "exact")}</dd>
+                    <dt>模型最大输出上限</dt>
+                    <dd>{formatTokenCount(view.modelMaxOutputTokens, "exact")}</dd>
                   </div>
                 ) : null}
-                {view.outputReserveTokens != null ? (
+                {view.requestOutputReserveTokens != null ? (
                   <div className="context-usage-row">
-                    <dt>输出预留</dt>
-                    <dd>{formatTokenCount(view.outputReserveTokens, "exact")}</dd>
+                    <dt>本次输出预留</dt>
+                    <dd>
+                      {formatTokenCount(view.requestOutputReserveTokens, "exact")}
+                      {view.requestReserveIsConservativeFallback
+                        ? "（保守回退：模型最大输出上限）"
+                        : ""}
+                    </dd>
+                  </div>
+                ) : null}
+                {view.safetyReserveTokens != null ? (
+                  <div className="context-usage-row">
+                    <dt>安全预留</dt>
+                    <dd>{formatTokenCount(view.safetyReserveTokens, "exact")}</dd>
+                  </div>
+                ) : null}
+                {view.maxInputTokens != null ? (
+                  <div className="context-usage-row">
+                    <dt>当前输入预算</dt>
+                    <dd>{formatTokenCount(view.maxInputTokens, "exact")}</dd>
                   </div>
                 ) : null}
                 {view.pressureThresholdTokens != null ? (

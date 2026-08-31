@@ -9,8 +9,8 @@ use crate::config::{Config, ModelProviderConfig};
 use crate::providers::ChatMessage;
 use crate::tools::ToolSpec;
 
-/// Default output reserve used when a provider/model has no explicit
-/// `max_output_tokens`. This is intentionally conservative.
+/// Conservative output reserve used only when neither a request cap nor a
+/// model maximum is known. This is not a generation default to send.
 pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 16_384;
 
 /// Fixed safety reserve kept between the effective input budget and the
@@ -147,10 +147,35 @@ pub struct ContextWindowSpec {
     pub source: ContextBudgetSource,
 }
 
+/// Configuration error when reserved tokens leave no usable input budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBudgetConfigError {
+    pub context_window_tokens: u64,
+    pub output_reserve_tokens: u64,
+    pub safety_reserve_tokens: u64,
+}
+
+impl std::fmt::Display for ContextBudgetConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: output reserve {} + safety reserve {} >= context window {}",
+            CONTEXT_BUDGET_EXCEEDED_MARKER,
+            self.output_reserve_tokens,
+            self.safety_reserve_tokens,
+            self.context_window_tokens
+        )
+    }
+}
+
+impl std::error::Error for ContextBudgetConfigError {}
+
 /// Effective input budget after reserving output and safety space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
     pub context_window_tokens: u64,
+    pub model_max_output_tokens: Option<u64>,
+    pub request_output_reserve_tokens: u64,
     pub output_reserve_tokens: u64,
     pub safety_reserve_tokens: u64,
     pub max_input_tokens: u64,
@@ -163,17 +188,63 @@ impl ContextBudget {
         max_output_tokens: Option<u64>,
         source: ContextBudgetSource,
     ) -> Self {
-        let output_reserve_tokens = max_output_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS);
-        let safety_reserve_tokens = DEFAULT_SAFETY_RESERVE_TOKENS;
+        Self::from_parts(
+            context_window_tokens,
+            max_output_tokens,
+            None,
+            DEFAULT_SAFETY_RESERVE_TOKENS,
+            source,
+        )
+    }
+
+    /// Rebuilds the budget using an authoritative per-request output cap.
+    ///
+    /// `None` or `0` falls back to the model maximum (conservative). A known
+    /// request cap is clamped to the model maximum when that capability is known.
+    pub fn with_request_output_cap(self, request_output_cap: Option<u64>) -> Self {
+        Self::from_parts(
+            self.context_window_tokens,
+            self.model_max_output_tokens,
+            request_output_cap,
+            self.safety_reserve_tokens,
+            self.source,
+        )
+    }
+
+    fn from_parts(
+        context_window_tokens: u64,
+        model_max_output_tokens: Option<u64>,
+        request_output_cap: Option<u64>,
+        safety_reserve_tokens: u64,
+        source: ContextBudgetSource,
+    ) -> Self {
+        let output_reserve_tokens =
+            effective_request_output_tokens(request_output_cap, model_max_output_tokens);
         let reserved = output_reserve_tokens.saturating_add(safety_reserve_tokens);
         let max_input_tokens = context_window_tokens.saturating_sub(reserved);
         Self {
             context_window_tokens,
+            model_max_output_tokens,
+            request_output_reserve_tokens: output_reserve_tokens,
             output_reserve_tokens,
             safety_reserve_tokens,
             max_input_tokens,
             source,
         }
+    }
+
+    pub fn ensure_usable(&self) -> Result<(), ContextBudgetConfigError> {
+        let reserved = self
+            .output_reserve_tokens
+            .saturating_add(self.safety_reserve_tokens);
+        if reserved >= self.context_window_tokens {
+            return Err(ContextBudgetConfigError {
+                context_window_tokens: self.context_window_tokens,
+                output_reserve_tokens: self.output_reserve_tokens,
+                safety_reserve_tokens: self.safety_reserve_tokens,
+            });
+        }
+        Ok(())
     }
 
     pub fn pressure_threshold(&self) -> u64 {
@@ -187,6 +258,52 @@ impl ContextBudget {
     pub fn recent_tail_budget(&self) -> u64 {
         ratio_tokens(self.max_input_tokens, RECENT_TAIL_RATIO)
     }
+}
+
+/// Resolves the single semantic output reserve for this request.
+///
+/// Authority: explicit request cap (when > 0) clamped to model max, else
+/// model max, else the conservative default. Never invents a smaller cap
+/// merely to enlarge the input budget.
+pub fn effective_request_output_tokens(
+    request_output_cap: Option<u64>,
+    model_max_output_tokens: Option<u64>,
+) -> u64 {
+    let request = request_output_cap.filter(|value| *value > 0);
+    match (request, model_max_output_tokens.filter(|value| *value > 0)) {
+        (Some(request), Some(model_max)) => request.min(model_max),
+        (Some(request), None) => request,
+        (None, Some(model_max)) => model_max,
+        (None, None) => DEFAULT_OUTPUT_RESERVE_TOKENS,
+    }
+}
+
+/// Reads the provider-native output limit from a finalized request body.
+///
+/// Normalizes OpenAI `max_tokens` / `max_completion_tokens`, Anthropic
+/// `max_tokens`, and Gemini `max_output_tokens` to one semantic value.
+/// `0` is treated as missing (OpenAI-compatible providers omit a zero cap).
+pub fn native_request_output_limit_from_json(body: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        if let Some(tokens) = value.get(key).and_then(json_positive_u64) {
+            return Some(tokens);
+        }
+    }
+    if let Some(tokens) = value
+        .pointer("/generationConfig/maxOutputTokens")
+        .and_then(json_positive_u64)
+    {
+        return Some(tokens);
+    }
+    None
+}
+
+fn json_positive_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .filter(|tokens| *tokens > 0)
 }
 
 fn ratio_tokens(value: u64, ratio: f64) -> u64 {
@@ -306,6 +423,8 @@ mod tests {
         let budget = ContextBudget::new(1_048_576, Some(16_384), ContextBudgetSource::ExplicitConfig);
         assert_eq!(budget.max_input_tokens, 999_424);
         assert_eq!(budget.output_reserve_tokens, 16_384);
+        assert_eq!(budget.request_output_reserve_tokens, 16_384);
+        assert_eq!(budget.model_max_output_tokens, Some(16_384));
         assert_eq!(budget.safety_reserve_tokens, 32_768);
     }
 
@@ -313,6 +432,7 @@ mod tests {
     fn budget_never_underflows() {
         let budget = ContextBudget::new(1_000, None, ContextBudgetSource::ExplicitConfig);
         assert_eq!(budget.max_input_tokens, 0);
+        assert!(budget.ensure_usable().is_err());
     }
 
     #[test]
@@ -350,6 +470,7 @@ mod tests {
         let cfg = Config::default();
         let budget = resolve_context_budget(&cfg, "deepseek-v4-flash", None).unwrap();
         assert_eq!(budget.context_window_tokens, 1_000_000);
+        assert_eq!(budget.model_max_output_tokens, Some(384_000));
         assert_eq!(budget.output_reserve_tokens, 384_000);
         assert_eq!(budget.source, ContextBudgetSource::BuiltIn);
     }
@@ -393,5 +514,124 @@ mod tests {
     fn unknown_model_has_no_fabricated_budget() {
         let cfg = Config::default();
         assert!(resolve_context_budget(&cfg, "unknown-alias", None).is_none());
+    }
+
+    fn flash_budget() -> ContextBudget {
+        ContextBudget::new(1_000_000, Some(384_000), ContextBudgetSource::BuiltIn)
+    }
+
+    #[test]
+    fn r2_a_one_million_model_with_32k_request_uses_32k_reserve() {
+        let budget = flash_budget().with_request_output_cap(Some(32_000));
+        assert_eq!(budget.model_max_output_tokens, Some(384_000));
+        assert_eq!(budget.request_output_reserve_tokens, 32_000);
+        assert_eq!(budget.output_reserve_tokens, 32_000);
+        assert_eq!(budget.safety_reserve_tokens, 32_768);
+        assert_eq!(budget.max_input_tokens, 1_000_000 - 32_000 - 32_768);
+        assert_ne!(budget.max_input_tokens, 583_232);
+    }
+
+    #[test]
+    fn r2_b_one_million_model_with_384k_request_keeps_conservative_input() {
+        let budget = flash_budget().with_request_output_cap(Some(384_000));
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+        assert_eq!(budget.max_input_tokens, 1_000_000 - 384_000 - 32_768);
+        assert_eq!(budget.max_input_tokens, 583_232);
+    }
+
+    #[test]
+    fn r2_c_request_output_above_model_max_clamps_to_model_max() {
+        let budget = flash_budget().with_request_output_cap(Some(500_000));
+        assert_eq!(budget.request_output_reserve_tokens, 384_000);
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+        assert_eq!(budget.max_input_tokens, 583_232);
+    }
+
+    #[test]
+    fn r2_d_missing_request_output_falls_back_to_model_max() {
+        let budget = flash_budget().with_request_output_cap(None);
+        assert_eq!(budget.output_reserve_tokens, 384_000);
+        assert_eq!(budget.max_input_tokens, 583_232);
+        let zero = flash_budget().with_request_output_cap(Some(0));
+        assert_eq!(zero.output_reserve_tokens, 384_000);
+    }
+
+    #[test]
+    fn r2_h_pressure_threshold_recalculates_from_new_max_input() {
+        let conservative = flash_budget();
+        let dynamic = flash_budget().with_request_output_cap(Some(32_000));
+        assert_eq!(
+            conservative.pressure_threshold(),
+            ratio_tokens(conservative.max_input_tokens, PRESSURE_THRESHOLD_RATIO)
+        );
+        assert_eq!(
+            dynamic.pressure_threshold(),
+            ratio_tokens(dynamic.max_input_tokens, PRESSURE_THRESHOLD_RATIO)
+        );
+        assert!(dynamic.pressure_threshold() > conservative.pressure_threshold());
+    }
+
+    #[test]
+    fn r2_i_safety_reserve_remains_unchanged() {
+        let budget = flash_budget().with_request_output_cap(Some(32_000));
+        assert_eq!(budget.safety_reserve_tokens, DEFAULT_SAFETY_RESERVE_TOKENS);
+        assert_eq!(
+            flash_budget().safety_reserve_tokens,
+            DEFAULT_SAFETY_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn r2_known_request_cap_without_model_max_uses_request_cap() {
+        let budget = ContextBudget::new(1_000_000, None, ContextBudgetSource::ExplicitConfig)
+            .with_request_output_cap(Some(32_000));
+        assert_eq!(budget.model_max_output_tokens, None);
+        assert_eq!(budget.output_reserve_tokens, 32_000);
+        assert_eq!(budget.max_input_tokens, 1_000_000 - 32_000 - 32_768);
+    }
+
+    #[test]
+    fn r2_overflow_reserve_is_a_config_error() {
+        let budget = ContextBudget::new(1_000, Some(384_000), ContextBudgetSource::ExplicitConfig);
+        let error = budget.ensure_usable().expect_err("unusable budget");
+        assert!(error.to_string().contains(CONTEXT_BUDGET_EXCEEDED_MARKER));
+        assert_eq!(budget.max_input_tokens, 0);
+    }
+
+    #[test]
+    fn r2_native_request_json_normalizes_provider_output_fields() {
+        assert_eq!(
+            native_request_output_limit_from_json(r#"{"max_tokens":32000}"#),
+            Some(32_000)
+        );
+        assert_eq!(
+            native_request_output_limit_from_json(r#"{"max_completion_tokens":64000}"#),
+            Some(64_000)
+        );
+        assert_eq!(
+            native_request_output_limit_from_json(r#"{"max_output_tokens":8192}"#),
+            Some(8_192)
+        );
+        assert_eq!(
+            native_request_output_limit_from_json(
+                r#"{"generationConfig":{"maxOutputTokens":4096}}"#
+            ),
+            Some(4_096)
+        );
+        assert_eq!(
+            native_request_output_limit_from_json(r#"{"max_tokens":0}"#),
+            None
+        );
+        assert_eq!(native_request_output_limit_from_json("hello"), None);
+    }
+
+    #[test]
+    fn r2_l_switching_models_recalculates_budget() {
+        let cfg = Config::default();
+        let flash = resolve_context_budget(&cfg, "deepseek-v4-flash", None).unwrap();
+        let gpt = resolve_context_budget(&cfg, "gpt-4o", None).unwrap();
+        assert_eq!(flash.context_window_tokens, 1_000_000);
+        assert_eq!(gpt.context_window_tokens, 128_000);
+        assert_ne!(flash.max_input_tokens, gpt.max_input_tokens);
     }
 }

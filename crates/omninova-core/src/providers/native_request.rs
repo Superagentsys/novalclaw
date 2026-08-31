@@ -208,3 +208,12 @@ pub fn native_context_view_json(messages: &[ChatMessage], tools: &[ToolSpec]) ->
 pub fn serialize_native_chat_request(request: &NativeChatRequest) -> anyhow::Result<String> {
     serde_json::to_string(request).map_err(|error| anyhow::anyhow!(error))
 }
+
+impl NativeChatRequest {
+    /// Semantic output cap for this finalized OpenAI-compatible envelope.
+    pub fn output_limit_tokens(&self) -> Option<u64> {
+        self.max_tokens
+            .map(u64::from)
+            .filter(|tokens| *tokens > 0)
+    }
+}

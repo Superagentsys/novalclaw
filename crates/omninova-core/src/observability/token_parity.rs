@@ -303,6 +303,8 @@ fn snapshot(
         context_window_tokens: None,
         max_input_tokens: None,
         output_reserve_tokens: None,
+        model_max_output_tokens: None,
+        request_output_reserve_tokens: None,
         safety_reserve_tokens: None,
         pressure_threshold_tokens: None,
         budget_source: None,

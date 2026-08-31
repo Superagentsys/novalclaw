@@ -66,7 +66,11 @@ export interface ContextUsageView {
   estimatedTokens: number | null;
   maxInputTokens: number | null;
   contextWindowTokens: number | null;
+  modelMaxOutputTokens: number | null;
+  requestOutputReserveTokens: number | null;
+  requestReserveIsConservativeFallback: boolean;
   outputReserveTokens: number | null;
+  safetyReserveTokens: number | null;
   pressureThresholdTokens: number | null;
   percent: number | null;
   barPercent: number | null;
@@ -518,7 +522,16 @@ export function selectContextUsageView(state: ContextUsageState): ContextUsageVi
     estimatedTokens,
     maxInputTokens,
     contextWindowTokens: current?.context_window_tokens ?? null,
+    modelMaxOutputTokens: current?.model_max_output_tokens ?? null,
+    requestOutputReserveTokens:
+      current?.request_output_reserve_tokens ?? current?.output_reserve_tokens ?? null,
+    requestReserveIsConservativeFallback:
+      (current?.request_output_reserve_tokens ?? current?.output_reserve_tokens) != null
+      && current?.model_max_output_tokens != null
+      && (current?.request_output_reserve_tokens ?? current?.output_reserve_tokens)
+        === current.model_max_output_tokens,
     outputReserveTokens: current?.output_reserve_tokens ?? null,
+    safetyReserveTokens: current?.safety_reserve_tokens ?? null,
     pressureThresholdTokens: current?.pressure_threshold_tokens ?? null,
     percent,
     barPercent: percent == null ? null : clampPercent(percent),

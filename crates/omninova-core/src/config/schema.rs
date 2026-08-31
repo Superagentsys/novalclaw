@@ -298,10 +298,16 @@ pub struct ModelProviderConfig {
     /// Optional authoritative model context-window override.
     #[serde(default)]
     pub context_window_tokens: Option<u64>,
-    /// Optional model max-output-token override. Also used as the output
-    /// reserve when known.
+    /// Optional model max-output-token capability override.
+    /// This is model metadata, not the per-request generation cap.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Optional per-request generation cap sent on outgoing Provider calls.
+    /// Distinct from `max_output_tokens` (model capability). `None` or `0`
+    /// leaves the native request uncapped; ContextBudget then falls back to
+    /// the conservative model maximum.
+    #[serde(default)]
+    pub request_max_output_tokens: Option<u64>,
     /// Optional trusted display tokenizer implementation name. Unknown names
     /// are ignored; this never infers a tokenizer from a model alias.
     #[serde(default)]
@@ -2918,6 +2924,42 @@ mode = "http10"
 "#,
         );
         assert!(result.is_err(), "invalid transport mode must fail config loading");
+    }
+
+    #[test]
+    fn r21_h_request_max_output_tokens_parses_and_roundtrips() {
+        let cfg: Config = toml::from_str(
+            r#"
+[model_providers.deepseek]
+request_max_output_tokens = 32000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_providers["deepseek"].request_max_output_tokens,
+            Some(32_000)
+        );
+        assert_eq!(cfg.model_providers["deepseek"].max_output_tokens, None);
+        let restored: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.model_providers["deepseek"].request_max_output_tokens,
+            Some(32_000)
+        );
+    }
+
+    #[test]
+    fn r21_request_max_output_tokens_absent_stays_none() {
+        let cfg: Config = toml::from_str(
+            r#"
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_providers["deepseek"].request_max_output_tokens,
+            None
+        );
     }
 }
 

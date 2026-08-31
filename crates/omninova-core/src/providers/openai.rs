@@ -5,8 +5,8 @@ use crate::observability::{
     ContextLifecycleEventKind, ContextRequestIdentity, ContextTelemetryMode, MeasurementKind,
 };
 use crate::providers::context_budget::{
-    context_window_exceeded_info, ContextBudget, ProviderOverflowInfo, TokenEstimator,
-    CONTEXT_BUDGET_EXCEEDED_MARKER,
+    context_window_exceeded_info, native_request_output_limit_from_json, ContextBudget,
+    ProviderOverflowInfo, TokenEstimator, CONTEXT_BUDGET_EXCEEDED_MARKER,
 };
 use crate::providers::anthropic_count::{count_anthropic_tokens, AnthropicCountConfig};
 use crate::providers::native_request::{
@@ -976,9 +976,10 @@ impl OpenAiProvider {
     /// C1 hard preflight: conservative TokenEstimator only. Display metering
     /// (exact tokenizer / ProviderActual) must not be used here.
     fn preflight_context(&self, request_body: &str) -> anyhow::Result<()> {
-        let Some(budget) = self.context_budget else {
+        let Some(budget) = self.budget_for_request_body(request_body) else {
             return Ok(());
         };
+        budget.ensure_usable()?;
         let estimator = TokenEstimator::new();
         let estimated_input_tokens = estimator.estimate_request(request_body);
         if estimated_input_tokens <= budget.max_input_tokens {
@@ -990,6 +991,8 @@ impl OpenAiProvider {
                 estimated_input_tokens = %estimated_input_tokens,
                 max_input_tokens = %budget.max_input_tokens,
                 output_reserve_tokens = %budget.output_reserve_tokens,
+                request_output_reserve_tokens = %budget.request_output_reserve_tokens,
+                model_max_output_tokens = ?budget.model_max_output_tokens,
                 safety_reserve_tokens = %budget.safety_reserve_tokens,
                 result = "allow",
                 "context_preflight"
@@ -1004,6 +1007,8 @@ impl OpenAiProvider {
             estimated_input_tokens = %estimated_input_tokens,
             max_input_tokens = %budget.max_input_tokens,
             output_reserve_tokens = %budget.output_reserve_tokens,
+            request_output_reserve_tokens = %budget.request_output_reserve_tokens,
+            model_max_output_tokens = ?budget.model_max_output_tokens,
             safety_reserve_tokens = %budget.safety_reserve_tokens,
             result = "blocked",
             "context_preflight"
@@ -1017,6 +1022,28 @@ impl OpenAiProvider {
             budget.safety_reserve_tokens,
             self.model
         ))
+    }
+
+    fn budget_for_request_body(&self, request_body: &str) -> Option<ContextBudget> {
+        let base = self.context_budget?;
+        Some(base.with_request_output_cap(native_request_output_limit_from_json(request_body)))
+    }
+
+    fn finalized_max_tokens(&self) -> Option<u32> {
+        let raw = self.max_tokens.filter(|value| *value > 0)?;
+        match self
+            .context_budget
+            .and_then(|budget| budget.model_max_output_tokens)
+            .filter(|value| *value > 0)
+        {
+            Some(model_max) => u32::try_from((raw as u64).min(model_max)).ok().filter(|v| *v > 0),
+            None => Some(raw),
+        }
+    }
+
+    fn runtime_request_budget(&self) -> Option<ContextBudget> {
+        let base = self.context_budget?;
+        Some(base.with_request_output_cap(self.max_tokens.map(u64::from).filter(|v| *v > 0)))
     }
 
     fn observe_preflight(
@@ -1045,7 +1072,7 @@ impl OpenAiProvider {
             MeasurementKind::FinalRequestEstimate,
             messages,
             tools,
-            self.context_budget.as_ref(),
+            self.budget_for_request_body(request_body).as_ref(),
             Some(request_body),
         );
         emit_snapshot(snapshot);
@@ -1075,7 +1102,7 @@ impl OpenAiProvider {
             MeasurementKind::ProviderActual,
             messages,
             tools,
-            self.context_budget.as_ref(),
+            self.budget_for_request_body(request_body).as_ref(),
             Some(request_body),
         )
         .with_provider_actual(actual);
@@ -1461,7 +1488,7 @@ impl Provider for OpenAiProvider {
     }
 
     fn context_budget(&self) -> Option<ContextBudget> {
-        self.context_budget
+        self.runtime_request_budget()
     }
 
     fn exact_tokenizer(&self) -> Option<&str> {
@@ -1492,7 +1519,7 @@ impl Provider for OpenAiProvider {
         let messages = messages.to_vec();
         let tools = tools.to_vec();
         let request_body = request_body.to_string();
-        let budget = self.context_budget;
+        let budget = self.budget_for_request_body(&request_body);
         let timeout = self.timeouts.connect.min(Duration::from_millis(750));
         crate::observability::spawn_context_usage_task(ctx, async move {
             let Some(measurement) = count_anthropic_tokens(
@@ -1684,7 +1711,7 @@ impl OpenAiProvider {
             model: self.model.clone(),
             messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.max_tokens,
+            max_tokens: self.finalized_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: None,
@@ -1771,7 +1798,7 @@ impl OpenAiProvider {
             model: self.model.clone(),
             messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.max_tokens,
+            max_tokens: self.finalized_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: Some(true),
@@ -3342,6 +3369,127 @@ mod tests {
         provider
             .preflight_context("hello")
             .expect("small request must pass");
+    }
+
+    #[test]
+    fn r2_e_request_cap_is_preserved_through_native_construction() {
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: Some(32_000),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        assert_eq!(native.output_limit_tokens(), Some(32_000));
+        let body = serde_json::to_string(&native).unwrap();
+        assert_eq!(
+            native_request_output_limit_from_json(&body),
+            Some(32_000)
+        );
+        assert!(body.contains("\"max_tokens\":32000"));
+    }
+
+    #[test]
+    fn r2_f_c1_preflight_uses_final_request_output_cap() {
+        let base = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        );
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(base));
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: Some(32_000),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        provider
+            .preflight_context(&body)
+            .expect("32K reserve should leave a large input budget");
+        let resolved = base.with_request_output_cap(Some(32_000));
+        assert_eq!(resolved.max_input_tokens, 1_000_000 - 32_000 - 32_768);
+        assert_eq!(
+            native_request_output_limit_from_json(&body),
+            Some(32_000)
+        );
+        assert_eq!(provider.context_budget().unwrap().output_reserve_tokens, 32_000);
+    }
+
+    #[test]
+    fn r2_c1_clamps_outgoing_max_tokens_to_model_max() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(500_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )));
+        assert_eq!(provider.finalized_max_tokens(), Some(384_000));
+        assert_eq!(provider.context_budget().unwrap().output_reserve_tokens, 384_000);
+    }
+
+    #[test]
+    fn r21_j_c1_native_reserve_matches_factory_resolved_cap() {
+        let profile = crate::config::ModelProviderConfig {
+            request_max_output_tokens: Some(32_000),
+            ..crate::config::ModelProviderConfig::default()
+        };
+        let cap = crate::providers::factory::resolve_request_generation_limit(
+            Some(&profile),
+            Some(384_000),
+        );
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            cap,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )));
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: provider.finalized_max_tokens(),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        provider
+            .preflight_context(&body)
+            .expect("configured 32K reserve must pass C1");
+        assert_eq!(native_request_output_limit_from_json(&body), Some(32_000));
+        assert_eq!(
+            provider.context_budget().unwrap().request_output_reserve_tokens,
+            32_000
+        );
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
     }
 
     #[test]

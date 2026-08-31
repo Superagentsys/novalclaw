@@ -76,6 +76,10 @@ pub struct ContextUsageSnapshot {
     pub context_window_tokens: Option<u64>,
     pub max_input_tokens: Option<u64>,
     pub output_reserve_tokens: Option<u64>,
+    #[serde(default)]
+    pub model_max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub request_output_reserve_tokens: Option<u64>,
     pub safety_reserve_tokens: Option<u64>,
     pub pressure_threshold_tokens: Option<u64>,
     pub budget_source: Option<String>,
@@ -143,6 +147,8 @@ pub fn build_snapshot(
     let context_window_tokens = budget.map(|b| b.context_window_tokens);
     let max_input_tokens = budget.map(|b| b.max_input_tokens);
     let output_reserve_tokens = budget.map(|b| b.output_reserve_tokens);
+    let model_max_output_tokens = budget.and_then(|b| b.model_max_output_tokens);
+    let request_output_reserve_tokens = budget.map(|b| b.request_output_reserve_tokens);
     let safety_reserve_tokens = budget.map(|b| b.safety_reserve_tokens);
     let pressure_threshold_tokens = budget.map(|b| b.pressure_threshold());
     let budget_source = budget.map(|b| b.source.as_str().to_string());
@@ -174,6 +180,8 @@ pub fn build_snapshot(
         context_window_tokens,
         max_input_tokens,
         output_reserve_tokens,
+        model_max_output_tokens,
+        request_output_reserve_tokens,
         safety_reserve_tokens,
         pressure_threshold_tokens,
         budget_source,
@@ -816,6 +824,8 @@ mod tests {
         assert_eq!(snapshot.context_window_tokens, Some(1_000_000));
         assert_eq!(snapshot.max_input_tokens, Some(950_848));
         assert_eq!(snapshot.output_reserve_tokens, Some(16_384));
+        assert_eq!(snapshot.model_max_output_tokens, Some(16_384));
+        assert_eq!(snapshot.request_output_reserve_tokens, Some(16_384));
         assert_eq!(snapshot.safety_reserve_tokens, Some(32_768));
         assert!(snapshot.usage_ratio.is_some());
     }

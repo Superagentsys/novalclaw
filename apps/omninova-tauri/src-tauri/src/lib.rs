@@ -3502,6 +3502,10 @@ fn setup_config_to_core(
                         .model_providers
                         .get(&provider.id)
                         .and_then(|p| p.max_output_tokens),
+                    request_max_output_tokens: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.request_max_output_tokens),
                     exact_tokenizer: current
                         .model_providers
                         .get(&provider.id)

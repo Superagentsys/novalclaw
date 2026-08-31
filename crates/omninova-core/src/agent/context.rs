@@ -682,6 +682,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn r2_g_c2_uses_best_authoritative_output_cap() {
+        let conservative = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            ContextBudgetSource::BuiltIn,
+        );
+        let runtime = conservative.with_request_output_cap(Some(32_000));
+        assert_eq!(runtime.output_reserve_tokens, 32_000);
+        assert_eq!(runtime.safety_reserve_tokens, conservative.safety_reserve_tokens);
+        assert!(runtime.pressure_threshold() > conservative.pressure_threshold());
+        assert!(runtime.max_input_tokens > conservative.max_input_tokens);
+    }
+
+    #[test]
+    fn r21_k_c2_uses_factory_runtime_request_budget() {
+        let conservative = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            ContextBudgetSource::BuiltIn,
+        );
+        let runtime = conservative.with_request_output_cap(Some(32_000));
+        assert_eq!(runtime.request_output_reserve_tokens, 32_000);
+        assert!(runtime.max_input_tokens > conservative.max_input_tokens);
+        assert_eq!(runtime.max_input_tokens, 935_232);
+    }
+
     #[tokio::test]
     async fn long_run_mid_turn_compaction_preserves_continuity_and_stays_under_budget() {
         let (provider, requests, summaries) = BudgetProvider::new(60_000);

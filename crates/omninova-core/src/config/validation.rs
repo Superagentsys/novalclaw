@@ -147,6 +147,14 @@ impl Config {
             }
         }
 
+        for (provider_id, profile) in &self.model_providers {
+            if profile.request_max_output_tokens == Some(0) {
+                report.warnings.push(format!(
+                    "model_providers.{provider_id}.request_max_output_tokens is 0 – treated as unset; native requests stay uncapped."
+                ));
+            }
+        }
+
         for (name, delegate) in &self.agents {
             if delegate.allowed_tools.is_empty() && delegate.agentic {
                 report.warnings.push(format!(
@@ -265,6 +273,26 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("maxChildrenPerAgent"))
+        );
+    }
+
+    #[test]
+    fn r21_zero_request_max_output_tokens_is_a_warning() {
+        let mut cfg = Config::default();
+        cfg.model_providers.insert(
+            "deepseek".into(),
+            crate::config::schema::ModelProviderConfig {
+                request_max_output_tokens: Some(0),
+                ..crate::config::schema::ModelProviderConfig::default()
+            },
+        );
+        let report = cfg.validate();
+        assert!(report.is_ok());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("request_max_output_tokens is 0"))
         );
     }
 }
