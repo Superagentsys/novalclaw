@@ -63,7 +63,7 @@ function formatStamp(value: string) {
   return date.toLocaleString();
 }
 
-export function Knowledge() {
+export function Knowledge({ isActive = true }: { isActive?: boolean }) {
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [collections, setCollections] = useState<string[]>([]);
   const [collection, setCollection] = useState("all");
@@ -367,8 +367,9 @@ export function Knowledge() {
     [hits, query]
   );
 
-  // Keyboard shortcut: Ctrl/Cmd+K to focus search
+  // Keyboard shortcut: Ctrl/Cmd+K to focus search (only while this page is visible)
   useEffect(() => {
+    if (!isActive) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
@@ -377,7 +378,7 @@ export function Knowledge() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [isActive]);
 
   // Highlight search query in text
   const highlightMatch = (text: string, searchQuery: string) => {

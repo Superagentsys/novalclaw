@@ -83,7 +83,7 @@ function App() {
             hidden={nav !== "knowledge"}
             aria-hidden={nav !== "knowledge"}
           >
-            <Knowledge />
+            <Knowledge isActive={nav === "knowledge"} />
           </div>
         ) : null}
       </AppShell>

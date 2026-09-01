@@ -566,12 +566,52 @@ fn new_doc_id() -> String {
 }
 
 fn tokenize(value: &str) -> Vec<String> {
-    value
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .map(str::trim)
-        .filter(|token| token.chars().count() >= 2)
-        .map(|token| token.to_lowercase())
-        .collect()
+    let mut tokens = Vec::new();
+    let mut latin = String::new();
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if is_cjk(ch) {
+            flush_latin_token(&mut latin, &mut tokens);
+            if index + 1 < chars.len() && is_cjk(chars[index + 1]) {
+                tokens.push(format!("{}{}", ch, chars[index + 1]));
+            }
+            index += 1;
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            latin.push(ch);
+            index += 1;
+            continue;
+        }
+        flush_latin_token(&mut latin, &mut tokens);
+        index += 1;
+    }
+    flush_latin_token(&mut latin, &mut tokens);
+    tokens
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
+}
+
+fn flush_latin_token(latin: &mut String, tokens: &mut Vec<String>) {
+    if latin.is_empty() {
+        return;
+    }
+    let token = latin.to_lowercase();
+    latin.clear();
+    if token.chars().count() >= 2 {
+        tokens.push(token);
+    }
 }
 
 fn score_chunk(query: &str, doc: &KnowledgeDocument, chunk: &StoredChunk) -> f64 {
@@ -594,13 +634,13 @@ fn score_chunk(query: &str, doc: &KnowledgeDocument, chunk: &StoredChunk) -> f64
         score += 4.0;
     }
     for token in &tokens {
-        if hay_title.split_whitespace().any(|w| w == token) {
+        if hay_title.contains(token) {
             score += 2.5;
         }
-        if hay_heading.split_whitespace().any(|w| w == token) {
+        if hay_heading.contains(token) {
             score += 1.5;
         }
-        if hay_text.split_whitespace().any(|w| w == token) {
+        if hay_text.contains(token) {
             score += 1.0;
         }
     }
@@ -610,12 +650,21 @@ fn score_chunk(query: &str, doc: &KnowledgeDocument, chunk: &StoredChunk) -> f64
 fn snippet_around(text: &str, query: &str) -> String {
     let lower = text.to_lowercase();
     let needle = query.trim().to_lowercase();
-    let idx = if needle.is_empty() {
+    let byte_idx = if needle.is_empty() {
         0
     } else {
-        lower.find(&needle).unwrap_or(0)
+        lower.find(&needle).unwrap_or_else(|| {
+            tokenize(&needle)
+                .into_iter()
+                .find_map(|token| lower.find(&token))
+                .unwrap_or(0)
+        })
     };
-    let start = idx.saturating_sub(80);
+    let char_start = lower
+        .char_indices()
+        .position(|(offset, _)| offset >= byte_idx)
+        .unwrap_or(0);
+    let start = char_start.saturating_sub(80);
     let snippet: String = text.chars().skip(start).take(240).collect();
     let mut out = snippet.trim().to_string();
     if start > 0 {

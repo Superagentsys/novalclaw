@@ -991,6 +991,37 @@ impl AgentRunRegistry {
             None => Err(anyhow::anyhow!("未找到正在运行的 Agent Run")),
         }
     }
+
+    async fn cancel_runs_for_session(&self, session_id: &str) -> Vec<String> {
+        let runs = self.inner.read().await;
+        let mut cancelled = Vec::new();
+        for run in runs.values() {
+            let matches = run.session_id == session_id
+                || run.session_id.rsplit_once(':').is_some_and(|(_, id)| id == session_id);
+            if matches && !run.cancel_token.is_cancelled() {
+                run.cancel_token.cancel();
+                cancelled.push(run.run_id.clone());
+            }
+        }
+        cancelled
+    }
+}
+
+#[cfg(test)]
+mod agent_run_registry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_runs_for_session_stops_active_token() {
+        let registry = AgentRunRegistry::new();
+        let token = registry
+            .start_run("run-1".into(), "web-session".into())
+            .await
+            .unwrap();
+        let cancelled = registry.cancel_runs_for_session("web-session").await;
+        assert_eq!(cancelled, vec!["run-1".to_string()]);
+        assert!(token.is_cancelled());
+    }
 }
 
 struct ActiveRunGuard {
@@ -1704,6 +1735,18 @@ impl GatewayRuntime {
         let controller = ApprovalController::from_workspace(&cfg.workspace_dir);
         let _ = controller.cancel_for_run(run_id).await?;
         Ok(())
+    }
+
+    pub async fn cancel_session_runs(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        let run_ids = self.run_registry.cancel_runs_for_session(session_id).await;
+        if !run_ids.is_empty() {
+            let cfg = self.config.read().await.clone();
+            let controller = ApprovalController::from_workspace(&cfg.workspace_dir);
+            for run_id in &run_ids {
+                let _ = controller.cancel_for_run(run_id).await;
+            }
+        }
+        Ok(run_ids)
     }
 
     pub async fn refresh_memory_from_config(&self) -> anyhow::Result<()> {
@@ -2738,6 +2781,7 @@ impl GatewayRuntime {
     ) -> anyhow::Result<bool> {
         let cfg = self.config.read().await.clone();
         let key = session_key(channel, session_id);
+        let _ = self.cancel_session_runs(session_id).await?;
 
         {
             let mut tree = self.session_tree.write().await;
@@ -2752,6 +2796,7 @@ impl GatewayRuntime {
             atomic_write_string(&path, &serialized).await?;
         }
         let removed_log = crate::session::delete_messages(&cfg.workspace_dir, &key).await?;
+        let _ = self.cancel_session_runs(session_id).await?;
         Ok(removed_index || removed_log)
     }
 

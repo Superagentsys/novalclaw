@@ -96,6 +96,28 @@ fn docx_extraction_reads_document_body() {
 }
 
 #[test]
+#[ignore = "known bug: xml_visible_text 在每个标签后插空格，公文标题变成「关于 开展…」"]
+fn docx_adjacent_runs_keep_official_title_without_spaces() {
+    let path = temp_file("notice.docx");
+    let xml = r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>关于</w:t></w:r><w:r><w:t>开展专项整治工作的通知</w:t></w:r></w:p></w:body></w:document>"#;
+    let file = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file(
+        "word/document.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(xml.as_bytes()).unwrap();
+    zip.finish().unwrap();
+    let extracted = extract_document_text(&path).unwrap();
+    assert!(
+        extracted.text.contains("关于开展专项整治工作的通知"),
+        "合同审核抽取会把相邻 run 拆成「关于 开展…」，实际：{:?}",
+        extracted.text
+    );
+}
+
+#[test]
 fn empty_or_scanned_pdf_is_rejected_without_base64_fallback() {
     let empty = temp_file("empty.txt");
     std::fs::write(&empty, "").unwrap();

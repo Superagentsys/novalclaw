@@ -24,12 +24,27 @@ const MAX_OFFICE_TEXT_BYTES: usize = 512 * 1024;
 #[serde(rename_all = "camelCase")]
 pub struct PreparedComposerAttachment {
     name: String,
+    requested_path: String,
     original_path: String,
     workspace_relative_path: String,
     size: u64,
     kind: String,
     content: String,
     note: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedComposerAttachment {
+    path: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareComposerAttachmentsResult {
+    attachments: Vec<PreparedComposerAttachment>,
+    skipped: Vec<SkippedComposerAttachment>,
 }
 
 fn extension_lower(path: &Path) -> Option<String> {
@@ -482,6 +497,7 @@ async fn prepare_path_attachment(
 
     Ok(PreparedComposerAttachment {
         name,
+        requested_path: raw,
         original_path: source.to_string_lossy().to_string(),
         workspace_relative_path: mounted,
         size,
@@ -569,14 +585,18 @@ pub async fn read_composer_attachments(paths: Vec<String>) -> Result<String, Str
 }
 
 /// 把桌面端绝对路径附件安全挂载到当前 Workspace，并返回可直接传给 Agent 的结构化上下文。
+/// 单个坏路径不会让整批失败：成功的附件仍会挂上，失败项放进 `skipped`。
 #[tauri::command]
 pub async fn prepare_composer_attachments(
     paths: Vec<String>,
     workspace_path: String,
     session_id: String,
-) -> Result<Vec<PreparedComposerAttachment>, String> {
+) -> Result<PrepareComposerAttachmentsResult, String> {
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PrepareComposerAttachmentsResult {
+            attachments: Vec::new(),
+            skipped: Vec::new(),
+        });
     }
     let workspace_raw = PathBuf::from(workspace_path.trim());
     if !workspace_raw.is_absolute() {
@@ -589,17 +609,25 @@ pub async fn prepare_composer_attachments(
         .await
         .map_err(|error| format!("Workspace 无法访问：{error}"))?;
 
-    let mut prepared = Vec::new();
+    let mut attachments = Vec::new();
+    let mut skipped = Vec::new();
     for (index, raw) in paths.into_iter().take(MAX_FILES).enumerate() {
-        prepared.push(prepare_path_attachment(raw, workspace.clone(), &session_id, index).await?);
+        match prepare_path_attachment(raw.clone(), workspace.clone(), &session_id, index).await {
+            Ok(prepared) => attachments.push(prepared),
+            Err(error) => skipped.push(SkippedComposerAttachment { path: raw, error }),
+        }
     }
-    Ok(prepared)
+    Ok(PrepareComposerAttachmentsResult {
+        attachments,
+        skipped,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{ImageFormat, Rgb, RgbImage};
+    use std::fs::File;
     use std::io::Cursor;
 
     fn noisy_png(width: u32, height: u32) -> Vec<u8> {
@@ -639,5 +667,238 @@ mod tests {
         assert!(inline.compressed);
         assert!(inline.data_url.starts_with("data:image/jpeg;base64,"));
         assert!(inline.encoded_bytes <= MAX_IMAGE_INLINE_BYTES);
+    }
+
+    fn write_office_zip(path: &Path, files: &[(&str, &str)]) {
+        use std::io::Write;
+        let file = File::create(path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in files {
+            zip.start_file(*name, options).expect("start file");
+            zip.write_all(body.as_bytes()).expect("write xml");
+        }
+        zip.finish().expect("finish zip");
+    }
+
+    #[test]
+    #[ignore = "known bug: Word 相邻 run 会被插入空格，公文标题变成「关于 开展…」"]
+    fn docx_official_notice_keeps_chinese_runs_together() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-office-docx-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("notice.docx");
+        write_office_zip(
+            &path,
+            &[(
+                "word/document.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t>关于</w:t></w:r>
+      <w:r><w:t>开展专项整治工作的通知</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#,
+            )],
+        );
+        let text = extract_office_text(&path, "docx").expect("extract docx");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            text.contains("关于开展专项整治工作的通知"),
+            "公文标题被拆开或插入空格，实际提取：{text:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: PPT 只抽 slide XML，讲者备注 notesSlide 会被丢掉"]
+    fn pptx_extracts_slide_text_but_drops_speaker_notes() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-office-pptx-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("briefing.pptx");
+        write_office_zip(
+            &path,
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>季度工作汇报</a:t></a:r></p:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/notesSlides/notesSlide1.xml",
+                    r#"<?xml version="1.0"?><p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>讲者备注：强调预算缺口</a:t></a:r></p:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#,
+                ),
+            ],
+        );
+        let text = extract_office_text(&path, "pptx").expect("extract pptx");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            text.contains("季度工作汇报"),
+            "幻灯片正文应能提取，实际：{text:?}"
+        );
+        assert!(
+            text.contains("讲者备注：强调预算缺口"),
+            "PPT 备注页未提取，实际：{text:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: Excel 会抽出共享字符串，同时把单元格下标 0 拼进正文"]
+    fn xlsx_shared_strings_should_show_cell_text_not_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-office-xlsx-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("budget.xlsx");
+        write_office_zip(
+            &path,
+            &[
+                (
+                    "xl/sharedStrings.xml",
+                    r#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>廉洁纪律</t></si></sst>"#,
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>"#,
+                ),
+            ],
+        );
+        let text = extract_office_text(&path, "xlsx").expect("extract xlsx");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            text.contains("廉洁纪律"),
+            "应还原共享字符串，实际：{text:?}"
+        );
+        assert!(
+            !text.split_whitespace().any(|token| token == "0"),
+            "工作表下标 0 不应当成单元格文字，实际：{text:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: selected.sort() 按文件名排序，slide10 会排在 slide2 前面"]
+    fn pptx_slide_order_follows_slide_number_not_lexicographic_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-office-pptx-order-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("deck.pptx");
+        write_office_zip(
+            &path,
+            &[
+                (
+                    "ppt/slides/slide10.xml",
+                    r#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>第十页结论</a:t></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/slide2.xml",
+                    r#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>第二页进展</a:t></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>第一页开场</a:t></p:sld>"#,
+                ),
+            ],
+        );
+        let text = extract_office_text(&path, "pptx").expect("extract pptx");
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = text.find("第一页开场").expect("missing slide 1");
+        let second = text.find("第二页进展").expect("missing slide 2");
+        let tenth = text.find("第十页结论").expect("missing slide 10");
+        assert!(
+            first < second && second < tenth,
+            "幻灯片应按 1→2→10 的页码顺序，实际：{text:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: 只抽 slides/document/header/footer，Word 批注 comments.xml 不会进入上下文"]
+    fn docx_extracts_headers_but_drops_review_comments() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-office-docx-comments-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("reviewed.docx");
+        write_office_zip(
+            &path,
+            &[
+                (
+                    "word/document.xml",
+                    r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>正文段落</w:t></w:r></w:p></w:body></w:document>"#,
+                ),
+                (
+                    "word/header1.xml",
+                    r#"<?xml version="1.0"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>红头文件</w:t></w:r></w:p></w:hdr>"#,
+                ),
+                (
+                    "word/comments.xml",
+                    r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0"><w:p><w:r><w:t>批注：请改主送机关</w:t></w:r></w:p></w:comment></w:comments>"#,
+                ),
+            ],
+        );
+        let text = extract_office_text(&path, "docx").expect("extract docx");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("正文段落"), "正文应提取，实际：{text:?}");
+        assert!(text.contains("红头文件"), "页眉应提取，实际：{text:?}");
+        assert!(
+            text.contains("批注：请改主送机关"),
+            "审阅批注未进入附件文本，实际：{text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_attachments_keeps_valid_files_when_one_path_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-attach-batch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let good = dir.join("ok.txt");
+        std::fs::write(&good, "hello").unwrap();
+        let missing = dir.join("missing.txt");
+        let result = prepare_composer_attachments(
+            vec![
+                good.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            dir.to_string_lossy().into_owned(),
+            "sess-1".into(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let prepared = result.expect("valid file should still mount");
+        assert_eq!(prepared.attachments.len(), 1, "好文件应挂上，实际：{prepared:?}");
+        assert_eq!(prepared.skipped.len(), 1, "坏路径应单独跳过，实际：{prepared:?}");
+        assert!(
+            prepared.attachments[0].content.contains("hello"),
+            "好文件内容应可读，实际：{:?}",
+            prepared.attachments[0].content
+        );
     }
 }

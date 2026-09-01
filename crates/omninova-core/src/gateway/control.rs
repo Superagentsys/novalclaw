@@ -237,8 +237,24 @@ async fn dispatch(runtime: &GatewayRuntime, command: &str, args: Value) -> Resul
             stream_inbound(runtime, inbound_from_args(&args)?).await
         }
         "cancel_agent_run" => {
-            let run_id = args_string(&args, &["runId", "run_id"])?;
-            runtime.cancel_agent_run(&run_id).await.map_err(|e| e.to_string())?;
+            let run_id = args_opt_string(&args, &["runId", "run_id"]);
+            let session_id = args_opt_string(&args, &["sessionId", "session_id"]);
+            if run_id.is_none() && session_id.is_none() {
+                return Err("runId or sessionId is required".to_string());
+            }
+            if let Some(run_id) = run_id {
+                match runtime.cancel_agent_run(&run_id).await {
+                    Ok(()) => {}
+                    Err(error) if session_id.is_none() => return Err(error.to_string()),
+                    Err(_) => {}
+                }
+            }
+            if let Some(session_id) = session_id {
+                runtime
+                    .cancel_session_runs(&session_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(Value::Null)
         }
         "session_tree_snapshot" => {

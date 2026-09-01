@@ -208,3 +208,57 @@ pub fn format_timestamp(value: time::OffsetDateTime) -> String {
 pub fn parse_timestamp(value: &str) -> Option<time::OffsetDateTime> {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_job(id: &str) -> CronJob {
+        CronJob {
+            id: id.into(),
+            name: "每日巡检".into(),
+            schedule: "every 1h".into(),
+            prompt: "汇报状态".into(),
+            command: String::new(),
+            description: String::new(),
+            template_id: None,
+            tz_offset_minutes: 480,
+            enabled: true,
+            last_run: None,
+            last_status: None,
+            next_run: None,
+            last_error: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            task_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "known bug: cron.json 解析失败当成空列表，再保存会覆盖原文件"]
+    async fn corrupt_cron_json_is_not_silently_wiped_on_next_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-cron-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("cron.json");
+        tokio::fs::write(&path, "{ this is not json")
+            .await
+            .unwrap();
+        let store = CronStore::open(&path).await.unwrap();
+        assert!(
+            !store.list().await.is_empty(),
+            "损坏的 cron.json 不应被当成「没有任务」"
+        );
+        store.add(sample_job("job-new")).await.unwrap();
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        assert!(
+            raw.contains("{ this is not json") || raw.contains("每日巡检") && raw.contains("job-old"),
+            "写入新任务时不应把损坏文件覆盖成只有新列表，实际：{raw}"
+        );
+    }
+}

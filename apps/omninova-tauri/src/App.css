@@ -1937,6 +1937,22 @@
   color: var(--text-primary);
 }
 
+.chat-toolbar-text-btn {
+  width: auto;
+  min-height: 36px;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.chat-toolbar-text-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .chat-icon-btn.is-active {
   border-color: rgba(80, 120, 220, 0.45);
   background: rgba(80, 120, 220, 0.12);

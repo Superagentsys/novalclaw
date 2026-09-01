@@ -338,6 +338,17 @@ mod tests {
         );
         assert_eq!(provider.name(), "openai");
     }
+
+    #[test]
+    #[ignore = "known bug: 纯大写无连字符的密钥会被当成环境变量名，resolve 失败"]
+    fn uppercase_raw_secret_is_not_treated_as_env_var_name() {
+        let secret = "ABCDEFGH12345678";
+        assert_eq!(
+            resolve_secret_or_env(secret),
+            Some(secret.to_string()),
+            "用户把密钥填进 api_key_env 时应直接使用，而不是去读同名环境变量"
+        );
+    }
 }
 
 fn resolve_api_key(

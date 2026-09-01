@@ -15,6 +15,7 @@ pub use store::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn splits_markdown_sections_and_long_paragraphs() {
@@ -108,6 +109,94 @@ mod tests {
         store.remove(&doc.id).await.expect("remove");
         assert!(store.list(None).await.is_empty());
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn chinese_sentence_query_hits_and_snippet_stays_on_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-kb-zh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("tempdir");
+        let store = KnowledgeStore::open_in(&dir).await.expect("open");
+        let content = format!("{}廉洁纪律主要禁止以权谋私。", "甲".repeat(120));
+        store
+            .upsert(KnowledgeUpsert {
+                id: None,
+                title: "党纪条例节选".into(),
+                collection: "default".into(),
+                source: "note".into(),
+                source_path: None,
+                kind: "md".into(),
+                tags: Vec::new(),
+                content,
+                enabled: true,
+            })
+            .await
+            .expect("upsert");
+        let hits = store
+            .search("廉洁纪律主要禁止哪些行为？", None, 5)
+            .await;
+        assert!(!hits.is_empty(), "Chinese question should not miss the passage");
+        assert!(
+            hits[0].snippet.contains("廉洁纪律"),
+            "snippet should keep the hit, got {:?}",
+            hits[0].snippet
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "known bug: 知识库对 docx 按 UTF-8 读 zip；压缩后的 OOXML 无法检索正文"]
+    async fn import_bytes_docx_should_index_document_text_not_zip_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "omninova-kb-docx-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("tempdir");
+        let store = KnowledgeStore::open_in(&dir).await.expect("open");
+        let mut zip_bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            zip.start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("start");
+            zip.write_all(
+                r#"<?xml version="1.0"?><w:document><w:t>关于开展专项整治工作的通知</w:t></w:document>"#
+                    .as_bytes(),
+            )
+            .expect("write");
+            zip.finish().expect("finish");
+        }
+        let imported = store
+            .import_bytes("notice.docx", &zip_bytes, None, Vec::new())
+            .await
+            .expect("import");
+        let (_, body) = store
+            .get(&imported.id)
+            .await
+            .expect("get")
+            .expect("document");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        assert!(
+            body.contains("关于开展专项整治工作的通知"),
+            "知识库应抽出 Word 正文，实际：{body:?}"
+        );
+        assert!(
+            !body.contains("PK") && !body.contains("<w:t>"),
+            "不应把 OOXML zip/XML 当知识正文，实际：{body:?}"
+        );
     }
 
     #[tokio::test]

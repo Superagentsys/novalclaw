@@ -10,6 +10,7 @@ export async function readComposerAttachmentsFromPaths(
 
 export interface PreparedComposerAttachment {
   name: string;
+  requestedPath: string;
   originalPath: string;
   workspaceRelativePath: string;
   size: number;
@@ -18,14 +19,19 @@ export interface PreparedComposerAttachment {
   note: string;
 }
 
+export interface PrepareComposerAttachmentsResult {
+  attachments: PreparedComposerAttachment[];
+  skipped: Array<{ path: string; error: string }>;
+}
+
 /** 将桌面绝对路径附件复制/挂载进当前 Workspace，并生成 Agent 可读取的上下文。 */
 export async function prepareComposerAttachments(
   paths: string[],
   workspacePath: string,
   sessionId: string,
-): Promise<PreparedComposerAttachment[]> {
-  if (!paths.length) return [];
-  return invokeTauri<PreparedComposerAttachment[]>("prepare_composer_attachments", {
+): Promise<PrepareComposerAttachmentsResult> {
+  if (!paths.length) return { attachments: [], skipped: [] };
+  return invokeTauri<PrepareComposerAttachmentsResult>("prepare_composer_attachments", {
     paths,
     workspacePath,
     sessionId,

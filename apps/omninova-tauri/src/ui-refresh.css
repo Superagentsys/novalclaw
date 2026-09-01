@@ -522,6 +522,11 @@
   color: var(--ui-text-muted);
 }
 
+.chat-toolbar-text-btn.chat-icon-btn {
+  flex: 0 0 auto;
+  width: auto;
+}
+
 .chat-icon-btn.is-active {
   border-color: color-mix(in srgb, var(--ui-accent) 45%, var(--ui-border));
   background: var(--ui-accent-soft);

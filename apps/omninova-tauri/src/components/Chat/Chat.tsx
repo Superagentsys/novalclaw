@@ -2541,7 +2541,29 @@ export function Chat({
     setPendingDeleteAvatarId(null);
     // 终止该会话可能正在进行的任务，并清理其计时器/运行态。
     cancelledRef.current[id] = true;
-    const deletingRunId = runs[id]?.runId;
+    const deletingRunId = runsRef.current[id]?.runId;
+    const target = avatars.find((a) => a.id === id);
+    const deletingSessionId = target?.sessionId;
+    void (async () => {
+      try {
+        await invokeTauri<void>("cancel_agent_run", {
+          runId: deletingRunId,
+          sessionId: deletingSessionId,
+        });
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setError(`删除会话时未能终止后台任务：${message}`);
+      }
+      if (deletingSessionId) {
+        try {
+          await invokeTauri<boolean>("delete_chat_session", {
+            query: { sessionId: deletingSessionId, channel: "web" },
+          });
+        } catch {
+          // 网关未连接时忽略：墓碑已能阻止其在本地重新出现。
+        }
+      }
+    })();
     if (deletingRunId) {
       appendTaskActivity(deletingRunId, "会话被删除，任务已取消", "warning");
       finalizeTask(deletingRunId, "cancelled", "会话已删除");
@@ -2560,17 +2582,10 @@ export function Chat({
       return next;
     });
 
-    // 记录墓碑并在网关侧删除，避免被会话同步重新合并回来。
-    const target = avatars.find((a) => a.id === id);
     if (target) {
       setDeletedSessionIds((prev) =>
         prev.includes(target.sessionId) ? prev : [...prev, target.sessionId]
       );
-      void invokeTauri<boolean>("delete_chat_session", {
-        query: { sessionId: target.sessionId, channel: "web" },
-      }).catch(() => {
-        // 网关未连接时忽略：墓碑已能阻止其在本地重新出现。
-      });
     }
 
     const remaining = avatars.filter((a) => a.id !== id);
@@ -2662,11 +2677,14 @@ export function Chat({
   const handleCancel = useCallback(() => {
     if (!activeRunId) return;
     cancelledRef.current[activeAvatarId] = true;
-    void invokeTauri<void>("cancel_agent_run", { runId: activeRunId }).catch((err) => {
+    void invokeTauri<void>("cancel_agent_run", {
+      runId: activeRunId,
+      sessionId: avatars.find((a) => a.id === activeAvatarId)?.sessionId,
+    }).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       setError(`取消失败：${message}`);
     });
-  }, [activeAvatarId, activeRunId]);
+  }, [activeAvatarId, activeRunId, avatars]);
 
   const handleExportRiskJson = useCallback(() => {
     if (!lastRiskExport) return;
@@ -2870,7 +2888,7 @@ export function Chat({
     }
 
     if (gatewayStatus !== "connected") {
-      setError("网关未连接，请先在侧栏「设置」中启动网关后再发送消息");
+      setError("网关未连接，请先点击输入栏的网关按钮启动后再发送。草稿可先写在输入框里。");
       return;
     }
 
@@ -2889,21 +2907,32 @@ export function Chat({
           activeWorkspaceDir,
           targetSessionId,
         );
-        let preparedIndex = 0;
-        pendingAttachments = pendingAttachments.map((attachment) => {
-          if (!attachment.sourcePath) return attachment;
-          const mounted = prepared[preparedIndex];
-          preparedIndex += 1;
-          if (!mounted) return attachment;
-          return {
+        const mountedByPath = new Map(
+          prepared.attachments.map((item) => [item.requestedPath, item])
+        );
+        pendingAttachments = pendingAttachments.flatMap((attachment) => {
+          if (!attachment.sourcePath) return [attachment];
+          const mounted = mountedByPath.get(attachment.sourcePath);
+          if (!mounted) return [];
+          return [{
             ...attachment,
             kind: mounted.kind === "image" ? "image" : mounted.kind === "text" ? "text" : "other",
             content: mounted.content,
             note: mounted.note,
             mountedPath: mounted.workspaceRelativePath,
-          };
+          }];
         });
         setAttachmentsBySession((prev) => ({ ...prev, [avatarId]: pendingAttachments }));
+        if (prepared.skipped.length) {
+          const skippedNames = prepared.skipped
+            .map((item) => item.path.split(/[/\\]/).pop() || item.path)
+            .join("、");
+          if (!prepared.attachments.length) {
+            setError(`附件均无法挂载：${prepared.skipped[0]?.error ?? skippedNames}`);
+            return;
+          }
+          setError(`已跳过无法访问的附件：${skippedNames}。其余文件已挂载，可继续发送。`);
+        }
       } catch (reason) {
         setError(`附件挂载失败：${reason instanceof Error ? reason.message : String(reason)}`);
         return;
@@ -3797,32 +3826,35 @@ export function Chat({
             <div className="chat-main-toolbar-actions">
               <button
                 type="button"
-                className="chat-icon-btn"
+                className={`chat-icon-btn chat-toolbar-text-btn${inspectorOpen ? " is-active" : ""}`}
                 title="打开任务检查器"
                 aria-label="打开任务检查器"
                 aria-expanded={inspectorOpen}
                 onClick={() => openInspector("process")}
               >
                 <UiIcon name="menuUnfold" size={15} />
+                <span>检查器</span>
               </button>
               <button
                 type="button"
-                className="chat-icon-btn"
+                className="chat-icon-btn chat-toolbar-text-btn"
                 title="从网关重新加载当前会话历史"
                 aria-label="从网关重新加载当前会话历史"
                 disabled={historyLoading || gatewayStatus !== "connected"}
                 onClick={() => void handleRefreshHistory()}
               >
                 <UiIcon name="history" size={15} />
+                <span>拉历史</span>
               </button>
               <button
                 type="button"
-                className="chat-icon-btn"
+                className="chat-icon-btn chat-toolbar-text-btn"
                 title="刷新网关状态"
                 aria-label="刷新网关状态"
                 onClick={() => void refreshGatewayStatus()}
               >
                 <UiIcon name="reload" size={15} />
+                <span>刷新</span>
               </button>
               <span
                 className="chat-main-toolbar-status"
@@ -4154,6 +4186,9 @@ export function Chat({
                     ...prev,
                     [activeAvatarId]: { stage: "idle" },
                   }));
+                  // Tauri 下 HTML5 File 没有本地路径，开始审核会报「请先上传」。
+                  // 与输入框相同：桌面拖放由 onDragDropEvent 写入 sourcePath。
+                  if (isTauriEnvironment()) return;
                   void mergeDroppedIntoInput(files).catch((reason) => {
                     setError(reason instanceof Error ? reason.message : String(reason));
                   });
@@ -4362,11 +4397,11 @@ export function Chat({
                         : selectedSkill
                         ? `已选择 ${selectedSkill.displayName}，输入任务后发送…`
                         : "输入 / 选择技能，或直接发消息…（支持拖入/粘贴文件）"
-                      : "网关未连接…（仍可拖入文件编辑草稿）"
+                      : "网关未连接，可先写草稿或拖入文件；启动网关后再发送"
                   }
                   rows={2}
                   style={{ height: `${composerInputHeight}px` }}
-                  disabled={gatewayStatus !== "connected"}
+                  disabled={sending}
                 />
                 {sending ? (
                   <button type="button" className="chat-cancel-button" onClick={handleCancel}>

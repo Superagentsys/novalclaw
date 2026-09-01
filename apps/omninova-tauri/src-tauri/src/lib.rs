@@ -1300,17 +1300,36 @@ async fn process_inbound_message_streaming(
 
 #[tauri::command]
 async fn cancel_agent_run(
-    run_id: String,
+    run_id: Option<String>,
+    session_id: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
     let runtime = {
         let app_state = state.lock().await;
         app_state.runtime.clone()
     };
-    runtime
-        .cancel_agent_run(&run_id)
-        .await
-        .map_err(|e| e.to_string())
+    let run_id = run_id.filter(|id| !id.is_empty());
+    let session_id = session_id.filter(|id| !id.is_empty());
+    if run_id.is_none() && session_id.is_none() {
+        return Err("runId or sessionId is required".to_string());
+    }
+    if let Some(run_id) = run_id.as_deref() {
+        match runtime.cancel_agent_run(run_id).await {
+            Ok(()) => {}
+            Err(error) => {
+                if session_id.as_deref().filter(|id| !id.is_empty()).is_none() {
+                    return Err(error.to_string());
+                }
+            }
+        }
+    }
+    if let Some(session_id) = session_id.as_deref().filter(|id| !id.is_empty()) {
+        runtime
+            .cancel_session_runs(session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Approve the exact tool call currently waiting in an active desktop run.
