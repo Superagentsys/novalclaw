@@ -652,7 +652,7 @@ fn build_tool_phase_summary(tool_name: &str, args: &serde_json::Value, phase: &s
         "file_read" | "read_file" => path
             .map(|p| format!("{phase}读取文件：{p}"))
             .unwrap_or_else(|| format!("{phase}读取文件")),
-        "file_write" | "write_file" => path
+        "file_write" | "write_file" | "office_create" => path
             .map(|p| format!("{phase}写入文件：{p}"))
             .unwrap_or_else(|| format!("{phase}写入文件")),
         "file_edit" | "edit_file" | "str_replace_editor" => path
@@ -713,7 +713,7 @@ pub fn build_tool_summary(tool_name: &str, args: &serde_json::Value) -> String {
                 "正在读取文件".into()
             }
         }
-        "file_write" | "write_file" => {
+        "file_write" | "write_file" | "office_create" => {
             if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                 format!("正在写入文件：{}", p)
             } else {
@@ -790,7 +790,7 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
 
 /// Helper to extract diff stats from `git diff --numstat` output.
 pub fn extract_diff_stats(tool_name: &str, output: &str) -> Option<DiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor" | "git_operations" | "git") {
+    if !matches!(tool_name, "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor" | "git_operations" | "git") {
         return None;
     }
     for line in output.lines() {
@@ -808,7 +808,7 @@ pub fn extract_diff_stats(tool_name: &str, output: &str) -> Option<DiffStats> {
 
 /// Compute diff stats from written content when git is not available.
 pub fn compute_content_diff(tool_name: &str, args: &serde_json::Value, output: &str) -> Option<DiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor") {
+    if !matches!(tool_name, "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor") {
         return None;
     }
     if output.to_lowercase().contains("success")

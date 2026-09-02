@@ -355,6 +355,8 @@ mod tests {
             command: String::new(),
             description: String::new(),
             template_id: None,
+            provider: None,
+            model: None,
             tz_offset_minutes: 0,
             enabled: true,
             last_run: None,

@@ -1112,6 +1112,8 @@ async fn run_cron(cmd: &CronCommands, config: &Config) -> Result<String> {
                 command: command.clone().unwrap_or_default(),
                 description: String::new(),
                 template_id: None,
+                provider: None,
+                model: None,
                 tz_offset_minutes: 0,
                 enabled: true,
                 last_run: None,

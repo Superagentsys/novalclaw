@@ -28,6 +28,16 @@ fn now_ts() -> String {
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+
+/// Force the Windows child pipeline to UTF-8. Otherwise PowerShell and native
+/// programs inherit the active OEM/ANSI code page and Chinese output becomes
+/// replacement characters when the tool result is decoded as UTF-8.
+fn windows_powershell_script(command: &str) -> String {
+    format!(
+        "$utf8 = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; $env:PYTHONIOENCODING = 'utf-8'; $env:PYTHONUTF8 = '1'; {command}"
+    )
+}
+
 pub struct ShellTool {
     workspace_dir: PathBuf,
     allowed_commands: Vec<String>,
@@ -250,7 +260,8 @@ impl Tool for ShellTool {
         // continue to work without each caller having to know the platform.
         let mut child = if cfg!(target_os = "windows") {
             let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            let script = windows_powershell_script(command);
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
             c
         } else {
             let mut c = Command::new("sh");
@@ -421,7 +432,8 @@ impl ShellTool {
             c
         } else if cfg!(target_os = "windows") {
             let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+            let script = windows_powershell_script(&command);
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
             c
         } else {
             let mut c = Command::new("sh");
@@ -562,4 +574,17 @@ fn preview(s: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::windows_powershell_script;
+
+    #[test]
+    fn powershell_child_is_forced_to_utf8() {
+        let script = windows_powershell_script("Write-Output '中文'");
+        assert!(script.contains("UTF8Encoding"));
+        assert!(script.contains("PYTHONIOENCODING"));
+        assert!(script.ends_with("Write-Output '中文'"));
+    }
 }

@@ -516,6 +516,7 @@ export function getToolLabel(toolName: string): string {
     file_read: "读取文件",
     read_file: "读取文件",
     file_write: "写入文件",
+    office_create: "生成 Office 文件",
     write_file: "写入文件",
     file_edit: "修改文件",
     edit_file: "修改文件",

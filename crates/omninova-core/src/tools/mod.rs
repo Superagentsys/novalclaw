@@ -12,6 +12,7 @@ pub mod http_request;
 pub mod knowledge_search;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod office_create;
 pub mod pdf_read;
 pub mod registry;
 pub mod shell;
@@ -37,6 +38,7 @@ pub use http_request::HttpRequestTool;
 pub use knowledge_search::KnowledgeSearchTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use office_create::OfficeCreateTool;
 pub use pdf_read::PdfReadTool;
 pub use registry::{
     build_tools, capabilities_for, capabilities_or_unknown, read_only_tool_names, ToolBuildContext,

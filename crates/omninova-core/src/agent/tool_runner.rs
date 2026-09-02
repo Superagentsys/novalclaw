@@ -198,7 +198,7 @@ impl<'a> ToolRunner<'a> {
         let is_shell = tool.name() == "shell";
         let is_file_write = matches!(
             tool_call.name.as_str(),
-            "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor"
+            "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor"
         );
         let is_file_patch = matches!(tool_call.name.as_str(), "file_patch" | "apply_patch");
 

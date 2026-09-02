@@ -154,7 +154,7 @@ pub(super) fn apply_agent_tool_allowlist(
 /// like `/workspace` or `~` and then tries to probe them with shell calls.
 fn append_workspace_note(system_prompt: &mut Option<String>, workspace: &Path) {
     let note = format!(
-        "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。\n",
+        "\n[环境信息] 当前 Workspace 目录是：{}。回答“你当前 workspace 在哪里”这类问题时，必须直接引用本路径，不要尝试通过 shell 或 file_read 探测 /workspace、/home、~ 等路径。\n[工具路径规则] 调用文件、搜索、Shell working_directory 或 Git 工具时，所有 path 必须是 workspace-relative；Workspace 根目录用 \".\"。不要把 D:\\、E:\\ 或完整 Workspace 绝对路径传给工具。写 index.html 时 path 只能是 \"index.html\"。编辑已存在文件时优先 file_read 后使用 file_patch；新建文件才使用 file_write，除非用户明确要求整文件重写。用户要求 Word、PowerPoint 或 Excel 文件时，必须调用 office_create 生成真实可编辑的 .docx、.pptx 或 .xlsx；不得用 HTML、Markdown、CSV、XML 或改扩展名的文件冒充 Office 文件，也不得因为外部 KDocs/Python/Node 不可用而降级为网页。\n",
         workspace.display()
     );
     let current = system_prompt.take().unwrap_or_default();

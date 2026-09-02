@@ -823,7 +823,7 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: default_auto_approve(),
             non_cli_excluded_tools: vec![
-                "shell".into(), "file_write".into(), "file_edit".into(),
+                "shell".into(), "file_write".into(), "office_create".into(), "file_edit".into(),
                 "git_operations".into(), "browser".into(),
             ],
         }

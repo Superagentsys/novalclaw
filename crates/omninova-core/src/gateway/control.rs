@@ -535,6 +535,16 @@ async fn upsert_job(runtime: &GatewayRuntime, input: Value) -> Result<Value, Str
             .or_else(|| input.get("template_id"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        provider: input
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().and_then(|job| job.provider.clone())),
+        model: input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().and_then(|job| job.model.clone())),
         tz_offset_minutes: tz,
         enabled: input
             .get("enabled")

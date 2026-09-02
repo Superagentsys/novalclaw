@@ -268,7 +268,7 @@ export function aggregateSteps(events: RawEvent[], options: AggregateStepsOption
       const step = ensureStep(id, toolName, title);
       step.status = "running";
       if (title) step.title = cleanTitle(title, toolName);
-      if (["file_write", "write_file", "file_edit", "edit_file", "str_replace_editor", "file_patch", "apply_patch"].includes(toolName)) {
+      if (["file_write", "write_file", "office_create", "file_edit", "edit_file", "str_replace_editor", "file_patch", "apply_patch"].includes(toolName)) {
         lastFileStepId = id;
       }
       return;

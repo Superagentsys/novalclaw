@@ -221,6 +221,8 @@ async fn ensure_task_cron(workspace: &PathBuf, task: &Task) -> anyhow::Result<()
             command: String::new(),
             description: task.goal.clone(),
             template_id: Some("long-horizon-task".into()),
+            provider: None,
+            model: None,
             tz_offset_minutes: 480,
             enabled: true,
             last_run: None,

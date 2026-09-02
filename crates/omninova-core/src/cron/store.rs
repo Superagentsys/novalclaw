@@ -29,6 +29,12 @@ pub struct CronJob {
     /// Template the job was created from, for UI grouping.
     #[serde(default)]
     pub template_id: Option<String>,
+    /// Explicit route captured from the desktop model picker so scheduled
+    /// execution follows the same provider/model as an interactive chat.
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     /// Minutes east of UTC used when evaluating cron expressions.
     #[serde(default)]
     pub tz_offset_minutes: i32,
@@ -146,6 +152,23 @@ impl CronStore {
         if !enabled {
             job.next_run = None;
         }
+        self.write_all(&jobs).await?;
+        Ok(true)
+    }
+
+    pub async fn set_route(
+        &self,
+        id: &str,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Result<bool> {
+        let _guard = self.write_guard.lock().await;
+        let mut jobs = self.read_all().await;
+        let Some(job) = jobs.iter_mut().find(|job| job.id == id) else {
+            return Ok(false);
+        };
+        job.provider = provider.filter(|value| !value.trim().is_empty());
+        job.model = model.filter(|value| !value.trim().is_empty());
         self.write_all(&jobs).await?;
         Ok(true)
     }

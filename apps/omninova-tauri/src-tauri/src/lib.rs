@@ -1435,6 +1435,8 @@ struct AutomationJobInput {
     #[serde(default)]
     description: String,
     template_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     tz_offset_minutes: Option<i32>,
     enabled: Option<bool>,
 }
@@ -1465,6 +1467,14 @@ fn build_cron_job(input: AutomationJobInput, existing: Option<CronJob>) -> Resul
         command: String::new(),
         description: input.description.trim().to_string(),
         template_id: input.template_id.filter(|value| !value.is_empty()),
+        provider: input
+            .provider
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| existing.as_ref().and_then(|job| job.provider.clone())),
+        model: input
+            .model
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| existing.as_ref().and_then(|job| job.model.clone())),
         tz_offset_minutes,
         enabled: input.enabled.unwrap_or(existing.as_ref().map(|job| job.enabled).unwrap_or(true)),
         last_run: existing.as_ref().and_then(|job| job.last_run.clone()),
@@ -1521,9 +1531,17 @@ async fn automation_delete_job(
 async fn automation_set_enabled(
     id: String,
     enabled: bool,
+    provider: Option<String>,
+    model: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<CronJob>, String> {
     let store = open_cron_store(&state).await?;
+    if enabled && (provider.is_some() || model.is_some()) {
+        store
+            .set_route(&id, provider, model)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let found = store
         .set_enabled(&id, enabled)
         .await
@@ -1546,6 +1564,8 @@ async fn automation_set_enabled(
 #[tauri::command]
 async fn automation_run_now(
     id: String,
+    provider: Option<String>,
+    model: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<CronRun, String> {
     let runtime = {
@@ -1556,6 +1576,12 @@ async fn automation_run_now(
     let store = CronStore::open(workspace.join("cron.json"))
         .await
         .map_err(|error| error.to_string())?;
+    if provider.is_some() || model.is_some() {
+        store
+            .set_route(&id, provider, model)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let runs = CronRunStore::open(workspace.join("cron_runs.json"))
         .await
         .map_err(|error| error.to_string())?;

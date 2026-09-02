@@ -208,6 +208,7 @@ function friendlyToolApprovalError(message: string): string {
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   shell: "运行命令",
   file_write: "新建或写入文件",
+  office_create: "生成 Office 文件",
   file_edit: "编辑文件",
   file_patch: "修改文件",
   git_operations: "执行 Git 操作",

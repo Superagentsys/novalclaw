@@ -10,6 +10,8 @@ export interface AutomationJob {
   command: string;
   description: string;
   template_id?: string | null;
+  provider?: string | null;
+  model?: string | null;
   tz_offset_minutes: number;
   enabled: boolean;
   last_run?: string | null;
@@ -39,6 +41,8 @@ export interface AutomationJobInput {
   prompt: string;
   description?: string;
   templateId?: string;
+  provider?: string;
+  model?: string;
   tzOffsetMinutes?: number;
   enabled?: boolean;
 }

@@ -3250,6 +3250,18 @@ impl crate::cron::CronJobExecutor for AgentJobExecutor {
             "automation_name".to_string(),
             serde_json::Value::String(job.name.clone()),
         );
+        if let Some(provider) = job.provider.as_ref().filter(|value| !value.trim().is_empty()) {
+            metadata.insert(
+                "preferred_provider".to_string(),
+                serde_json::Value::String(provider.clone()),
+            );
+        }
+        if let Some(model) = job.model.as_ref().filter(|value| !value.trim().is_empty()) {
+            metadata.insert(
+                "preferred_model".to_string(),
+                serde_json::Value::String(model.clone()),
+            );
+        }
 
         if let Some(task_id) = job.task_id.as_deref() {
             metadata.insert(
@@ -9659,6 +9671,8 @@ async fn http_api_cron_add(
         command: req.command,
         description: String::new(),
         template_id: None,
+        provider: None,
+        model: None,
         tz_offset_minutes: 0,
         enabled: true,
         last_run: None,

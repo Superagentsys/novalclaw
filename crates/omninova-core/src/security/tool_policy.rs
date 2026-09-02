@@ -47,7 +47,7 @@ pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
     if direct {
         return true;
     }
-    if matches!(tool_name, "file_patch" | "apply_patch") {
+    if matches!(tool_name, "file_patch" | "apply_patch" | "office_create") {
         return ["file_write", "file_edit"].iter().any(|alias| {
             config
                 .autonomy
@@ -177,14 +177,14 @@ pub fn evaluate_tool_call(
     }
 
     if config.approvals.enabled {
-        let is_patch_tool = matches!(tool_name, "file_patch" | "apply_patch");
-        let requires_direct = !is_patch_tool
+        let is_equivalent_write = matches!(tool_name, "file_patch" | "apply_patch" | "office_create");
+        let requires_direct = !is_equivalent_write
             && config
                 .approvals
                 .require_approval
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(tool_name));
-        let requires_equivalent_write = is_patch_tool
+        let requires_equivalent_write = is_equivalent_write
             && config.approvals.require_approval.iter().any(|t| {
                 t.eq_ignore_ascii_case("file_write") || t.eq_ignore_ascii_case("file_edit")
             });

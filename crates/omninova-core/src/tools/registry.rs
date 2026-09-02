@@ -12,8 +12,8 @@ use crate::security::{is_tool_globally_allowed, resolve_shell_allowlist};
 use crate::tools::{
     BrowserTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool, FileReadTool,
     FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool,
-    MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, TaskCheckpointTool, TodoWriteTool,
-    Tool, WebFetchTool, WebSearchTool,
+    MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool, ShellTool,
+    TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -166,6 +166,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: always,
         build: |ctx| Some(Box::new(FileWriteTool::new(ctx.workspace.to_path_buf()))),
+    },
+    ToolDef {
+        name: "office_create",
+        capabilities: ToolCapabilities::WORKSPACE_WRITE,
+        aliases: &["create_pptx", "create_docx", "create_xlsx"],
+        enabled: always,
+        build: |ctx| Some(Box::new(OfficeCreateTool::new(ctx.workspace.to_path_buf()))),
     },
     ToolDef {
         name: "file_edit",
@@ -545,6 +552,7 @@ mod tests {
         for name in [
             "shell",
             "file_write",
+            "office_create",
             "file_edit",
             "file_patch",
             "git_operations",
@@ -565,6 +573,7 @@ mod tests {
         assert!(names.contains(&"content_search"), "names={names:?}");
         for forbidden in [
             "file_write",
+            "office_create",
             "file_edit",
             "file_patch",
             "shell",
