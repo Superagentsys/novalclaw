@@ -24,6 +24,10 @@ use omninova_core::gateway::{
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
+use omninova_core::tools::{
+    agent_browser_runtime_available, cleanup_owned_browser_sessions, resolve_agent_browser_binary,
+    set_agent_browser_search_roots, sync_browser_enabled_with_runtime, AGENT_BROWSER_BIN_ENV,
+};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
     import_skills_from_dir, load_skills_from_dir, skill_runtime_snapshot, skillhub_categories,
@@ -153,7 +157,6 @@ struct AppState {
     last_public_health: Option<GatewayPublicHealthStatus>,
 }
 
-const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
 const WEBVIEW2_DATA_DIR_ENV: &str = "OMNINOVA_WEBVIEW2_DATA_DIR";
 const OPEN_DEVTOOLS_ENV: &str = "OMNINOVA_OPEN_DEVTOOLS";
 const WEBVIEW2_LOCK_SCAN_MAX_DEPTH: usize = 4;
@@ -348,119 +351,32 @@ fn log_webview_startup_diagnostics(diagnostics: &WebviewStartupDiagnostics) {
     );
 }
 
-fn resolve_embedded_agent_browser_relative_path() -> Option<&'static str> {
-    match std::env::consts::OS {
-        "macos" => Some("agent-browser/macos/agent-browser"),
-        "linux" => Some("agent-browser/linux/agent-browser"),
-        "windows" => Some("agent-browser/windows/agent-browser.exe"),
-        _ => None,
-    }
-}
-
 fn configure_embedded_agent_browser_env(app_handle: &tauri::AppHandle) {
-    let Some(relative_path) = resolve_embedded_agent_browser_relative_path() else {
-        return;
-    };
-
-    let Ok(resource_dir) = app_handle.path().resource_dir() else {
-        eprintln!("[browser] failed to resolve resource_dir");
-        return;
-    };
-
-    let candidates = [
-        resource_dir.join(relative_path),
-        resource_dir.join("resources").join(relative_path),
-    ];
-
-    if let Some(found) = candidates.iter().find(|path| is_working_agent_browser_binary(path)) {
-        std::env::set_var(
-            EMBEDDED_AGENT_BROWSER_BIN_ENV,
-            found.to_string_lossy().into_owned(),
-        );
-        eprintln!(
-            "[browser] using embedded binary from {}",
-            found.to_string_lossy()
-        );
-        return;
-    }
-
-    if let Some(found) = detect_agent_browser_binary() {
-        std::env::set_var(
-            EMBEDDED_AGENT_BROWSER_BIN_ENV,
-            found.to_string_lossy().into_owned(),
-        );
-        eprintln!(
-            "[browser] using system binary from {}",
-            found.to_string_lossy()
-        );
-    } else {
-        eprintln!(
-            "[browser] embedded binary not found. looked for: {}",
-            candidates
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
-fn is_working_agent_browser_binary(path: &std::path::Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    let mut command = StdCommand::new(path);
-    hide_std_command_window(&mut command);
-    let Ok(output) = command
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
-fn detect_agent_browser_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(EMBEDDED_AGENT_BROWSER_BIN_ENV) {
-        let candidate = PathBuf::from(path);
-        if is_working_agent_browser_binary(&candidate) {
-            return Some(candidate);
+    let mut roots = Vec::new();
+    match app_handle.path().resource_dir() {
+        Ok(dir) => {
+            eprintln!("[browser] resource_dir={}", dir.display());
+            roots.push(dir);
+        }
+        Err(error) => {
+            eprintln!("[browser] failed to resolve resource_dir: {error}");
         }
     }
+    set_agent_browser_search_roots(roots);
 
-    let static_candidates = [
-        "/opt/homebrew/bin/agent-browser",
-        "/usr/local/bin/agent-browser",
-        "/usr/bin/agent-browser",
-    ];
-    for candidate in static_candidates {
-        let path = PathBuf::from(candidate);
-        if is_working_agent_browser_binary(&path) {
-            return Some(path);
+    match resolve_agent_browser_binary() {
+        Ok(resolved) => {
+            std::env::set_var(AGENT_BROWSER_BIN_ENV, resolved.path.as_os_str());
+            eprintln!(
+                "[browser] resolved binary source={} path={}",
+                resolved.source.as_str(),
+                resolved.path.display()
+            );
+        }
+        Err(missing) => {
+            eprintln!("[browser] {missing}");
         }
     }
-
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let mut dynamic_candidates = vec![
-            home.join(".npm-global/bin/agent-browser"),
-            home.join(".local/bin/agent-browser"),
-        ];
-        let nvm_versions = home.join(".nvm/versions/node");
-        if let Ok(entries) = std::fs::read_dir(nvm_versions) {
-            for entry in entries.flatten() {
-                dynamic_candidates.push(entry.path().join("bin/agent-browser"));
-            }
-        }
-        for candidate in dynamic_candidates {
-            if is_working_agent_browser_binary(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1893,6 +1809,30 @@ struct DepStatusPayload {
     detail: String,
 }
 
+fn chromium_status_from_doctor(stdout: &[u8]) -> Result<String, String> {
+    let payload: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("browser doctor returned invalid JSON: {error}"))?;
+    let check = payload
+        .get("checks")
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check.get("id").and_then(Value::as_str) == Some("chrome.installed"))
+        })
+        .ok_or_else(|| "browser doctor did not report Chromium status".to_string())?;
+    let message = check
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Chromium status unavailable")
+        .to_string();
+    if check.get("status").and_then(Value::as_str) == Some("pass") {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillSummaryItem {
@@ -1930,39 +1870,64 @@ struct SkillHubInstallResult {
 
 #[tauri::command]
 async fn check_browser_dep() -> Result<DepStatusPayload, String> {
-    if let Some(path) = detect_agent_browser_binary() {
-        let version = check_command_installed(path.to_string_lossy().as_ref(), "--version").await;
-        if version.installed {
-            return Ok(DepStatusPayload {
-                name: "agent-browser".to_string(),
-                installed: true,
+    match resolve_agent_browser_binary() {
+        Ok(resolved) => {
+            let path = resolved.path.to_string_lossy().into_owned();
+            let version = check_command_installed(&path, "--version").await;
+            if !version.installed {
+                return Ok(DepStatusPayload {
+                    name: "browser-runtime".to_string(),
+                    installed: false,
+                    version: None,
+                    detail: format!(
+                        "agent-browser CLI cannot run (source={})",
+                        resolved.source.as_str()
+                    ),
+                });
+            }
+
+            let mut doctor = tokio::process::Command::new(&resolved.path);
+            hide_tokio_command_window(&mut doctor);
+            let output = doctor
+                .args(["doctor", "--offline", "--quick", "--json"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await;
+            let chromium = output
+                .map_err(|error| format!("browser doctor could not start: {error}"))
+                .and_then(|output| chromium_status_from_doctor(&output.stdout));
+            let (installed, chromium_detail) = match chromium {
+                Ok(detail) => (true, detail),
+                Err(detail) => (false, detail),
+            };
+            Ok(DepStatusPayload {
+                name: "browser-runtime".to_string(),
+                installed,
                 version: version.version,
-                detail: format!("{} ({})", version.detail, path.to_string_lossy()),
-            });
+                detail: format!(
+                    "{chromium_detail} (agent-browser source={})",
+                    resolved.source.as_str()
+                ),
+            })
         }
+        Err(missing) => Ok(DepStatusPayload {
+            name: "browser-runtime".to_string(),
+            installed: false,
+            version: None,
+            detail: missing.to_string(),
+        }),
     }
-    let status = check_command_installed("agent-browser", "--version").await;
-    Ok(status)
 }
 
 #[tauri::command]
 async fn install_browser_dep() -> Result<DepStatusPayload, String> {
-    let mut npm_command = tokio::process::Command::new("npm");
-    hide_tokio_command_window(&mut npm_command);
-    let npm_out = npm_command
-        .args(["install", "-g", "agent-browser"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("npm install failed: {e}"))?;
-    if !npm_out.status.success() {
-        let stderr = String::from_utf8_lossy(&npm_out.stderr);
-        return Err(format!("npm install -g agent-browser failed: {stderr}"));
-    }
-
-    let agent_browser_cmd = detect_agent_browser_binary()
-        .unwrap_or_else(|| PathBuf::from("agent-browser"));
+    let agent_browser_cmd = match resolve_agent_browser_binary() {
+        Ok(resolved) => resolved.path,
+        Err(missing) => {
+            return Err(missing.to_string());
+        }
+    };
     let mut chromium_command = tokio::process::Command::new(&agent_browser_cmd);
     hide_tokio_command_window(&mut chromium_command);
     let chromium_out = chromium_command
@@ -1978,7 +1943,14 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
     }
 
     let status = check_browser_dep().await?;
-    Ok(status)
+    if status.installed {
+        Ok(status)
+    } else {
+        Err(format!(
+            "agent-browser install completed, but Chromium is still unavailable: {}",
+            status.detail
+        ))
+    }
 }
 
 async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayload {
@@ -2010,6 +1982,33 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
             version: None,
             detail: "not installed".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod browser_dep_tests {
+    use super::chromium_status_from_doctor;
+
+    #[test]
+    fn doctor_reports_chromium_ready_only_for_a_passing_install_check() {
+        let ready = br#"{"checks":[{"id":"chrome.installed","status":"pass","message":"Chrome ready"}]}"#;
+        assert_eq!(chromium_status_from_doctor(ready).unwrap(), "Chrome ready");
+
+        let missing = br#"{"checks":[{"id":"chrome.installed","status":"fail","message":"Chrome missing"}]}"#;
+        assert_eq!(
+            chromium_status_from_doctor(missing).unwrap_err(),
+            "Chrome missing"
+        );
+    }
+
+    #[test]
+    fn doctor_without_a_chromium_check_is_not_reported_as_ready() {
+        let unrelated = br#"{"checks":[{"id":"env.version","status":"pass"}]}"#;
+        assert!(
+            chromium_status_from_doctor(unrelated)
+                .unwrap_err()
+                .contains("did not report Chromium")
+        );
     }
 }
 
@@ -3746,8 +3745,10 @@ fn protect_channel_extra_fields(config: &mut Config) {
 fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
     let mut changed = false;
 
-    if !config.browser.enabled {
-        config.browser.enabled = true;
+    if sync_browser_enabled_with_runtime(
+        &mut config.browser.enabled,
+        agent_browser_runtime_available(),
+    ) {
         changed = true;
     }
 
@@ -5381,6 +5382,10 @@ pub fn run() {
     };
 
     app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            // Window close only hides to tray. Cleanup runs on real process exit.
+            cleanup_owned_browser_sessions();
+        }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
             if let Some(w) = app_handle.get_webview_window("main") {

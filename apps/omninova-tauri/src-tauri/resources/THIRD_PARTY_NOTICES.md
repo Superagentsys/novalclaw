@@ -27,3 +27,22 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## agent-browser
+
+This application may bundle the `agent-browser` native CLI (pinned 0.36.0) as
+an optional Browser Runtime. The CLI is extracted at build time from the npm
+package `agent-browser` and is **not** copied from a developer machine path.
+
+Source: <https://github.com/vercel-labs/agent-browser>
+
+Copyright 2025 Vercel Inc.
+
+Licensed under the Apache License, Version 2.0.
+A copy of the Apache-2.0 license is staged next to the binary as
+`resources/agent-browser/LICENSE` when `npm run prepare:browser-runtime` runs.
+
+The bundled CLI does not include Chromium. Chrome for Testing / system Chrome
+is obtained at runtime by `agent-browser install` or by detecting an existing
+Chrome/Brave/Playwright/Puppeteer install. OmniNova does not redistribute
+Google Chrome.

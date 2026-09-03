@@ -823,7 +823,7 @@ pub async fn run_cli(cli: Cli) -> Result<String> {
         Some(Commands::Browser { command }) => match command {
             Some(BrowserCommands::Install) => install_agent_browser().await,
             Some(BrowserCommands::Status) => {
-                let status = check_dep_installed("agent-browser", "--version").await;
+                let status = agent_browser_dep_status().await;
                 Ok(serde_json::to_string_pretty(&status)?)
             }
             Some(BrowserCommands::Debug) => {
@@ -2221,7 +2221,7 @@ async fn install_agent_browser() -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("agent-browser install failed: {}", stderr);
     }
-    let status = check_dep_installed("agent-browser", "--version").await;
+    let status = agent_browser_dep_status().await;
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "installed": status.installed,
@@ -2232,7 +2232,7 @@ async fn install_agent_browser() -> Result<String> {
 async fn run_doctor(config: &Config) -> Result<String> {
     let runtime = GatewayRuntime::new(config.clone());
     let health = runtime.health().await;
-    let agent_browser = check_dep_installed("agent-browser", "--version").await;
+    let agent_browser = agent_browser_dep_status().await;
     let node = check_dep_installed("node", "--version").await;
     let npm = check_dep_installed("npm", "--version").await;
     let rg = check_dep_installed("rg", "--version").await;
@@ -2265,7 +2265,7 @@ async fn run_doctor(config: &Config) -> Result<String> {
         checks.push(serde_json::json!({
             "check": "browser_tool_ready",
             "ok": false,
-            "detail": "browser.enabled=true but agent-browser is not installed. Run: omninova setup-deps browser",
+            "detail": agent_browser.detail,
         }));
     } else if config.browser.enabled {
         checks.push(serde_json::json!({
@@ -3173,6 +3173,29 @@ pub struct DepStatus {
     pub installed: bool,
     pub version: Option<String>,
     pub detail: String,
+}
+
+async fn agent_browser_dep_status() -> DepStatus {
+    match crate::tools::resolve_agent_browser_binary() {
+        Ok(resolved) => {
+            let path = resolved.path.to_string_lossy().into_owned();
+            let mut status = check_dep_installed(&path, "--version").await;
+            status.name = "agent-browser".to_string();
+            if status.installed {
+                status.detail = format!("{} (source={})", status.detail, resolved.source.as_str());
+            } else {
+                status.installed = true;
+                status.detail = format!("resolved {} (source={})", path, resolved.source.as_str());
+            }
+            status
+        }
+        Err(missing) => DepStatus {
+            name: "agent-browser".to_string(),
+            installed: false,
+            version: None,
+            detail: missing.to_string(),
+        },
+    }
 }
 
 async fn check_dep_installed(bin: &str, version_flag: &str) -> DepStatus {

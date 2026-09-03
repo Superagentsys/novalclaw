@@ -232,6 +232,30 @@ interface CliInstallStatus {
   onPath: boolean;
   hint: string;
 }
+
+interface BrowserDepStatus {
+  name: string;
+  installed: boolean;
+  version: string | null;
+  detail: string;
+}
+
+type BrowserDepUiState =
+  | "checking"
+  | "ready"
+  | "missing"
+  | "installing"
+  | "installed"
+  | "failed";
+
+const BROWSER_DEP_STATE_LABELS: Record<BrowserDepUiState, string> = {
+  checking: "检测中",
+  ready: "可用",
+  missing: "缺少 Chromium",
+  installing: "安装中",
+  installed: "已安装",
+  failed: "安装或检测失败",
+};
 type SetupTabItem = {
   id: SetupTab;
   label: string;
@@ -385,6 +409,9 @@ export function Setup({
   const [dingtalkRouteLoading, setDingtalkRouteLoading] = useState(false);
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
+  const [browserDep, setBrowserDep] = useState<BrowserDepStatus | null>(null);
+  const [browserDepState, setBrowserDepState] =
+    useState<BrowserDepUiState>("checking");
   const jsonPreview = useMemo(() => {
     const redacted = redactSensitiveFields(config);
     return JSON.stringify(redacted, null, 2);
@@ -501,6 +528,25 @@ export function Setup({
     }
   }, []);
 
+  const refreshBrowserDep = useCallback(async () => {
+    setBrowserDepState("checking");
+    try {
+      const status = await invokeTauri<BrowserDepStatus>("check_browser_dep");
+      setBrowserDep(status);
+      setBrowserDepState(status.installed ? "ready" : "missing");
+      return status;
+    } catch (error) {
+      setBrowserDep({
+        name: "browser-runtime",
+        installed: false,
+        version: null,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      setBrowserDepState("failed");
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     void loadSetupState();
   }, []);
@@ -508,8 +554,9 @@ export function Setup({
   useEffect(() => {
     if (activeTab === "general") {
       void refreshCliInstall();
+      void refreshBrowserDep();
     }
-  }, [activeTab, refreshCliInstall]);
+  }, [activeTab, refreshBrowserDep, refreshCliInstall]);
 
   useEffect(() => {
     if (activeTab !== "channels") {
@@ -801,6 +848,23 @@ export function Setup({
       );
     } finally {
       setCliBusy(false);
+    }
+  };
+
+  const handleBrowserDepInstall = async () => {
+    setBrowserDepState("installing");
+    try {
+      const status = await invokeTauri<BrowserDepStatus>("install_browser_dep");
+      setBrowserDep(status);
+      setBrowserDepState(status.installed ? "installed" : "failed");
+    } catch (error) {
+      setBrowserDep((current) => ({
+        name: current?.name ?? "browser-runtime",
+        installed: false,
+        version: current?.version ?? null,
+        detail: error instanceof Error ? error.message : String(error),
+      }));
+      setBrowserDepState("failed");
     }
   };
 
@@ -1297,6 +1361,50 @@ export function Setup({
                     }
                   />
                 </label>
+              </div>
+            </section>
+
+            <section className="setup-section">
+              <h2>浏览器运行环境</h2>
+              <p
+                className="setup-embed-sub"
+                style={{ marginTop: 0, marginBottom: "0.75rem" }}
+              >
+                网页交互使用随应用分发的 agent-browser CLI；首次使用只需安装
+                Chromium，无需安装 npm 或全局命令。
+              </p>
+              <div className="setup-grid">
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <p style={{ margin: "0 0 0.5rem", fontSize: "0.9rem" }}>
+                    状态：{BROWSER_DEP_STATE_LABELS[browserDepState]}
+                    {browserDep?.version ? ` · agent-browser ${browserDep.version}` : ""}
+                  </p>
+                  {browserDep?.detail ? (
+                    <p className="setup-action-hint" style={{ margin: "0 0 0.75rem" }}>
+                      {browserDep.detail}
+                    </p>
+                  ) : null}
+                  <div className="setup-embed-buttons">
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      disabled={browserDepState === "checking" || browserDepState === "installing"}
+                      onClick={() => void refreshBrowserDep()}
+                    >
+                      {browserDepState === "checking" ? "检测中…" : "重新检测"}
+                    </button>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--primary"
+                      disabled={browserDepState === "checking" || browserDepState === "installing"}
+                      onClick={() => void handleBrowserDepInstall()}
+                    >
+                      {browserDepState === "installing"
+                        ? "正在安装 Chromium…"
+                        : "安装浏览器运行环境"}
+                    </button>
+                  </div>
+                </div>
               </div>
             </section>
 

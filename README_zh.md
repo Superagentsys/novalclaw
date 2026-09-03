@@ -256,12 +256,11 @@ OmniNova Claw 使用 `config.toml` 文件进行配置，可以通过桌面 UI �
 
 ### 浏览器自动化（agent-browser）
 
-启用 `[browser] enabled = true` 后，Agent 可通过 **agent-browser** 控制无头浏览器。若出现「找不到 CLI」或工具报错：
+启用 `[browser] enabled = true` 后，Agent 可通过 **agent-browser** 控制无头浏览器。桌面构建会从固定版本的 npm 包提取当前 OS 的 native CLI 到 Tauri resources（`npm run prepare:browser-runtime`），**不需要**全局 `npm install -g agent-browser`。
 
-1. 安装 CLI 并下载 Chromium：`npm install -g agent-browser && agent-browser install`
-2. 桌面端仓库内也可：`cd apps/omninova-tauri && npm run setup:browser`
-3. 自定义二进制路径：设置环境变量 `OMNINOVA_AGENT_BROWSER_BIN` 为可执行文件绝对路径
-4. 暂不需要浏览器时：在 `config.toml` 中设 `[browser] enabled = false`，避免模型尝试调用 `browser` 工具
+Chromium 不在安装包里：若本机没有 Chrome/Brave，需用官方命令下载 Chrome for Testing：`cd apps/omninova-tauri && npm run setup:browser`（prepare + 对已暂存 CLI 执行 `install`）。
+
+自定义二进制：`OMNINOVA_AGENT_BROWSER_BIN`。暂不需要浏览器时：`[browser] enabled = false`。
 
 命令行自检：`omninova doctor`（或网关返回的 `/api/doctor`）会提示依赖是否就绪。
 

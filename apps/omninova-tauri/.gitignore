@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Staged by prepare:browser-runtime — do not commit
+src-tauri/resources/agent-browser/windows/agent-browser.exe
+src-tauri/resources/agent-browser/macos/agent-browser
+src-tauri/resources/agent-browser/linux/agent-browser
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
