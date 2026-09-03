@@ -251,9 +251,13 @@ pub(crate) fn compact_use_skill_payload(content: &str) -> String {
         return content.to_string();
     }
     if let Some(object) = inner.as_object_mut() {
-        object.insert("instructions".into(), serde_json::Value::String(String::new()));
-        object.insert("resource_prompt".into(), serde_json::Value::String(String::new()));
-        object.insert("provider_envelope".into(), serde_json::Value::String(String::new()));
+        object.remove("instructions");
+        object.remove("resource_prompt");
+        object.remove("provider_envelope");
+        object.insert(
+            "instructions_loaded_into_active_context".into(),
+            serde_json::Value::Bool(true),
+        );
         object.insert("working_context_stripped".into(), serde_json::Value::Bool(true));
     }
     if let Some(object) = outer.as_object_mut() {

@@ -1252,6 +1252,9 @@ mod output_tests {
         assert_eq!(messages.len(), 2);
         assert!(!messages[0].content.contains("PRIVATE_ACTIONABLE_INSTRUCTIONS"));
         assert!(!messages[0].content.contains("SAFE_PROVIDER_ENVELOPE"));
+        assert!(messages[0]
+            .content
+            .contains("instructions_loaded_into_active_context"));
         assert!(messages[1].content.contains("SAFE_PROVIDER_ENVELOPE"));
     }
 }
