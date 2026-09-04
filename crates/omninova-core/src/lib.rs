@@ -7,6 +7,7 @@ pub mod contract_review;
 pub mod cron;
 pub mod daemon;
 pub mod desktop_capture;
+pub mod document_text;
 pub mod gateway;
 pub mod knowledge;
 pub mod memory;

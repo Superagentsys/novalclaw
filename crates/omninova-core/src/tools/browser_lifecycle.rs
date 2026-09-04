@@ -135,7 +135,9 @@ fn looks_like_daemon_unavailable(lower: &str) -> bool {
 }
 
 fn looks_like_crash(lower: &str) -> bool {
-    lower.contains("target closed")
+    lower.contains("chrome exited early")
+        || lower.contains("browser failed to launch")
+        || lower.contains("target closed")
         || lower.contains("browser has been closed")
         || lower.contains("browser closed")
         || lower.contains("page crashed")

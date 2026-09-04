@@ -2,14 +2,24 @@
 
 use super::chunk::{chunk_text, Chunk};
 use crate::cron::now_timestamp;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::Mutex;
 
 const MAX_DOC_CHARS: usize = 1_500_000;
 const PREVIEW_CHARS: usize = 280;
+
+fn shared_write_guard(path: PathBuf) -> Arc<Mutex<()>> {
+    static GUARDS: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut guards = GUARDS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    guards.retain(|_, guard| guard.strong_count() > 0);
+    if let Some(guard) = guards.get(&path).and_then(Weak::upgrade) { return guard; }
+    let guard = Arc::new(Mutex::new(()));
+    guards.insert(path, Arc::downgrade(&guard));
+    guard
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeDocument {
@@ -79,6 +89,8 @@ pub struct KnowledgeUpsert {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct StoreFile {
     #[serde(default)]
+    collections: Vec<String>,
+    #[serde(default)]
     documents: Vec<KnowledgeDocument>,
     #[serde(default)]
     chunks: Vec<StoredChunk>,
@@ -104,10 +116,11 @@ impl KnowledgeStore {
         let root = workspace.as_ref().join("knowledge");
         let docs_dir = root.join("docs");
         tokio::fs::create_dir_all(&docs_dir).await?;
+        let index_path = tokio::fs::canonicalize(&root).await?.join("index.json");
         Ok(Self {
-            index_path: root.join("index.json"),
+            write_guard: shared_write_guard(index_path.clone()),
+            index_path,
             docs_dir,
-            write_guard: Arc::new(Mutex::new(())),
         })
     }
 
@@ -122,20 +135,43 @@ impl KnowledgeStore {
     }
 
     pub async fn collections(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .read_all()
-            .await
-            .documents
-            .into_iter()
-            .map(|doc| doc.collection)
-            .collect();
+        let file = self.read_all().await;
+        let mut names = file.collections;
+        names.push("default".into());
+        names.extend(file.documents.into_iter().map(|doc| doc.collection));
         names.sort();
         names.dedup();
         names
     }
 
+    /// Persist empty collections as well as document-backed collections.
+    /// Rename/delete only alter metadata, never rewrite document bodies.
+    pub async fn update_collection(&self, name: &str, replacement: Option<&str>, delete: bool) -> Result<()> {
+        let name = name.trim();
+        let target = replacement.unwrap_or(name).trim();
+        if name.is_empty() || target.is_empty() || name == "all" || target == "all"
+            || name.chars().count() > 100 || target.chars().count() > 100 {
+            return Err(anyhow!("分类名称不能为空、不能为 all，且最多 100 个字符"));
+        }
+        if name == "default" && (delete || replacement.is_some()) {
+            return Err(anyhow!("default 是保留分类，不能重命名或删除"));
+        }
+        let _guard = self.write_guard.lock().await;
+        let mut file = self.read_all().await;
+        file.collections.retain(|c| c != name);
+        if !delete && !file.collections.iter().any(|c| c == target) {
+            file.collections.push(target.to_owned());
+        }
+        for doc in &mut file.documents {
+            if doc.collection == name {
+                doc.collection = if delete { "default" } else { target }.to_owned();
+            }
+        }
+        self.write_all(&file).await
+    }
+
     pub async fn get(&self, id: &str) -> Result<Option<(KnowledgeDocument, String)>> {
-        let StoreFile { documents, chunks } = self.read_all().await;
+        let StoreFile { documents, chunks, .. } = self.read_all().await;
         let Some(doc) = documents.into_iter().find(|doc| doc.id == id) else {
             return Ok(None);
         };
@@ -247,11 +283,7 @@ impl KnowledgeStore {
             .and_then(|ext| ext.to_str())
             .unwrap_or("txt")
             .to_ascii_lowercase();
-        let content = if kind == "pdf" {
-            extract_pdf_bytes(bytes)?
-        } else {
-            String::from_utf8_lossy(bytes).into_owned()
-        };
+        let content = crate::document_text::extract(filename, bytes).await?;
         let title = Path::new(filename)
             .file_stem()
             .and_then(|name| name.to_str())
@@ -628,31 +660,5 @@ fn snippet_around(text: &str, query: &str) -> String {
 }
 
 async fn extract_file_text(path: &Path) -> Result<String> {
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "pdf" {
-        let path = path.to_path_buf();
-        let text = tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path))
-            .await
-            .context("pdf extract task")?
-            .context("pdf extract")?;
-        return Ok(text);
-    }
-    Ok(tokio::fs::read_to_string(path).await?)
-}
-
-fn extract_pdf_bytes(bytes: &[u8]) -> Result<String> {
-    let dir = std::env::temp_dir().join("omninova-knowledge");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!(
-        "upload-{}.pdf",
-        now_timestamp().replace([':', '.'], "-")
-    ));
-    std::fs::write(&path, bytes)?;
-    let text = pdf_extract::extract_text(&path).context("pdf extract")?;
-    let _ = std::fs::remove_file(&path);
-    Ok(text)
+    crate::document_text::read(path).await
 }

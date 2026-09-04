@@ -1543,7 +1543,9 @@ struct KnowledgeUpsertInput {
 #[serde(rename_all = "camelCase")]
 struct KnowledgeImportFile {
     name: String,
+    #[serde(default)]
     content: String,
+    content_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1568,6 +1570,18 @@ async fn knowledge_collections(
 ) -> Result<Vec<String>, String> {
     let store = open_knowledge_store(&state).await?;
     Ok(store.collections().await)
+}
+
+#[tauri::command]
+async fn knowledge_collection_update(
+    name: String,
+    replacement: Option<String>,
+    delete: Option<bool>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    open_knowledge_store(&state).await?.update_collection(
+        &name, replacement.as_deref(), delete.unwrap_or(false),
+    ).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1624,9 +1638,14 @@ async fn knowledge_import(
         );
     }
     for file in files.unwrap_or_default() {
+        let bytes = match file.content_base64 {
+            Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)
+                .map_err(|e| format!("{}: invalid base64: {e}", file.name))?,
+            None => file.content.into_bytes(),
+        };
         imported.push(
             store
-                .import_bytes(&file.name, file.content.as_bytes(), collection.as_deref(), tags.clone())
+                .import_bytes(&file.name, &bytes, collection.as_deref(), tags.clone())
                 .await
                 .map_err(|error| format!("{}: {error}", file.name))?,
         );
@@ -4941,11 +4960,23 @@ fn open_task_artifact(
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer does not accept Rust canonicalize's verbatim path prefix.
+        let raw = resolved.to_string_lossy();
+        let shell_path = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+        };
+        if shell_path.contains('"') || shell_path.contains(['\r', '\n']) {
+            return Err("文件路径包含无效字符".into());
+        }
         let mut command = StdCommand::new("explorer.exe");
         if resolved.is_dir() {
-            command.arg(&resolved);
+            command.arg(&shell_path);
         } else {
-            command.arg(format!("/select,{}", resolved.display()));
+            // Quote the path, NOT the /select, switch (Explorer's own grammar).
+            command.raw_arg(format!("/select,\"{shell_path}\""));
         }
         hide_std_command_window(&mut command);
         command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
@@ -5202,6 +5233,7 @@ pub fn run() {
             automation_clear_runs,
             knowledge_list,
             knowledge_collections,
+            knowledge_collection_update,
             knowledge_get,
             knowledge_upsert,
             knowledge_import,

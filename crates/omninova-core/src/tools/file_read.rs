@@ -27,7 +27,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Path must be workspace-relative; use '.' for the workspace root and never pass an absolute path like D:\\project."
+        "Read text or extract DOC/DOCX/PPTX/XLSX/PDF document content locally with line numbers. Path must be workspace-relative; use '.' for the workspace root and never pass an absolute path like D:\\project."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -80,7 +80,7 @@ impl Tool for FileReadTool {
             }
         }
 
-        let contents = match tokio::fs::read_to_string(&resolved).await {
+        let contents = match crate::document_text::read(&resolved).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {

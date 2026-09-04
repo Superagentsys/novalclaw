@@ -30,7 +30,7 @@ struct Slide {
     image_path: String,
     #[serde(default)]
     image_alt: String,
-    /// auto | image_left | image_right | full_bleed | cards
+    /// auto | image_left | image_right | full_bleed | cards | editorial
     #[serde(default)]
     layout: String,
     /// Optional six-digit RGB color, for example 315BE8.
@@ -123,7 +123,7 @@ impl Tool for OfficeCreateTool {
                         "bullets": { "type": "array", "items": { "type": "string" } },
                         "image_path": { "type": "string", "description": "Workspace-relative .png, .jpg, or .jpeg image path" },
                         "image_alt": { "type": "string", "description": "Accessible image description" },
-                        "layout": { "type": "string", "enum": ["auto", "image_left", "image_right", "full_bleed", "cards"] },
+                        "layout": { "type": "string", "enum": ["auto", "image_left", "image_right", "full_bleed", "cards", "editorial"], "description": "auto uses image/text or open editorial layout; cards only for comparisons. Keep titles under 36 Chinese characters, body under 120 and 3-5 short bullets." },
                         "accent_color": { "type": "string", "description": "Optional six-digit RGB accent color" }
                     }}
                 },
@@ -333,8 +333,9 @@ fn ppt_rect(
     fill: &str,
     line: &str,
 ) -> String {
+    let geometry = if name.ends_with("Card") || name == "Section Badge" { "roundRect" } else { "rect" };
     format!(
-        r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="{}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="{fill}"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="{line}"/></a:solidFill></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>"#,
+        r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="{}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="{geometry}"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="{fill}"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="{line}"/></a:solidFill></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>"#,
         xml(name)
     )
 }
@@ -558,7 +559,7 @@ fn presentation_slide_shapes(
         shapes.push_str(&ppt_text_box(
             4,
             "Eyebrow",
-            &[("OMNINOVA · INSIGHT DECK".into(), false)],
+            &[("专题简报".into(), false)],
             914_400,
             731_520,
             5_486_400,
@@ -577,7 +578,7 @@ fn presentation_slide_shapes(
             1_554_480,
             if has_image { 5_943_600 } else { 9_601_200 },
             2_102_640,
-            5200,
+            if slide.title.chars().count() > 22 { 4200 } else { 5200 },
             "FFFFFF",
             true,
             "l",
@@ -602,12 +603,12 @@ fn presentation_slide_shapes(
         shapes.push_str(&ppt_text_box(
             7,
             "Cover Footer",
-            &[(format!("共 {total} 页  ·  由 OmniNova 生成"), false)],
+            &[(format!("共 {total} 页"), false)],
             914_400,
             5_806_440,
             4_572_000,
             365_760,
-            1000,
+            1200,
             "7F9AB5",
             false,
             "l",
@@ -756,8 +757,8 @@ fn presentation_slide_shapes(
         1_600_200,
         365_760,
         9_144_000,
-        731_520,
-        3500,
+        914_400,
+        3200,
         "102A43",
         true,
         "l",
@@ -828,7 +829,7 @@ fn presentation_slide_shapes(
                 "Image Caption",
                 &[(slide.image_alt.clone(), false)],
                 image_x,
-                5_669_280,
+                6_095_520,
                 4_937_760,
                 274_320,
                 900,
@@ -852,6 +853,36 @@ fn presentation_slide_shapes(
             "r",
             "ctr",
         ));
+        return shapes;
+    }
+
+    // Open editorial layout avoids turning every slide into an identical card grid.
+    // Cards remain an explicit choice for comparisons.
+    if !slide.layout.eq_ignore_ascii_case("cards") {
+        let intro = [&slide.subtitle, &slide.body].into_iter()
+            .filter(|s| !s.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n");
+        let start_y = if intro.is_empty() { 1_554_480 } else { 2_286_000 };
+        if !intro.is_empty() {
+            shapes.push_str(&ppt_text_box(8, "Introduction", &[(intro, false)],
+                685_800, 1_280_160, 10_820_400, 822_960, 2000, "52677C", false, "l", "t"));
+        }
+        let rows = slide.bullets.len().max(1) as i64;
+        let row_h = (5_943_600 - start_y) / rows;
+        for (n, point) in slide.bullets.iter().enumerate() {
+            let y = start_y + n as i64 * row_h;
+            shapes.push_str(&ppt_text_box(20 + n * 3, "Point Number",
+                &[(format!("{:02}", n + 1), false)], 685_800, y,
+                914_400, row_h - 91_440, 3000, &accent, true, "l", "ctr"));
+            shapes.push_str(&ppt_text_box(21 + n * 3, "Key Point", &[(point.clone(), false)],
+                1_828_800, y, 9_601_200, row_h - 91_440,
+                if point.chars().count() > 70 { 2000 } else { 2400 }, "183B56", false, "l", "ctr"));
+            if n + 1 < slide.bullets.len() {
+                shapes.push_str(&ppt_rect(22 + n * 3, "Row Separator", 1_828_800,
+                    y + row_h - 30_480, 9_601_200, 9_525, "D8E0EC", "D8E0EC"));
+            }
+        }
+        shapes.push_str(&ppt_text_box(90, "Page Number", &[(format!("{:02} / {:02}", index + 1, total), false)],
+            10_424_160, 6_217_920, 1_066_800, 274_320, 1100, "6B7C93", false, "r", "ctr"));
         return shapes;
     }
 
@@ -921,9 +952,9 @@ fn presentation_slide_shapes(
                 y + 91_440,
                 card_w - 365_760,
                 card_h - 182_880,
-                1650,
+                1800,
                 "183B56",
-                bullet.len() < 28,
+                bullet.chars().count() < 28,
                 "l",
                 "ctr",
             ));
@@ -946,6 +977,45 @@ fn presentation_slide_shapes(
     shapes
 }
 
+fn split_slide_text(text: &str, limit: usize) -> Vec<String> {
+    text.chars().collect::<Vec<_>>().chunks(limit)
+        .map(|chunk| chunk.iter().collect::<String>()).collect()
+}
+
+fn paginate_slides(input: Vec<Slide>) -> Vec<Slide> {
+    let mut output = Vec::new();
+    for (index, slide) in input.into_iter().enumerate() {
+        if index == 0 {
+            let mut cover = slide.clone();
+            cover.body.clear();
+            cover.bullets.clear();
+            output.push(cover);
+            if slide.body.is_empty() && slide.bullets.is_empty() { continue; }
+        }
+        let has_image = !slide.image_path.trim().is_empty();
+        let point_limit = if has_image { 60 } else { 100 };
+        let per_page = if has_image { 3 } else { 4 };
+        let mut points: Vec<String> = slide.bullets.iter()
+            .flat_map(|s| split_slide_text(s, point_limit)).collect();
+        let body = if slide.body.chars().count() > if has_image { 80 } else { 140 } {
+            let mut paragraphs = split_slide_text(&slide.body, point_limit);
+            paragraphs.append(&mut points);
+            points = paragraphs;
+            String::new()
+        } else { slide.body.clone() };
+        let batches = points.len().max(1).div_ceil(per_page);
+        let batch_size = points.len().max(1).div_ceil(batches);
+        for page in 0..batches {
+            let mut part = slide.clone();
+            if page > 0 { part.title = format!("{}（续 {}）", slide.title, page + 1); }
+            part.body = if page == 0 { body.clone() } else { String::new() };
+            part.bullets = points.iter().skip(page * batch_size).take(batch_size).cloned().collect();
+            output.push(part);
+        }
+    }
+    output
+}
+
 async fn build_pptx(
     input: &OfficeCreateInput,
     workspace_dir: &std::path::Path,
@@ -964,6 +1034,7 @@ async fn build_pptx(
     } else {
         input.slides.clone()
     };
+    let slides = paginate_slides(slides);
     if slides.len() > 100 {
         anyhow::bail!("A presentation may contain at most 100 slides");
     }
@@ -1009,11 +1080,11 @@ async fn build_pptx(
         ("docProps/app.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>OmniNova</Application><Slides>{}</Slides></Properties>"#, slides.len())),
         ("ppt/presentation.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst><p:sldIdLst>{slide_ids}</p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>"#)),
         ("ppt/_rels/presentation.xml.rels".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>{relationships}</Relationships>"#)),
-        ("ppt/slideMasters/slideMaster1.xml".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMap accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" bg1="lt1" bg2="lt2" folHlink="folHlink" hlink="hlink" tx1="dk1" tx2="dk2"/><p:sldLayoutIdLst><p:sldLayoutId id="1" r:id="rId1"/></p:sldLayoutIdLst><p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles></p:sldMaster>"#.into()),
+        ("ppt/slideMasters/slideMaster1.xml".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMap accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" bg1="lt1" bg2="lt2" folHlink="folHlink" hlink="hlink" tx1="dk1" tx2="dk2"/><p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst><p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles></p:sldMaster>"#.into()),
         ("ppt/slideMasters/_rels/slideMaster1.xml.rels".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#.into()),
         ("ppt/slideLayouts/slideLayout1.xml".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank"><p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>"#.into()),
         ("ppt/slideLayouts/_rels/slideLayout1.xml.rels".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#.into()),
-        ("ppt/theme/theme1.xml".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="OmniNova"><a:themeElements><a:clrScheme name="OmniNova"><a:dk1><a:srgbClr val="101828"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="1F2937"/></a:dk2><a:lt2><a:srgbClr val="F3F6FC"/></a:lt2><a:accent1><a:srgbClr val="315BE8"/></a:accent1><a:accent2><a:srgbClr val="12B8B0"/></a:accent2><a:accent3><a:srgbClr val="6B7C93"/></a:accent3><a:accent4><a:srgbClr val="F59E0B"/></a:accent4><a:accent5><a:srgbClr val="7C3AED"/></a:accent5><a:accent6><a:srgbClr val="EF4444"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="OmniNova"><a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface="微软雅黑"/><a:cs typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Aptos"/><a:ea typeface="微软雅黑"/><a:cs typeface="Arial"/></a:minorFont></a:fontScheme><a:fmtScheme name="OmniNova"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#.into()),
+        ("ppt/theme/theme1.xml".into(), r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="OmniNova"><a:themeElements><a:clrScheme name="OmniNova"><a:dk1><a:srgbClr val="101828"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="1F2937"/></a:dk2><a:lt2><a:srgbClr val="F3F6FC"/></a:lt2><a:accent1><a:srgbClr val="315BE8"/></a:accent1><a:accent2><a:srgbClr val="12B8B0"/></a:accent2><a:accent3><a:srgbClr val="6B7C93"/></a:accent3><a:accent4><a:srgbClr val="F59E0B"/></a:accent4><a:accent5><a:srgbClr val="7C3AED"/></a:accent5><a:accent6><a:srgbClr val="EF4444"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="OmniNova"><a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface="微软雅黑"/><a:cs typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Aptos"/><a:ea typeface="微软雅黑"/><a:cs typeface="Arial"/></a:minorFont></a:fontScheme><a:fmtScheme name="OmniNova"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#.into()),
     ]);
     zip_package_with_binary(entries, binary_entries)
 }
@@ -1155,6 +1226,32 @@ mod tests {
         let mut content = Vec::new();
         file.read_to_end(&mut content).unwrap();
         content
+    }
+
+    #[tokio::test]
+    async fn office_regression_master_theme_and_pagination() {
+        let input: OfficeCreateInput = serde_json::from_value(json!({
+            "path":"sample.pptx", "title":"回归验证",
+            "slides":[{"title":"封面"}, {"title":"进展概览", "body":"正文摘要", "bullets":["第一项","第二项","第三项","第四项","最后一项"]}]
+        })).unwrap();
+        let pptx = build_pptx(&input, std::path::Path::new(".")).await.unwrap();
+        let master = entry(&pptx, "ppt/slideMasters/slideMaster1.xml");
+        assert!(master.contains("sldLayoutId id=\"2147483649\""));
+        let theme = entry(&pptx, "ppt/theme/theme1.xml");
+        for (list, element) in [("fillStyleLst", "solidFill"), ("lnStyleLst", "ln "), ("effectStyleLst", "effectStyle>"), ("bgFillStyleLst", "solidFill")] {
+            let inner = theme.split(&format!("<a:{list}>")).nth(1).unwrap().split(&format!("</a:{list}>")).next().unwrap();
+            assert_eq!(inner.matches(&format!("<a:{element}")).count(), 3);
+        }
+        assert!(entry(&pptx, "ppt/slides/slide3.xml").contains("最后一项"));
+        assert!(!entry(&pptx, "ppt/slides/slide2.xml").contains("Point Card"));
+        // Optional fixture for the separate Open XML validator / PowerPoint render.
+        if let Ok(path) = std::env::var("OMNINOVA_OFFICE_QA_OUTPUT") {
+            std::fs::write(path, &pptx).unwrap();
+        }
+        let extracted = crate::document_text::extract("sample.pptx", &pptx).await.unwrap();
+        assert!(extracted.contains("最后一项"));
+        let docx = build_docx(&input).unwrap();
+        assert!(crate::document_text::extract("sample.docx", &docx).await.unwrap().contains("回归验证"));
     }
 
     #[tokio::test]

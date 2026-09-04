@@ -134,6 +134,14 @@ fn spawn_error_message(path: &Path, e: std::io::Error) -> String {
 }
 
 impl BrowserTool {
+    async fn readable_page_after_timeout(&self, target: &str) -> Option<ToolResult> {
+        // Fixed read-only probe. Never replay clicks, submits, or arbitrary model JS.
+        const PROBE: &str = "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,text:document.body?document.body.innerText.slice(0,6000):''})";
+        let (ok, stdout, _, _) = self.run_agent_browser("_navigation_probe", &["eval", PROBE]).await.ok()?;
+        if !ok { return None; }
+        readable_navigation_probe(target, &stdout)
+    }
+
     pub fn new(
         allowed_domains: Vec<String>,
         headless: bool,
@@ -193,6 +201,12 @@ impl BrowserTool {
         let mut cmd = Command::new(&resolved.path);
         configure_background_command(&mut cmd);
 
+        if !self.attach_only && self.cdp_url.is_none() {
+            if let Some(browser) = super::browser_executable::installed_browser() {
+                cmd.arg("--executable-path").arg(browser);
+            }
+        }
+
         if self.headless {
             // headless is the default for agent-browser, no flag needed
         } else {
@@ -230,11 +244,12 @@ impl BrowserTool {
 
         remember_owned_browser_session(session);
 
-        let output = match run_command_with_timeout(cmd, DEFAULT_TIMEOUT_SECS).await {
+        let timeout_secs = if action == "_navigation_probe" { 5 } else { DEFAULT_TIMEOUT_SECS };
+        let output = match run_command_with_timeout(cmd, timeout_secs).await {
             Ok(output) => output,
             Err(ChildRunError::Timeout { .. }) => {
                 return Err(anyhow::anyhow!(
-                    "BrowserCommandTimeout: requested_binary={} timeout_secs={DEFAULT_TIMEOUT_SECS}",
+                    "BrowserCommandTimeout: requested_binary={} timeout_secs={DEFAULT_TIMEOUT_SECS}. Browser startup or navigation timed out; this is not proof that network/shell access is forbidden. If no local Edge/Chrome is installed, install Chromium via browser setup; otherwise check the destination site's connectivity.",
                     resolved.path.display()
                 ));
             }
@@ -567,6 +582,11 @@ impl Tool for BrowserTool {
                         outcome.error_text.as_deref().unwrap_or_default(),
                         stderr
                     );
+                    if action == "open" && diagnostic.to_ascii_lowercase().contains("timed out") {
+                        if let Some(result) = self.readable_page_after_timeout(&cli_args[1]).await {
+                            return Ok(result);
+                        }
+                    }
                     let kind = classify_browser_output(&diagnostic);
                     if auto_retry_allowed(action, recovered, concurrent_followup, kind, &diagnostic)
                     {
@@ -616,6 +636,11 @@ impl Tool for BrowserTool {
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    if action == "open" && msg.starts_with("BrowserCommandTimeout:") {
+                        if let Some(result) = self.readable_page_after_timeout(&cli_args[1]).await {
+                            return Ok(result);
+                        }
+                    }
                     if retryable && !recovered && msg.starts_with("BrowserCommandTimeout:") {
                         if let Some(session) = self.session.as_deref() {
                             if recover_owned_session(session) {
@@ -640,11 +665,69 @@ impl Tool for BrowserTool {
     }
 }
 
+fn readable_navigation_probe(target: &str, stdout: &str) -> Option<ToolResult> {
+    let envelope: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    if envelope.get("success")?.as_bool()? != true { return None; }
+    let data: serde_json::Value = serde_json::from_str(envelope.get("data")?.get("result")?.as_str()?).ok()?;
+    let current = Url::parse(data.get("url")?.as_str()?).ok()?;
+    let requested = Url::parse(target).ok()?;
+    // Do not mistake a previous page, redirect to another site, or Chrome error page for success.
+    if current.origin() != requested.origin() || current.path() != requested.path()
+        || current.query() != requested.query()
+        || !matches!(data.get("readyState")?.as_str()?, "interactive" | "complete") { return None; }
+    let body = data.get("text")?.as_str()?.trim();
+    if body.is_empty() { return None; }
+    Some(ToolResult {
+        success: true,
+        output: format!("Navigation warning: the load wait timed out, but the requested page is readable. Some resources may be incomplete; use snapshot for interactive controls.\nURL: {}\n--- BEGIN WEB CONTENT ---\nTitle: {}\n{}\n--- END WEB CONTENT ---",
+            redact_secrets_in_text(current.as_str()), data.get("title")?.as_str()?, body.chars().take(6000).collect::<String>()),
+        error: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::browser_bin::{bundled_agent_browser_relative_path, BrowserBinarySearch};
     use serde_json::json;
+
+    #[test]
+    fn navigation_timeout_probe_requires_readable_requested_page() {
+        let response = |url: &str, state: &str, text: &str| json!({"success":true,"data":{"result":json!({
+            "url":url,"title":"Fixture","readyState":state,"text":text
+        }).to_string()}}).to_string();
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/", "complete", "正文")).is_some());
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/old", "complete", "旧页面")).is_none());
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/", "loading", "正文")).is_none());
+        assert!(readable_navigation_probe("https://example.com/", &response("chrome-error://chromewebdata/", "complete", "错误")).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed browser runtime; manually run smoke test"]
+    async fn browser_live_smoke() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8;4096];
+                    let _ = stream.read(&mut request).await;
+                    let body = "<!doctype html><title>OmniNova Browser QA</title><h1>Browser working</h1><p>Independent test session.</p>";
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                });
+            }
+        });
+        let tool = BrowserTool::new(vec!["127.0.0.1".into()], true, false, None)
+            .with_session(format!("omninova-qa-{}",uuid::Uuid::new_v4().simple()));
+        let result = tool.execute(json!({"action":"open","url":format!("http://{addr}/")})).await.unwrap();
+        let snapshot = tool.execute(json!({"action":"snapshot","compact":true})).await.unwrap();
+        let _ = tool.execute(json!({"action":"close"})).await;
+        server.abort();
+        assert!(result.success, "{:?}", result.error);
+        assert!(snapshot.success && snapshot.output.contains("Browser working"), "{:?} {}",snapshot.error,snapshot.output);
+    }
 
     fn isolated_missing_search() -> BrowserBinarySearch {
         let root = std::env::temp_dir().join(format!(

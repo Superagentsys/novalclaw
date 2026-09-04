@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod browser_bin;
+mod browser_executable;
 pub mod browser_lifecycle;
 pub mod browser_output;
 pub mod content_search;
