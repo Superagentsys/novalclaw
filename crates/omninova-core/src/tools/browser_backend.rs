@@ -222,6 +222,7 @@ mod tests {
                     text: "hello".into(),
                     elements: Vec::new(),
                 }),
+                truncated: false,
             })
         }
 

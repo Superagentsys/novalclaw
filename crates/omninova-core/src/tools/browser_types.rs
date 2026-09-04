@@ -22,9 +22,13 @@ pub struct BrowserSessionKey(String);
 /// V1 model-facing missing-session text. Shared so Tool and Runtime stay in lockstep.
 pub const BROWSER_SESSION_MISSING_DETAIL: &str = "BrowserSessionMissing: OmniNova session id is required; refusing to use a default or shared agent-browser session. Do not retry this call without a valid session.";
 
-/// V1 model-facing reserved logical session. OmniNova policy, not a CLI token check.
 pub const BROWSER_SESSION_RESERVED_DEFAULT_DETAIL: &str =
     "BrowserSessionInvalid: refusing to use the agent-browser default session";
+
+/// V1-compatible model-facing stale-handle guidance. Internal kind is
+/// [`BrowserErrorKind::StaleReference`]; the prefix stays `BrowserCommandFailed`.
+pub const BROWSER_STALE_REFERENCE_DETAIL: &str =
+    "BrowserCommandFailed: element reference is stale or unavailable; run snapshot again before retrying";
 
 impl BrowserSessionKey {
     pub fn new(value: impl Into<String>) -> Result<Self, BrowserTypeError> {
@@ -279,6 +283,12 @@ pub enum BrowserObserveKind {
         /// V1 `value` for `find` (click/text/etc). Defaults to `"text"`.
         action: Option<String>,
     },
+    /// Document-reading observation of the current page. Distinct from
+    /// [`Self::Text`] (page/target text). Not a V1 tool `action=read`.
+    Read {
+        outline: bool,
+        filter: Option<String>,
+    },
 }
 
 impl BrowserObserveKind {
@@ -294,6 +304,7 @@ impl BrowserObserveKind {
             Self::Visibility { .. } => "is_visible",
             Self::Enabled { .. } => "is_enabled",
             Self::Find { .. } => "find",
+            Self::Read { .. } => "read",
         }
     }
 }
@@ -356,6 +367,9 @@ pub struct BrowserObservation {
     pub title: Option<String>,
     pub text: Option<String>,
     pub snapshot: Option<BrowserSnapshot>,
+    /// Backend-neutral: source or runtime truncated untrusted content.
+    /// Does not change V1 model-visible snapshot/get_text envelopes.
+    pub truncated: bool,
 }
 
 /// Page snapshot. `text` is the model-visible envelope. `elements` is an
@@ -407,6 +421,14 @@ impl ObserveRequest {
     pub fn snapshot() -> Self {
         Self {
             kind: BrowserObserveKind::Snapshot,
+            interactive_only: false,
+            compact: false,
+        }
+    }
+
+    pub fn read(outline: bool, filter: Option<String>) -> Self {
+        Self {
+            kind: BrowserObserveKind::Read { outline, filter },
             interactive_only: false,
             compact: false,
         }
@@ -482,6 +504,9 @@ pub enum BrowserErrorKind {
     Timeout,
     Rejected,
     CommandFailed,
+    /// Observation-scoped element handle is no longer valid. Session may
+    /// still be healthy. Not retryable; caller must re-observe.
+    StaleReference,
 }
 
 impl BrowserErrorKind {
@@ -903,7 +928,26 @@ mod tests {
         }
         assert!(!BrowserErrorKind::BinaryMissing.default_retryable());
         assert!(!BrowserErrorKind::Rejected.default_retryable());
+        assert!(!BrowserErrorKind::StaleReference.default_retryable());
         assert!(BrowserErrorKind::Timeout.default_retryable());
         assert!(BrowserErrorKind::Crashed.default_retryable());
+        assert_ne!(
+            BrowserErrorKind::StaleReference,
+            BrowserErrorKind::SessionNotFound
+        );
+    }
+
+    #[test]
+    fn read_observe_kind_is_not_a_v1_tool_action() {
+        assert!(!V1_TOOL_ACTIONS.contains(&"read"));
+        assert_eq!(
+            BrowserObserveKind::Read {
+                outline: false,
+                filter: None,
+            }
+            .v1_action_name(),
+            "read"
+        );
+        assert_eq!(route_v1_tool_action("read"), None);
     }
 }

@@ -43,7 +43,9 @@ pub(crate) enum BrowserFailureKind {
 pub(crate) fn action_kind(action: &str) -> BrowserActionKind {
     match action {
         "snapshot" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
-        | "is_visible" | "is_enabled" | "screenshot" | "find" => BrowserActionKind::ReadOnly,
+        | "is_visible" | "is_enabled" | "screenshot" | "find" | "read" => {
+            BrowserActionKind::ReadOnly
+        }
         "open" | "reload" | "wait" | "back" | "forward" | "close" => BrowserActionKind::Idempotent,
         _ => BrowserActionKind::Mutating,
     }
@@ -63,6 +65,7 @@ pub(crate) fn is_retryable_action(action: &str) -> bool {
             | "is_enabled"
             | "wait"
             | "reload"
+            | "read"
     )
 }
 

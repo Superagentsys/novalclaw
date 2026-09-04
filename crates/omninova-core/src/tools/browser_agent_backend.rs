@@ -14,7 +14,8 @@ use crate::tools::browser_lifecycle::{
     AGENT_BROWSER_NAMESPACE,
 };
 use crate::tools::browser_output::{
-    cli_max_output_for_action, parse_action_outcome, parse_snapshot_refs, RawSnapshotRef,
+    cli_max_output_for_action, observation_from_read, parse_action_outcome, parse_read_output,
+    parse_snapshot_refs, RawSnapshotRef,
 };
 use crate::tools::browser_types::{
     BackendAvailability, BackendCapabilities, BackendSessionHandle, BrowserAction,
@@ -22,7 +23,7 @@ use crate::tools::browser_types::{
     BrowserErrorKind, BrowserHealth, BrowserObservation, BrowserObserveKind, BrowserPageId,
     BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot,
     BrowserTab, BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest,
-    ScreenshotResult,
+    ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
 };
 use crate::tools::configure_background_command;
 use crate::tools::web_client::redact_secrets_in_text;
@@ -225,6 +226,24 @@ impl AgentBrowserBackend {
                         outcome.error_text.as_deref().unwrap_or_default(),
                         stderr
                     );
+                    if looks_like_agent_browser_stale_ref(&diagnostic) {
+                        let summary: String = redact_secrets_in_text(
+                            outcome.error_text.as_deref().unwrap_or("unknown ref"),
+                        )
+                        .chars()
+                        .take(1200)
+                        .collect();
+                        let mut err = BrowserBackendError::new(
+                            BrowserErrorKind::StaleReference,
+                            self.id_value(),
+                            format!(
+                                "{BROWSER_STALE_REFERENCE_DETAIL}; requested_binary={} summary={summary}",
+                                binary_path.display()
+                            ),
+                        );
+                        err.retryable = false;
+                        return Err(err);
+                    }
                     let kind = classify_browser_output(&diagnostic);
                     if auto_retry_allowed(
                         v1_action,
@@ -391,6 +410,7 @@ fn observation(output: String) -> BrowserObservation {
             text: output,
             elements: Vec::new(),
         }),
+        truncated: false,
     }
 }
 
@@ -407,6 +427,7 @@ fn snapshot_observation(
             text: output,
             elements: snapshot_elements_from_stdout(backend, stdout),
         }),
+        truncated: false,
     }
 }
 
@@ -482,6 +503,28 @@ fn action_result(output: String) -> BrowserActionResult {
         url: None,
         title: None,
     }
+}
+
+fn read_cli_args(outline: bool, filter: Option<&str>) -> Vec<String> {
+    let mut args = vec!["read".into()];
+    if outline {
+        args.push("--outline".into());
+    }
+    if let Some(filter) = filter {
+        args.push("--filter".into());
+        args.push(filter.to_string());
+    }
+    args
+}
+
+/// agent-browser 0.36.0 element.rs: `Unknown ref: {id}`, role/name fallback
+/// failure, and missing objectId after a stored ref. Not session loss.
+fn looks_like_agent_browser_stale_ref(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unknown ref:")
+        || lower.contains("could not locate element with role=")
+        || lower.contains("no objectid for ref ")
+        || lower.contains("ax node has no backenddomnodeid")
 }
 
 /// Production factory. Legacy `"playwright"` maps to this backend.
@@ -623,6 +666,24 @@ impl BrowserBackend for AgentBrowserBackend {
                 result.output,
                 &result.stdout,
             ))
+        } else if matches!(req.kind, BrowserObserveKind::Read { .. }) {
+            Ok(match parse_read_output(&result.stdout) {
+                Ok(parsed) => observation_from_read(parsed),
+                Err(reason) => {
+                    tracing::debug!(
+                        target: "browser",
+                        reason,
+                        "typed read output unavailable; using normalized text"
+                    );
+                    BrowserObservation {
+                        url: None,
+                        title: None,
+                        text: Some(result.output),
+                        snapshot: None,
+                        truncated: false,
+                    }
+                }
+            })
         } else {
             Ok(observation(result.output))
         }
@@ -726,6 +787,9 @@ impl AgentBrowserBackend {
                     args.push(name.clone());
                 }
                 Ok(("find", args))
+            }
+            BrowserObserveKind::Read { outline, filter } => {
+                Ok(("read", read_cli_args(*outline, filter.as_deref())))
             }
         }
     }
@@ -1025,6 +1089,52 @@ mod tests {
                 .unwrap(),
             "@e13"
         );
+    }
+
+    #[test]
+    fn read_outline_maps_to_backend_argv() {
+        let args = read_cli_args(true, None);
+        assert_eq!(args, vec!["read", "--outline"]);
+    }
+
+    #[test]
+    fn read_filter_is_passed_as_single_argv() {
+        let args = read_cli_args(false, Some("security"));
+        assert_eq!(args, vec!["read", "--filter", "security"]);
+        assert_eq!(args[2], "security");
+        let both = read_cli_args(true, Some("auth docs"));
+        assert_eq!(both, vec!["read", "--outline", "--filter", "auth docs"]);
+    }
+
+    #[test]
+    fn unknown_ref_maps_to_stale_reference() {
+        assert!(looks_like_agent_browser_stale_ref("Unknown ref: e999"));
+        assert!(looks_like_agent_browser_stale_ref(
+            "Could not locate element with role=button name=Submit"
+        ));
+        assert!(!looks_like_agent_browser_stale_ref(
+            "Element not found: #missing"
+        ));
+        assert!(!looks_like_agent_browser_stale_ref(
+            "BrowserSessionUnavailable: session gone"
+        ));
+        assert!(!looks_like_agent_browser_stale_ref(
+            "element went stale after navigation"
+        ));
+        assert!(looks_like_agent_browser_stale_ref("No objectId for ref e8"));
+        assert!(looks_like_agent_browser_stale_ref(
+            "AX node has no backendDOMNodeId for role=button"
+        ));
+        let err = BrowserBackendError::new(
+            BrowserErrorKind::StaleReference,
+            BrowserBackendId::agent_browser(),
+            format!("{BROWSER_STALE_REFERENCE_DETAIL}; summary=Unknown ref: e999"),
+        );
+        assert_eq!(err.kind, BrowserErrorKind::StaleReference);
+        assert_ne!(err.kind, BrowserErrorKind::SessionNotFound);
+        assert!(!err.retryable);
+        assert!(err.detail.starts_with("BrowserCommandFailed:"));
+        assert!(err.detail.contains("snapshot again"));
     }
 
     #[tokio::test]

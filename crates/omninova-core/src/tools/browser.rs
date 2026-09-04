@@ -502,7 +502,7 @@ mod tests {
         forget_owned_browser_session, recover_owned_session, remember_owned_browser_session,
     };
     use crate::tools::browser_output::parse_action_outcome;
-    use crate::tools::browser_types::V1_TOOL_ACTIONS;
+    use crate::tools::browser_types::{BrowserErrorKind, BrowserHealth, V1_TOOL_ACTIONS};
     use serde_json::json;
 
     fn isolated_missing_search() -> BrowserBinarySearch {
@@ -769,6 +769,23 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!actions.iter().any(|a| a == "tabs"));
+        assert!(!actions.iter().any(|a| a == "read"));
+    }
+
+    #[test]
+    fn read_does_not_change_tool_schema() {
+        let tool = BrowserTool::new(Vec::new(), true, false, None);
+        let schema = tool.parameters_schema();
+        let encoded = schema.to_string();
+        assert!(!encoded.contains("\"read\""));
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
+        assert!(!actions.contains(&"read"));
     }
 
     #[test]
@@ -1199,6 +1216,285 @@ mod tests {
                 || !filled.detail.is_empty(),
             "fill detail={}",
             filled.detail
+        );
+
+        let _ = runtime.close_session(&key, &opts).await;
+    }
+
+    /// Live Chromium: document Read + stale element-ref diagnostic + re-observe.
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_browser_read_and_stale_ref_diagnostics() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|req, stream| {
+            let path = req.request_line.split(' ').nth(1).unwrap_or("/");
+            if path.starts_with("/after-click") {
+                crate::tools::web_client::tests::write_response(
+                    stream,
+                    "HTTP/1.1 200 OK",
+                    "<html><body><p>after click</p></body></html>",
+                    &["content-type: text/html".to_string()],
+                );
+            } else {
+                crate::tools::web_client::tests::write_response(
+                    stream,
+                    "HTTP/1.1 200 OK",
+                    "<html><head><title>B32C Readable</title></head><body>\
+                     <article>\
+                     <h1>Security Handbook</h1>\
+                     <p>This article discusses authentication and security practices.</p>\
+                     <h2>Auth section</h2>\
+                     <p>Use unique credentials on every service.</p>\
+                     <h2>Cooking</h2>\
+                     <p>Pasta recipes are unrelated filler text.</p>\
+                     </article>\
+                     <button id=\"delete-me\">DeleteMeUniqueB32C</button>\
+                     <a id=\"keep-me\" href=\"/after-click\">KeepMeUniqueB32C</a>\
+                     </body></html>",
+                    &["content-type: text/html".to_string()],
+                );
+            }
+        });
+
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b32c-{}", uuid::Uuid::new_v4())).unwrap();
+        let opts = BrowserSessionOptions::default();
+        let open = runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/page"),
+                },
+            )
+            .await;
+        assert!(open.is_ok(), "open failed: {open:?}");
+        let _ = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Wait {
+                    timeout_ms: Some(800),
+                    text: None,
+                    target: None,
+                },
+            )
+            .await;
+
+        let read = runtime
+            .observe(&key, &opts, &ObserveRequest::read(false, None))
+            .await
+            .expect("read observe");
+        let read_text = read.text.as_deref().unwrap_or("");
+        assert!(
+            read_text.contains("BEGIN WEB CONTENT"),
+            "read must reuse WEB CONTENT bounds: {read_text}"
+        );
+        assert!(
+            read_text.to_ascii_lowercase().contains("security")
+                || read_text.to_ascii_lowercase().contains("authentication"),
+            "read content missing article body: {read_text}"
+        );
+        assert!(read.snapshot.is_none());
+        assert!(
+            read.url
+                .as_deref()
+                .is_some_and(|url| url.contains("127.0.0.1")),
+            "read should prefer page url, got {:?}",
+            read.url
+        );
+
+        let outline = runtime
+            .observe(&key, &opts, &ObserveRequest::read(true, None))
+            .await
+            .expect("read outline");
+        let outline_text = outline.text.as_deref().unwrap_or("");
+        assert!(
+            outline_text.to_ascii_lowercase().contains("outline")
+                || outline_text.contains("Security Handbook")
+                || outline_text.contains("Auth"),
+            "outline missing headings: {outline_text}"
+        );
+
+        let filtered = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest::read(false, Some("security".into())),
+            )
+            .await
+            .expect("read filter");
+        let filtered_text = filtered.text.as_deref().unwrap_or("");
+        assert!(
+            filtered_text.to_ascii_lowercase().contains("security"),
+            "filtered read should keep the filter term: {filtered_text}"
+        );
+
+        let snap = runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect("snapshot")
+            .snapshot
+            .expect("structured snapshot");
+        let delete = snap
+            .elements
+            .iter()
+            .find(|el| {
+                el.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("DeleteMeUniqueB32C"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "DeleteMeUniqueB32C missing; elements={:?}",
+                    snap.elements
+                        .iter()
+                        .map(|el| (el.reference.as_str(), el.name.as_deref()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let old_ref = delete.reference.clone();
+
+        let removed = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Eval {
+                    script: "document.getElementById('delete-me').remove(); true".into(),
+                },
+            )
+            .await;
+        assert!(removed.is_ok(), "eval remove failed: {removed:?}");
+        let _ = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Wait {
+                    timeout_ms: Some(400),
+                    text: None,
+                    target: None,
+                },
+            )
+            .await;
+
+        let stale = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Click {
+                    target: BrowserTarget::Element(old_ref.clone()),
+                },
+            )
+            .await
+            .expect_err("old ref must fail after DOM removal");
+        assert_eq!(
+            stale.kind,
+            BrowserErrorKind::StaleReference,
+            "stale click classified as {:?}: {}",
+            stale.kind,
+            stale.detail
+        );
+        assert_ne!(stale.kind, BrowserErrorKind::SessionNotFound);
+        assert!(!stale.retryable);
+        let presented = present_backend_error(&stale);
+        assert!(
+            presented.starts_with("BrowserCommandFailed:"),
+            "model prefix changed: {presented}"
+        );
+        assert!(
+            presented.contains("snapshot again"),
+            "re-observe guidance missing: {presented}"
+        );
+        let health = runtime.session_health(&key, &opts).await;
+        assert!(
+            matches!(health, BrowserHealth::Healthy),
+            "session must stay healthy after stale ref: {health:?}"
+        );
+
+        let snap2 = runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect("re-observe snapshot")
+            .snapshot
+            .expect("re-observe payload");
+        assert!(
+            snap2.elements.iter().all(|el| el.reference != old_ref || {
+                !el.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("DeleteMeUniqueB32C"))
+            }),
+            "removed unique button must not reappear under the old handle"
+        );
+        let keep = snap2
+            .elements
+            .iter()
+            .find(|el| {
+                el.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("KeepMeUniqueB32C"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "KeepMeUniqueB32C missing after re-observe; elements={:?}",
+                    snap2
+                        .elements
+                        .iter()
+                        .map(|el| (el.reference.as_str(), el.name.as_deref()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let clicked = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Click {
+                    target: BrowserTarget::Element(keep.reference.clone()),
+                },
+            )
+            .await
+            .expect("click via fresh ref after re-observe");
+        assert!(
+            clicked.detail.to_lowercase().contains("click")
+                || clicked.detail.contains('@')
+                || !clicked.detail.is_empty(),
+            "click detail={}",
+            clicked.detail
+        );
+        let url_after = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Url,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("get url after re-observe click");
+        assert!(
+            url_after
+                .text
+                .as_deref()
+                .or(url_after.url.as_deref())
+                .is_some_and(|url| url.contains("/after-click")),
+            "fresh ref click should navigate: text={:?} url={:?}",
+            url_after.text,
+            url_after.url
         );
 
         let _ = runtime.close_session(&key, &opts).await;

@@ -11,7 +11,7 @@ use crate::tools::browser_types::{
     BrowserBackendError, BrowserBackendId, BrowserElement, BrowserErrorKind, BrowserHealth,
     BrowserObservation, BrowserObserveKind, BrowserSessionKey, BrowserSessionOpenRequest,
     BrowserSessionOptions, BrowserSnapshot, BrowserTab, NavigateRequest, ObserveRequest,
-    ScreenshotRequest, ScreenshotResult,
+    ScreenshotRequest, ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
 };
 use crate::tools::text_bound::{bound_head, truncate_head_chars};
 use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
@@ -343,7 +343,8 @@ impl BrowserRuntime {
         let text = match kind {
             BrowserObserveKind::Snapshot
             | BrowserObserveKind::Text { .. }
-            | BrowserObserveKind::Html { .. } => obs.text.map(|t| redact_secrets_in_text(&t)),
+            | BrowserObserveKind::Html { .. }
+            | BrowserObserveKind::Read { .. } => obs.text.map(|t| redact_secrets_in_text(&t)),
             _ => obs.text.map(|t| {
                 bound_head(
                     &redact_secrets_in_text(&t),
@@ -363,6 +364,7 @@ impl BrowserRuntime {
             title,
             text,
             snapshot,
+            truncated: obs.truncated,
         }
     }
 
@@ -469,6 +471,15 @@ fn runtime_should_recover(kind: BrowserErrorKind) -> bool {
 
 /// Future model-facing prefix mapping. V1 production output is unchanged.
 pub fn present_backend_error(err: &BrowserBackendError) -> String {
+    if err.kind == BrowserErrorKind::StaleReference {
+        if err.detail.starts_with("Browser") {
+            return err.detail.clone();
+        }
+        if err.detail.is_empty() || err.detail == "injected" {
+            return BROWSER_STALE_REFERENCE_DETAIL.to_string();
+        }
+        return format!("{BROWSER_STALE_REFERENCE_DETAIL} ({})", err.detail);
+    }
     if err.detail.starts_with("Browser") {
         return err.detail.clone();
     }
@@ -481,6 +492,7 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
         BrowserErrorKind::Timeout => "BrowserCommandTimeout",
         BrowserErrorKind::Rejected => "BrowserUrlRejected",
         BrowserErrorKind::CommandFailed => "BrowserCommandFailed",
+        BrowserErrorKind::StaleReference => "BrowserCommandFailed",
     };
     format!("{prefix}: {}", err.detail)
 }
@@ -567,6 +579,7 @@ mod tests {
                             text: "hello".into(),
                             elements: Vec::new(),
                         }),
+                        truncated: false,
                     },
                     tabs: Vec::new(),
                     last_handle_tokens: HashMap::new(),
@@ -929,6 +942,7 @@ mod tests {
             title: Some("t".into()),
             text: Some("see https://user:secret@example.com/x".into()),
             snapshot: None,
+            truncated: false,
         });
         let mut policy = BrowserRuntimePolicy::default();
         policy.allowed_domains = vec!["example.com".into()];
@@ -1094,6 +1108,7 @@ mod tests {
                     },
                 ],
             }),
+            truncated: false,
         });
         let mut policy = BrowserRuntimePolicy::default();
         policy.snapshot_char_limit = 40;
@@ -1142,6 +1157,7 @@ mod tests {
                     },
                 ],
             }),
+            truncated: false,
         });
         let mut policy = BrowserRuntimePolicy::default();
         policy.max_structured_elements = 2;
@@ -1178,6 +1194,169 @@ mod tests {
             .unwrap();
         assert_eq!(clicked.detail, "click");
         assert_eq!(backend.call_count(CallKind::Act), 1);
+    }
+
+    #[tokio::test]
+    async fn read_content_is_redacted_and_bounded() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.set_observation(BrowserObservation {
+            url: Some("https://user:SECRET@example.com/doc".into()),
+            title: None,
+            text: Some(
+                "--- BEGIN WEB CONTENT ---\napi_key=SECRET_TOKEN_VALUE\n--- END WEB CONTENT ---"
+                    .into(),
+            ),
+            snapshot: None,
+            truncated: true,
+        });
+        let rt = runtime(backend);
+        let obs = rt
+            .observe(&key("s"), &opts(), &ObserveRequest::read(false, None))
+            .await
+            .unwrap();
+        assert!(obs.snapshot.is_none());
+        assert!(obs.truncated);
+        assert!(!obs.url.as_deref().unwrap_or("").contains("SECRET"));
+        assert!(!obs.text.as_deref().unwrap_or("").contains("user:SECRET"));
+        assert!(obs.text.as_deref().unwrap().contains("BEGIN WEB CONTENT"));
+    }
+
+    #[tokio::test]
+    async fn stale_reference_is_not_session_not_found() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 1);
+        let rt = runtime(backend);
+        let err = rt
+            .act(&key("s"), &opts(), &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::StaleReference);
+        assert_ne!(err.kind, BrowserErrorKind::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn stale_reference_is_not_retryable() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 3);
+        let rt = runtime(backend.clone());
+        let err = rt
+            .act(&key("s"), &opts(), &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert!(!err.retryable);
+        assert!(!runtime_should_recover(BrowserErrorKind::StaleReference));
+        assert_eq!(backend.call_count(CallKind::Act), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_retry_stale_mutating_action() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 3);
+        let rt = runtime(backend.clone());
+        let err = rt
+            .act(
+                &key("s"),
+                &opts(),
+                &BrowserAction::Fill {
+                    target: css(),
+                    value: "x".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::StaleReference);
+        assert!(!err.retryable);
+        assert_eq!(backend.call_count(CallKind::Act), 1);
+        assert_eq!(backend.call_count(CallKind::Observe), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_retry_stale_reference_with_old_handle() {
+        let backend = Arc::new(FakeBackend::new());
+        let old_ref = BrowserElementRef::new(BrowserBackendId::new("fake"), "e8");
+        backend.set_observation(BrowserObservation {
+            url: Some("https://example.com/".into()),
+            title: None,
+            text: Some("snap".into()),
+            snapshot: Some(BrowserSnapshot {
+                text: "snap".into(),
+                elements: vec![BrowserElement {
+                    reference: old_ref.clone(),
+                    role: Some("button".into()),
+                    name: Some("DeleteMe".into()),
+                    interactive: true,
+                }],
+            }),
+            truncated: false,
+        });
+        let rt = runtime(backend.clone());
+        let obs = rt
+            .observe(&key("s"), &opts(), &ObserveRequest::snapshot())
+            .await
+            .unwrap();
+        let handle = obs.snapshot.unwrap().elements[0].reference.clone();
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 3);
+        let err = rt
+            .act(
+                &key("s"),
+                &opts(),
+                &BrowserAction::Click {
+                    target: BrowserTarget::Element(handle),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::StaleReference);
+        assert!(!err.retryable);
+        assert_eq!(backend.call_count(CallKind::Act), 1);
+        assert_eq!(backend.call_count(CallKind::Observe), 1);
+        backend.fail_next(CallKind::Observe, BrowserErrorKind::StaleReference, 3);
+        let text_err = rt
+            .observe(
+                &key("s"),
+                &opts(),
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Text {
+                        target: Some(BrowserTarget::Element(old_ref)),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(text_err.kind, BrowserErrorKind::StaleReference);
+        assert!(!text_err.retryable);
+        assert_eq!(backend.call_count(CallKind::Observe), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_error_guides_reobserve() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 1);
+        let rt = runtime(backend);
+        let err = rt
+            .act(&key("s"), &opts(), &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        let presented = present_backend_error(&err);
+        assert!(presented.starts_with("BrowserCommandFailed:"));
+        assert!(presented.contains("snapshot again"));
+        assert!(!presented.starts_with("BrowserStaleReference:"));
+    }
+
+    #[tokio::test]
+    async fn backend_session_remains_healthy_when_ref_is_stale() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::StaleReference, 1);
+        let rt = runtime(backend);
+        let err = rt
+            .act(&key("s"), &opts(), &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::StaleReference);
+        let health = rt.session_health(&key("s"), &opts()).await;
+        assert!(matches!(health, BrowserHealth::Healthy));
     }
 
     #[tokio::test]
@@ -1257,6 +1436,7 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert!(!actions.iter().any(|a| a == "tabs"));
+        assert!(!actions.iter().any(|a| a == "read"));
         assert_eq!(
             actions,
             V1_TOOL_ACTIONS
@@ -1279,6 +1459,10 @@ mod tests {
             BrowserObserveKind::Value { target: css() },
             BrowserObserveKind::Visibility { target: css() },
             BrowserObserveKind::Enabled { target: css() },
+            BrowserObserveKind::Read {
+                outline: false,
+                filter: None,
+            },
         ] {
             assert_eq!(
                 operation_is_retryable(&RuntimeOp::Observe(kind.clone())),
@@ -1337,6 +1521,7 @@ mod tests {
         assert!(!operation_is_retryable(&RuntimeOp::CloseSession));
         assert!(!runtime_should_recover(BrowserErrorKind::BinaryMissing));
         assert!(!runtime_should_recover(BrowserErrorKind::Timeout));
+        assert!(!runtime_should_recover(BrowserErrorKind::StaleReference));
         assert!(runtime_should_recover(BrowserErrorKind::NotConnected));
     }
 
@@ -1348,11 +1533,16 @@ mod tests {
             (BrowserErrorKind::NotConnected, "BrowserDaemonUnavailable"),
             (BrowserErrorKind::Timeout, "BrowserCommandTimeout"),
             (BrowserErrorKind::Rejected, "BrowserUrlRejected"),
+            (BrowserErrorKind::StaleReference, "BrowserCommandFailed"),
         ];
         for (kind, prefix) in cases {
             let err = BrowserBackendError::new(kind, id.clone(), "detail");
             assert!(present_backend_error(&err).starts_with(prefix), "{kind:?}");
         }
+        let stale = BrowserBackendError::new(BrowserErrorKind::StaleReference, id, "injected");
+        let presented = present_backend_error(&stale);
+        assert_eq!(presented, BROWSER_STALE_REFERENCE_DETAIL);
+        assert!(presented.contains("snapshot again"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! Raw byte truncation of JSON is forbidden; stderr is diagnostics only and
 //! never concatenated into successful model content.
 
+use crate::tools::browser_types::BrowserObservation;
 use crate::tools::text_bound::bound_head;
 use crate::tools::web_client::redact_secrets_in_text;
 use serde_json::Value;
@@ -25,7 +26,7 @@ pub const BROWSER_PROCESS_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 pub fn cli_max_output_for_action(action: &str) -> Option<&'static str> {
     match action {
         "snapshot" => Some("24000"),
-        "get_text" | "get_html" => Some("20000"),
+        "get_text" | "get_html" | "read" => Some("20000"),
         _ => None,
     }
 }
@@ -157,6 +158,72 @@ pub fn parse_snapshot_refs(raw_json: &str) -> Result<Vec<RawSnapshotRef>, &'stat
             }
             Ok(out)
         }
+    }
+}
+
+/// Backend-internal agent-browser 0.36.0 `read --json` data fields.
+///
+/// `lifecycle` is ignored and must not enter the Runtime domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedReadOutput {
+    pub content: String,
+    pub content_type: Option<String>,
+    pub final_url: Option<String>,
+    pub url: Option<String>,
+    pub source: Option<String>,
+    pub truncated: bool,
+}
+
+/// Extract typed `data` from raw `read --json` stdout.
+pub fn parse_read_output(raw_json: &str) -> Result<ParsedReadOutput, &'static str> {
+    let trimmed = raw_json.trim();
+    if trimmed.is_empty() {
+        return Err("empty read json");
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|_| "read stdout is not valid JSON")?;
+    let data = value.get("data").ok_or("read json missing data")?;
+    Ok(ParsedReadOutput {
+        content: json_string_field(data.get("content"))
+            .or_else(|| json_string_field(data.get("text")))
+            .unwrap_or_default(),
+        content_type: json_string_field(data.get("contentType")),
+        final_url: json_string_field(data.get("finalUrl")),
+        url: json_string_field(data.get("url")),
+        source: json_string_field(data.get("source")),
+        truncated: data
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Map parsed read JSON onto the backend-neutral observation.
+///
+/// `content` → text (WEB CONTENT + existing text budget).
+/// `finalUrl` preferred over `url`. `snapshot` is always None.
+pub fn observation_from_read(parsed: ParsedReadOutput) -> BrowserObservation {
+    let redacted = redact_secrets_in_text(&parsed.content);
+    let (head, locally_truncated, _) =
+        crate::tools::text_bound::truncate_head_chars(&redacted, BROWSER_TEXT_CHAR_LIMIT);
+    let mut body = if locally_truncated {
+        bound_head(&redacted, BROWSER_TEXT_CHAR_LIMIT)
+    } else {
+        head
+    };
+    let truncated = parsed.truncated || locally_truncated;
+    if parsed.truncated && !body.to_ascii_lowercase().contains("truncated") {
+        body.push_str("\n[content truncated]");
+    }
+    BrowserObservation {
+        url: parsed
+            .final_url
+            .or(parsed.url)
+            .map(|u| redact_secrets_in_text(&u)),
+        title: None,
+        text: Some(wrap_web_content(&body)),
+        snapshot: None,
+        truncated,
     }
 }
 
@@ -573,5 +640,129 @@ mod tests {
     #[test]
     fn invalid_json_is_a_structured_parse_error() {
         assert!(parse_snapshot_refs("{not-json").is_err());
+    }
+
+    fn sample_read_stdout() -> String {
+        json!({
+            "success": true,
+            "data": {
+                "url": "https://example.com/start",
+                "finalUrl": "https://example.com/article",
+                "contentType": "text/markdown",
+                "source": "active-tab-html",
+                "truncated": false,
+                "content": "Readable document body",
+                "lifecycle": {"launched": true, "reused": false}
+            },
+            "error": null
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn read_maps_content_to_observation() {
+        let parsed = parse_read_output(&sample_read_stdout()).unwrap();
+        assert_eq!(parsed.content, "Readable document body");
+        let obs = observation_from_read(parsed);
+        let text = obs.text.as_deref().unwrap();
+        assert!(text.contains("--- BEGIN WEB CONTENT ---"));
+        assert!(text.contains("Readable document body"));
+        assert!(text.contains("--- END WEB CONTENT ---"));
+        assert!(obs.snapshot.is_none());
+        assert_eq!(obs.title, None);
+        assert!(!obs.truncated);
+    }
+
+    #[test]
+    fn read_prefers_final_url() {
+        let parsed = parse_read_output(&sample_read_stdout()).unwrap();
+        assert_eq!(
+            parsed.final_url.as_deref(),
+            Some("https://example.com/article")
+        );
+        assert_eq!(parsed.url.as_deref(), Some("https://example.com/start"));
+        let obs = observation_from_read(parsed);
+        assert_eq!(obs.url.as_deref(), Some("https://example.com/article"));
+    }
+
+    #[test]
+    fn read_truncated_is_preserved() {
+        let stdout = json!({
+            "success": true,
+            "data": {
+                "url": "https://example.com/",
+                "finalUrl": "https://example.com/",
+                "content": "short",
+                "truncated": true
+            }
+        })
+        .to_string();
+        let parsed = parse_read_output(&stdout).unwrap();
+        assert!(parsed.truncated);
+        let obs = observation_from_read(parsed);
+        assert!(obs.truncated);
+        assert!(obs
+            .text
+            .as_deref()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("truncated"));
+    }
+
+    #[test]
+    fn read_output_does_not_expose_lifecycle() {
+        let parsed = parse_read_output(&sample_read_stdout()).unwrap();
+        let obs = observation_from_read(parsed);
+        let text = obs.text.as_deref().unwrap();
+        assert!(!text.contains("lifecycle"));
+        assert!(!text.contains("launched"));
+        assert!(!text.contains("reused"));
+        assert!(!format!("{obs:?}").contains("launched"));
+    }
+
+    #[test]
+    fn read_content_is_redacted_and_bounded() {
+        let stdout = json!({
+            "success": true,
+            "data": {
+                "url": "https://user:SECRET@example.com/start",
+                "finalUrl": "https://user:SECRET@example.com/article",
+                "content": format!(
+                    "see https://user:SECRET@example.com/doc {}",
+                    "x".repeat(BROWSER_TEXT_CHAR_LIMIT + 80)
+                ),
+                "truncated": false
+            }
+        })
+        .to_string();
+        let obs = observation_from_read(parse_read_output(&stdout).unwrap());
+        let text = obs.text.as_deref().unwrap();
+        assert!(obs.truncated);
+        assert!(!text.contains("user:SECRET"));
+        assert!(!obs.url.as_deref().unwrap_or("").contains("SECRET"));
+        assert!(text.contains("BEGIN WEB CONTENT"));
+        assert!(text.contains("[content truncated"));
+        let inner = text
+            .split("--- BEGIN WEB CONTENT ---")
+            .nth(1)
+            .unwrap_or(text)
+            .split("--- END WEB CONTENT ---")
+            .next()
+            .unwrap_or(text);
+        let inner_body = inner
+            .split("[content truncated")
+            .next()
+            .unwrap_or(inner)
+            .trim();
+        assert!(inner_body.chars().count() <= BROWSER_TEXT_CHAR_LIMIT);
+    }
+
+    #[test]
+    fn read_source_bound_reuses_text_budget() {
+        assert_eq!(cli_max_output_for_action("read"), Some("20000"));
+        assert_eq!(
+            cli_max_output_for_action("read"),
+            cli_max_output_for_action("get_text")
+        );
     }
 }
