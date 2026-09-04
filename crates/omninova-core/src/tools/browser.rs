@@ -5,9 +5,10 @@ use crate::tools::browser_lifecycle::{
     run_command_with_timeout, BrowserFailureKind, ChildRunError, AGENT_BROWSER_NAMESPACE,
 };
 use crate::tools::browser_output::{cli_max_output_for_action, parse_action_outcome};
+use crate::tools::browser_runtime::{browser_host_allowed, parse_browser_open_url};
 use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
-use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
+use crate::tools::web_client::redact_secrets_in_text;
 use async_trait::async_trait;
 use serde_json::json;
 use std::io::ErrorKind;
@@ -50,32 +51,6 @@ pub fn browser_session_id(session_id: Option<&str>) -> Result<String, String> {
 fn browser_session_missing_error() -> String {
     "BrowserSessionMissing: OmniNova session id is required; refusing to use a default or shared agent-browser session. Do not retry this call without a valid session."
         .to_string()
-}
-
-/// Only http(s) navigation is allowed. Bare hosts like `example.com` are
-/// treated as `https://example.com`. `file:`, `javascript:`, `data:`,
-/// `chrome:`, `chrome-extension:`, and `about:` are rejected.
-fn parse_browser_open_url(raw: &str) -> Result<Url, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("BrowserUrlRejected: URL is empty".into());
-    }
-    let parsed = match Url::parse(trimmed) {
-        Ok(url) => url,
-        Err(_) => Url::parse(&format!("https://{trimmed}"))
-            .map_err(|e| format!("BrowserUrlRejected: invalid URL ({e})"))?,
-    };
-    match parsed.scheme() {
-        "http" | "https" => {
-            if parsed.host_str().is_none() {
-                return Err("BrowserUrlRejected: URL has no host".into());
-            }
-            Ok(parsed)
-        }
-        other => Err(format!(
-            "BrowserUrlRejected: scheme '{other}' is not allowed; only http/https"
-        )),
-    }
 }
 
 const BROWSER_SESSION_MAX_LEN: usize = 64;
@@ -167,8 +142,7 @@ impl BrowserTool {
     }
 
     fn is_domain_allowed(&self, url: &Url) -> bool {
-        url.host_str()
-            .is_some_and(|host| host_matches_allowlist(host, &self.allowed_domains))
+        browser_host_allowed(url, &self.allowed_domains)
     }
 
     fn resolve_binary(&self) -> Result<AgentBrowserBinaryResolved, String> {
