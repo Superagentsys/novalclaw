@@ -11,7 +11,7 @@ use crate::tools::browser_types::{
 };
 use async_trait::async_trait;
 
-/// Planned config.browser.backend mapping. Not wired into V1 runtime.
+/// Planned config.browser.backend mapping.
 ///
 /// missing / empty → agent-browser
 /// legacy `"playwright"` → agent-browser
@@ -480,7 +480,7 @@ mod tests {
             .unwrap();
         assert!(
             !result.success,
-            "missing session must fail in V1 before any backend trait"
+            "missing session must fail before binary resolve"
         );
         let error = result.error.expect("error");
         assert!(error.starts_with("BrowserSessionMissing:"), "error={error}");

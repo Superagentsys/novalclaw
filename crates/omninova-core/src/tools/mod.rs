@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod browser_agent_backend;
 pub mod browser_backend;
 pub mod browser_bin;
 pub mod browser_lifecycle;
@@ -34,15 +35,15 @@ pub mod web_search;
 mod workspace_walk;
 
 pub use browser::BrowserTool;
-pub use browser_lifecycle::{
-    cleanup_owned_browser_sessions, forget_owned_browser_session, remember_owned_browser_session,
-    AGENT_BROWSER_NAMESPACE,
-};
 pub use browser_bin::{
     agent_browser_runtime_available, bundled_agent_browser_relative_path,
     effective_browser_capability, resolve_agent_browser_binary, set_agent_browser_search_roots,
     sync_browser_enabled_with_runtime, AgentBrowserBinaryMissing, AgentBrowserBinaryResolved,
     AgentBrowserBinarySource, AgentBrowserResolveError, BrowserBinarySearch, AGENT_BROWSER_BIN_ENV,
+};
+pub use browser_lifecycle::{
+    cleanup_owned_browser_sessions, forget_owned_browser_session, remember_owned_browser_session,
+    AGENT_BROWSER_NAMESPACE,
 };
 pub use content_search::ContentSearchTool;
 pub use delegate::{AgentInvoker, DelegateRequest, DelegateTool};

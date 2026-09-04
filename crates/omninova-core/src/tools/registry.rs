@@ -9,14 +9,14 @@
 use crate::config::Config;
 use crate::memory::Memory;
 use crate::security::{is_tool_globally_allowed, resolve_shell_allowlist};
+use crate::tools::web_client::{
+    WebToolSettings, DEFAULT_WEB_MAX_RESPONSE_BYTES, DEFAULT_WEB_REQUEST_TIMEOUT_SECS,
+};
 use crate::tools::{
     BrowserTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool, FileReadTool,
     FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool,
     MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool, ShellTool,
     TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
-};
-use crate::tools::web_client::{
-    WebToolSettings, DEFAULT_WEB_MAX_RESPONSE_BYTES, DEFAULT_WEB_REQUEST_TIMEOUT_SECS,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -346,20 +346,16 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 .web_search
                 .timeout_secs
                 .unwrap_or(DEFAULT_WEB_REQUEST_TIMEOUT_SECS);
-            ctx.config
-                .web_search
-                .brave_api_key
-                .as_ref()
-                .map(|key| {
-                    Box::new(WebSearchTool::new(
-                        key.clone(),
-                        WebToolSettings::from_config(
-                            &ctx.config.proxy,
-                            timeout_secs,
-                            DEFAULT_WEB_MAX_RESPONSE_BYTES,
-                        ),
-                    )) as Box<dyn Tool>
-                })
+            ctx.config.web_search.brave_api_key.as_ref().map(|key| {
+                Box::new(WebSearchTool::new(
+                    key.clone(),
+                    WebToolSettings::from_config(
+                        &ctx.config.proxy,
+                        timeout_secs,
+                        DEFAULT_WEB_MAX_RESPONSE_BYTES,
+                    ),
+                )) as Box<dyn Tool>
+            })
         },
     },
     ToolDef {
@@ -372,22 +368,49 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         },
         aliases: &[],
         enabled: |config| {
-            crate::tools::browser_bin::effective_browser_capability(
+            crate::tools::browser_agent_backend::browser_backend_enabled(
                 config.browser.enabled,
-                crate::tools::browser_bin::agent_browser_runtime_available(),
+                &config.browser.backend,
             )
         },
         build: |ctx| {
-            let tool = BrowserTool::new(
-                ctx.config.browser.allowed_domains.clone(),
-                ctx.config.browser.native_headless,
-                ctx.config.browser.attach_only,
-                ctx.config.browser.cdp_url.clone(),
-            );
-            match crate::tools::browser::browser_session_id(ctx.session_id) {
-                Ok(mapped) => Some(Box::new(tool.with_session(mapped))),
-                Err(_) => Some(Box::new(tool)),
-            }
+            let session_opts = crate::tools::browser_types::BrowserSessionOptions {
+                headless: ctx.config.browser.native_headless,
+                attach_only: ctx.config.browser.attach_only,
+                cdp_url: ctx.config.browser.cdp_url.clone(),
+                profile: None,
+            };
+            let backend = match crate::tools::browser_agent_backend::backend_from_config(
+                &ctx.config.browser.backend,
+                None,
+                session_opts.clone(),
+            ) {
+                Ok(backend) => backend,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "browser",
+                        backend = %ctx.config.browser.backend,
+                        detail = %err.detail,
+                        "browser backend unavailable; tool not registered"
+                    );
+                    return None;
+                }
+            };
+            let policy = crate::tools::browser_runtime::BrowserRuntimePolicy {
+                allowed_domains: ctx.config.browser.allowed_domains.clone(),
+                ..crate::tools::browser_runtime::BrowserRuntimePolicy::default()
+            };
+            let runtime = crate::tools::browser_runtime::BrowserRuntime::new(backend, policy);
+            let session_key = ctx
+                .session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| crate::tools::browser_types::BrowserSessionKey::new(s).ok());
+            Some(Box::new(BrowserTool::from_runtime(
+                runtime,
+                session_opts,
+                session_key,
+            )))
         },
     },
 ];
@@ -573,15 +596,24 @@ mod tests {
 
         let session_a = "chat/房间 1".to_string();
         let session_b = "chat/房间 2".to_string();
-        let mapped_a = build(Some(&session_a));
-        let mapped_b = build(Some(&session_b));
+        let logical_a = build(Some(&session_a));
+        let logical_b = build(Some(&session_b));
+        assert_ne!(logical_a, logical_b);
+        assert_eq!(logical_a, session_a);
+        assert_eq!(logical_b, session_b);
+        let mapped_a = crate::tools::browser::browser_session_id(Some(&logical_a)).unwrap();
+        let mapped_b = crate::tools::browser::browser_session_id(Some(&logical_b)).unwrap();
         assert_ne!(mapped_a, mapped_b);
         assert!(mapped_a.starts_with("omninova-"));
         assert!(mapped_b.starts_with("omninova-"));
         assert_eq!(
-            mapped_a,
+            logical_a,
             build(Some(&session_a)),
             "same session must map stable"
+        );
+        assert_eq!(
+            mapped_a,
+            crate::tools::browser::browser_session_id(Some(&session_a)).unwrap()
         );
 
         let mapped_none = build(None);
@@ -601,16 +633,44 @@ mod tests {
         }
 
         let long = format!("x{}y", "a".repeat(500));
-        let mapped_long = build(Some(&long));
+        let logical_long = build(Some(&long));
+        assert_eq!(logical_long, long);
+        let mapped_long = crate::tools::browser::browser_session_id(Some(&logical_long)).unwrap();
         assert!(mapped_long.starts_with("omninova-"));
         assert!(mapped_long.len() < 64);
 
         let unicode = "会话-😀-中文-空格 end";
-        let mapped_unicode = build(Some(unicode));
+        let logical_unicode = build(Some(unicode));
+        assert_eq!(logical_unicode, unicode);
+        let mapped_unicode = crate::tools::browser::browser_session_id(Some(unicode)).unwrap();
         assert!(mapped_unicode
             .chars()
             .all(|c| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit()));
-        assert_eq!(mapped_unicode, build(Some(unicode)));
+        assert_eq!(
+            mapped_unicode,
+            crate::tools::browser::browser_session_id(Some(&logical_unicode)).unwrap()
+        );
+    }
+
+    #[test]
+    fn browser_tool_is_not_registered_for_unsupported_backends() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.backend = "personal-chrome".into();
+        assert!(
+            !contains(&built_names(&config, None), "browser"),
+            "personal-chrome must not silently fall back"
+        );
+        config.browser.backend = "unknown-backend".into();
+        assert!(
+            !contains(&built_names(&config, None), "browser"),
+            "unknown backend must not silently fall back"
+        );
+        config.browser.backend = "playwright".into();
+        assert_eq!(
+            contains(&built_names(&config, None), "browser"),
+            crate::tools::browser_bin::agent_browser_runtime_available()
+        );
     }
 
     #[test]

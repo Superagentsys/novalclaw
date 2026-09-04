@@ -1,7 +1,6 @@
-//! Backend-neutral Browser Runtime orchestration (B3.1B).
+//! Backend-neutral Browser Runtime orchestration.
 //!
-//! Production `BrowserTool::execute` still uses the V1 path. This module is
-//! compiled and unit-tested only until B3.1C.
+//! Production path: `BrowserTool` → `BrowserRuntime` → `BrowserBackend`.
 
 use crate::tools::browser_backend::BrowserBackend;
 use crate::tools::browser_output::{
@@ -9,9 +8,10 @@ use crate::tools::browser_output::{
 };
 use crate::tools::browser_types::{
     BackendAvailability, BackendSessionHandle, BrowserAction, BrowserActionResult,
-    BrowserBackendError, BrowserErrorKind, BrowserHealth, BrowserObservation, BrowserObserveKind,
-    BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot,
-    BrowserTab, NavigateRequest, ObserveRequest, ScreenshotRequest, ScreenshotResult,
+    BrowserBackendError, BrowserBackendId, BrowserErrorKind, BrowserHealth, BrowserObservation,
+    BrowserObserveKind, BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions,
+    BrowserSnapshot, BrowserTab, NavigateRequest, ObserveRequest, ScreenshotRequest,
+    ScreenshotResult,
 };
 use crate::tools::text_bound::bound_head;
 use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
@@ -69,6 +69,14 @@ pub struct BrowserRuntime {
 impl BrowserRuntime {
     pub fn new(backend: Arc<dyn BrowserBackend>, policy: BrowserRuntimePolicy) -> Self {
         Self { backend, policy }
+    }
+
+    pub fn backend_id(&self) -> BrowserBackendId {
+        self.backend.id()
+    }
+
+    pub fn policy(&self) -> &BrowserRuntimePolicy {
+        &self.policy
     }
 
     pub fn availability(&self) -> BackendAvailability {
@@ -214,11 +222,24 @@ impl BrowserRuntime {
         key: &BrowserSessionKey,
         opts: &BrowserSessionOptions,
     ) -> Result<BackendSessionHandle, BrowserBackendError> {
+        self.reject_reserved_logical_session(key)?;
         if let BackendAvailability::Unavailable { kind, detail } = self.backend.availability() {
             return Err(BrowserBackendError::new(kind, self.backend.id(), detail));
         }
         let req = BrowserSessionOpenRequest::new(key.clone(), opts.clone());
         self.backend.open_session(&req).await
+    }
+
+    fn reject_reserved_logical_session(
+        &self,
+        key: &BrowserSessionKey,
+    ) -> Result<(), BrowserBackendError> {
+        let Some((kind, detail)) = key.omninova_policy_error() else {
+            return Ok(());
+        };
+        let mut err = BrowserBackendError::new(kind, self.backend.id(), detail.to_string());
+        err.retryable = false;
+        Err(err)
     }
 
     async fn with_recovery<T, F, Fut>(
@@ -236,7 +257,7 @@ impl BrowserRuntime {
         loop {
             let handle = match self.ensure_session(key, opts).await {
                 Ok(handle) => handle,
-                Err(err) if self.can_recover(&op, recovered, err.kind) => {
+                Err(err) if self.can_recover(&op, recovered, &err) => {
                     recovered = recovered.saturating_add(1);
                     continue;
                 }
@@ -244,7 +265,7 @@ impl BrowserRuntime {
             };
             match call(handle).await {
                 Ok(value) => return Ok(value),
-                Err(err) if self.can_recover(&op, recovered, err.kind) => {
+                Err(err) if self.can_recover(&op, recovered, &err) => {
                     recovered = recovered.saturating_add(1);
                     continue;
                 }
@@ -253,10 +274,11 @@ impl BrowserRuntime {
         }
     }
 
-    fn can_recover(&self, op: &RuntimeOp, recovered: u8, kind: BrowserErrorKind) -> bool {
-        recovered < self.policy.max_recovery_attempts
+    fn can_recover(&self, op: &RuntimeOp, recovered: u8, err: &BrowserBackendError) -> bool {
+        err.retryable
+            && recovered < self.policy.max_recovery_attempts
             && operation_is_retryable(op)
-            && runtime_should_recover(kind)
+            && runtime_should_recover(err.kind)
     }
 
     fn validate_open_url(&self, raw: &str) -> Result<Url, BrowserBackendError> {
@@ -302,16 +324,20 @@ impl BrowserRuntime {
     ) -> BrowserObservation {
         let url = obs.url.map(|u| redact_secrets_in_text(&u));
         let title = obs.title.map(|t| redact_secrets_in_text(&t));
-        let text_limit = match kind {
-            BrowserObserveKind::Snapshot => self.policy.snapshot_char_limit,
-            BrowserObserveKind::Text { .. } | BrowserObserveKind::Html { .. } => {
-                self.policy.text_char_limit
-            }
-            _ => self.policy.operation_char_limit,
+        // Snapshot/text/html model envelopes are already bounded by the
+        // backend's vendor normalizer (V1 `parse_action_outcome`). Re-applying
+        // the inner content limit would clip headers and truncation markers.
+        let text = match kind {
+            BrowserObserveKind::Snapshot
+            | BrowserObserveKind::Text { .. }
+            | BrowserObserveKind::Html { .. } => obs.text.map(|t| redact_secrets_in_text(&t)),
+            _ => obs.text.map(|t| {
+                bound_head(
+                    &redact_secrets_in_text(&t),
+                    self.policy.operation_char_limit,
+                )
+            }),
         };
-        let text = obs
-            .text
-            .map(|t| bound_head(&redact_secrets_in_text(&t), text_limit));
         let snapshot = obs.snapshot.map(|snap| BrowserSnapshot {
             text: bound_head(
                 &redact_secrets_in_text(&snap.text),
@@ -742,6 +768,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_default_logical_session_is_rejected_before_backend() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let err = rt
+            .open(
+                &key("default"),
+                &opts(),
+                &NavigateRequest {
+                    url: "https://example.com/".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        assert!(!err.retryable);
+        assert!(err.detail.starts_with("BrowserSessionInvalid:"));
+        assert_eq!(backend.call_count(CallKind::OpenSession), 0);
+        assert_eq!(backend.call_count(CallKind::Open), 0);
+
+        let err = rt
+            .open(
+                &key("Default"),
+                &opts(),
+                &NavigateRequest {
+                    url: "https://example.com/".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.detail.starts_with("BrowserSessionInvalid:"));
+        assert_eq!(backend.call_count(CallKind::OpenSession), 0);
+    }
+
+    #[tokio::test]
     async fn rebuilt_runtime_passes_same_logical_key() {
         let backend = Arc::new(FakeBackend::new());
         let k = key("rebuild-chat");
@@ -1112,6 +1172,7 @@ mod tests {
             BrowserObserveKind::Find {
                 role: "button".into(),
                 name: None,
+                action: None,
             }
         )));
         assert!(!is_retryable_action("find"));

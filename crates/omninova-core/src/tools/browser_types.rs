@@ -5,7 +5,7 @@
 //! or raw vendor JSON. Vendor encoding lives in a backend implementation
 //! (B3.1C), not here.
 //!
-//! B3.1A.1 is a contract closeout. BrowserTool still executes the V1 path.
+//! B3.1A.1 is a contract closeout. Production execute goes through BrowserRuntime.
 
 use std::fmt;
 
@@ -15,9 +15,16 @@ use std::fmt;
 /// session, not a vendor connection token. Construction is controlled
 /// (non-empty only). It does not require `omninova-`, hex charset,
 /// CLI-safe names, or `@eN`. Vendor naming stays in AgentBrowserBackend.
-/// Hashing (`omninova-<sha256>`) stays in V1 `browser_session_id` until B3.1B.
+/// Hashing (`omninova-<sha256>`) lives in `AgentBrowserBackend`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BrowserSessionKey(String);
+
+/// V1 model-facing missing-session text. Shared so Tool and Runtime stay in lockstep.
+pub const BROWSER_SESSION_MISSING_DETAIL: &str = "BrowserSessionMissing: OmniNova session id is required; refusing to use a default or shared agent-browser session. Do not retry this call without a valid session.";
+
+/// V1 model-facing reserved logical session. OmniNova policy, not a CLI token check.
+pub const BROWSER_SESSION_RESERVED_DEFAULT_DETAIL: &str =
+    "BrowserSessionInvalid: refusing to use the agent-browser default session";
 
 impl BrowserSessionKey {
     pub fn new(value: impl Into<String>) -> Result<Self, BrowserTypeError> {
@@ -30,6 +37,25 @@ impl BrowserSessionKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// OmniNova logical session policy (V1 Tool parity). Does not constrain
+    /// [`BackendSessionHandle`] tokens.
+    pub fn omninova_policy_error(&self) -> Option<(BrowserErrorKind, &'static str)> {
+        let trimmed = self.0.trim();
+        if trimmed.is_empty() {
+            return Some((
+                BrowserErrorKind::SessionNotFound,
+                BROWSER_SESSION_MISSING_DETAIL,
+            ));
+        }
+        if trimmed.eq_ignore_ascii_case("default") {
+            return Some((
+                BrowserErrorKind::Rejected,
+                BROWSER_SESSION_RESERVED_DEFAULT_DETAIL,
+            ));
+        }
+        None
     }
 }
 
@@ -226,14 +252,29 @@ impl BrowserAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserObserveKind {
     Snapshot,
-    Text { target: Option<BrowserTarget> },
-    Html { target: Option<BrowserTarget> },
+    Text {
+        target: Option<BrowserTarget>,
+    },
+    Html {
+        target: Option<BrowserTarget>,
+    },
     Url,
     Title,
-    Value { target: BrowserTarget },
-    Visibility { target: BrowserTarget },
-    Enabled { target: BrowserTarget },
-    Find { role: String, name: Option<String> },
+    Value {
+        target: BrowserTarget,
+    },
+    Visibility {
+        target: BrowserTarget,
+    },
+    Enabled {
+        target: BrowserTarget,
+    },
+    Find {
+        role: String,
+        name: Option<String>,
+        /// V1 `value` for `find` (click/text/etc). Defaults to `"text"`.
+        action: Option<String>,
+    },
 }
 
 impl BrowserObserveKind {
@@ -576,6 +617,19 @@ mod tests {
         assert_ne!(key.as_str(), handle.token());
         assert!(BrowserSessionKey::new("").is_err());
         assert!(BackendSessionHandle::new(BrowserBackendId::agent_browser(), "").is_err());
+        let reserved = BrowserSessionKey::new("default").unwrap();
+        let (kind, detail) = reserved
+            .omninova_policy_error()
+            .expect("default is reserved");
+        assert_eq!(kind, BrowserErrorKind::Rejected);
+        assert!(detail.starts_with("BrowserSessionInvalid:"));
+        let handle =
+            BackendSessionHandle::new(BrowserBackendId::agent_browser(), "default").unwrap();
+        assert_eq!(handle.token(), "default");
+        assert!(BrowserSessionKey::new("chat-1")
+            .unwrap()
+            .omninova_policy_error()
+            .is_none());
     }
 
     #[test]
@@ -686,6 +740,7 @@ mod tests {
             BrowserObserveKind::Find {
                 role: "button".into(),
                 name: Some("Go".into()),
+                action: None,
             },
         ];
         let names: Vec<&str> = kinds
