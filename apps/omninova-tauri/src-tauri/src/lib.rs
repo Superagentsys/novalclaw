@@ -497,6 +497,34 @@ fn default_desktop_vision_max_dimension_px() -> u32 {
     1280
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupComputerUseConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_computer_use_allowed_apps")]
+    allowed_apps: Vec<String>,
+    #[serde(default = "default_true_computer_use_screenshot")]
+    require_screenshot_before_click: bool,
+}
+
+impl Default for SetupComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_apps: default_computer_use_allowed_apps(),
+            require_screenshot_before_click: true,
+        }
+    }
+}
+
+fn default_computer_use_allowed_apps() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn default_true_computer_use_screenshot() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SetupObservabilityConfig {
     #[serde(default)]
@@ -534,6 +562,7 @@ const APPROVAL_CONTROLLED_TOOLS: &[&str] = &[
     "apply_patch",
     "git_operations",
     "browser",
+    "computer_use",
     "http_request",
 ];
 
@@ -692,6 +721,8 @@ struct SetupAppConfig {
     channels: Option<SetupChannelsConfig>,
     #[serde(default)]
     multimodal: SetupMultimodalConfig,
+    #[serde(default)]
+    computer_use: SetupComputerUseConfig,
     #[serde(default)]
     observability: SetupObservabilityConfig,
     #[serde(default)]
@@ -1386,7 +1417,12 @@ async fn open_knowledge_store(
 }
 
 async fn spawn_desktop_automation_scheduler(runtime: GatewayRuntime) {
-    let workspace = runtime.get_config().await.workspace_dir;
+    let cfg = runtime.get_config().await;
+    if !cfg.scheduler.enabled && !cfg.computer_use.enabled {
+        eprintln!("[automation] scheduler skipped (scheduler.enabled=false)");
+        return;
+    }
+    let workspace = cfg.workspace_dir;
     let store = match CronStore::open(workspace.join("cron.json")).await {
         Ok(store) => store,
         Err(error) => {
@@ -3268,6 +3304,11 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             desktop_vision_enabled: config.multimodal.desktop_vision_enabled,
             desktop_vision_max_dimension_px: config.multimodal.desktop_vision_max_dimension_px,
         },
+        computer_use: SetupComputerUseConfig {
+            enabled: config.computer_use.enabled,
+            allowed_apps: config.computer_use.allowed_apps.clone(),
+            require_screenshot_before_click: config.computer_use.require_screenshot_before_click,
+        },
         observability: SetupObservabilityConfig {
             prometheus_enabled: config.observability.prometheus_enabled,
             prometheus_port: config.observability.prometheus_port,
@@ -3614,6 +3655,28 @@ fn setup_config_to_core(
         .multimodal
         .desktop_vision_max_dimension_px
         .max(320);
+
+    current.computer_use.enabled = setup.computer_use.enabled;
+    current.computer_use.allowed_apps = setup
+        .computer_use
+        .allowed_apps
+        .into_iter()
+        .map(|app| app.trim().to_string())
+        .filter(|app| !app.is_empty())
+        .collect();
+    current.computer_use.require_screenshot_before_click =
+        setup.computer_use.require_screenshot_before_click;
+    if current.computer_use.enabled {
+        current.scheduler.enabled = true;
+        if !current
+            .approvals
+            .require_approval
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("computer_use"))
+        {
+            current.approvals.require_approval.push("computer_use".into());
+        }
+    }
 
     current.observability.prometheus_enabled = setup.observability.prometheus_enabled;
     current.observability.prometheus_port = setup.observability.prometheus_port;

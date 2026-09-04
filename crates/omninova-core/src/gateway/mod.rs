@@ -1630,6 +1630,14 @@ impl GatewayRuntime {
     /// executing each job's instruction through the agent pipeline. No-ops when
     /// another scheduler is already running in this process.
     pub async fn spawn_automation_scheduler(&self, workspace_dir: &std::path::Path) {
+        let (scheduler_on, computer_use_on) = {
+            let cfg = self.config.read().await;
+            (cfg.scheduler.enabled, cfg.computer_use.enabled)
+        };
+        if !scheduler_on && !computer_use_on {
+            info!("automation scheduler skipped (scheduler.enabled=false)");
+            return;
+        }
         let store = match crate::cron::CronStore::open(workspace_dir.join("cron.json")).await {
             Ok(store) => store,
             Err(error) => {
@@ -1917,7 +1925,9 @@ impl GatewayRuntime {
         }
 
         let raw_vision_images = collect_desktop_vision_images(&cfg, inbound);
-        let vision_images = if provider_supports_openai_vision(route.provider.as_deref()) {
+        let vision_images = if cfg.multimodal.vision_enabled
+            && provider_supports_openai_vision(route.provider.as_deref())
+        {
             raw_vision_images.clone()
         } else {
             Vec::new()
@@ -1934,14 +1944,9 @@ impl GatewayRuntime {
             ));
         }
 
+        agent.set_pending_user_images(vision_images);
         steps.push(ExecutionStep::running("Agent 执行", "调用模型；如模型请求工具，将继续执行工具循环"));
-        let (reply, run_events) = if vision_images.is_empty() {
-            agent.process_message_with_events(&inbound.text).await?
-        } else {
-            // Vision is not yet supported in process_message_with_events; degrade.
-            let reply = agent.process_message(&inbound.text).await?;
-            (reply, Vec::new())
-        };
+        let (reply, run_events) = agent.process_message_with_events(&inbound.text).await?;
         let run_events: Vec<RunEvent> = run_events.into_iter().map(RunEvent::from).collect();
         steps.push(
             ExecutionStep::done("Agent 执行", "模型返回最终回复")
@@ -2150,6 +2155,16 @@ impl GatewayRuntime {
                 }
             }
         }
+
+        let raw_vision_images = collect_desktop_vision_images(&cfg, inbound);
+        let vision_images = if cfg.multimodal.vision_enabled
+            && provider_supports_openai_vision(route.provider.as_deref())
+        {
+            raw_vision_images
+        } else {
+            Vec::new()
+        };
+        agent.set_pending_user_images(vision_images);
 
         // Use the frontend-provided run_id if available, otherwise generate a new one.
         let run_id = metadata_str(inbound, &["run_id"])
@@ -3290,6 +3305,28 @@ impl crate::cron::CronJobExecutor for AgentJobExecutor {
                             prompt = next;
                             if let Some(existing) = task.session_id {
                                 session_id = existing;
+                            }
+                            let evidence_images = crate::computer_use::evidence_data_urls(
+                                &task.checkpoint.evidence,
+                                cfg.computer_use.max_dimension_px.max(
+                                    cfg.multimodal.desktop_vision_max_dimension_px,
+                                ),
+                                2,
+                            );
+                            if !evidence_images.is_empty() {
+                                metadata.insert(
+                                    "desktop_vision".to_string(),
+                                    serde_json::Value::Bool(true),
+                                );
+                                metadata.insert(
+                                    "desktop_vision_images".to_string(),
+                                    serde_json::Value::Array(
+                                        evidence_images
+                                            .into_iter()
+                                            .map(serde_json::Value::String)
+                                            .collect(),
+                                    ),
+                                );
                             }
                         }
                     }

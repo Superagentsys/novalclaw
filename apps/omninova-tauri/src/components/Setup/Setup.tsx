@@ -211,6 +211,11 @@ const initialConfig: Config = {
     desktop_vision_enabled: false,
     desktop_vision_max_dimension_px: 1280,
   },
+  computer_use: {
+    enabled: false,
+    allowed_apps: ["*"],
+    require_screenshot_before_click: true,
+  },
   observability: {
     prometheus_enabled: false,
     prometheus_port: 9090,
@@ -220,6 +225,13 @@ const initialConfig: Config = {
     record_arguments: false,
   },
 };
+
+function computerUseAllowsAllApps(apps: string[] | undefined): boolean {
+  return (apps ?? []).some((app) => {
+    const trimmed = app.trim();
+    return trimmed === "*" || trimmed.toLowerCase() === "all";
+  });
+}
 
 export type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
 
@@ -1206,6 +1218,107 @@ export function Setup({
                             320,
                             Number(event.target.value) || 1280
                           ),
+                        },
+                      })
+                    }
+                  />
+                </label>
+              </div>
+            </section>
+
+            <section className="setup-section">
+              <h2>Computer Use（桌面操作）</h2>
+              <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
+                让助手操作本机原生窗口（钉钉、飞书客户端、Excel、用友等）。网页请继续用浏览器工具。
+                默认关闭；开启后截屏可自动执行，点击/输入仍需审批。勾选「允许操作系统内的所有软件」即可操作前台任意应用。
+                不勾选且白名单为空时，只能看屏、不能点。macOS 需同时授权「屏幕录制」和「辅助功能」。
+              </p>
+              <div className="setup-grid">
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={config.computer_use?.enabled ?? false}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: event.target.checked,
+                          allowed_apps:
+                            event.target.checked &&
+                            !(config.computer_use?.allowed_apps?.length)
+                              ? ["*"]
+                              : config.computer_use?.allowed_apps ?? ["*"],
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                        },
+                      })
+                    }
+                  />
+                  <span>启用桌面 Computer Use（总开关）</span>
+                </label>
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={
+                      config.computer_use?.require_screenshot_before_click ?? true
+                    }
+                    disabled={!config.computer_use?.enabled}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          allowed_apps: config.computer_use?.allowed_apps ?? ["*"],
+                          require_screenshot_before_click: event.target.checked,
+                        },
+                      })
+                    }
+                  />
+                  <span>点击前必须先截屏</span>
+                </label>
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={computerUseAllowsAllApps(config.computer_use?.allowed_apps)}
+                    disabled={!config.computer_use?.enabled}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                          allowed_apps: event.target.checked ? ["*"] : [],
+                        },
+                      })
+                    }
+                  />
+                  <span>允许操作系统内的所有软件</span>
+                </label>
+                <label>
+                  允许操作的应用（逗号分隔；勾选「所有软件」时为 *）
+                  <input
+                    value={(config.computer_use?.allowed_apps ?? ["*"]).join("，")}
+                    disabled={
+                      !config.computer_use?.enabled ||
+                      computerUseAllowsAllApps(config.computer_use?.allowed_apps)
+                    }
+                    placeholder="钉钉，飞书，Excel"
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                          allowed_apps: event.target.value
+                            .split(/[,，]/)
+                            .map((item) => item.trim())
+                            .filter(Boolean),
                         },
                       })
                     }

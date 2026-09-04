@@ -31,6 +31,11 @@ fn waiting_approval_reply(tool_result: &str) -> Option<String> {
     ))
 }
 
+fn tool_loop_interrupt(tool_result: &str) -> Option<String> {
+    waiting_approval_reply(tool_result)
+        .or_else(|| crate::computer_use::hard_thrash_reply(tool_result))
+}
+
 fn has_active_skill(messages: &[ChatMessage]) -> bool {
     messages.iter().any(|message| {
         message.role == "system"
@@ -292,6 +297,47 @@ impl<'a> AgentDispatcher<'a> {
         self.refresh_candidate(messages);
     }
 
+    fn after_tool_result(&self, messages: &mut Vec<ChatMessage>, tool_result: &str) -> Option<String> {
+        if let Some(reply) = tool_loop_interrupt(tool_result) {
+            self.push_assistant(messages, &reply);
+            return Some(reply);
+        }
+        if let Some(advice) = crate::computer_use::soft_thrash_advice(tool_result) {
+            messages.push(ChatMessage::user(advice));
+            self.refresh_candidate(messages);
+        }
+        None
+    }
+
+    fn push_computer_use_observations(&self, messages: &mut Vec<ChatMessage>, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        if !self.security.config.multimodal.vision_enabled {
+            messages.push(ChatMessage::user(format!(
+                "[computer_use] 当前模型未开视觉。截图已保存，请根据工具 JSON 的 nodes / path 行动，不要猜像素。paths={}",
+                paths.join(", ")
+            )));
+            self.refresh_candidate(messages);
+            return;
+        }
+        let max_dim = self
+            .security
+            .config
+            .computer_use
+            .max_dimension_px
+            .max(320);
+        let images = crate::computer_use::observation_data_urls(paths, max_dim);
+        if images.is_empty() {
+            return;
+        }
+        messages.push(ChatMessage::user_with_images(
+            "[computer_use] 当前屏幕观察。优先 snapshot 后按 name/ref 点击；坐标 x,y 必须相对此图像素，原点左上角。网页请用 browser。",
+            images,
+        ));
+        self.refresh_candidate(messages);
+    }
+
     /// Run the tool-calling loop against `messages` and return final assistant text.
     /// Uses the legacy path (no real-time events).
     pub async fn run(&self, messages: &mut Vec<ChatMessage>) -> Result<String> {
@@ -405,6 +451,7 @@ impl<'a> AgentDispatcher<'a> {
             .to_string();
             self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -416,12 +463,13 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    self.push_assistant(messages, &reply);
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())
@@ -613,6 +661,7 @@ impl<'a> AgentDispatcher<'a> {
             .to_string();
             self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 if let Some(token) = &self.cancel_token {
                     token.check()?;
@@ -654,12 +703,13 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    self.push_assistant(messages, &reply);
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())
@@ -769,6 +819,7 @@ impl<'a> AgentDispatcher<'a> {
             .to_string();
             self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -790,13 +841,14 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    self.push_assistant(messages, &reply);
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     let _ = events.send(AgentEvent::Done(reply.clone()));
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         let _ = events.send(AgentEvent::Done(String::new()));
@@ -895,6 +947,7 @@ impl<'a> AgentDispatcher<'a> {
             .to_string();
             self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -909,12 +962,13 @@ impl<'a> AgentDispatcher<'a> {
                 })
                 .to_string();
                 self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    self.push_assistant(messages, &reply);
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())

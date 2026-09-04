@@ -311,8 +311,24 @@ export interface AgentPersonaConfig {
 }
 
 export interface MultimodalConfig {
+  vision_enabled?: boolean;
+  audio_enabled?: boolean;
   desktop_vision_enabled?: boolean;
   desktop_vision_max_dimension_px?: number;
+}
+
+export interface ComputerUseConfig {
+  enabled?: boolean;
+  /** Default `*` = every foreground app. Empty = observe-only. */
+  allowed_apps?: string[];
+  require_screenshot_before_click?: boolean;
+  max_actions_per_turn?: number;
+  max_actions_per_hour?: number;
+  max_tool_iterations?: number;
+  max_dimension_px?: number;
+  thrash_soft_limit?: number;
+  thrash_hard_limit?: number;
+  max_snapshot_nodes?: number;
 }
 
 export interface ObservabilityConfig {
@@ -373,6 +389,7 @@ export interface Config {
   skills?: SkillsConfig;
   agent?: AgentPersonaConfig;
   multimodal?: MultimodalConfig;
+  computer_use?: ComputerUseConfig;
   observability?: ObservabilityConfig;
   audit?: AuditConfig;
   gateway_public?: GatewayPublicConfig;

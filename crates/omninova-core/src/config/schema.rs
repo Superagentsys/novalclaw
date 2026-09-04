@@ -70,6 +70,8 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
+    #[serde(default, alias = "computerUse")]
+    pub computer_use: ComputerUseConfig,
     #[serde(default, alias = "httpRequest")]
     pub http_request: HttpRequestConfig,
     #[serde(default, alias = "webFetch")]
@@ -209,6 +211,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             tunnel: TunnelConfig::default(),
             browser: BrowserConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             http_request: HttpRequestConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -807,6 +810,8 @@ fn default_auto_approve() -> Vec<String> {
         "memory_recall".into(),
         "memory_store".into(),
         "knowledge_search".into(),
+        "web_search".into(),
+        "web_fetch".into(),
     ]
 }
 
@@ -824,7 +829,7 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             non_cli_excluded_tools: vec![
                 "shell".into(), "file_write".into(), "office_create".into(), "file_edit".into(),
-                "git_operations".into(), "browser".into(),
+                "git_operations".into(), "browser".into(), "computer_use".into(),
             ],
         }
     }
@@ -1531,6 +1536,91 @@ impl Default for BrowserConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Computer Use (OS desktop control)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputerUseConfig {
+    /// Off by default. Enabling still requires approval for click/type/press.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default `*` = operate any foreground app.
+    /// Empty = observe-only. Otherwise a name whitelist.
+    #[serde(default = "default_computer_use_allowed_apps")]
+    pub allowed_apps: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_screenshot_before_click: bool,
+    #[serde(default = "default_computer_use_max_actions_per_turn")]
+    pub max_actions_per_turn: u32,
+    #[serde(default = "default_computer_use_max_actions_per_hour")]
+    pub max_actions_per_hour: u32,
+    /// Raise the ReAct iteration cap when this tool is in the session.
+    #[serde(default = "default_computer_use_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+    #[serde(default = "default_desktop_vision_max_dimension_px")]
+    pub max_dimension_px: u32,
+    #[serde(default = "default_computer_use_thrash_soft")]
+    pub thrash_soft_limit: u32,
+    #[serde(default = "default_computer_use_thrash_hard")]
+    pub thrash_hard_limit: u32,
+    #[serde(default = "default_computer_use_max_snapshot_nodes")]
+    pub max_snapshot_nodes: usize,
+}
+
+fn default_computer_use_allowed_apps() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn default_computer_use_max_actions_per_turn() -> u32 {
+    15
+}
+fn default_computer_use_max_actions_per_hour() -> u32 {
+    40
+}
+fn default_computer_use_max_tool_iterations() -> usize {
+    40
+}
+fn default_computer_use_thrash_soft() -> u32 {
+    3
+}
+fn default_computer_use_thrash_hard() -> u32 {
+    5
+}
+fn default_computer_use_max_snapshot_nodes() -> usize {
+    80
+}
+
+impl ComputerUseConfig {
+    pub fn allowlist_allows_all(allowed_apps: &[String]) -> bool {
+        allowed_apps.iter().any(|app| {
+            let trimmed = app.trim();
+            trimmed == "*" || trimmed.eq_ignore_ascii_case("all")
+        })
+    }
+
+    pub fn allows_all_apps(&self) -> bool {
+        Self::allowlist_allows_all(&self.allowed_apps)
+    }
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_apps: default_computer_use_allowed_apps(),
+            require_screenshot_before_click: true,
+            max_actions_per_turn: default_computer_use_max_actions_per_turn(),
+            max_actions_per_hour: default_computer_use_max_actions_per_hour(),
+            max_tool_iterations: default_computer_use_max_tool_iterations(),
+            max_dimension_px: default_desktop_vision_max_dimension_px(),
+            thrash_soft_limit: default_computer_use_thrash_soft(),
+            thrash_hard_limit: default_computer_use_thrash_hard(),
+            max_snapshot_nodes: default_computer_use_max_snapshot_nodes(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP Request Tool
 // ---------------------------------------------------------------------------
 
@@ -1570,7 +1660,7 @@ impl Default for HttpRequestConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebFetchConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -1583,7 +1673,7 @@ pub struct WebFetchConfig {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: Vec::new(),
             max_response_size: default_max_response_size(),
             timeout_secs: default_timeout_secs(),
@@ -1595,14 +1685,31 @@ impl Default for WebFetchConfig {
 // Web Search Tool
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     pub provider: Option<String>,
+    pub api_key: Option<String>,
     pub brave_api_key: Option<String>,
     pub max_results: Option<u32>,
     pub timeout_secs: Option<u64>,
+    /// How many top result pages to fetch as plaintext during search.
+    pub fetch_top: Option<u32>,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: Some("jina".into()),
+            api_key: None,
+            brave_api_key: None,
+            max_results: None,
+            timeout_secs: None,
+            fetch_top: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,10 +1939,16 @@ pub struct ResearchPhaseConfig {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2525,6 +2638,7 @@ fn default_require_approval_tools() -> Vec<String> {
         "file_edit".into(),
         "git_operations".into(),
         "browser".into(),
+        "computer_use".into(),
         "http_request".into(),
     ]
 }
@@ -2960,6 +3074,26 @@ base_url = "https://api.deepseek.com"
             cfg.model_providers["deepseek"].request_max_output_tokens,
             None
         );
+    }
+
+    #[test]
+    fn computer_use_and_scheduler_phase2_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.computer_use.enabled);
+        assert!(cfg.computer_use.allows_all_apps());
+        assert_eq!(cfg.computer_use.thrash_soft_limit, 3);
+        assert_eq!(cfg.computer_use.thrash_hard_limit, 5);
+        assert_eq!(cfg.computer_use.max_snapshot_nodes, 80);
+        assert!(cfg.scheduler.enabled);
+
+        let loaded: Config = toml::from_str("[computer_use]\nenabled = false\n").unwrap();
+        assert!(loaded.scheduler.enabled);
+        assert!(loaded.computer_use.allows_all_apps());
+        assert_eq!(loaded.computer_use.thrash_hard_limit, 5);
+
+        let observe_only: Config =
+            toml::from_str("[computer_use]\nenabled = true\nallowed_apps = []\n").unwrap();
+        assert!(!observe_only.computer_use.allows_all_apps());
     }
 }
 

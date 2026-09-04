@@ -264,6 +264,8 @@ impl SecurityContext {
             "desktop_vision",
             "screenshot",
             "screen_capture",
+            "computer_use",
+            "desktop_use",
             "git",
             "git_clone",
             "git_commit",

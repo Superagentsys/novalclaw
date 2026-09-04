@@ -26,7 +26,7 @@ impl Tool for TaskCheckpointTool {
     }
 
     fn description(&self) -> &str {
-        "Write durable progress for a long-running task (hours to days). Call this before ending a turn. status=continue schedules the next wake; complete stops the task; blocked waits for a human."
+        "Write durable progress for a long-running task (hours to days). Call this before ending a turn. status=continue schedules the next wake; complete stops the task; blocked waits for a human. For desktop computer_use tasks, put the latest screenshot path in evidence."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -134,11 +134,20 @@ impl Tool for TaskCheckpointTool {
             });
         }
 
+        let mut evidence = strings("evidence");
+        if !evidence.iter().any(|path| crate::computer_use::is_image_evidence_path(path)) {
+            if let Some(latest) = crate::computer_use::latest_observation_in(
+                &self.workspace.join(".omninova").join("computer_use"),
+            ) {
+                evidence.push(latest.to_string_lossy().into_owned());
+            }
+        }
+
         task.checkpoint = TaskCheckpoint {
             summary,
             done: strings("done"),
             next: strings("next"),
-            evidence: strings("evidence"),
+            evidence,
             blocker: args
                 .get("blocker")
                 .and_then(|v| v.as_str())
@@ -164,6 +173,18 @@ impl Tool for TaskCheckpointTool {
             });
         }
         let _ = write_workspace_files(&self.workspace, &task).await;
+        let warning = if matches!(task.status, TaskStatus::Sleeping)
+            && !task
+                .checkpoint
+                .evidence
+                .iter()
+                .any(|path| crate::computer_use::is_image_evidence_path(path))
+        {
+            Some("continue 没有截图证据；下一轮唤醒看不到当前屏幕。请先 computer_use screenshot/snapshot，或把图片路径放入 evidence。")
+        } else {
+            None
+        };
+
         if let Err(error) = ensure_task_cron(&self.workspace, &task).await {
             return Ok(ToolResult {
                 success: true,
@@ -171,6 +192,7 @@ impl Tool for TaskCheckpointTool {
                     "task_id": task.id,
                     "status": task.status.as_str(),
                     "cron_warning": error.to_string(),
+                    "warning": warning,
                 })
                 .to_string(),
                 error: None,
@@ -182,6 +204,7 @@ impl Tool for TaskCheckpointTool {
             output: json!({
                 "task_id": task.id,
                 "status": task.status.as_str(),
+                "warning": warning,
             })
             .to_string(),
             error: None,

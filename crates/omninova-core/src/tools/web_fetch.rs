@@ -5,6 +5,57 @@ use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+pub(crate) const FETCH_USER_AGENT: &str =
+    "Mozilla/5.0 (compatible; OmniNova/1.0; +https://github.com/Superagentsys/novalclaw)";
+
+pub(crate) fn http_client(timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent(FETCH_USER_AGENT)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))
+}
+
+pub(crate) async fn fetch_url_text(
+    client: &reqwest::Client,
+    url: &str,
+    max_chars: usize,
+) -> anyhow::Result<String> {
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}");
+    }
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    let body_bytes = resp.bytes().await.unwrap_or_default();
+    let raw = if body_bytes.len() > MAX_RESPONSE_BYTES {
+        String::from_utf8_lossy(&body_bytes[..MAX_RESPONSE_BYTES]).to_string()
+    } else {
+        String::from_utf8_lossy(&body_bytes).to_string()
+    };
+    let text = if content_type.contains("text/html") || content_type.contains("application/xhtml") {
+        strip_html_tags(&raw)
+    } else {
+        raw
+    };
+    Ok(truncate_chars(&text, max_chars))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max_chars).collect();
+    format!("{cut}…")
+}
 
 pub struct WebFetchTool {
     allowed_domains: Vec<String>,
@@ -38,7 +89,9 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a web page and return its text content. HTML is stripped to plain text."
+        "Fetch a public URL and return plaintext (HTML stripped). \
+         Use after web_search when you need the full article. \
+         Do not use the browser tool for ordinary news or documentation pages."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -65,48 +118,23 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?;
-
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status >= 400 {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("HTTP {status}")),
-                    });
-                }
-                let content_type = resp
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                let raw = if body_bytes.len() > MAX_RESPONSE_BYTES {
-                    String::from_utf8_lossy(&body_bytes[..MAX_RESPONSE_BYTES]).to_string()
-                } else {
-                    String::from_utf8_lossy(&body_bytes).to_string()
-                };
-
-                let text = if content_type.contains("text/html") {
-                    strip_html_tags(&raw)
-                } else {
-                    raw
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: text,
-                    error: None,
-                })
+        let client = match http_client(Duration::from_secs(REQUEST_TIMEOUT_SECS)) {
+            Ok(client) => client,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
             }
+        };
+
+        match fetch_url_text(&client, url, usize::MAX).await {
+            Ok(text) => Ok(ToolResult {
+                success: true,
+                output: text,
+                error: None,
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -116,7 +144,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-fn strip_html_tags(html: &str) -> String {
+pub(crate) fn strip_html_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut in_script = false;
@@ -131,6 +159,10 @@ fn strip_html_tags(html: &str) -> String {
             if lower.starts_with("<script") {
                 in_script = true;
             } else if lower.starts_with("</script") {
+                in_script = false;
+            } else if lower.starts_with("<style") {
+                in_script = true;
+            } else if lower.starts_with("</style") {
                 in_script = false;
             }
             in_tag = true;

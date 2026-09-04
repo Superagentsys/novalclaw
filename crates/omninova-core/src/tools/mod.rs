@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod computer_use;
 pub mod content_search;
 pub mod delegate;
 pub mod file_edit;
@@ -25,6 +26,7 @@ pub mod web_search;
 mod workspace_walk;
 
 pub use browser::BrowserTool;
+pub use computer_use::ComputerUseTool;
 pub use content_search::ContentSearchTool;
 pub use delegate::{AgentInvoker, DelegateRequest, DelegateTool};
 pub use file_edit::FileEditTool;

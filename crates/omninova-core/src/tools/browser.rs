@@ -150,10 +150,10 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a headless browser via the agent-browser CLI (must be on PATH; run `npm i -g agent-browser && agent-browser install`). \
-         Supports: open (navigate to URL), snapshot (get accessibility tree with element refs), click, fill, type, screenshot, \
-         get_text, get_html, get_url, get_title, wait, scroll, select, press, eval, close, etc. \
-         Use snapshot first to discover element refs (@e1, @e2, …). If the CLI is missing, disable [browser] in config or set OMNINOVA_AGENT_BROWSER_BIN."
+        "Control a headless browser for login, forms, CAPTCHA, or JavaScript-only apps. \
+         Do NOT use this to search the web or read public news/docs — use web_search then web_fetch. \
+         Requires agent-browser on PATH (`npm i -g agent-browser && agent-browser install`). \
+         Use snapshot first to discover element refs (@e1, @e2, …)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

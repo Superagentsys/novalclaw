@@ -2127,10 +2127,8 @@
 }
 
 .chat-workspace-menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 8px);
-  z-index: 20;
+  position: fixed;
+  z-index: 80;
   min-width: 220px;
   padding: 6px;
   border-radius: 12px;

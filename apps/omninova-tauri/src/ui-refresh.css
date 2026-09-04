@@ -691,10 +691,8 @@
 }
 
 .chat-permission-menu {
-  position: absolute;
+  position: fixed;
   z-index: 80;
-  bottom: calc(100% + 9px);
-  left: 0;
   width: min(370px, calc(100vw - 42px));
   padding: 7px;
   border: 1px solid var(--ui-border-strong);
@@ -2165,6 +2163,7 @@
 .chat-composer-toolbar {
   display: grid;
   min-width: 0;
+  overflow: visible;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -2184,6 +2183,25 @@
 .chat-composer-tools-center {
   justify-content: flex-start;
   overflow: visible;
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.chat-composer-tools-center > .context-usage,
+.chat-composer-tools-center > .chat-composer-model-shell,
+.chat-composer-tools-center > .chat-approval-actions {
+  flex: 0 1 auto;
+}
+
+.chat-composer-tools-center > .chat-workspace-actions {
+  flex: 1 1 96px;
+  min-width: 96px;
+}
+
+.chat-composer-permission {
+  flex-shrink: 0;
+  min-width: max-content;
+  white-space: nowrap;
 }
 
 .chat-tool-approval {
@@ -2472,13 +2490,21 @@
 }
 
 .chat-composer-model-shell {
+  flex: 1 1 108px;
+  min-width: 108px;
+  max-width: 220px;
+}
+
+.chat-composer-model-shell .model-picker,
+.chat-composer-model-shell .model-picker-trigger {
+  width: 100%;
   min-width: 0;
+  max-width: 220px;
 }
 
 .chat-composer-model-shell .model-picker-trigger {
   min-height: 32px;
   height: 32px;
-  max-width: 180px;
   border-radius: var(--theme-control-radius);
   box-shadow: none;
 }
@@ -2556,23 +2582,10 @@
   .chat-composer-toolbar .chat-workspace-actions {
     max-width: 210px;
   }
-
-  .chat-composer-permission span,
-  .chat-workspace-pill-scope {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-  }
 }
 
 @media (max-width: 720px) {
   .chat-permission-menu {
-    position: fixed;
-    right: 14px;
-    bottom: 84px;
-    left: 14px;
     width: auto;
   }
 }

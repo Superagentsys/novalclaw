@@ -76,6 +76,54 @@ impl Config {
             );
         }
 
+        if self.computer_use.enabled {
+            if self.computer_use.max_actions_per_turn == 0 {
+                report.errors.push(
+                    "computer_use.max_actions_per_turn must be > 0 when computer_use is enabled"
+                        .into(),
+                );
+            }
+            if self.computer_use.max_actions_per_hour == 0 {
+                report.errors.push(
+                    "computer_use.max_actions_per_hour must be > 0 when computer_use is enabled"
+                        .into(),
+                );
+            }
+            if self.computer_use.max_tool_iterations == 0 {
+                report.errors.push(
+                    "computer_use.max_tool_iterations must be > 0 when computer_use is enabled"
+                        .into(),
+                );
+            }
+            if self.computer_use.allows_all_apps() {
+                report.warnings.push(
+                    "computer_use.allowed_apps is * / all – click/type/press can target any foreground app. Keep E-Stop available.".into(),
+                );
+            } else if self.computer_use.allowed_apps.is_empty() {
+                report.warnings.push(
+                    "computer_use.allowed_apps is empty – screenshot/wait/snapshot work, but click/type/press are denied until you whitelist apps or set allowed_apps = [\"*\"].".into(),
+                );
+            }
+            if self.computer_use.max_snapshot_nodes == 0 {
+                report.errors.push(
+                    "computer_use.max_snapshot_nodes must be > 0 when computer_use is enabled"
+                        .into(),
+                );
+            }
+            if self.computer_use.thrash_hard_limit > 0
+                && self.computer_use.thrash_soft_limit > self.computer_use.thrash_hard_limit
+            {
+                report.errors.push(
+                    "computer_use.thrash_soft_limit must be <= thrash_hard_limit".into(),
+                );
+            }
+            if self.autonomy.level == "autonomous" {
+                report.warnings.push(
+                    "computer_use is enabled under autonomous mode. Keep E-Stop on and do not auto-approve click/type/press.".into(),
+                );
+            }
+        }
+
         if self.agent.budget.max_total_tokens == Some(0) {
             report.warnings.push(
                 "agent.budget.max_total_tokens is 0 – every request will be budget-blocked."
@@ -293,6 +341,22 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("request_max_output_tokens is 0"))
+        );
+    }
+
+    #[test]
+    fn computer_use_thrash_soft_cannot_exceed_hard() {
+        let mut cfg = Config::default();
+        cfg.computer_use.enabled = true;
+        cfg.computer_use.thrash_soft_limit = 9;
+        cfg.computer_use.thrash_hard_limit = 5;
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("thrash_soft_limit"))
         );
     }
 }

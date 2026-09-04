@@ -10,10 +10,10 @@ use crate::config::Config;
 use crate::memory::Memory;
 use crate::security::{is_tool_globally_allowed, resolve_shell_allowlist};
 use crate::tools::{
-    BrowserTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool, FileReadTool,
-    FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool,
-    MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool, ShellTool,
-    TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
+    BrowserTool, ComputerUseTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool,
+    FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
+    KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool,
+    ShellTool, TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -316,11 +316,8 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_search.enabled,
         build: |ctx| {
-            ctx.config
-                .web_search
-                .brave_api_key
-                .as_ref()
-                .map(|key| Box::new(WebSearchTool::new(key.clone())) as Box<dyn Tool>)
+            WebSearchTool::from_config(&ctx.config.web_search)
+                .map(|tool| Box::new(tool) as Box<dyn Tool>)
         },
     },
     ToolDef {
@@ -339,6 +336,23 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 ctx.config.browser.native_headless,
                 ctx.config.browser.attach_only,
                 ctx.config.browser.cdp_url.clone(),
+            )))
+        },
+    },
+    ToolDef {
+        name: "computer_use",
+        capabilities: ToolCapabilities {
+            read_only: false,
+            writes: WriteScope::Workspace,
+            network: false,
+            spawns_process: true,
+        },
+        aliases: &["computer", "desktop_use", "os_use"],
+        enabled: |config| config.computer_use.enabled,
+        build: |ctx| {
+            Some(Box::new(ComputerUseTool::new(
+                ctx.workspace.to_path_buf(),
+                ctx.config.computer_use.clone(),
             )))
         },
     },
@@ -468,9 +482,24 @@ mod tests {
     }
 
     #[test]
-    fn web_search_is_skipped_without_an_api_key() {
+    fn web_search_falls_back_to_jina_without_an_api_key() {
         let mut config = Config::default();
         config.web_search.enabled = true;
+        config.web_search.provider = None;
+        config.web_search.api_key = None;
+        config.web_search.brave_api_key = None;
+
+        let names = built_names(&config, None);
+
+        assert!(contains(&names, "web_search"), "names={names:?}");
+    }
+
+    #[test]
+    fn web_search_brave_without_key_is_skipped() {
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+        config.web_search.provider = Some("brave".into());
+        config.web_search.api_key = None;
         config.web_search.brave_api_key = None;
 
         let names = built_names(&config, None);
@@ -484,12 +513,24 @@ mod tests {
         config.web_fetch.enabled = false;
         config.http_request.enabled = false;
         config.browser.enabled = false;
+        config.computer_use.enabled = false;
+        config.web_search.enabled = false;
 
         let names = built_names(&config, None);
 
         assert!(!contains(&names, "web_fetch"), "names={names:?}");
         assert!(!contains(&names, "http_request"), "names={names:?}");
         assert!(!contains(&names, "browser"), "names={names:?}");
+        assert!(!contains(&names, "computer_use"), "names={names:?}");
+        assert!(!contains(&names, "web_search"), "names={names:?}");
+    }
+
+    #[test]
+    fn computer_use_is_built_when_enabled() {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        let names = built_names(&config, None);
+        assert!(contains(&names, "computer_use"), "names={names:?}");
     }
 
     #[test]
@@ -557,6 +598,7 @@ mod tests {
             "file_patch",
             "git_operations",
             "browser",
+            "computer_use",
             "http_request",
         ] {
             assert!(
@@ -581,6 +623,7 @@ mod tests {
             "http_request",
             "web_search",
             "browser",
+            "computer_use",
             "todo_write",
             "task_checkpoint",
         ] {

@@ -155,7 +155,7 @@
 # enabled = true
 # mode = "supervised"
 # auto_approve = ["file_read", "memory_recall"]
-# require_approval = ["shell", "file_write", "file_edit", "git_operations", "browser", "http_request"]
+# require_approval = ["shell", "file_write", "file_edit", "git_operations", "browser", "computer_use", "http_request"]
 
 # --- Runtime ---
 # [runtime]
@@ -266,6 +266,28 @@
 # cdp_url = "http://127.0.0.1:9222"
 # allowed_domains = []
 
+# --- Computer Use (OS desktop) ---
+# 操作本机原生窗口（钉钉/飞书客户端/Excel/用友等）。网页请用 [browser]。
+# 默认关闭。开启后 screenshot/wait/snapshot 可自动执行；click/type/press 默认要审批。
+# allowed_apps 默认 ["*"]，允许前台任意应用。设为 [] 则只能观察；也可写成具体名单。
+# macOS 需屏幕录制 + 辅助功能权限。
+# [computer_use]
+# enabled = false
+# allowed_apps = ["*"]              # 默认全部应用；或 [] 禁止键鼠；或 ["钉钉", "飞书"]
+# require_screenshot_before_click = true
+# max_actions_per_turn = 15
+# max_actions_per_hour = 40         # 仅桌面键鼠，与 autonomy.max_actions_per_hour 独立
+# max_tool_iterations = 40
+# max_dimension_px = 1280
+# thrash_soft_limit = 3             # 同控件连续失败后提示改用 snapshot/name
+# thrash_hard_limit = 5             # 再失败则硬停，需 snapshot 或换目标
+# max_snapshot_nodes = 80
+
+# --- Scheduler ---
+# 网关启动时会拉起 cron 轮询。长程 task_checkpoint(continue) 依赖它按时唤醒。
+# [scheduler]
+# enabled = true
+
 # --- HTTP Request Tool ---
 # [http_request]
 # enabled = false
@@ -274,18 +296,22 @@
 # timeout_secs = 30
 
 # --- Web Fetch Tool ---
+# 公开网页转正文。新闻/文档优先用这个，不要开浏览器。
 # [web_fetch]
-# enabled = false
+# enabled = true
 # allowed_domains = []
 # max_response_size = 1048576
 # timeout_secs = 30
 
 # --- Web Search Tool ---
+# 直接搜索（WorkBuddy 同款路径），不要为检索去操作 browser。
+# provider: jina（默认，无 key 也可）| bocha（国内中文更好，按次付费）| tavily | brave
 # [web_search]
-# enabled = false
-# provider = "brave"
-# brave_api_key = "..."
-# max_results = 10
+# enabled = true
+# provider = "jina"
+# api_key = "..."                 # 可选；Jina 免费额度不够时再填 JINA_API_KEY
+# max_results = 8
+# fetch_top = 2                   # 搜索后顺带拉取前 N 条正文，适合早报/简报
 # timeout_secs = 15
 
 # --- WeCom Smart Bot ---
