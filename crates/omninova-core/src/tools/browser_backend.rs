@@ -201,6 +201,7 @@ mod tests {
                 detail: "opened".into(),
                 url: Some(req.url.clone()),
                 title: Some("Example".into()),
+                structured_output: None,
             })
         }
 
@@ -235,6 +236,7 @@ mod tests {
                 detail: action.name().into(),
                 url: None,
                 title: None,
+                structured_output: None,
             })
         }
 
@@ -362,7 +364,7 @@ mod tests {
         assert!(backend.capabilities().eval);
         assert!(backend
             .capabilities()
-            .supports_action(&BrowserAction::Eval { script: "1".into() }));
+            .supports_action(&BrowserAction::eval_raw("1")));
         assert!(backend
             .capabilities()
             .supports_observation(&BrowserObserveKind::Url));

@@ -15,15 +15,16 @@ use crate::tools::browser_lifecycle::{
 };
 use crate::tools::browser_output::{
     cli_max_output_for_action, observation_from_read, parse_action_outcome, parse_read_output,
-    parse_snapshot_refs, RawSnapshotRef,
+    parse_snapshot_refs, parse_structured_eval_wire, RawSnapshotRef, StructuredEvalWire,
+    BROWSER_EXTRACT_SOURCE_CHAR_LIMIT,
 };
 use crate::tools::browser_types::{
     BackendAvailability, BackendCapabilities, BackendSessionHandle, BrowserAction,
     BrowserActionResult, BrowserBackendError, BrowserBackendId, BrowserElement, BrowserElementRef,
-    BrowserErrorKind, BrowserHealth, BrowserObservation, BrowserObserveKind, BrowserPageId,
-    BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot,
-    BrowserTab, BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest,
-    ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
+    BrowserErrorKind, BrowserEvalMode, BrowserHealth, BrowserObservation, BrowserObserveKind,
+    BrowserPageId, BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions,
+    BrowserSnapshot, BrowserTab, BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest,
+    ScreenshotResult, BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL, BROWSER_STALE_REFERENCE_DETAIL,
 };
 use crate::tools::configure_background_command;
 use crate::tools::web_client::redact_secrets_in_text;
@@ -31,7 +32,7 @@ use async_trait::async_trait;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -101,11 +102,20 @@ pub fn browser_session_hash_chars() -> usize {
 pub struct AgentBrowserBackend {
     search: Option<BrowserBinarySearch>,
     defaults: BrowserSessionOptions,
+    last_stdout_len: Mutex<Option<usize>>,
 }
 
 impl AgentBrowserBackend {
     pub fn new(search: Option<BrowserBinarySearch>, defaults: BrowserSessionOptions) -> Self {
-        Self { search, defaults }
+        Self {
+            search,
+            defaults,
+            last_stdout_len: Mutex::new(None),
+        }
+    }
+
+    pub fn last_stdout_len(&self) -> Option<usize> {
+        self.last_stdout_len.lock().ok().and_then(|guard| *guard)
     }
 
     fn id_value(&self) -> BrowserBackendId {
@@ -211,6 +221,9 @@ impl AgentBrowserBackend {
                 .await
             {
                 Ok((exit_success, stdout, stderr, binary_path)) => {
+                    if let Ok(mut len) = self.last_stdout_len.lock() {
+                        *len = Some(stdout.len());
+                    }
                     let outcome = parse_action_outcome(v1_action, &stdout, &stderr, exit_success);
                     if outcome.success {
                         if v1_action == "close" {
@@ -219,6 +232,7 @@ impl AgentBrowserBackend {
                         return Ok(NamedSuccess {
                             output: outcome.output,
                             stdout,
+                            data: outcome.data,
                         });
                     }
                     let diagnostic = format!(
@@ -272,6 +286,7 @@ impl AgentBrowserBackend {
                         return Ok(NamedSuccess {
                             output: outcome.output,
                             stdout,
+                            data: outcome.data,
                         });
                     }
                     let prefix = failure_prefix(kind);
@@ -360,6 +375,7 @@ fn exhausted(mut err: BrowserBackendError) -> BrowserBackendError {
 struct NamedSuccess {
     output: String,
     stdout: String,
+    data: Option<serde_json::Value>,
 }
 
 fn failure_kind(kind: BrowserFailureKind) -> BrowserErrorKind {
@@ -502,6 +518,7 @@ fn action_result(output: String) -> BrowserActionResult {
         detail: output,
         url: None,
         title: None,
+        structured_output: None,
     }
 }
 
@@ -695,11 +712,24 @@ impl BrowserBackend for AgentBrowserBackend {
         action: &BrowserAction,
     ) -> Result<BrowserActionResult, BrowserBackendError> {
         let (v1_action, args) = self.act_args(action)?;
-        let output = self
+        let result = self
             .run_named(session, &self.defaults, v1_action, &args)
-            .await?
-            .output;
-        Ok(action_result(output))
+            .await?;
+        let structured_output = match action {
+            BrowserAction::Eval {
+                mode: BrowserEvalMode::StructuredJson,
+                ..
+            } => {
+                return structured_eval_action_result(self.id_value(), result);
+            }
+            _ => structured_output_for_action(action, result.data.as_ref()),
+        };
+        Ok(BrowserActionResult {
+            detail: result.output,
+            url: None,
+            title: None,
+            structured_output,
+        })
     }
 
     async fn screenshot(
@@ -835,7 +865,13 @@ impl AgentBrowserBackend {
             BrowserAction::Hover { target } => {
                 Ok(("hover", vec!["hover".into(), self.target_arg(target)?]))
             }
-            BrowserAction::Eval { script } => Ok(("eval", vec!["eval".into(), script.clone()])),
+            BrowserAction::Eval { script, mode } => match mode {
+                BrowserEvalMode::Raw => Ok(("eval", vec!["eval".into(), script.clone()])),
+                BrowserEvalMode::StructuredJson => Ok((
+                    "eval",
+                    vec!["eval".into(), wrap_structured_eval_expression(script)],
+                )),
+            },
             BrowserAction::Wait {
                 timeout_ms,
                 text,
@@ -857,6 +893,131 @@ impl AgentBrowserBackend {
             BrowserAction::Reload => Ok(("reload", vec!["reload".into()])),
         }
     }
+}
+
+fn structured_output_for_action(
+    action: &BrowserAction,
+    data: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    matches!(
+        action,
+        BrowserAction::Eval {
+            mode: BrowserEvalMode::Raw,
+            ..
+        }
+    )
+    .then(|| data.and_then(|value| value.get("result")).cloned())
+    .flatten()
+}
+
+fn structured_eval_action_result(
+    backend: BrowserBackendId,
+    result: NamedSuccess,
+) -> Result<BrowserActionResult, BrowserBackendError> {
+    let wire = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("result"))
+        .map(parse_structured_eval_wire)
+        .unwrap_or(StructuredEvalWire::InvalidEnvelope);
+    match wire {
+        StructuredEvalWire::Value(value) => Ok(BrowserActionResult {
+            detail: result.output,
+            url: None,
+            title: None,
+            structured_output: Some(value),
+        }),
+        StructuredEvalWire::SourceTooLarge { observed_chars } => {
+            let mut err = BrowserBackendError::new(
+                BrowserErrorKind::CommandFailed,
+                backend,
+                match observed_chars {
+                    Some(chars) => format!(
+                        "{BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL}; observed_chars={chars}"
+                    ),
+                    None => BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL.to_string(),
+                },
+            );
+            err.retryable = false;
+            Err(err)
+        }
+        StructuredEvalWire::NotSerializable { detail } => {
+            let mut err = BrowserBackendError::new(
+                BrowserErrorKind::InvalidStructuredOutput,
+                backend,
+                format!(
+                    "BrowserStructuredOutputInvalid: structured extract result is not JSON-serializable; {detail}"
+                ),
+            );
+            err.retryable = false;
+            Err(err)
+        }
+        StructuredEvalWire::InvalidEnvelope => {
+            let mut err = BrowserBackendError::new(
+                BrowserErrorKind::InvalidStructuredOutput,
+                backend,
+                "BrowserStructuredOutputInvalid: structured extract envelope is missing or invalid",
+            );
+            err.retryable = false;
+            Err(err)
+        }
+    }
+}
+
+/// Compatibility workaround for agent-browser 0.36.0 JSON eval path ignoring
+/// `--max-output`. Expression is spliced as an expression body (not regex-
+/// escaped) so quotes / backticks remain JS source. Evaluates once, then
+/// `JSON.stringify`s a protocol envelope in page context. Oversized results
+/// return a small `source_too_large` envelope instead of the huge value.
+///
+/// Future upgrades should re-smoke `eval --json --max-output`. If upstream
+/// JSON mode starts honoring that flag, re-evaluate removing this wrapper.
+/// Do not branch on CLI version.
+pub(crate) fn wrap_structured_eval_expression(expression: &str) -> String {
+    let mut out = String::new();
+    out.push_str("(async () => {\n");
+    out.push_str("  const SOURCE_LIMIT = ");
+    out.push_str(&BROWSER_EXTRACT_SOURCE_CHAR_LIMIT.to_string());
+    out.push_str(";\n");
+    out.push_str(
+        r#"  const fail = (error, extra) => JSON.stringify(Object.assign({
+    "__omninova_extract_v": 1,
+    ok: false,
+    error
+  }, extra || {}));
+  let value;
+  try {
+    value = await (async () => {
+      return ("#,
+    );
+    out.push_str(expression);
+    out.push_str(
+        r#");
+    })();
+  } catch (err) {
+    return fail("not_json_serializable", { detail: String((err && err.message) || err).slice(0, 200) });
+  }
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+    return fail("not_json_serializable", { detail: typeof value });
+  }
+  let serialized;
+  try {
+    const envelope = { "__omninova_extract_v": 1, ok: true };
+    envelope.value = value;
+    serialized = JSON.stringify(envelope);
+  } catch (err) {
+    return fail("not_json_serializable", { detail: String((err && err.message) || err).slice(0, 200) });
+  }
+  if (typeof serialized !== "string") {
+    return fail("not_json_serializable", { detail: "stringify returned non-string" });
+  }
+  if (serialized.length > SOURCE_LIMIT) {
+    return fail("source_too_large", { observed_chars: serialized.length });
+  }
+  return serialized;
+})()"#,
+    );
+    out
 }
 
 fn parse_tabs_output(stdout: &str, normalized: &str) -> Vec<BrowserTab> {
@@ -903,8 +1064,481 @@ fn parse_tabs_output(stdout: &str, normalized: &str) -> Vec<BrowserTab> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser_bin::bundled_agent_browser_relative_path;
     use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
-    use crate::tools::browser_types::{BrowserElement, BrowserElementRef};
+    use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy};
+    use crate::tools::browser_output::BROWSER_EXTRACT_SOURCE_CHAR_LIMIT;
+    use crate::tools::browser_types::{
+        BrowserElement, BrowserElementRef, BrowserErrorKind, BrowserExtractRequest,
+        BrowserSessionKey,
+    };
+    use serde_json::{json, Value};
+
+    fn native_cli_search() -> Option<BrowserBinarySearch> {
+        let resource_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/omninova-tauri/src-tauri/resources");
+        let bundled = resource_root.join(bundled_agent_browser_relative_path());
+        if bundled.is_file() {
+            return Some(BrowserBinarySearch {
+                env_path: None,
+                bundled_candidates: Vec::new(),
+                extra_roots: vec![resource_root],
+                include_exe_relative: false,
+                path_dirs: Some(Vec::new()),
+            });
+        }
+        let resolved = BrowserBinarySearch::from_process().resolve().ok()?;
+        Some(BrowserBinarySearch {
+            env_path: Some(resolved.path),
+            bundled_candidates: Vec::new(),
+            extra_roots: Vec::new(),
+            include_exe_relative: false,
+            path_dirs: Some(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn eval_maps_agent_browser_data_result_without_changing_text_output() {
+        let action = BrowserAction::eval_raw("JSON.stringify({name:'Alpha'})");
+        let data = json!({
+            "result": "{\"name\":\"Alpha\"}",
+            "origin": "about:blank",
+            "lifecycle": {"reused": true}
+        });
+        assert_eq!(
+            structured_output_for_action(&action, Some(&data)),
+            Some(json!("{\"name\":\"Alpha\"}"))
+        );
+        assert_eq!(
+            crate::tools::browser_output::normalize_action("eval", &data),
+            "{\"name\":\"Alpha\"}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_runtime_extract_json_returns_typed_page_data() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                "<html><body><div class='product'><span class='name'>Alpha</span><span class='price'>12.50</span></div><div class='product'><span class='name'>你好🚀</span><span class='price'>7</span></div></body></html>",
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b32d-{}", uuid::Uuid::new_v4())).unwrap();
+        let opts = BrowserSessionOptions::default();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/products"),
+                },
+            )
+            .await
+            .expect("open fixture");
+        let extracted = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "Array.from(document.querySelectorAll('.product')).map(product => ({name: product.querySelector('.name').textContent, price: Number(product.querySelector('.price').textContent), active: true, note: null}))".into(),
+                },
+            )
+            .await
+            .expect("structured extract");
+        let _ = runtime.close_session(&key, &opts).await;
+
+        assert!(!extracted.truncated);
+        assert_eq!(
+            extracted.value,
+            json!([
+                {"name": "Alpha", "price": 12.5, "active": true, "note": null},
+                {"name": "你好🚀", "price": 7, "active": true, "note": null}
+            ])
+        );
+    }
+
+    fn wire_named(result: serde_json::Value) -> NamedSuccess {
+        NamedSuccess {
+            output: "ok".into(),
+            stdout: "{}".into(),
+            data: Some(json!({ "result": result })),
+        }
+    }
+
+    #[test]
+    fn raw_eval_does_not_use_structured_wrapper() {
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        let action = BrowserAction::eval_raw("1 + 1");
+        let (name, args) = backend.act_args(&action).unwrap();
+        assert_eq!(name, "eval");
+        assert_eq!(args, vec!["eval", "1 + 1"]);
+        assert!(!args.iter().any(|arg| arg.contains("__omninova_extract_v")));
+        assert!(!args.iter().any(|arg| arg.contains("SOURCE_LIMIT")));
+        assert!(!wrap_structured_eval_expression("1").contains("1 + 1"));
+    }
+
+    #[test]
+    fn structured_eval_wraps_expression_as_source_body() {
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        let expression = r#""hello 'world' `tick`" || (1 ? await Promise.resolve({ok: true}) : null)"#;
+        let (_, args) = backend
+            .act_args(&BrowserAction::eval_structured_json(expression))
+            .unwrap();
+        assert_eq!(args[0], "eval");
+        let wrapped = &args[1];
+        assert!(wrapped.contains("__omninova_extract_v"));
+        assert!(wrapped.contains("SOURCE_LIMIT"));
+        assert!(wrapped.contains(&BROWSER_EXTRACT_SOURCE_CHAR_LIMIT.to_string()));
+        assert!(wrapped.contains(expression));
+        assert!(wrapped.contains("return ("));
+        assert_eq!(wrapped.matches("await (async () =>").count(), 1);
+        assert!(wrapped.contains("JSON.stringify(envelope)"));
+    }
+
+    #[test]
+    fn structured_expression_executes_exactly_once() {
+        let expression = "window.__calls = (window.__calls || 0) + 1";
+        let wrapped = wrap_structured_eval_expression(expression);
+        assert_eq!(wrapped.matches(expression).count(), 1);
+        assert_eq!(wrapped.matches("return (").count(), 1);
+        assert!(!wrapped.contains(expression.repeat(2).as_str()));
+    }
+
+    #[test]
+    fn promise_result_is_awaited() {
+        let wrapped = wrap_structured_eval_expression("await Promise.resolve({ awaited: true })");
+        assert!(wrapped.contains("await (async () =>"));
+        assert!(wrapped.contains("await Promise.resolve({ awaited: true })"));
+        assert_eq!(
+            wrapped
+                .matches("await Promise.resolve({ awaited: true })")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cyclic_value_returns_serialization_error() {
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "not_json_serializable",
+            "detail": "Converting circular structure to JSON"
+        });
+        let err = structured_eval_action_result(
+            BrowserBackendId::agent_browser(),
+            wire_named(Value::String(envelope.to_string())),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::InvalidStructuredOutput);
+        assert!(!err.retryable);
+        assert!(err.detail.contains("not JSON-serializable"));
+        assert!(!err.detail.contains(&"X".repeat(50)));
+    }
+
+    #[test]
+    fn bigint_returns_serialization_error() {
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "not_json_serializable",
+            "detail": "Do not know how to serialize a BigInt"
+        });
+        let err = structured_eval_action_result(
+            BrowserBackendId::agent_browser(),
+            wire_named(Value::String(envelope.to_string())),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::InvalidStructuredOutput);
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn source_too_large_wire_is_command_failed_and_not_retryable() {
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "source_too_large",
+            "observed_chars": 5_000_000
+        });
+        let err = structured_eval_action_result(
+            BrowserBackendId::agent_browser(),
+            wire_named(Value::String(envelope.to_string())),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::CommandFailed);
+        assert!(!err.retryable);
+        assert!(err.detail.contains("source limit"));
+        assert!(err.detail.contains("observed_chars=5000000"));
+        assert!(!err.detail.contains(&"X".repeat(100)));
+    }
+
+    #[test]
+    fn json_compatibility_policy_is_json_stringify() {
+        let wrapped = wrap_structured_eval_expression("value");
+        assert!(wrapped.contains("JSON.stringify(envelope)"));
+        assert!(wrapped.contains("value === undefined"));
+        assert!(wrapped.contains("typeof value === \"function\""));
+        assert!(wrapped.contains("typeof value === \"symbol\""));
+        assert!(wrapped.contains(".slice(0, 200)"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_structured_eval_source_bound_rejects_five_megabyte_payload() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                "<html><body><p>source-bound</p></body></html>",
+                &["content-type: text/html".to_string()],
+            );
+        });
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b32d1-{}", uuid::Uuid::new_v4())).unwrap();
+        let opts = BrowserSessionOptions::default();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/blank"),
+                },
+            )
+            .await
+            .expect("open");
+        const PAGE_VALUE_SIZE: usize = 5_000_000;
+        let err = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: format!("({{ blob: 'X'.repeat({PAGE_VALUE_SIZE}) }})"),
+                },
+            )
+            .await
+            .expect_err("5MB extract must fail at source bound");
+        let stdout_len = backend.last_stdout_len().unwrap_or(0);
+        let _ = runtime.close_session(&key, &opts).await;
+
+        assert_eq!(err.kind, BrowserErrorKind::CommandFailed);
+        assert!(!err.retryable);
+        assert!(err.detail.contains("source limit"));
+        assert!(!err.detail.contains(&"X".repeat(1000)));
+        assert!(
+            stdout_len < 64 * 1024,
+            "CLI_STDOUT_SIZE={stdout_len} leaked the 5MB payload"
+        );
+        eprintln!(
+            "PAGE_VALUE_SIZE={PAGE_VALUE_SIZE} CLI_STDOUT_SIZE={stdout_len} SOURCE_LIMIT={} ERROR_RESULT_SIZE={}",
+            BROWSER_EXTRACT_SOURCE_CHAR_LIMIT,
+            err.detail.len()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_structured_eval_edges_and_single_execution() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                "<html><body></body></html>",
+                &["content-type: text/html".to_string()],
+            );
+        });
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b32d1e-{}", uuid::Uuid::new_v4())).unwrap();
+        let opts = BrowserSessionOptions::default();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/edges"),
+                },
+            )
+            .await
+            .expect("open");
+
+        let once = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "(window.__omninovaExtractCalls = (window.__omninovaExtractCalls || 0) + 1, { n: window.__omninovaExtractCalls })".into(),
+                },
+            )
+            .await
+            .expect("count");
+        assert_eq!(once.value, json!({"n": 1}));
+
+        let promised = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "await Promise.resolve({ awaited: true })".into(),
+                },
+            )
+            .await
+            .expect("promise");
+        assert_eq!(promised.value, json!({"awaited": true}));
+
+        let cyclic = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "(() => { const o = {}; o.self = o; return o; })()".into(),
+                },
+            )
+            .await
+            .expect_err("cyclic");
+        assert_eq!(cyclic.kind, BrowserErrorKind::InvalidStructuredOutput);
+        assert!(!cyclic.retryable);
+
+        let bigint = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "({ n: 1n })".into(),
+                },
+            )
+            .await
+            .expect_err("bigint");
+        assert_eq!(bigint.kind, BrowserErrorKind::InvalidStructuredOutput);
+
+        let nan = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "Number.NaN".into(),
+                },
+            )
+            .await
+            .expect("nan");
+        assert_eq!(nan.value, Value::Null);
+
+        let inf = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "Infinity".into(),
+                },
+            )
+            .await
+            .expect("infinity");
+        assert_eq!(inf.value, Value::Null);
+
+        let undef = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "undefined".into(),
+                },
+            )
+            .await
+            .expect_err("undefined");
+        assert_eq!(undef.kind, BrowserErrorKind::InvalidStructuredOutput);
+
+        let func = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "(() => {})".into(),
+                },
+            )
+            .await
+            .expect_err("function");
+        assert_eq!(func.kind, BrowserErrorKind::InvalidStructuredOutput);
+
+        let quoted = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: r#""hello 'world' `tick`""#.into(),
+                },
+            )
+            .await
+            .expect("quotes");
+        assert_eq!(quoted.value, json!("hello 'world' `tick`"));
+
+        let unicode = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: r#""你好🚀""#.into(),
+                },
+            )
+            .await
+            .expect("unicode");
+        assert_eq!(unicode.value, json!("你好🚀"));
+
+        let _ = runtime.close_session(&key, &opts).await;
+    }
+
+    #[test]
+    fn non_eval_action_never_exposes_structured_payload() {
+        let data = json!({"result": "{\"hidden\":true}"});
+        assert_eq!(
+            structured_output_for_action(&BrowserAction::Reload, Some(&data)),
+            None
+        );
+    }
 
     #[test]
     fn session_mapping_is_deterministic() {

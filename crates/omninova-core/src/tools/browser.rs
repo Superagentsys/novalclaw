@@ -437,9 +437,7 @@ impl Tool for BrowserTool {
                         let js = value.ok_or_else(|| {
                             anyhow::anyhow!("'eval' requires 'value' (JavaScript code)")
                         })?;
-                        BrowserAction::Eval {
-                            script: js.to_string(),
-                        }
+                        BrowserAction::eval_raw(js.to_string())
                     }
                     "wait" => BrowserAction::Wait {
                         timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
@@ -786,6 +784,29 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
         assert!(!actions.contains(&"read"));
+    }
+
+    #[test]
+    fn extract_does_not_change_tool_schema() {
+        let tool = BrowserTool::new(Vec::new(), true, false, None);
+        let schema = tool.parameters_schema();
+        let encoded = schema.to_string();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(!props.contains_key("eval_mode"));
+        assert!(!props.contains_key("extract"));
+        assert!(!props.contains_key("extract_json"));
+        assert!(!props.contains_key("structured"));
+        assert!(!encoded.contains("eval_mode"));
+        assert!(!encoded.contains("extract_json"));
+        assert!(!encoded.contains("BrowserEvalMode"));
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
+        assert!(!actions.contains(&"extract"));
     }
 
     #[test]
@@ -1373,9 +1394,9 @@ mod tests {
             .act(
                 &key,
                 &opts,
-                &BrowserAction::Eval {
-                    script: "document.getElementById('delete-me').remove(); true".into(),
-                },
+                &BrowserAction::eval_raw(
+                    "document.getElementById('delete-me').remove(); true",
+                ),
             )
             .await;
         assert!(removed.is_ok(), "eval remove failed: {removed:?}");

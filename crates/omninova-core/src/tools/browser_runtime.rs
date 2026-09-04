@@ -8,14 +8,15 @@ use crate::tools::browser_output::{
 };
 use crate::tools::browser_types::{
     BackendAvailability, BackendSessionHandle, BrowserAction, BrowserActionResult,
-    BrowserBackendError, BrowserBackendId, BrowserElement, BrowserErrorKind, BrowserHealth,
-    BrowserObservation, BrowserObserveKind, BrowserSessionKey, BrowserSessionOpenRequest,
-    BrowserSessionOptions, BrowserSnapshot, BrowserTab, NavigateRequest, ObserveRequest,
-    ScreenshotRequest, ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
+    BrowserBackendError, BrowserBackendId, BrowserElement, BrowserErrorKind, BrowserExtractRequest,
+    BrowserExtractResult, BrowserHealth, BrowserObservation, BrowserObserveKind, BrowserSessionKey,
+    BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot, BrowserTab, NavigateRequest,
+    ObserveRequest, ScreenshotRequest, ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
 };
 use crate::tools::text_bound::{bound_head, truncate_head_chars};
 use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
 use regex::Regex;
+use serde_json::{Map, Value};
 use std::sync::{Arc, OnceLock};
 use url::Url;
 
@@ -24,6 +25,15 @@ use url::Url;
 pub const BROWSER_MAX_STRUCTURED_ELEMENTS: usize = 512;
 pub const BROWSER_MAX_ELEMENT_ROLE_CHARS: usize = 64;
 pub const BROWSER_MAX_ELEMENT_NAME_CHARS: usize = 512;
+
+/// Backend-neutral structured-extract limits. The final budget intentionally
+/// reuses the existing eval/operation model-output budget.
+pub const BROWSER_MAX_JSON_DEPTH: usize = 16;
+pub const BROWSER_MAX_JSON_ARRAY_ITEMS: usize = 128;
+pub const BROWSER_MAX_JSON_OBJECT_FIELDS: usize = 128;
+pub const BROWSER_MAX_JSON_STRING_CHARS: usize = 2_000;
+pub const BROWSER_MAX_JSON_KEY_CHARS: usize = 128;
+pub const BROWSER_MAX_SERIALIZED_JSON_CHARS: usize = BROWSER_OP_CHAR_LIMIT;
 
 /// Backend-independent runtime limits and allowlist. Vendor launch flags are
 /// not stored here; they travel on [`BrowserSessionOptions`].
@@ -169,6 +179,31 @@ impl BrowserRuntime {
         })
         .await
         .map(|result| self.budget_action_result(result))
+    }
+
+    /// Execute a page-level expression through StructuredJson eval and decode
+    /// the backend-unwrapped JSON value. The backend serializes in page
+    /// context; Runtime only applies semantic JSON budgets.
+    ///
+    /// Like ordinary Eval, this operation may mutate page state and is never
+    /// blindly replayed.
+    pub async fn extract_json(
+        &self,
+        key: &BrowserSessionKey,
+        opts: &BrowserSessionOptions,
+        req: &BrowserExtractRequest,
+    ) -> Result<BrowserExtractResult, BrowserBackendError> {
+        let result = self
+            .act(
+                key,
+                opts,
+                &BrowserAction::eval_structured_json(req.expression.clone()),
+            )
+            .await?;
+        let value = result.structured_output.ok_or_else(|| {
+            self.invalid_structured_output("structured extract payload is missing")
+        })?;
+        Ok(bound_structured_json(value))
     }
 
     pub async fn screenshot(
@@ -319,6 +354,16 @@ impl BrowserRuntime {
         )
     }
 
+    fn invalid_structured_output(&self, reason: &str) -> BrowserBackendError {
+        let mut error = BrowserBackendError::new(
+            BrowserErrorKind::InvalidStructuredOutput,
+            self.backend.id(),
+            format!("BrowserStructuredOutputInvalid: {reason}"),
+        );
+        error.retryable = false;
+        error
+    }
+
     fn budget_action_result(&self, result: BrowserActionResult) -> BrowserActionResult {
         BrowserActionResult {
             detail: bound_head(
@@ -327,6 +372,7 @@ impl BrowserRuntime {
             ),
             url: result.url.map(|u| redact_secrets_in_text(&u)),
             title: result.title.map(|t| redact_secrets_in_text(&t)),
+            structured_output: result.structured_output,
         }
     }
 
@@ -389,6 +435,148 @@ impl BrowserRuntime {
         let sanitized = sanitize_untrusted_web_field(text);
         truncate_head_chars(&sanitized, max_chars).0
     }
+}
+
+fn bound_structured_json(value: Value) -> BrowserExtractResult {
+    let mut truncated = false;
+    let sanitized = sanitize_structured_value(value, 0, &mut truncated);
+    let bounded =
+        fit_structured_value(sanitized, BROWSER_MAX_SERIALIZED_JSON_CHARS, &mut truncated);
+    BrowserExtractResult {
+        value: bounded,
+        truncated,
+    }
+}
+
+fn sanitize_structured_value(value: Value, depth: usize, truncated: &mut bool) -> Value {
+    match value {
+        Value::String(text) => {
+            let redacted = redact_credential_assignments(&redact_secrets_in_text(&text));
+            let (bounded, was_truncated, _) =
+                truncate_head_chars(&redacted, BROWSER_MAX_JSON_STRING_CHARS);
+            *truncated |= was_truncated;
+            Value::String(bounded)
+        }
+        Value::Array(values) => {
+            if depth >= BROWSER_MAX_JSON_DEPTH {
+                *truncated = true;
+                return Value::Null;
+            }
+            if values.len() > BROWSER_MAX_JSON_ARRAY_ITEMS {
+                *truncated = true;
+            }
+            Value::Array(
+                values
+                    .into_iter()
+                    .take(BROWSER_MAX_JSON_ARRAY_ITEMS)
+                    .map(|value| sanitize_structured_value(value, depth + 1, truncated))
+                    .collect(),
+            )
+        }
+        Value::Object(fields) => {
+            if depth >= BROWSER_MAX_JSON_DEPTH {
+                *truncated = true;
+                return Value::Null;
+            }
+            if fields.len() > BROWSER_MAX_JSON_OBJECT_FIELDS {
+                *truncated = true;
+            }
+            let mut bounded = Map::new();
+            for (key, value) in fields.into_iter().take(BROWSER_MAX_JSON_OBJECT_FIELDS) {
+                let (key, key_truncated, _) = truncate_head_chars(&key, BROWSER_MAX_JSON_KEY_CHARS);
+                *truncated |= key_truncated;
+                // Never overwrite when two untrusted keys share a truncated
+                // prefix. Dropping the later field is explicit truncation.
+                if bounded.contains_key(&key) {
+                    *truncated = true;
+                    continue;
+                }
+                bounded.insert(key, sanitize_structured_value(value, depth + 1, truncated));
+            }
+            Value::Object(bounded)
+        }
+        scalar => scalar,
+    }
+}
+
+fn serialized_chars(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|text| text.chars().count())
+        .unwrap_or(usize::MAX)
+}
+
+/// Fit a sanitized tree to a final serialized-char limit while preserving
+/// valid JSON. Containers retain the longest deterministic prefix that fits.
+fn fit_structured_value(value: Value, limit: usize, truncated: &mut bool) -> Value {
+    if serialized_chars(&value) <= limit {
+        return value;
+    }
+    *truncated = true;
+    match value {
+        Value::String(text) => fit_json_string(text, limit),
+        Value::Array(values) => {
+            let mut bounded = Vec::new();
+            for value in values {
+                let current_len = serialized_chars(&Value::Array(bounded.clone()));
+                let separator = usize::from(!bounded.is_empty());
+                let available = limit.saturating_sub(current_len + separator);
+                if available == 0 {
+                    break;
+                }
+                let fitted = fit_structured_value(value, available, truncated);
+                bounded.push(fitted);
+                if serialized_chars(&Value::Array(bounded.clone())) > limit {
+                    bounded.pop();
+                    break;
+                }
+            }
+            Value::Array(bounded)
+        }
+        Value::Object(fields) => {
+            let mut bounded = Map::new();
+            for (key, value) in fields {
+                let current_len = serialized_chars(&Value::Object(bounded.clone()));
+                let separator = usize::from(!bounded.is_empty());
+                let key_len = serde_json::to_string(&key)
+                    .map(|text| text.chars().count())
+                    .unwrap_or(usize::MAX);
+                let available = limit.saturating_sub(current_len + separator + key_len + 1);
+                if available == 0 {
+                    break;
+                }
+                let fitted = fit_structured_value(value, available, truncated);
+                bounded.insert(key.clone(), fitted);
+                if serialized_chars(&Value::Object(bounded.clone())) > limit {
+                    bounded.remove(&key);
+                    break;
+                }
+            }
+            Value::Object(bounded)
+        }
+        scalar => {
+            if serialized_chars(&scalar) <= limit {
+                scalar
+            } else {
+                Value::Null
+            }
+        }
+    }
+}
+
+fn fit_json_string(text: String, limit: usize) -> Value {
+    let chars: Vec<char> = text.chars().collect();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect();
+        if serialized_chars(&Value::String(candidate)) <= limit {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Value::String(chars[..low].iter().collect())
 }
 
 /// `role` / `name` are page-controlled. Redact credential-like spans and URL
@@ -492,6 +680,7 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
         BrowserErrorKind::Timeout => "BrowserCommandTimeout",
         BrowserErrorKind::Rejected => "BrowserUrlRejected",
         BrowserErrorKind::CommandFailed => "BrowserCommandFailed",
+        BrowserErrorKind::InvalidStructuredOutput => "BrowserStructuredOutputInvalid",
         BrowserErrorKind::StaleReference => "BrowserCommandFailed",
     };
     format!("{prefix}: {}", err.detail)
@@ -510,7 +699,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CallKind {
@@ -537,6 +726,7 @@ mod tests {
         fail_remaining: u32,
         unhealthy_keys: HashSet<String>,
         observation: BrowserObservation,
+        structured_output: Option<Value>,
         tabs: Vec<BrowserTab>,
         last_handle_tokens: HashMap<String, String>,
     }
@@ -581,6 +771,7 @@ mod tests {
                         }),
                         truncated: false,
                     },
+                    structured_output: None,
                     tabs: Vec::new(),
                     last_handle_tokens: HashMap::new(),
                 }),
@@ -634,6 +825,10 @@ mod tests {
 
         fn set_observation(&self, observation: BrowserObservation) {
             self.state.lock().expect("state").observation = observation;
+        }
+
+        fn set_structured_output(&self, value: Option<Value>) {
+            self.state.lock().expect("state").structured_output = value;
         }
 
         fn maybe_fail(&self, kind: CallKind) -> Result<(), BrowserBackendError> {
@@ -732,6 +927,7 @@ mod tests {
                 detail: "opened".into(),
                 url: Some(req.url.clone()),
                 title: Some("Example".into()),
+                structured_output: None,
             })
         }
 
@@ -761,6 +957,7 @@ mod tests {
                 detail: action.name().into(),
                 url: None,
                 title: None,
+                structured_output: self.state.lock().expect("state").structured_output.clone(),
             })
         }
 
@@ -1376,7 +1573,7 @@ mod tests {
             .act(
                 &key("s"),
                 &opts(),
-                &BrowserAction::Eval { script: "1".into() },
+                &BrowserAction::eval_raw("1"),
             )
             .await
             .unwrap_err();
@@ -1499,7 +1696,7 @@ mod tests {
                 target: css(),
                 value: "1".into(),
             },
-            BrowserAction::Eval { script: "1".into() },
+            BrowserAction::eval_raw("1"),
         ] {
             assert_eq!(retry_class_for_action(&action), BrowserRetryClass::Mutating);
             assert!(!operation_is_retryable(&RuntimeOp::Act(action.clone())));
@@ -1533,6 +1730,10 @@ mod tests {
             (BrowserErrorKind::NotConnected, "BrowserDaemonUnavailable"),
             (BrowserErrorKind::Timeout, "BrowserCommandTimeout"),
             (BrowserErrorKind::Rejected, "BrowserUrlRejected"),
+            (
+                BrowserErrorKind::InvalidStructuredOutput,
+                "BrowserStructuredOutputInvalid",
+            ),
             (BrowserErrorKind::StaleReference, "BrowserCommandFailed"),
         ];
         for (kind, prefix) in cases {
@@ -1543,6 +1744,238 @@ mod tests {
         let presented = present_backend_error(&stale);
         assert_eq!(presented, BROWSER_STALE_REFERENCE_DETAIL);
         assert!(presented.contains("snapshot again"));
+    }
+
+    #[tokio::test]
+    async fn extract_json_parses_object_array_and_json_scalars_once() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let key = BrowserSessionKey::new("extract-session").unwrap();
+        let opts = BrowserSessionOptions::default();
+
+        for (value, expected) in [
+            (
+                json!({"name":"Alpha","price":12.5}),
+                json!({"name": "Alpha", "price": 12.5}),
+            ),
+            (
+                json!([{"name":"A"},{"name":"B"}]),
+                json!([{"name": "A"}, {"name": "B"}]),
+            ),
+            (json!("text"), json!("text")),
+            (json!(42), json!(42)),
+            (json!(true), json!(true)),
+            (Value::Null, Value::Null),
+        ] {
+            backend.set_structured_output(Some(value));
+            let result = rt
+                .extract_json(
+                    &key,
+                    &opts,
+                    &BrowserExtractRequest {
+                        expression: "window.__fixture".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.value, expected);
+            assert!(!result.truncated);
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_json_does_not_reparse_json_strings_or_require_stringify() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let key = BrowserSessionKey::new("invalid-extract").unwrap();
+        let opts = BrowserSessionOptions::default();
+
+        backend.set_structured_output(None);
+        let err = rt
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "undefined".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::InvalidStructuredOutput);
+        assert!(!err.retryable);
+
+        backend.set_structured_output(Some(json!("not json")));
+        let text = rt
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "'not json'".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(text.value, json!("not json"));
+
+        backend.set_structured_output(Some(json!(r#"{"nested":true}"#)));
+        let once = rt
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "'{\"nested\":true}'".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(once.value, json!(r#"{"nested":true}"#));
+    }
+
+    #[tokio::test]
+    async fn extract_json_recursively_redacts_strings_without_retyping_values() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.set_structured_output(Some(json!({
+            "token": "api_key=SUPERSECRET",
+            "nested": {"password": "password=hunter2"},
+            "number": 12.5,
+            "enabled": true,
+            "nothing": null
+        })));
+        let result = runtime(backend)
+            .extract_json(
+                &BrowserSessionKey::new("redact-extract").unwrap(),
+                &BrowserSessionOptions::default(),
+                &BrowserExtractRequest {
+                    expression: "window.__fixture".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let rendered = serde_json::to_string(&result.value).unwrap();
+        assert!(!rendered.contains("SUPERSECRET"));
+        assert!(!rendered.contains("hunter2"));
+        assert_eq!(result.value["number"], json!(12.5));
+        assert_eq!(result.value["enabled"], json!(true));
+        assert_eq!(result.value["nothing"], Value::Null);
+        assert!(result.value.get("token").is_some());
+        assert!(result.value["nested"].get("password").is_some());
+    }
+
+    #[tokio::test]
+    async fn extract_json_bounds_depth_breadth_unicode_and_total_size_as_valid_json() {
+        let mut deep = json!("leaf");
+        for _ in 0..(BROWSER_MAX_JSON_DEPTH + 8) {
+            deep = json!({"child": deep});
+        }
+        let huge_array: Vec<Value> = (0..(BROWSER_MAX_JSON_ARRAY_ITEMS + 40))
+            .map(|index| json!({"index": index, "label": "商品🚀".repeat(40)}))
+            .collect();
+        let mut huge_object = Map::new();
+        for index in 0..(BROWSER_MAX_JSON_OBJECT_FIELDS + 40) {
+            huge_object.insert(format!("field-{index}"), json!(index));
+        }
+        let fixture = json!({
+            "deep": deep,
+            "array": huge_array,
+            "object": huge_object,
+            "unicode": "你好🚀".repeat(BROWSER_MAX_JSON_STRING_CHARS)
+        });
+        let backend = Arc::new(FakeBackend::new());
+        backend.set_structured_output(Some(fixture));
+        let result = runtime(backend)
+            .extract_json(
+                &BrowserSessionKey::new("bounded-extract").unwrap(),
+                &BrowserSessionOptions::default(),
+                &BrowserExtractRequest {
+                    expression: "window.__fixture".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+        let encoded = serde_json::to_string(&result.value).unwrap();
+        assert!(encoded.chars().count() <= BROWSER_MAX_SERIALIZED_JSON_CHARS);
+        assert!(serde_json::from_str::<Value>(&encoded).is_ok());
+        assert!(std::str::from_utf8(encoded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn structured_limits_bound_array_object_and_key_collisions_without_overwrite() {
+        let array = Value::Array(
+            (0..(BROWSER_MAX_JSON_ARRAY_ITEMS + 10))
+                .map(|index| json!(index))
+                .collect(),
+        );
+        let array = bound_structured_json(array);
+        assert!(array.truncated);
+        assert_eq!(
+            array.value.as_array().unwrap().len(),
+            BROWSER_MAX_JSON_ARRAY_ITEMS
+        );
+
+        let mut fields = Map::new();
+        for index in 0..(BROWSER_MAX_JSON_OBJECT_FIELDS + 10) {
+            fields.insert(format!("k{index}"), json!(index));
+        }
+        let object = bound_structured_json(Value::Object(fields));
+        assert!(object.truncated);
+        assert_eq!(
+            object.value.as_object().unwrap().len(),
+            BROWSER_MAX_JSON_OBJECT_FIELDS
+        );
+
+        let prefix = "x".repeat(BROWSER_MAX_JSON_KEY_CHARS);
+        let mut colliding_fields = Map::new();
+        colliding_fields.insert(format!("{prefix}A"), json!(1));
+        colliding_fields.insert(format!("{prefix}B"), json!(2));
+        let collision = bound_structured_json(Value::Object(colliding_fields));
+        assert!(collision.truncated);
+        assert_eq!(collision.value.as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_json_is_mutating_and_never_blind_retried() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::NotConnected, 3);
+        let err = runtime(backend.clone())
+            .extract_json(
+                &BrowserSessionKey::new("extract-no-retry").unwrap(),
+                &BrowserSessionOptions::default(),
+                &BrowserExtractRequest {
+                    expression: "{sideEffect:true}".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::NotConnected);
+        assert_eq!(backend.call_count(CallKind::Act), 1);
+        assert_eq!(
+            retry_class_for_action(&BrowserAction::eval_structured_json("{sideEffect:true}")),
+            BrowserRetryClass::Mutating
+        );
+        assert_eq!(
+            retry_class_for_action(&BrowserAction::eval_raw("1")),
+            BrowserRetryClass::Mutating
+        );
+    }
+
+    #[tokio::test]
+    async fn source_too_large_is_not_runtime_truncation_and_is_not_retried() {
+        let backend = Arc::new(FakeBackend::new());
+        backend.fail_next(CallKind::Act, BrowserErrorKind::CommandFailed, 3);
+        let err = runtime(backend.clone())
+            .extract_json(
+                &BrowserSessionKey::new("extract-too-large").unwrap(),
+                &BrowserSessionOptions::default(),
+                &BrowserExtractRequest {
+                    expression: "'X'.repeat(5000000)".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::CommandFailed);
+        assert_ne!(err.kind, BrowserErrorKind::InvalidStructuredOutput);
+        assert_eq!(backend.call_count(CallKind::Act), 1);
     }
 
     #[test]

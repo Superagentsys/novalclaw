@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use serde_json::Value;
+
 /// Logical OmniNova Browser session identity (Chat / Agent → Runtime).
 ///
 /// Distinct from [`BackendSessionHandle`]: this is OmniNova's stable
@@ -29,6 +31,11 @@ pub const BROWSER_SESSION_RESERVED_DEFAULT_DETAIL: &str =
 /// [`BrowserErrorKind::StaleReference`]; the prefix stays `BrowserCommandFailed`.
 pub const BROWSER_STALE_REFERENCE_DETAIL: &str =
     "BrowserCommandFailed: element reference is stale or unavailable; run snapshot again before retrying";
+
+/// Model-facing source-bound extract failure. Internal kind stays
+/// [`BrowserErrorKind::CommandFailed`]; not retryable.
+pub const BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL: &str =
+    "BrowserCommandFailed: structured extract result exceeds source limit; narrow the extraction expression";
 
 impl BrowserSessionKey {
     pub fn new(value: impl Into<String>) -> Result<Self, BrowserTypeError> {
@@ -224,6 +231,7 @@ pub enum BrowserAction {
     },
     Eval {
         script: String,
+        mode: BrowserEvalMode,
     },
     Wait {
         timeout_ms: Option<u64>,
@@ -235,7 +243,38 @@ pub enum BrowserAction {
     Reload,
 }
 
+/// Distinguishes V1 `action=eval` from internal structured extract.
+///
+/// Tool schema does not expose this field. [`Self::Raw`] preserves current
+/// model-visible eval text. [`Self::StructuredJson`] is a backend-neutral
+/// extract mode; vendor serialization lives in the backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserEvalMode {
+    Raw,
+    StructuredJson,
+}
+
+impl Default for BrowserEvalMode {
+    fn default() -> Self {
+        Self::Raw
+    }
+}
+
 impl BrowserAction {
+    pub fn eval_raw(script: impl Into<String>) -> Self {
+        Self::Eval {
+            script: script.into(),
+            mode: BrowserEvalMode::Raw,
+        }
+    }
+
+    pub fn eval_structured_json(script: impl Into<String>) -> Self {
+        Self::Eval {
+            script: script.into(),
+            mode: BrowserEvalMode::StructuredJson,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Click { .. } => "click",
@@ -392,11 +431,45 @@ pub struct BrowserElement {
     pub interactive: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BrowserActionResult {
     pub detail: String,
     pub url: Option<String>,
     pub title: Option<String>,
+    /// Backend-neutral internal result payload. It is never appended to
+    /// `detail` automatically and therefore is not model-visible.
+    pub structured_output: Option<Value>,
+}
+
+impl fmt::Debug for BrowserActionResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrowserActionResult")
+            .field("detail", &self.detail)
+            .field("url", &self.url)
+            .field("title", &self.title)
+            .field(
+                "structured_output_present",
+                &self.structured_output.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// Deterministic structured extraction from the current browser page.
+///
+/// `expression` is a JavaScript expression that evaluates to a
+/// JSON-compatible value (object, array, string, number, bool, or null).
+/// Callers must not wrap it in `JSON.stringify`; the backend serializes.
+/// Same mutating-risk class as [`BrowserAction::Eval`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserExtractRequest {
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserExtractResult {
+    pub value: Value,
+    pub truncated: bool,
 }
 
 /// Backend-independent screenshot locator. Not a multimodal image payload.
@@ -504,6 +577,8 @@ pub enum BrowserErrorKind {
     Timeout,
     Rejected,
     CommandFailed,
+    /// Structured extract did not yield a JSON-compatible payload.
+    InvalidStructuredOutput,
     /// Observation-scoped element handle is no longer valid. Session may
     /// still be healthy. Not retryable; caller must re-observe.
     StaleReference,
@@ -668,6 +743,19 @@ mod tests {
     }
 
     #[test]
+    fn action_result_debug_does_not_expose_internal_structured_output() {
+        let result = BrowserActionResult {
+            detail: "eval complete".into(),
+            url: None,
+            title: None,
+            structured_output: Some(serde_json::json!({"secret": "DO_NOT_LOG"})),
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("structured_output_present: true"));
+        assert!(!debug.contains("DO_NOT_LOG"));
+    }
+
+    #[test]
     fn element_ref_does_not_require_en_prefix() {
         let by_css_handle =
             BrowserElementRef::new(BrowserBackendId::personal_chrome(), "ext:node:按钮-日本語");
@@ -710,9 +798,7 @@ mod tests {
             BrowserAction::Hover {
                 target: sample_css(),
             },
-            BrowserAction::Eval {
-                script: "1+1".into(),
-            },
+            BrowserAction::eval_raw("1+1"),
             BrowserAction::Wait {
                 timeout_ms: Some(1000),
                 text: None,
@@ -880,7 +966,7 @@ mod tests {
         assert!(caps.supports_action(&BrowserAction::Click {
             target: sample_css(),
         }));
-        assert!(caps.supports_action(&BrowserAction::Eval { script: "1".into() }));
+        assert!(caps.supports_action(&BrowserAction::eval_raw("1")));
         assert!(caps.supports_observation(&BrowserObserveKind::Url));
         assert!(caps.supports_observation(&BrowserObserveKind::Snapshot));
         let observe_only = BackendCapabilities {
@@ -928,12 +1014,33 @@ mod tests {
         }
         assert!(!BrowserErrorKind::BinaryMissing.default_retryable());
         assert!(!BrowserErrorKind::Rejected.default_retryable());
+        assert!(!BrowserErrorKind::InvalidStructuredOutput.default_retryable());
         assert!(!BrowserErrorKind::StaleReference.default_retryable());
         assert!(BrowserErrorKind::Timeout.default_retryable());
         assert!(BrowserErrorKind::Crashed.default_retryable());
         assert_ne!(
             BrowserErrorKind::StaleReference,
             BrowserErrorKind::SessionNotFound
+        );
+    }
+
+    #[test]
+    fn eval_mode_does_not_change_action_name() {
+        assert_eq!(BrowserAction::eval_raw("1+1").name(), "eval");
+        assert_eq!(BrowserAction::eval_structured_json("{a:1}").name(), "eval");
+        assert_eq!(
+            BrowserAction::eval_raw("1"),
+            BrowserAction::Eval {
+                script: "1".into(),
+                mode: BrowserEvalMode::Raw,
+            }
+        );
+        assert_eq!(
+            BrowserAction::eval_structured_json("1"),
+            BrowserAction::Eval {
+                script: "1".into(),
+                mode: BrowserEvalMode::StructuredJson,
+            }
         );
     }
 

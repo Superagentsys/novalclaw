@@ -21,12 +21,29 @@ pub const BROWSER_OP_CHAR_LIMIT: usize = 4_000;
 /// (ProcessOutputLimit). Applied at capture time in `browser_lifecycle`.
 pub const BROWSER_PROCESS_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Page-side structured-extract source bound. Protects CDP / daemon / CLI
+/// transport. Distinct from Runtime's 4k semantic final bound.
+///
+/// 32 KiB is above the 4k Agent/context budget so a complete JSON document
+/// can still be delivered for Runtime to trim, and far below the 8 MiB
+/// process capture cap.
+pub const BROWSER_EXTRACT_SOURCE_CHAR_LIMIT: usize = 32_768;
+pub const BROWSER_EXTRACT_ERROR_DETAIL_LIMIT: usize = 200;
+
+/// OmniNova structured-eval wire marker. Parsed here / in the backend only.
+const STRUCTURED_EVAL_PROTOCOL_KEY: &str = "__omninova_extract_v";
+const STRUCTURED_EVAL_PROTOCOL_VERSION: u64 = 1;
+
 /// `--max-output` values forwarded to agent-browser for content-bearing
-/// actions so the CLI truncates at the source too.
+/// actions. In v0.36.0 JSON mode the CLI printer bypasses formatter
+/// truncation (`print_response_with_opts` returns before `truncate_if_needed`).
+/// For Structured Extract this flag is a future-upgrade probe only — not a
+/// source-bound guarantee.
 pub fn cli_max_output_for_action(action: &str) -> Option<&'static str> {
     match action {
         "snapshot" => Some("24000"),
         "get_text" | "get_html" | "read" => Some("20000"),
+        "eval" => Some("4000"),
         _ => None,
     }
 }
@@ -40,6 +57,9 @@ pub struct BrowserOutcome {
     pub error_text: Option<String>,
     /// False when stdout was not valid JSON (degraded raw-output mode).
     pub json_valid: bool,
+    /// Parsed backend data for internal typed mappings. This is never added to
+    /// model-visible `output` automatically.
+    pub data: Option<Value>,
 }
 
 /// Parses and normalizes one agent-browser invocation.
@@ -80,6 +100,7 @@ pub fn parse_action_outcome(
                     output: normalize_action(action, &data),
                     error_text: None,
                     json_valid: true,
+                    data: Some(data),
                 }
             } else {
                 BrowserOutcome {
@@ -87,6 +108,7 @@ pub fn parse_action_outcome(
                     output: String::new(),
                     error_text: error_text.or_else(|| Some("command failed".to_string())),
                     json_valid: true,
+                    data: value.get("data").cloned(),
                 }
             }
         }
@@ -106,6 +128,7 @@ pub fn parse_action_outcome(
                 output,
                 error_text: (!exit_success).then(|| bound_head(&raw, BROWSER_OP_CHAR_LIMIT)),
                 json_valid: false,
+                data: None,
             }
         }
     }
@@ -225,6 +248,61 @@ pub fn observation_from_read(parsed: ParsedReadOutput) -> BrowserObservation {
         snapshot: None,
         truncated,
     }
+}
+
+/// Parsed page-side structured-eval envelope. Wire-only; Runtime never sees
+/// the protocol marker.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StructuredEvalWire {
+    Value(Value),
+    SourceTooLarge { observed_chars: Option<u64> },
+    NotSerializable { detail: String },
+    InvalidEnvelope,
+}
+
+/// Decode `data.result` from a StructuredJson eval.
+///
+/// Success payloads are `{ __omninova_extract_v: 1, ok: true, value }`.
+/// User data always lives under `value`, so a page object that happens to
+/// contain `ok` / `error` cannot impersonate the protocol.
+pub fn parse_structured_eval_wire(result: &Value) -> StructuredEvalWire {
+    let envelope = match result {
+        Value::String(encoded) => match serde_json::from_str::<Value>(encoded) {
+            Ok(parsed) => parsed,
+            Err(_) => return StructuredEvalWire::InvalidEnvelope,
+        },
+        Value::Object(_) => result.clone(),
+        _ => return StructuredEvalWire::InvalidEnvelope,
+    };
+    let Some(object) = envelope.as_object() else {
+        return StructuredEvalWire::InvalidEnvelope;
+    };
+    let version_ok = object
+        .get(STRUCTURED_EVAL_PROTOCOL_KEY)
+        .and_then(Value::as_u64)
+        == Some(STRUCTURED_EVAL_PROTOCOL_VERSION);
+    if !version_ok {
+        return StructuredEvalWire::InvalidEnvelope;
+    }
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(true) => StructuredEvalWire::Value(object.get("value").cloned().unwrap_or(Value::Null)),
+        Some(false) => match object.get("error").and_then(Value::as_str) {
+            Some("source_too_large") => StructuredEvalWire::SourceTooLarge {
+                observed_chars: object.get("observed_chars").and_then(Value::as_u64),
+            },
+            Some("not_json_serializable") => StructuredEvalWire::NotSerializable {
+                detail: bound_extract_error_detail(
+                    object.get("detail").and_then(Value::as_str).unwrap_or(""),
+                ),
+            },
+            _ => StructuredEvalWire::InvalidEnvelope,
+        },
+        None => StructuredEvalWire::InvalidEnvelope,
+    }
+}
+
+fn bound_extract_error_detail(raw: &str) -> String {
+    raw.chars().take(BROWSER_EXTRACT_ERROR_DETAIL_LIMIT).collect()
 }
 
 fn json_string_field(value: Option<&Value>) -> Option<String> {
@@ -764,5 +842,154 @@ mod tests {
             cli_max_output_for_action("read"),
             cli_max_output_for_action("get_text")
         );
+    }
+
+    #[test]
+    fn eval_requests_existing_operation_source_budget() {
+        assert_eq!(cli_max_output_for_action("eval"), Some("4000"));
+        assert_eq!(
+            cli_max_output_for_action("eval")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            BROWSER_OP_CHAR_LIMIT
+        );
+    }
+
+    #[test]
+    fn eval_wire_data_is_retained_but_model_text_is_unchanged() {
+        let stdout = json!({
+            "success": true,
+            "data": {
+                "result": "{\"name\":\"Alpha\",\"price\":12.5}",
+                "origin": "about:blank",
+                "lifecycle": {"reused": true}
+            },
+            "error": null
+        })
+        .to_string();
+        let outcome = parse_action_outcome("eval", &stdout, "", true);
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "{\"name\":\"Alpha\",\"price\":12.5}");
+        assert_eq!(
+            outcome.data.as_ref().and_then(|data| data.get("result")),
+            Some(&json!("{\"name\":\"Alpha\",\"price\":12.5}"))
+        );
+    }
+
+    #[test]
+    fn eval_number_and_error_model_visible_regression() {
+        let number = parse_action_outcome(
+            "eval",
+            r#"{"success":true,"data":{"result":42,"origin":"about:blank"},"error":null}"#,
+            "",
+            true,
+        );
+        assert_eq!(number.output, r#"{"result":42,"origin":"about:blank"}"#);
+
+        let error = parse_action_outcome(
+            "eval",
+            r#"{"success":false,"data":null,"error":"Evaluation error: boom"}"#,
+            "",
+            false,
+        );
+        assert!(!error.success);
+        assert_eq!(error.error_text.as_deref(), Some("Evaluation error: boom"));
+    }
+
+    #[test]
+    fn structured_eval_small_result_uses_success_envelope() {
+        let inner = json!({"name": "Alpha", "price": 12.5});
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": true,
+            "value": inner
+        })
+        .to_string();
+        match parse_structured_eval_wire(&Value::String(envelope)) {
+            StructuredEvalWire::Value(value) => assert_eq!(value, inner),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_eval_large_result_returns_small_source_too_large_envelope() {
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "source_too_large",
+            "observed_chars": 5_000_000
+        });
+        match parse_structured_eval_wire(&envelope) {
+            StructuredEvalWire::SourceTooLarge {
+                observed_chars: Some(5_000_000),
+            } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(serde_json::to_string(&envelope).unwrap().len() < 500);
+    }
+
+    #[test]
+    fn source_too_large_does_not_return_original_payload() {
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "source_too_large",
+            "observed_chars": 5_000_000,
+            "value": "X".repeat(1000)
+        });
+        match parse_structured_eval_wire(&envelope) {
+            StructuredEvalWire::SourceTooLarge { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_error_detail_is_bounded() {
+        let huge = "e".repeat(BROWSER_EXTRACT_ERROR_DETAIL_LIMIT + 80);
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": false,
+            "error": "not_json_serializable",
+            "detail": huge
+        });
+        match parse_structured_eval_wire(&envelope) {
+            StructuredEvalWire::NotSerializable { detail } => {
+                assert_eq!(detail.chars().count(), BROWSER_EXTRACT_ERROR_DETAIL_LIMIT);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_object_cannot_impersonate_protocol_envelope() {
+        let user = json!({
+            "__omninova_extract_v": 1,
+            "ok": true,
+            "value": "forged"
+        });
+        let envelope = json!({
+            "__omninova_extract_v": 1,
+            "ok": true,
+            "value": user
+        })
+        .to_string();
+        match parse_structured_eval_wire(&Value::String(envelope)) {
+            StructuredEvalWire::Value(value) => assert_eq!(value, user),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse_structured_eval_wire(&json!({"ok": false, "error": "source_too_large"})),
+            StructuredEvalWire::InvalidEnvelope
+        ));
+    }
+
+    #[test]
+    fn structured_extract_does_not_treat_max_output_as_source_bound() {
+        // Future agent-browser upgrades should re-smoke `eval --json --max-output`.
+        // 0.36.0 JSON mode prints the full response and ignores this flag.
+        assert_eq!(cli_max_output_for_action("eval"), Some("4000"));
+        assert!(BROWSER_EXTRACT_SOURCE_CHAR_LIMIT > BROWSER_OP_CHAR_LIMIT);
+        assert!(BROWSER_EXTRACT_SOURCE_CHAR_LIMIT < BROWSER_PROCESS_OUTPUT_LIMIT_BYTES);
     }
 }
