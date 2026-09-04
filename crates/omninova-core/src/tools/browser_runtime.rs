@@ -8,15 +8,22 @@ use crate::tools::browser_output::{
 };
 use crate::tools::browser_types::{
     BackendAvailability, BackendSessionHandle, BrowserAction, BrowserActionResult,
-    BrowserBackendError, BrowserBackendId, BrowserErrorKind, BrowserHealth, BrowserObservation,
-    BrowserObserveKind, BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions,
-    BrowserSnapshot, BrowserTab, NavigateRequest, ObserveRequest, ScreenshotRequest,
-    ScreenshotResult,
+    BrowserBackendError, BrowserBackendId, BrowserElement, BrowserErrorKind, BrowserHealth,
+    BrowserObservation, BrowserObserveKind, BrowserSessionKey, BrowserSessionOpenRequest,
+    BrowserSessionOptions, BrowserSnapshot, BrowserTab, NavigateRequest, ObserveRequest,
+    ScreenshotRequest, ScreenshotResult,
 };
-use crate::tools::text_bound::bound_head;
+use crate::tools::text_bound::{bound_head, truncate_head_chars};
 use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
-use std::sync::Arc;
+use regex::Regex;
+use std::sync::{Arc, OnceLock};
 use url::Url;
+
+/// Independent of snapshot text (24k). Caps malicious pages that emit huge
+/// structured element maps. Does not change model-visible snapshot text.
+pub const BROWSER_MAX_STRUCTURED_ELEMENTS: usize = 512;
+pub const BROWSER_MAX_ELEMENT_ROLE_CHARS: usize = 64;
+pub const BROWSER_MAX_ELEMENT_NAME_CHARS: usize = 512;
 
 /// Backend-independent runtime limits and allowlist. Vendor launch flags are
 /// not stored here; they travel on [`BrowserSessionOptions`].
@@ -28,6 +35,9 @@ pub struct BrowserRuntimePolicy {
     pub operation_char_limit: usize,
     /// V1 recover-once: at most one automatic recovery per operation.
     pub max_recovery_attempts: u8,
+    pub max_structured_elements: usize,
+    pub max_element_role_chars: usize,
+    pub max_element_name_chars: usize,
 }
 
 impl Default for BrowserRuntimePolicy {
@@ -38,6 +48,9 @@ impl Default for BrowserRuntimePolicy {
             text_char_limit: BROWSER_TEXT_CHAR_LIMIT,
             operation_char_limit: BROWSER_OP_CHAR_LIMIT,
             max_recovery_attempts: 1,
+            max_structured_elements: BROWSER_MAX_STRUCTURED_ELEMENTS,
+            max_element_role_chars: BROWSER_MAX_ELEMENT_ROLE_CHARS,
+            max_element_name_chars: BROWSER_MAX_ELEMENT_NAME_CHARS,
         }
     }
 }
@@ -343,7 +356,7 @@ impl BrowserRuntime {
                 &redact_secrets_in_text(&snap.text),
                 self.policy.snapshot_char_limit,
             ),
-            elements: snap.elements,
+            elements: self.budget_snapshot_elements(snap.elements),
         });
         BrowserObservation {
             url,
@@ -352,6 +365,43 @@ impl BrowserRuntime {
             snapshot,
         }
     }
+
+    fn budget_snapshot_elements(&self, elements: Vec<BrowserElement>) -> Vec<BrowserElement> {
+        elements
+            .into_iter()
+            .take(self.policy.max_structured_elements)
+            .map(|element| BrowserElement {
+                reference: element.reference,
+                role: element.role.map(|role| {
+                    self.bound_untrusted_element_field(&role, self.policy.max_element_role_chars)
+                }),
+                name: element.name.map(|name| {
+                    self.bound_untrusted_element_field(&name, self.policy.max_element_name_chars)
+                }),
+                interactive: element.interactive,
+            })
+            .collect()
+    }
+
+    fn bound_untrusted_element_field(&self, text: &str, max_chars: usize) -> String {
+        let sanitized = sanitize_untrusted_web_field(text);
+        truncate_head_chars(&sanitized, max_chars).0
+    }
+}
+
+/// `role` / `name` are page-controlled. Redact credential-like spans and URL
+/// userinfo. Never applied to element reference values.
+fn sanitize_untrusted_web_field(text: &str) -> String {
+    redact_credential_assignments(&redact_secrets_in_text(text))
+}
+
+fn redact_credential_assignments(text: &str) -> String {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\b(api[_-]?key|password|passwd|authorization|secret|token)\s*[:=]\s*\S+")
+            .expect("credential assignment pattern")
+    });
+    pattern.replace_all(text, "$1=***").into_owned()
 }
 
 /// Shared with V1 `BrowserTool`: http(s) only; bare hosts become https.
@@ -1058,6 +1108,76 @@ mod tests {
         assert_eq!(snap.elements.len(), 2);
         assert_eq!(snap.elements[0].name, snap.elements[1].name);
         assert_ne!(snap.elements[0].reference, snap.elements[1].reference);
+    }
+
+    #[tokio::test]
+    async fn structured_element_fields_are_redacted_bounded_and_refs_untouched() {
+        let backend = Arc::new(FakeBackend::new());
+        let backend_id = BrowserBackendId::new("fake");
+        let long_name = "你好🌍".repeat(40);
+        backend.set_observation(BrowserObservation {
+            url: Some("https://example.com/".into()),
+            title: Some("t".into()),
+            text: Some("snapshot-text-must-survive".into()),
+            snapshot: Some(BrowserSnapshot {
+                text: "snapshot-text-must-survive".into(),
+                elements: vec![
+                    BrowserElement {
+                        reference: BrowserElementRef::new(backend_id.clone(), "e123"),
+                        role: Some("button".into()),
+                        name: Some("api_key=SECRET_TOKEN_VALUE".into()),
+                        interactive: false,
+                    },
+                    BrowserElement {
+                        reference: BrowserElementRef::new(backend_id.clone(), "e124"),
+                        role: Some("heading".into()),
+                        name: Some(long_name),
+                        interactive: false,
+                    },
+                    BrowserElement {
+                        reference: BrowserElementRef::new(backend_id, "e125"),
+                        role: Some("link".into()),
+                        name: Some("Keep me".into()),
+                        interactive: true,
+                    },
+                ],
+            }),
+        });
+        let mut policy = BrowserRuntimePolicy::default();
+        policy.max_structured_elements = 2;
+        policy.max_element_name_chars = 12;
+        policy.max_element_role_chars = 16;
+        let snapshot_text_before = "snapshot-text-must-survive".to_string();
+        let rt = BrowserRuntime::new(backend.clone(), policy);
+        let obs = rt
+            .observe(&key("s"), &opts(), &ObserveRequest::snapshot())
+            .await
+            .unwrap();
+        assert_eq!(obs.text.as_deref(), Some(snapshot_text_before.as_str()));
+        let snap = obs.snapshot.unwrap();
+        assert_eq!(snap.text, "snapshot-text-must-survive");
+        assert_eq!(snap.elements.len(), 2);
+        assert_eq!(snap.elements[0].reference.as_str(), "e123");
+        assert_eq!(snap.elements[1].reference.as_str(), "e124");
+        let secret_name = snap.elements[0].name.as_deref().unwrap();
+        assert!(!secret_name.contains("SECRET_TOKEN_VALUE"));
+        assert!(secret_name.contains("***"));
+        let unicode_name = snap.elements[1].name.as_deref().unwrap();
+        assert!(unicode_name.is_char_boundary(unicode_name.len()));
+        assert_eq!(unicode_name.chars().count(), 12);
+        assert!(!unicode_name.contains("Keep me"));
+        let clicked = rt
+            .act(
+                &key("s"),
+                &opts(),
+                &BrowserAction::Click {
+                    target: BrowserTarget::Element(snap.elements[0].reference.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(clicked.detail, "click");
+        assert_eq!(backend.call_count(CallKind::Act), 1);
     }
 
     #[tokio::test]

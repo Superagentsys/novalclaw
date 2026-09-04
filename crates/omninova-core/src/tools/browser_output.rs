@@ -110,6 +110,93 @@ pub fn parse_action_outcome(
     }
 }
 
+/// Backend-internal agent-browser 0.36.0 `data.refs` entry.
+///
+/// Only `role` and `name` are read from the object. Unknown fields are ignored.
+/// Missing fields degrade to `None`. The JSON object key is the opaque ref id
+/// (`e8`), not a rewritten `@eN` token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawSnapshotRef {
+    pub id: String,
+    pub role: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Extract `data.refs` from raw snapshot `--json` stdout.
+///
+/// Does not parse snapshot text or `[ref=eN]` markers. JSON object order is
+/// preserved (`serde_json` `preserve_order`). `Ok(vec![])` when `data.refs` is
+/// absent or null. `Err` when stdout is not JSON or `refs` is the wrong shape.
+pub fn parse_snapshot_refs(raw_json: &str) -> Result<Vec<RawSnapshotRef>, &'static str> {
+    let trimmed = raw_json.trim();
+    if trimmed.is_empty() {
+        return Err("empty snapshot json");
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|_| "snapshot stdout is not valid JSON")?;
+    let Some(data) = value.get("data") else {
+        return Ok(Vec::new());
+    };
+    match data.get("refs") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(refs) => {
+            let obj = refs.as_object().ok_or("data.refs is not a JSON object")?;
+            let mut out = Vec::with_capacity(obj.len());
+            for (id, entry) in obj {
+                if id.is_empty() {
+                    continue;
+                }
+                let Some(fields) = entry.as_object() else {
+                    continue;
+                };
+                out.push(RawSnapshotRef {
+                    id: id.clone(),
+                    role: json_string_field(fields.get("role")),
+                    name: json_string_field(fields.get("name")),
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn json_string_field(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_string)
+}
+
+/// Compact agent-browser 0.36.0 `snapshot --json` stdout used by structured
+/// observation tests. Names and roles match the audited CLI shape; extra
+/// fields on ref objects must be ignored.
+#[cfg(test)]
+pub(crate) fn agent_browser_0_36_snapshot_stdout() -> String {
+    use serde_json::json;
+    json!({
+        "success": true,
+        "data": {
+            "origin": "https://example.com/",
+            "snapshot": "- heading \"Example\" [ref=e1]\n- checkbox \" Remember me\" [ref=e6]\n- button \"Submit\" [ref=e8]\n- button \"Submit\" [ref=e9]\n- textbox \"Card number\" [ref=e13]\n- button \"Pay\" [ref=e14]",
+            "refs": {
+                "e1": {"name": "Example", "role": "heading"},
+                "e6": {"name": " Remember me", "role": "checkbox"},
+                "e8": {"name": "Submit", "role": "button"},
+                "e9": {"name": "Submit", "role": "button"},
+                "e13": {"name": "Card number", "role": "textbox"},
+                "e14": {
+                    "name": "Pay",
+                    "role": "button",
+                    "href": "https://pay.example/",
+                    "checked": false,
+                    "selector": "#pay",
+                    "frame": "iframe#checkout",
+                    "backendNodeId": 99
+                }
+            }
+        },
+        "error": null
+    })
+    .to_string()
+}
+
 fn wrap_web_content(body: &str) -> String {
     format!("--- BEGIN WEB CONTENT ---\n{body}\n--- END WEB CONTENT ---")
 }
@@ -403,5 +490,88 @@ mod tests {
         let stdout = r#"{"success":true,"data":{"path":"C:\\tmp\\shot.png"},"error":null}"#;
         let outcome = parse_action_outcome("screenshot", stdout, "", true);
         assert_eq!(outcome.output, "Screenshot saved to: C:\\tmp\\shot.png");
+    }
+
+    #[test]
+    fn snapshot_refs_are_extracted_from_raw_json_not_text() {
+        let refs = parse_snapshot_refs(&agent_browser_0_36_snapshot_stdout()).unwrap();
+        assert_eq!(
+            refs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["e1", "e6", "e8", "e9", "e13", "e14"]
+        );
+        assert_eq!(refs[0].role.as_deref(), Some("heading"));
+        assert_eq!(refs[0].name.as_deref(), Some("Example"));
+        assert_eq!(refs[1].role.as_deref(), Some("checkbox"));
+        assert_eq!(refs[1].name.as_deref(), Some(" Remember me"));
+        assert_eq!(refs[2].role.as_deref(), Some("button"));
+        assert_eq!(refs[2].name.as_deref(), Some("Submit"));
+        assert_eq!(refs[3].role.as_deref(), Some("button"));
+        assert_eq!(refs[3].name.as_deref(), Some("Submit"));
+        assert_eq!(refs[2].id, "e8");
+        assert_eq!(refs[3].id, "e9");
+        assert_eq!(refs[4].id, "e13");
+        assert_eq!(refs[4].role.as_deref(), Some("textbox"));
+        assert_eq!(refs[4].name.as_deref(), Some("Card number"));
+        assert_eq!(refs[5].id, "e14");
+        assert_eq!(refs[5].role.as_deref(), Some("button"));
+        assert_eq!(refs[5].name.as_deref(), Some("Pay"));
+    }
+
+    #[test]
+    fn snapshot_text_parity_is_unchanged_when_refs_are_present() {
+        let outcome =
+            parse_action_outcome("snapshot", &agent_browser_0_36_snapshot_stdout(), "", true);
+        assert!(outcome.success);
+        assert!(outcome.output.starts_with("URL: https://example.com/\n\n"));
+        assert!(outcome.output.contains("--- BEGIN WEB CONTENT ---"));
+        assert!(outcome.output.contains("--- END WEB CONTENT ---"));
+        assert!(outcome.output.contains(r#"- heading "Example" [ref=e1]"#));
+        assert!(outcome
+            .output
+            .contains(r#"- checkbox " Remember me" [ref=e6]"#));
+        assert!(outcome.output.contains(r#"- button "Submit" [ref=e8]"#));
+        assert!(outcome.output.contains(r#"- button "Submit" [ref=e9]"#));
+        assert!(outcome
+            .output
+            .contains(r#"- textbox "Card number" [ref=e13]"#));
+        assert!(outcome.output.contains(r#"- button "Pay" [ref=e14]"#));
+        assert!(!outcome.output.contains("backendNodeId"));
+        assert!(!outcome.output.contains("\"refs\""));
+    }
+
+    #[test]
+    fn duplicate_accessible_names_stay_distinct_refs() {
+        let refs = parse_snapshot_refs(&agent_browser_0_36_snapshot_stdout()).unwrap();
+        let submit: Vec<_> = refs
+            .iter()
+            .filter(|r| r.name.as_deref() == Some("Submit"))
+            .collect();
+        assert_eq!(submit.len(), 2);
+        assert_eq!(submit[0].role.as_deref(), submit[1].role.as_deref());
+        assert_ne!(submit[0].id, submit[1].id);
+    }
+
+    #[test]
+    fn missing_refs_yield_empty_vec() {
+        let stdout = r#"{"success":true,"data":{"origin":"https://example.com/","snapshot":"- heading \"Example\" [ref=e1]"},"error":null}"#;
+        let refs = parse_snapshot_refs(stdout).unwrap();
+        assert!(refs.is_empty());
+        let outcome = parse_action_outcome("snapshot", stdout, "", true);
+        assert!(outcome.success);
+        assert!(outcome.output.contains("[ref=e1]"));
+    }
+
+    #[test]
+    fn malformed_refs_are_a_structured_parse_error() {
+        let stdout = r#"{"success":true,"data":{"origin":"https://example.com/","snapshot":"- heading \"Example\" [ref=e1]","refs":["e1"]},"error":null}"#;
+        assert!(parse_snapshot_refs(stdout).is_err());
+        let outcome = parse_action_outcome("snapshot", stdout, "", true);
+        assert!(outcome.success);
+        assert!(outcome.output.contains("[ref=e1]"));
+    }
+
+    #[test]
+    fn invalid_json_is_a_structured_parse_error() {
+        assert!(parse_snapshot_refs("{not-json").is_err());
     }
 }

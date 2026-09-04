@@ -1018,4 +1018,189 @@ mod tests {
 
         let _ = tool.execute(json!({"action": "close"})).await;
     }
+
+    /// Domain-level structured snapshot: `data.refs` → `BrowserElement` → act.
+    /// Ignored by default; run with `--ignored` when Chromium is available.
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_browser_structured_snapshot_elements_and_act() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|req, stream| {
+            let path = req.request_line.split(' ').nth(1).unwrap_or("/");
+            if path.starts_with("/pay") {
+                crate::tools::web_client::tests::write_response(
+                    stream,
+                    "HTTP/1.1 200 OK",
+                    "<html><body>\
+                     <label>Card number <input type=\"text\" name=\"card\"></label>\
+                     <button>Pay</button>\
+                     </body></html>",
+                    &["content-type: text/html".to_string()],
+                );
+            } else {
+                crate::tools::web_client::tests::write_response(
+                    stream,
+                    "HTTP/1.1 200 OK",
+                    "<html><head><title>B32B</title></head><body>\
+                     <h1>Example</h1>\
+                     <label><input type=\"checkbox\"> Remember me</label>\
+                     <button>Submit</button>\
+                     <button>Submit</button>\
+                     <iframe src=\"/pay\" title=\"checkout\"></iframe>\
+                     </body></html>",
+                    &["content-type: text/html".to_string()],
+                );
+            }
+        });
+
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b32b-{}", uuid::Uuid::new_v4())).unwrap();
+        let opts = BrowserSessionOptions::default();
+        let open = runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/page"),
+                },
+            )
+            .await;
+        assert!(open.is_ok(), "open failed: {open:?}");
+        let _ = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Wait {
+                    timeout_ms: Some(800),
+                    text: None,
+                    target: None,
+                },
+            )
+            .await;
+
+        let obs = runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect("snapshot observe");
+        let snap = obs.snapshot.expect("snapshot payload");
+        assert!(
+            !snap.elements.is_empty(),
+            "structured elements must be non-empty; text={}",
+            snap.text
+        );
+        let buttons: Vec<_> = snap
+            .elements
+            .iter()
+            .filter(|el| el.role.as_deref() == Some("button"))
+            .collect();
+        assert!(
+            buttons
+                .iter()
+                .any(|el| el.reference.as_str().starts_with('e')),
+            "button refs should be opaque eN handles: {:?}",
+            buttons
+                .iter()
+                .map(|el| el.reference.as_str())
+                .collect::<Vec<_>>()
+        );
+        let submits: Vec<_> = snap
+            .elements
+            .iter()
+            .filter(|el| {
+                el.role.as_deref() == Some("button")
+                    && el
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.contains("Submit"))
+            })
+            .collect();
+        assert_eq!(
+            submits.len(),
+            2,
+            "two Submit buttons must stay distinct; elements={:?}",
+            snap.elements
+                .iter()
+                .map(|el| (
+                    el.reference.as_str(),
+                    el.role.as_deref(),
+                    el.name.as_deref()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(submits[0].reference, submits[1].reference);
+        assert!(submits.iter().all(|el| el.interactive));
+
+        let clicked = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Click {
+                    target: BrowserTarget::Element(submits[0].reference.clone()),
+                },
+            )
+            .await
+            .expect("click via BrowserElement.reference");
+        assert!(
+            clicked.detail.to_lowercase().contains("click")
+                || clicked.detail.contains('@')
+                || !clicked.detail.is_empty(),
+            "click detail={}",
+            clicked.detail
+        );
+
+        let card = snap
+            .elements
+            .iter()
+            .find(|el| {
+                el.role.as_deref() == Some("textbox")
+                    && el.name.as_deref().is_some_and(|name| name.contains("Card"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "iframe textbox must be a normal element ref; elements={:?}",
+                    snap.elements
+                        .iter()
+                        .map(|el| (
+                            el.reference.as_str(),
+                            el.role.as_deref(),
+                            el.name.as_deref()
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let filled = runtime
+            .act(
+                &key,
+                &opts,
+                &BrowserAction::Fill {
+                    target: BrowserTarget::Element(card.reference.clone()),
+                    value: "4242".into(),
+                },
+            )
+            .await
+            .expect("iframe fill via ordinary element ref");
+        assert!(
+            filled.detail.to_lowercase().contains("fill")
+                || filled.detail.contains('@')
+                || !filled.detail.is_empty(),
+            "fill detail={}",
+            filled.detail
+        );
+
+        let _ = runtime.close_session(&key, &opts).await;
+    }
 }

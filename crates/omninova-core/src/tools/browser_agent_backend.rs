@@ -13,13 +13,16 @@ use crate::tools::browser_lifecycle::{
     remember_owned_browser_session, run_command_with_timeout, BrowserFailureKind, ChildRunError,
     AGENT_BROWSER_NAMESPACE,
 };
-use crate::tools::browser_output::{cli_max_output_for_action, parse_action_outcome};
+use crate::tools::browser_output::{
+    cli_max_output_for_action, parse_action_outcome, parse_snapshot_refs, RawSnapshotRef,
+};
 use crate::tools::browser_types::{
     BackendAvailability, BackendCapabilities, BackendSessionHandle, BrowserAction,
-    BrowserActionResult, BrowserBackendError, BrowserBackendId, BrowserErrorKind, BrowserHealth,
-    BrowserObservation, BrowserObserveKind, BrowserPageId, BrowserSessionKey,
-    BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot, BrowserTab, BrowserTarget,
-    NavigateRequest, ObserveRequest, ScreenshotRequest, ScreenshotResult,
+    BrowserActionResult, BrowserBackendError, BrowserBackendId, BrowserElement, BrowserElementRef,
+    BrowserErrorKind, BrowserHealth, BrowserObservation, BrowserObserveKind, BrowserPageId,
+    BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot,
+    BrowserTab, BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest,
+    ScreenshotResult,
 };
 use crate::tools::configure_background_command;
 use crate::tools::web_client::redact_secrets_in_text;
@@ -152,7 +155,7 @@ impl AgentBrowserBackend {
                         ),
                     ));
                 }
-                Ok(reference.as_str().to_string())
+                Ok(cli_element_arg(reference.as_str()))
             }
             BrowserTarget::Css(selector) => Ok(selector.clone()),
             BrowserTarget::Role { role, name } => {
@@ -391,6 +394,88 @@ fn observation(output: String) -> BrowserObservation {
     }
 }
 
+fn snapshot_observation(
+    backend: BrowserBackendId,
+    output: String,
+    stdout: &str,
+) -> BrowserObservation {
+    BrowserObservation {
+        url: None,
+        title: None,
+        text: Some(output.clone()),
+        snapshot: Some(BrowserSnapshot {
+            text: output,
+            elements: snapshot_elements_from_stdout(backend, stdout),
+        }),
+    }
+}
+
+/// Prefix `@` for agent-browser CLI element args. Runtime never adds or parses `@`.
+/// Stored observe refs are opaque (`e8`); the V1 tool path may already pass `@e8`.
+fn cli_element_arg(value: &str) -> String {
+    if value.starts_with('@') {
+        value.to_string()
+    } else {
+        format!("@{value}")
+    }
+}
+
+/// agent-browser 0.36.0 `INTERACTIVE_ROLES`. Conservative metadata only:
+/// `interactive == false` must not cause Runtime to refuse `BrowserAction`.
+const AGENT_BROWSER_INTERACTIVE_ROLES: &[&str] = &[
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "treeitem",
+    "Iframe",
+];
+
+fn is_agent_browser_interactive_role(role: &str) -> bool {
+    AGENT_BROWSER_INTERACTIVE_ROLES.contains(&role)
+}
+
+fn snapshot_elements_from_stdout(backend: BrowserBackendId, stdout: &str) -> Vec<BrowserElement> {
+    match parse_snapshot_refs(stdout) {
+        Ok(raw) => raw
+            .into_iter()
+            .map(|entry| element_from_raw_ref(backend.clone(), entry))
+            .collect(),
+        Err(reason) => {
+            tracing::debug!(
+                target: "browser",
+                reason,
+                "structured snapshot refs unavailable; continuing with text observation"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn element_from_raw_ref(backend: BrowserBackendId, entry: RawSnapshotRef) -> BrowserElement {
+    BrowserElement {
+        reference: BrowserElementRef::new(backend, entry.id),
+        interactive: entry
+            .role
+            .as_deref()
+            .is_some_and(is_agent_browser_interactive_role),
+        role: entry.role,
+        name: entry.name,
+    }
+}
+
 fn action_result(output: String) -> BrowserActionResult {
     BrowserActionResult {
         detail: output,
@@ -529,11 +614,18 @@ impl BrowserBackend for AgentBrowserBackend {
         req: &ObserveRequest,
     ) -> Result<BrowserObservation, BrowserBackendError> {
         let (v1_action, args) = self.observe_args(req)?;
-        let output = self
+        let result = self
             .run_named(session, &self.defaults, v1_action, &args)
-            .await?
-            .output;
-        Ok(observation(output))
+            .await?;
+        if matches!(req.kind, BrowserObserveKind::Snapshot) {
+            Ok(snapshot_observation(
+                self.id_value(),
+                result.output,
+                &result.stdout,
+            ))
+        } else {
+            Ok(observation(result.output))
+        }
     }
 
     async fn act(
@@ -747,7 +839,8 @@ fn parse_tabs_output(stdout: &str, normalized: &str) -> Vec<BrowserTab> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::browser_types::BrowserElementRef;
+    use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
+    use crate::tools::browser_types::{BrowserElement, BrowserElementRef};
 
     #[test]
     fn session_mapping_is_deterministic() {
@@ -835,6 +928,103 @@ mod tests {
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].url.as_deref(), Some("https://example.com/"));
         assert!(tabs[0].active);
+    }
+
+    #[test]
+    fn structured_refs_map_to_elements_without_merging_duplicates() {
+        let elements = snapshot_elements_from_stdout(
+            BrowserBackendId::agent_browser(),
+            &agent_browser_0_36_snapshot_stdout(),
+        );
+        assert_eq!(elements.len(), 6);
+        assert_eq!(elements[0].reference.as_str(), "e1");
+        assert_eq!(elements[0].role.as_deref(), Some("heading"));
+        assert!(!elements[0].interactive);
+        assert_eq!(elements[1].name.as_deref(), Some(" Remember me"));
+        assert!(elements[1].interactive);
+        let submit: Vec<&BrowserElement> = elements
+            .iter()
+            .filter(|el| el.name.as_deref() == Some("Submit"))
+            .collect();
+        assert_eq!(submit.len(), 2);
+        assert_eq!(submit[0].role.as_deref(), Some("button"));
+        assert_eq!(submit[1].role.as_deref(), Some("button"));
+        assert_ne!(submit[0].reference, submit[1].reference);
+        assert_eq!(submit[0].reference.as_str(), "e8");
+        assert_eq!(submit[1].reference.as_str(), "e9");
+        assert!(submit.iter().all(|el| el.interactive));
+        let iframe_box = elements
+            .iter()
+            .find(|el| el.reference.as_str() == "e13")
+            .expect("iframe textbox");
+        assert_eq!(iframe_box.role.as_deref(), Some("textbox"));
+        assert_eq!(iframe_box.name.as_deref(), Some("Card number"));
+        assert!(iframe_box.interactive);
+        assert_eq!(
+            iframe_box.reference.backend(),
+            &BrowserBackendId::agent_browser()
+        );
+        let pay = elements
+            .iter()
+            .find(|el| el.reference.as_str() == "e14")
+            .expect("iframe pay");
+        assert_eq!(pay.role.as_deref(), Some("button"));
+        assert_eq!(pay.name.as_deref(), Some("Pay"));
+    }
+
+    #[test]
+    fn observe_element_ref_maps_to_cli_at_ref() {
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        let elements = snapshot_elements_from_stdout(
+            backend.id_value(),
+            &agent_browser_0_36_snapshot_stdout(),
+        );
+        let e8 = elements
+            .iter()
+            .find(|el| el.reference.as_str() == "e8")
+            .expect("e8");
+        let cli = backend
+            .target_arg(&BrowserTarget::Element(e8.reference.clone()))
+            .unwrap();
+        assert_eq!(cli, "@e8");
+        let already_prefixed = backend
+            .target_arg(&BrowserTarget::Element(BrowserElementRef::new(
+                backend.id_value(),
+                "@e8",
+            )))
+            .unwrap();
+        assert_eq!(already_prefixed, "@e8");
+    }
+
+    #[test]
+    fn malformed_refs_do_not_fail_snapshot_text() {
+        let stdout = r#"{"success":true,"data":{"origin":"https://example.com/","snapshot":"- heading \"Example\" [ref=e1]","refs":["bad"]},"error":null}"#;
+        let outcome = parse_action_outcome("snapshot", stdout, "", true);
+        assert!(outcome.success);
+        assert!(outcome.output.contains("[ref=e1]"));
+        let obs = snapshot_observation(BrowserBackendId::agent_browser(), outcome.output, stdout);
+        assert!(obs.snapshot.as_ref().unwrap().elements.is_empty());
+        assert!(obs.text.as_ref().unwrap().contains("[ref=e1]"));
+    }
+
+    #[test]
+    fn iframe_refs_are_ordinary_element_handles() {
+        let elements = snapshot_elements_from_stdout(
+            BrowserBackendId::agent_browser(),
+            &agent_browser_0_36_snapshot_stdout(),
+        );
+        let card = elements
+            .iter()
+            .find(|el| el.reference.as_str() == "e13")
+            .unwrap();
+        assert_eq!(card.reference.as_str(), "e13");
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        assert_eq!(
+            backend
+                .target_arg(&BrowserTarget::Element(card.reference.clone()))
+                .unwrap(),
+            "@e13"
+        );
     }
 
     #[tokio::test]

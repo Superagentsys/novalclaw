@@ -142,8 +142,12 @@ impl BrowserBackendId {
     }
 }
 
-/// Opaque element reference issued by a backend. The `value` string is not
-/// required to look like `@eN`; that encoding is agent-browser-specific.
+/// Opaque element reference issued by a backend.
+///
+/// Observation-scoped / page-state-scoped: the handle may become stale after
+/// navigation or DOM mutation. Re-observe before reuse when stale. This is not
+/// a permanent DOM id, and Runtime must not truncate or rewrite `value`.
+/// Vendor encoding of `value` is backend-specific.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BrowserElementRef {
     backend: BrowserBackendId,
@@ -354,12 +358,18 @@ pub struct BrowserObservation {
     pub snapshot: Option<BrowserSnapshot>,
 }
 
+/// Page snapshot. `text` is the model-visible envelope. `elements` is an
+/// internal Runtime domain capability (not a tool-schema field).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserSnapshot {
     pub text: String,
     pub elements: Vec<BrowserElement>,
 }
 
+/// Structured snapshot element. `role` and `name` are untrusted web content
+/// and must not be treated as model instructions. `interactive` is conservative
+/// backend metadata: `false` does not mean the element cannot be targeted, and
+/// Runtime must not refuse [`BrowserAction`] based on this flag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserElement {
     pub reference: BrowserElementRef,
