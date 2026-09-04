@@ -162,29 +162,6 @@ pub fn apply_env_overrides(cfg: &mut Config) {
             cfg.web_search.brave_api_key = Some(v);
         }
     });
-    env_opt("OMNINOVA_WEB_SEARCH_API_KEY", |v| {
-        cfg.web_search.api_key = Some(v);
-    });
-    env_opt("BOCHA_API_KEY", |v| {
-        if cfg.web_search.api_key.is_none() {
-            cfg.web_search.api_key = Some(v);
-        }
-    });
-    env_opt("BOCHAAI_API_KEY", |v| {
-        if cfg.web_search.api_key.is_none() {
-            cfg.web_search.api_key = Some(v);
-        }
-    });
-    env_opt("TAVILY_API_KEY", |v| {
-        if cfg.web_search.api_key.is_none() {
-            cfg.web_search.api_key = Some(v);
-        }
-    });
-    env_opt("JINA_API_KEY", |v| {
-        if cfg.web_search.api_key.is_none() {
-            cfg.web_search.api_key = Some(v);
-        }
-    });
     env_opt("OMNINOVA_WEB_FETCH_ENABLED", |v| {
         cfg.web_fetch.enabled = v == "true" || v == "1";
     });

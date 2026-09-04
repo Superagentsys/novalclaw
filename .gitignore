@@ -17,6 +17,11 @@ apps/omninova-tauri/src-tauri/resources/cli/omninova
 .omninova-tasks.db-shm
 sessions/
 
+# Staged agent-browser native CLI (npm run prepare:browser-runtime)
+apps/omninova-tauri/src-tauri/resources/agent-browser/windows/agent-browser.exe
+apps/omninova-tauri/src-tauri/resources/agent-browser/macos/agent-browser
+apps/omninova-tauri/src-tauri/resources/agent-browser/linux/agent-browser
+
 # Android
 apps/omninova-android/.gradle/
 apps/omninova-android/**/build/

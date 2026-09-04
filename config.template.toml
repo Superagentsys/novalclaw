@@ -304,14 +304,12 @@
 # timeout_secs = 30
 
 # --- Web Search Tool ---
-# 直接搜索（WorkBuddy 同款路径），不要为检索去操作 browser。
-# provider: jina（默认，无 key 也可）| bocha（国内中文更好，按次付费）| tavily | brave
+# 检索用 web_search，读静态页用 web_fetch，不要为搜索去操作 browser。
 # [web_search]
-# enabled = true
-# provider = "jina"
-# api_key = "..."                 # 可选；Jina 免费额度不够时再填 JINA_API_KEY
-# max_results = 8
-# fetch_top = 2                   # 搜索后顺带拉取前 N 条正文，适合早报/简报
+# enabled = false
+# provider = "brave"
+# brave_api_key = "..."
+# max_results = 10
 # timeout_secs = 15
 
 # --- WeCom Smart Bot ---

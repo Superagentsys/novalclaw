@@ -15,6 +15,9 @@ use crate::tools::{
     KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool,
     ShellTool, TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
 };
+use crate::tools::web_client::{
+    WebToolSettings, DEFAULT_WEB_MAX_RESPONSE_BYTES, DEFAULT_WEB_REQUEST_TIMEOUT_SECS,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -207,14 +210,22 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["grep_search", "grep", "search"],
         enabled: always,
-        build: |ctx| Some(Box::new(ContentSearchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(ContentSearchTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "git_operations",
         capabilities: ToolCapabilities::PROCESS,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(GitOperationsTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(GitOperationsTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "shell",
@@ -242,7 +253,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(KnowledgeSearchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(KnowledgeSearchTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "memory_store",
@@ -296,6 +311,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         build: |ctx| {
             Some(Box::new(HttpRequestTool::new(
                 ctx.config.http_request.allowed_domains.clone(),
+                WebToolSettings::from_config(
+                    &ctx.config.proxy,
+                    ctx.config.http_request.timeout_secs,
+                    ctx.config.http_request.max_response_size,
+                ),
             )))
         },
     },
@@ -307,6 +327,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         build: |ctx| {
             Some(Box::new(WebFetchTool::new(
                 ctx.config.web_fetch.allowed_domains.clone(),
+                WebToolSettings::from_config(
+                    &ctx.config.proxy,
+                    ctx.config.web_fetch.timeout_secs,
+                    ctx.config.web_fetch.max_response_size,
+                ),
             )))
         },
     },
@@ -316,8 +341,25 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_search.enabled,
         build: |ctx| {
-            WebSearchTool::from_config(&ctx.config.web_search)
-                .map(|tool| Box::new(tool) as Box<dyn Tool>)
+            let timeout_secs = ctx
+                .config
+                .web_search
+                .timeout_secs
+                .unwrap_or(DEFAULT_WEB_REQUEST_TIMEOUT_SECS);
+            ctx.config
+                .web_search
+                .brave_api_key
+                .as_ref()
+                .map(|key| {
+                    Box::new(WebSearchTool::new(
+                        key.clone(),
+                        WebToolSettings::from_config(
+                            &ctx.config.proxy,
+                            timeout_secs,
+                            DEFAULT_WEB_MAX_RESPONSE_BYTES,
+                        ),
+                    )) as Box<dyn Tool>
+                })
         },
     },
     ToolDef {
@@ -329,14 +371,23 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             spawns_process: true,
         },
         aliases: &[],
-        enabled: |config| config.browser.enabled,
+        enabled: |config| {
+            crate::tools::browser_bin::effective_browser_capability(
+                config.browser.enabled,
+                crate::tools::browser_bin::agent_browser_runtime_available(),
+            )
+        },
         build: |ctx| {
-            Some(Box::new(BrowserTool::new(
+            let tool = BrowserTool::new(
                 ctx.config.browser.allowed_domains.clone(),
                 ctx.config.browser.native_headless,
                 ctx.config.browser.attach_only,
                 ctx.config.browser.cdp_url.clone(),
-            )))
+            );
+            match crate::tools::browser::browser_session_id(ctx.session_id) {
+                Ok(mapped) => Some(Box::new(tool.with_session(mapped))),
+                Err(_) => Some(Box::new(tool)),
+            }
         },
     },
     ToolDef {
@@ -482,29 +533,101 @@ mod tests {
     }
 
     #[test]
-    fn web_search_falls_back_to_jina_without_an_api_key() {
+    fn web_search_is_skipped_without_an_api_key() {
         let mut config = Config::default();
         config.web_search.enabled = true;
-        config.web_search.provider = None;
-        config.web_search.api_key = None;
-        config.web_search.brave_api_key = None;
-
-        let names = built_names(&config, None);
-
-        assert!(contains(&names, "web_search"), "names={names:?}");
-    }
-
-    #[test]
-    fn web_search_brave_without_key_is_skipped() {
-        let mut config = Config::default();
-        config.web_search.enabled = true;
-        config.web_search.provider = Some("brave".into());
-        config.web_search.api_key = None;
         config.web_search.brave_api_key = None;
 
         let names = built_names(&config, None);
 
         assert!(!contains(&names, "web_search"), "names={names:?}");
+    }
+
+    #[test]
+    fn browser_is_registered_only_when_configured_and_runtime_available() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+
+        let names = built_names(&config, None);
+        let present = contains(&names, "browser");
+        assert_eq!(
+            present,
+            crate::tools::browser_bin::agent_browser_runtime_available(),
+            "browser tool presence must follow runtime availability: names={names:?}"
+        );
+    }
+
+    #[test]
+    fn browser_tool_gets_stable_session_mapping_from_build_context() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.allowed_domains = Vec::new();
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+
+        let build = |session: Option<&str>| -> String {
+            let mut tools = build_tools(&ToolBuildContext {
+                config: &config,
+                workspace: Path::new("/fake/workspace"),
+                memory: Some(&memory),
+                session_id: session,
+            });
+            let browser = tools
+                .iter_mut()
+                .find(|tool| tool.name() == "browser")
+                .expect("browser should be built when runtime available");
+            let browser = browser
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::tools::BrowserTool>())
+                .expect("browser tool should be a BrowserTool");
+            browser.session_id().unwrap_or("").to_string()
+        };
+
+        // If no runtime is available the tool is intentionally not built.
+        if !crate::tools::browser_bin::agent_browser_runtime_available() {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        }
+
+        let session_a = "chat/房间 1".to_string();
+        let session_b = "chat/房间 2".to_string();
+        let mapped_a = build(Some(&session_a));
+        let mapped_b = build(Some(&session_b));
+        assert_ne!(mapped_a, mapped_b);
+        assert!(mapped_a.starts_with("omninova-"));
+        assert!(mapped_b.starts_with("omninova-"));
+        assert_eq!(
+            mapped_a,
+            build(Some(&session_a)),
+            "same session must map stable"
+        );
+
+        let mapped_none = build(None);
+        assert!(
+            mapped_none.is_empty(),
+            "missing session must not bind a shared browser session: {mapped_none}"
+        );
+        assert_ne!(mapped_none, "default");
+        assert!(!mapped_none.contains("anonymous"));
+
+        for blank in ["", "   "] {
+            let mapped_blank = build(Some(blank));
+            assert!(
+                mapped_blank.is_empty(),
+                "blank session {blank:?} must not bind a shared browser session: {mapped_blank}"
+            );
+        }
+
+        let long = format!("x{}y", "a".repeat(500));
+        let mapped_long = build(Some(&long));
+        assert!(mapped_long.starts_with("omninova-"));
+        assert!(mapped_long.len() < 64);
+
+        let unicode = "会话-😀-中文-空格 end";
+        let mapped_unicode = build(Some(unicode));
+        assert!(mapped_unicode
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit()));
+        assert_eq!(mapped_unicode, build(Some(unicode)));
     }
 
     #[test]

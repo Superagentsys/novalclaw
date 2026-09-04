@@ -1685,31 +1685,14 @@ impl Default for WebFetchConfig {
 // Web Search Tool
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebSearchConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     pub provider: Option<String>,
-    pub api_key: Option<String>,
     pub brave_api_key: Option<String>,
     pub max_results: Option<u32>,
     pub timeout_secs: Option<u64>,
-    /// How many top result pages to fetch as plaintext during search.
-    pub fetch_top: Option<u32>,
-}
-
-impl Default for WebSearchConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            provider: Some("jina".into()),
-            api_key: None,
-            brave_api_key: None,
-            max_results: None,
-            timeout_secs: None,
-            fetch_top: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

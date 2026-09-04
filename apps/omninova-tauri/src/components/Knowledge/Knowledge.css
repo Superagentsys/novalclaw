@@ -1031,3 +1031,17 @@
     overflow: visible;
   }
 }
+.knowledge-collection-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 0 0 20px;
+  padding: 16px;
+  border: 1px solid var(--ui-border);
+  border-radius: 14px;
+  background: var(--ui-surface);
+  color: var(--ui-text);
+}
+.knowledge-collection-form input { flex: 1; min-width: 160px; padding: 10px 12px; }
+.knowledge-collection-form button { padding: 10px 16px; }
