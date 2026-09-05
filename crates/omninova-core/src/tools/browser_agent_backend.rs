@@ -4237,4 +4237,268 @@ document.title = "persist-boot";
         let _ = crate::tools::browser_installed_profile::find_chrome_user_data_dir();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    fn headed_live_opts() -> BrowserSessionOptions {
+        BrowserSessionOptions {
+            headless: false,
+            ..BrowserSessionOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_observe_first_resume() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-takeover</title></head><body><h1>Takeover fixture</h1><p>synthetic</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-a-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open headed synthetic fixture");
+        let granted = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .expect("headed takeover");
+        assert_eq!(granted.phase, BrowserTakeoverPhase::HumanControlled);
+        let blocked = runtime
+            .act(&key, &opts, &BrowserAction::eval_raw("1+1"))
+            .await
+            .expect_err("agent work blocked during human control");
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+        let released = runtime.release_human_takeover(&key).unwrap();
+        assert_eq!(released.phase, BrowserTakeoverPhase::Resynchronizing);
+        let stale = runtime
+            .act(&key, &opts, &BrowserAction::Reload)
+            .await
+            .expect_err("mutation before observe");
+        assert_eq!(stale.kind, BrowserErrorKind::StaleAssumptions);
+        runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect("resync observe");
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        runtime
+            .act(&key, &opts, &BrowserAction::Reload)
+            .await
+            .expect("mutation after observe");
+        runtime.close_session(&key, &opts).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_in_flight_safe_point() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-inflight</title></head><body><p>wait</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = Arc::new(BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        ));
+        let key = BrowserSessionKey::new(format!("b34b-b-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open");
+        let task_rt = Arc::clone(&runtime);
+        let task_key = key.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .act(
+                    &task_key,
+                    &task_opts,
+                    &BrowserAction::Wait {
+                        timeout_ms: Some(4_000),
+                        text: Some("__omninova_never_match__".into()),
+                        target: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let pending = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ManualCorrection)
+            .unwrap();
+        assert!(
+            pending.phase == BrowserTakeoverPhase::TakeoverRequested
+                || pending.phase == BrowserTakeoverPhase::HumanControlled
+        );
+        let blocked = runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect_err("new ops blocked after request");
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+        let _ = inflight.await.unwrap();
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+        runtime.close_session(&key, &opts).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_multiple_cycles_and_close() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-cycles</title></head><body><p>cycle</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-c-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open");
+        for expected in 1..=2 {
+            runtime
+                .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+                .unwrap();
+            let released = runtime.release_human_takeover(&key).unwrap();
+            assert_eq!(released.generation, expected);
+            runtime
+                .observe(&key, &opts, &ObserveRequest::snapshot())
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.get_takeover_state(&key).phase,
+                BrowserTakeoverPhase::AgentControlled
+            );
+        }
+        runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .unwrap();
+        runtime.close_session(&key, &opts).await.expect("close during HumanControlled");
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn live_human_takeover_headless_typed_failure() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let opts = BrowserSessionOptions::default();
+        assert!(opts.headless);
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-d-{}", uuid::Uuid::new_v4())).unwrap();
+        let html = "<html><body>headless</body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open headless");
+        let err = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .expect_err("headless takeover must fail");
+        assert_eq!(err.kind, BrowserErrorKind::TakeoverUnsupportedHeadless);
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        runtime.close_session(&key, &opts).await.ok();
+    }
 }

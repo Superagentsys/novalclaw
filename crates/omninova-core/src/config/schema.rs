@@ -2809,6 +2809,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_native_headless_defaults_to_false() {
+        assert!(
+            !BrowserConfig::default().native_headless,
+            "BrowserConfig::default native_headless must be headed (false)"
+        );
+        let parsed: BrowserConfig = toml::from_str("enabled = true\nbackend = \"agent-browser\"\n")
+            .expect("partial browser config must deserialize");
+        assert!(
+            !parsed.native_headless,
+            "#[serde(default)] bool for native_headless is false, not a custom true default"
+        );
+        let from_table: Config = toml::from_str("[browser]\nenabled = true\n")
+            .expect("config with [browser] table must load");
+        assert!(!from_table.browser.native_headless);
+    }
+
+    #[test]
     fn provider_runtime_defaults_apply_when_fields_absent() {
         // Old config files have no [provider_runtime] table: serde defaults
         // fill 0s and the accessors fall back to the safe defaults.

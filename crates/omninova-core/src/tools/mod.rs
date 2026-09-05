@@ -2,6 +2,7 @@ pub mod browser;
 pub mod browser_agent_backend;
 pub mod browser_backend;
 pub mod browser_bin;
+pub mod browser_control;
 pub mod browser_executable;
 pub mod browser_installed_profile;
 pub mod browser_lifecycle;

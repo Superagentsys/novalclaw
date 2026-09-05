@@ -50,6 +50,26 @@ pub const BROWSER_SESSION_PROFILE_MISMATCH_DETAIL: &str =
 pub const BROWSER_INSTALLED_SNAPSHOT_INCOMPLETE_DETAIL: &str =
     "BrowserInstalledProfileSnapshotIncomplete: the installed Chrome profile could not be safely snapshotted; the source browser is commonly active or browser state is locked";
 
+/// Agent browser work is blocked because a human holds or is pending action control.
+pub const BROWSER_HUMAN_TAKEOVER_ACTIVE_DETAIL: &str =
+    "BrowserHumanTakeoverActive: a human currently controls this browser; agent browser operations are blocked until takeover is released";
+
+/// Human takeover requires a visible local headed window.
+pub const BROWSER_TAKEOVER_UNSUPPORTED_HEADLESS_DETAIL: &str =
+    "BrowserTakeoverUnsupportedHeadless: human takeover requires a headed local browser window; this session is headless. Start a headed browser session for interactive takeover.";
+
+/// After human release, Agent must observe before mutating.
+pub const BROWSER_STALE_ASSUMPTIONS_DETAIL: &str =
+    "BrowserStaleAssumptions: Browser state changed during human takeover. Observe the current browser state before acting.";
+
+/// Human-controlled browser disappeared; Runtime did not relaunch it.
+pub const BROWSER_TAKEOVER_LOST_DETAIL: &str =
+    "BrowserTakeoverLost: the human-controlled browser session disappeared; it was not relaunched automatically";
+
+/// Takeover cannot start from the current control phase.
+pub const BROWSER_TAKEOVER_REJECTED_DETAIL: &str =
+    "BrowserTakeoverRejected: takeover cannot start while the session is resynchronizing";
+
 /// Logical managed-profile id: `^[a-z0-9][a-z0-9_-]{0,63}$` (1..=64).
 pub const BROWSER_PROFILE_ID_MAX_LEN: usize = 64;
 
@@ -702,6 +722,16 @@ pub enum BrowserErrorKind {
     ProfileBusy,
     /// Installed Chrome profile snapshot is incomplete or locked.
     InstalledProfileSnapshotIncomplete,
+    /// Human currently holds, or has a pending grant of, action control.
+    HumanTakeoverActive,
+    /// Takeover was requested for a headless session.
+    TakeoverUnsupportedHeadless,
+    /// Agent attempted a mutating operation before a post-takeover observe.
+    StaleAssumptions,
+    /// Browser/process disappeared during Human Takeover.
+    TakeoverBrowserLost,
+    /// Takeover request is invalid in the current control phase.
+    TakeoverRejected,
 }
 
 impl BrowserErrorKind {
@@ -736,6 +766,13 @@ pub fn v1_error_kind(message: &str) -> Option<BrowserErrorKind> {
             Some(BrowserErrorKind::InstalledProfileSnapshotIncomplete)
         }
         "BrowserSessionConfigMismatch" => Some(BrowserErrorKind::Rejected),
+        "BrowserHumanTakeoverActive" => Some(BrowserErrorKind::HumanTakeoverActive),
+        "BrowserTakeoverUnsupportedHeadless" => {
+            Some(BrowserErrorKind::TakeoverUnsupportedHeadless)
+        }
+        "BrowserStaleAssumptions" => Some(BrowserErrorKind::StaleAssumptions),
+        "BrowserTakeoverLost" => Some(BrowserErrorKind::TakeoverBrowserLost),
+        "BrowserTakeoverRejected" => Some(BrowserErrorKind::TakeoverRejected),
         _ => None,
     }
 }
@@ -1175,6 +1212,23 @@ mod tests {
                 "BrowserSessionConfigMismatch: x",
                 BrowserErrorKind::Rejected,
             ),
+            (
+                "BrowserHumanTakeoverActive: x",
+                BrowserErrorKind::HumanTakeoverActive,
+            ),
+            (
+                "BrowserTakeoverUnsupportedHeadless: x",
+                BrowserErrorKind::TakeoverUnsupportedHeadless,
+            ),
+            (
+                "BrowserStaleAssumptions: x",
+                BrowserErrorKind::StaleAssumptions,
+            ),
+            ("BrowserTakeoverLost: x", BrowserErrorKind::TakeoverBrowserLost),
+            (
+                "BrowserTakeoverRejected: x",
+                BrowserErrorKind::TakeoverRejected,
+            ),
         ];
         for (msg, kind) in cases {
             assert_eq!(v1_error_kind(msg), Some(kind), "{msg}");
@@ -1186,6 +1240,11 @@ mod tests {
         assert!(!BrowserErrorKind::StaleReference.default_retryable());
         assert!(!BrowserErrorKind::ProfileBusy.default_retryable());
         assert!(!BrowserErrorKind::InstalledProfileSnapshotIncomplete.default_retryable());
+        assert!(!BrowserErrorKind::HumanTakeoverActive.default_retryable());
+        assert!(!BrowserErrorKind::TakeoverUnsupportedHeadless.default_retryable());
+        assert!(!BrowserErrorKind::StaleAssumptions.default_retryable());
+        assert!(!BrowserErrorKind::TakeoverBrowserLost.default_retryable());
+        assert!(!BrowserErrorKind::TakeoverRejected.default_retryable());
         assert!(BrowserErrorKind::Timeout.default_retryable());
         assert!(BrowserErrorKind::Crashed.default_retryable());
         assert_ne!(
