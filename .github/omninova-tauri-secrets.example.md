@@ -15,6 +15,7 @@ Examples:
 
 ```text
 omninova-claw_0.1.0_linux-x64_omninova-claw_0.1.0_amd64.deb
+omninova-claw_0.1.0_linux-arm64_omninova-claw_0.1.0_arm64.deb
 omninova-claw_0.1.0_macos-arm64_omninova-claw_0.1.0_aarch64.dmg
 omninova-claw_0.1.0_windows-x64_omninova-claw_0.1.0_x64_en-us.msi
 ```
