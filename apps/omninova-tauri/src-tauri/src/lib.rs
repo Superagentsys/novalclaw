@@ -3507,6 +3507,7 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        "omnirun" => Some("http://localhost:28090/v1".to_string()),
         "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
         _ => None,
     }
@@ -3684,16 +3685,12 @@ fn setup_config_to_core(
         .collect();
     current.computer_use.require_screenshot_before_click =
         setup.computer_use.require_screenshot_before_click;
+    // Approval handling for `computer_use` belongs to the approval profile
+    // applied by `ensure_desktop_automation_capabilities`. Force-adding it to
+    // `require_approval` here also contradicted the auto-approve list and made
+    // every click wait for a human, so a desktop task could never run through.
     if current.computer_use.enabled {
         current.scheduler.enabled = true;
-        if !current
-            .approvals
-            .require_approval
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("computer_use"))
-        {
-            current.approvals.require_approval.push("computer_use".into());
-        }
     }
 
     current.observability.prometheus_enabled = setup.observability.prometheus_enabled;
@@ -5143,6 +5140,7 @@ fn display_provider_name(id: &str) -> String {
         "openrouter" => "OpenRouter".to_string(),
         "ollama" => "Ollama (Local)".to_string(),
         "lmstudio" => "LM Studio (Local)".to_string(),
+        "omnirun" => "OmniRun (Local)".to_string(),
         "xai" => "xAI".to_string(),
         "mistral" => "Mistral".to_string(),
         other => other.to_string(),

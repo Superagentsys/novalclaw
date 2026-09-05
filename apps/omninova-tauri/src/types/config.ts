@@ -883,6 +883,17 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     enabled: false,
     category: 'local',
   },
+  {
+    id: 'omnirun',
+    name: 'OmniRun (Local)',
+    type: 'omnirun',
+    base_url: 'http://localhost:28090/v1',
+    // OmniRun serves whatever model is currently loaded; edit this field to
+    // match the ids returned by its /v1/models endpoint.
+    models: ['local-model'],
+    enabled: false,
+    category: 'local',
+  },
 ];
 
 export const cloneProviderPreset = (id: string): ProviderConfig | undefined => {

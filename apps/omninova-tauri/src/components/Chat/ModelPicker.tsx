@@ -79,7 +79,15 @@ export function persistMaxMode(value: boolean) {
 
 function isLocalProvider(type?: string, id?: string): boolean {
   const key = (type || id || "").toLowerCase();
-  return ["ollama", "lmstudio", "vllm", "sglang", "llamacpp", "local"].includes(key);
+  return [
+    "ollama",
+    "lmstudio",
+    "omnirun",
+    "vllm",
+    "sglang",
+    "llamacpp",
+    "local",
+  ].includes(key);
 }
 
 function providerInitial(label: string): string {

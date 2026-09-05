@@ -18,11 +18,12 @@ impl Config {
     pub fn validate(&self) -> ValidationReport {
         let mut report = ValidationReport::default();
 
-        if self.api_key.is_none()
-            && self.default_provider.as_deref() != Some("ollama")
-            && self.default_provider.as_deref() != Some("lmstudio")
-            && self.default_provider.as_deref() != Some("mock")
-        {
+        // Local runtimes and the mock provider serve without credentials.
+        let provider_needs_key = !matches!(
+            self.default_provider.as_deref(),
+            Some("ollama" | "lmstudio" | "omnirun" | "mock")
+        );
+        if self.api_key.is_none() && provider_needs_key {
             report.warnings.push(
                 "No api_key set. Most providers require an API key.".into(),
             );
@@ -77,16 +78,11 @@ impl Config {
         }
 
         if self.computer_use.enabled {
-            if self.computer_use.max_actions_per_turn == 0 {
-                report.errors.push(
-                    "computer_use.max_actions_per_turn must be > 0 when computer_use is enabled"
-                        .into(),
-                );
-            }
-            if self.computer_use.max_actions_per_hour == 0 {
-                report.errors.push(
-                    "computer_use.max_actions_per_hour must be > 0 when computer_use is enabled"
-                        .into(),
+            if self.computer_use.max_actions_per_turn == 0
+                && self.computer_use.max_actions_per_hour == 0
+            {
+                report.warnings.push(
+                    "computer_use action budgets are unlimited – the desktop keeps being driven until the task ends or E-Stop fires.".into(),
                 );
             }
             if self.computer_use.max_tool_iterations == 0 {
@@ -342,6 +338,20 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("request_max_output_tokens is 0"))
         );
+    }
+
+    #[test]
+    fn unlimited_computer_use_budgets_are_valid() {
+        let mut cfg = Config::default();
+        cfg.computer_use.enabled = true;
+        cfg.computer_use.max_actions_per_turn = 0;
+        cfg.computer_use.max_actions_per_hour = 0;
+        let report = cfg.validate();
+        assert!(report.is_ok(), "errors={:?}", report.errors);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("action budgets are unlimited")));
     }
 
     #[test]

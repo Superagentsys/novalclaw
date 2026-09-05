@@ -1550,8 +1550,11 @@ pub struct ComputerUseConfig {
     pub allowed_apps: Vec<String>,
     #[serde(default = "default_true")]
     pub require_screenshot_before_click: bool,
+    /// Mouse/keyboard actions one agent run may perform. `0` = unlimited, which
+    /// is what a long unattended desktop task needs.
     #[serde(default = "default_computer_use_max_actions_per_turn")]
     pub max_actions_per_turn: u32,
+    /// Process-wide hourly rate limit on mouse/keyboard actions. `0` = unlimited.
     #[serde(default = "default_computer_use_max_actions_per_hour")]
     pub max_actions_per_hour: u32,
     /// Raise the ReAct iteration cap when this tool is in the session.
@@ -1571,14 +1574,17 @@ fn default_computer_use_allowed_apps() -> Vec<String> {
     vec!["*".into()]
 }
 
+/// Unlimited by default: a desktop task runs until it is done, and the ReAct
+/// iteration cap plus E-Stop are what bound it. A small number here silently
+/// froze long runs halfway through.
 fn default_computer_use_max_actions_per_turn() -> u32 {
-    15
+    0
 }
 fn default_computer_use_max_actions_per_hour() -> u32 {
-    40
+    0
 }
 fn default_computer_use_max_tool_iterations() -> usize {
-    40
+    200
 }
 fn default_computer_use_thrash_soft() -> u32 {
     3
@@ -3064,6 +3070,10 @@ base_url = "https://api.deepseek.com"
         let cfg = Config::default();
         assert!(!cfg.computer_use.enabled);
         assert!(cfg.computer_use.allows_all_apps());
+        // 0 = unlimited, so a desktop task is not cut off mid-way.
+        assert_eq!(cfg.computer_use.max_actions_per_turn, 0);
+        assert_eq!(cfg.computer_use.max_actions_per_hour, 0);
+        assert!(cfg.computer_use.max_tool_iterations >= 200);
         assert_eq!(cfg.computer_use.thrash_soft_limit, 3);
         assert_eq!(cfg.computer_use.thrash_hard_limit, 5);
         assert_eq!(cfg.computer_use.max_snapshot_nodes, 80);

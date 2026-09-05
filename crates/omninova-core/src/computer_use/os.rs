@@ -507,7 +507,9 @@ $sb.ToString()
 #[cfg(target_os = "windows")]
 fn windows_sendkeys(key: &str) -> Result<String, String> {
     let mut mods = String::new();
-    let mut name = "";
+    // Owned: the lowercased part is a temporary that dies at the end of each
+    // match, so the key name cannot be kept as a borrow of it.
+    let mut name = String::new();
     for part in key.split(['+', '-', ' ']) {
         let part = part.trim();
         if part.is_empty() {
@@ -520,10 +522,10 @@ fn windows_sendkeys(key: &str) -> Result<String, String> {
             "cmd" | "command" | "win" => {
                 return Err("Windows computer_use 不支持 Win 组合键".into())
             }
-            other => name = other,
+            other => name = other.to_string(),
         }
     }
-    let token = match name {
+    let token = match name.as_str() {
         "enter" | "return" => "{ENTER}",
         "tab" => "{TAB}",
         "esc" | "escape" => "{ESC}",

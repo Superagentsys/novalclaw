@@ -275,12 +275,12 @@
 # enabled = false
 # allowed_apps = ["*"]              # 默认全部应用；或 [] 禁止键鼠；或 ["钉钉", "飞书"]
 # require_screenshot_before_click = true
-# max_actions_per_turn = 15
-# max_actions_per_hour = 40         # 仅桌面键鼠，与 autonomy.max_actions_per_hour 独立
-# max_tool_iterations = 40
+# max_actions_per_turn = 0          # 单次任务的键鼠次数；0 = 不限，桌面长跑用 0
+# max_actions_per_hour = 0          # 每小时键鼠限速；0 = 不限，与 autonomy.max_actions_per_hour 独立
+# max_tool_iterations = 200         # 桌面任务一轮里 snapshot+click 很费迭代，别给太小
 # max_dimension_px = 1280
 # thrash_soft_limit = 3             # 同控件连续失败后提示改用 snapshot/name
-# thrash_hard_limit = 5             # 再失败则硬停，需 snapshot 或换目标
+# thrash_hard_limit = 5             # 再失败则拒绝该目标，但任务继续，不会整轮中止
 # max_snapshot_nodes = 80
 
 # --- Scheduler ---

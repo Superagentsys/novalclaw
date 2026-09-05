@@ -463,32 +463,48 @@ impl ComputerUseSession {
         }
     }
 
+    /// Both budgets treat `0` as unlimited so an unattended desktop task can
+    /// keep going. Only the run counter is rolled back when a later check
+    /// rejects the action, otherwise a denied action would still be charged.
     fn consume_budget(&self, action: &str) -> Result<(), String> {
         if is_observe_action(action) {
             return Ok(());
         }
-        let next_turn = self.turn_actions.fetch_add(1, Ordering::SeqCst) + 1;
-        if next_turn > self.config.max_actions_per_turn {
-            self.turn_actions.fetch_sub(1, Ordering::SeqCst);
-            return Err(format!(
-                "computer_use turn budget exceeded ({}/{})",
-                next_turn - 1,
-                self.config.max_actions_per_turn
-            ));
+        let run_limit = self.config.max_actions_per_turn;
+        let charged_run = run_limit > 0;
+        if charged_run {
+            let used = self.turn_actions.fetch_add(1, Ordering::SeqCst) + 1;
+            if used > run_limit {
+                self.turn_actions.fetch_sub(1, Ordering::SeqCst);
+                return Err(format!(
+                    "computer_use run budget exceeded ({}/{run_limit}). Raise computer_use.max_actions_per_turn, or set it to 0 for unlimited.",
+                    used - 1
+                ));
+            }
         }
-        let mut stamps = hourly_stamps()
-            .lock()
-            .map_err(|_| "computer_use hourly budget lock poisoned".to_string())?;
+
+        let hourly_limit = self.config.max_actions_per_hour;
+        if hourly_limit == 0 {
+            return Ok(());
+        }
+        let refund_run = || {
+            if charged_run {
+                self.turn_actions.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+        let Ok(mut stamps) = hourly_stamps().lock() else {
+            refund_run();
+            return Err("computer_use hourly budget lock poisoned".to_string());
+        };
         let cutoff = Instant::now()
             .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
         stamps.retain(|stamp| *stamp > cutoff);
-        if stamps.len() as u32 >= self.config.max_actions_per_hour {
-            self.turn_actions.fetch_sub(1, Ordering::SeqCst);
+        if stamps.len() as u32 >= hourly_limit {
+            refund_run();
             return Err(format!(
-                "computer_use hourly budget exceeded ({}/{})",
-                stamps.len(),
-                self.config.max_actions_per_hour
+                "computer_use hourly budget exceeded ({}/{hourly_limit}). Raise computer_use.max_actions_per_hour, or set it to 0 for unlimited.",
+                stamps.len()
             ));
         }
         stamps.push(Instant::now());
@@ -1301,8 +1317,45 @@ mod tests {
         }
         let denied = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
         assert!(!denied.ok);
-        assert!(denied.message.contains("turn budget"));
+        assert!(denied.message.contains("run budget"), "{}", denied.message);
         assert_eq!(clicks.load(Ordering::SeqCst), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unlimited_budgets_keep_driving_the_desktop() {
+        let (mut session, clicks, dir) = session("Excel", &["*"]);
+        session.config.max_actions_per_turn = 0;
+        session.config.max_actions_per_hour = 0;
+        session.execute(&serde_json::json!({"action": "screenshot"}));
+        // Comfortably past the old 15-per-run / 40-per-hour walls.
+        for index in 0..60 {
+            let result = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
+            assert!(result.ok, "click {index} failed: {}", result.message);
+        }
+        assert_eq!(clicks.load(Ordering::SeqCst), 60);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn denied_action_is_not_charged_to_the_run_budget() {
+        let (mut session, clicks, dir) = session("Excel", &["Excel"]);
+        session.config.max_actions_per_turn = 2;
+        session.config.max_actions_per_hour = 0;
+        session.execute(&serde_json::json!({"action": "screenshot"}));
+        for _ in 0..2 {
+            assert!(session
+                .execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}))
+                .ok);
+        }
+        for _ in 0..3 {
+            let denied = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
+            assert!(!denied.ok);
+            assert!(denied.message.contains("run budget"), "{}", denied.message);
+        }
+        // Rejected attempts must not keep inflating the counter.
+        assert_eq!(session.turn_actions.load(Ordering::SeqCst), 2);
+        assert_eq!(clicks.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

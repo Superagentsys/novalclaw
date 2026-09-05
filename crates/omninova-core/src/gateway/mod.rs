@@ -3464,10 +3464,7 @@ async fn acquire_subagent_guard(
 }
 
 fn provider_supports_openai_vision(provider: Option<&str>) -> bool {
-    let Some(name) = provider.map(str::to_ascii_lowercase) else {
-        return true;
-    };
-    !matches!(name.as_str(), "anthropic" | "gemini" | "mock")
+    crate::providers::provider_accepts_openai_images(provider)
 }
 
 fn metadata_bool(inbound: &InboundMessage, keys: &[&str]) -> bool {

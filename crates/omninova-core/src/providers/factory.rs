@@ -44,6 +44,7 @@ const OPENAI_COMPATIBLE: &[&str] = &[
     "sglang",
     "vllm",
     "llamacpp",
+    "omnirun",
     "custom",
 ];
 
@@ -356,6 +357,7 @@ fn resolve_model(
         "mistral" => "mistral-small-latest".to_string(),
         "ollama" => "llama3.2".to_string(),
         "lmstudio" => "local-model".to_string(),
+        "omnirun" => "local-model".to_string(),
         "openrouter" => "anthropic/claude-3.5-sonnet".to_string(),
         "anthropic" => "claude-3-5-sonnet-latest".to_string(),
         "gemini" => "gemini-2.0-flash".to_string(),
@@ -387,7 +389,7 @@ fn normalize_openai_base_url(provider_name: &str, url: String) -> String {
         // transport would otherwise need.
         return trimmed;
     }
-    let needs_v1 = matches!(provider_name, "ollama" | "lmstudio")
+    let needs_v1 = matches!(provider_name, "ollama" | "lmstudio" | "omnirun")
         && !trimmed.ends_with("/v1")
         && !trimmed.contains("/v1/");
     if needs_v1 {
@@ -408,6 +410,7 @@ fn resolve_known_base_url(provider_name: &str) -> Option<String> {
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        "omnirun" => Some("http://localhost:28090/v1".to_string()),
         "together" => Some("https://api.together.xyz/v1".to_string()),
         "fireworks" => Some("https://api.fireworks.ai/inference/v1".to_string()),
         "novita" => Some("https://api.novita.ai/v3/openai".to_string()),
@@ -475,6 +478,37 @@ mod tests {
                 ..ModelProviderConfig::default()
             },
         )
+    }
+
+    #[test]
+    fn omnirun_is_a_keyless_openai_compatible_local_runtime() {
+        assert!(OPENAI_COMPATIBLE.contains(&"omnirun"));
+        assert_eq!(
+            resolve_known_base_url("omnirun").as_deref(),
+            Some("http://localhost:28090/v1")
+        );
+        // The port is usually pasted without the OpenAI path segment.
+        assert_eq!(
+            normalize_openai_base_url("omnirun", "http://localhost:28090".into()),
+            "http://localhost:28090/v1"
+        );
+        assert_eq!(
+            normalize_openai_base_url("omnirun", "http://localhost:28090/v1/".into()),
+            "http://localhost:28090/v1"
+        );
+
+        let mut config = Config::default();
+        config.default_provider = Some("omnirun".into());
+        config.api_key = None;
+        let report = config.validate();
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No api_key set")),
+            "local runtime must not demand an API key: {:?}",
+            report.warnings
+        );
     }
 
     #[test]
@@ -1082,6 +1116,7 @@ fn resolve_api_key(
         "xai" => "XAI_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
         "lmstudio" => "LMSTUDIO_API_KEY",
+        "omnirun" => "OMNIRUN_API_KEY",
         "together" => "TOGETHER_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
         "novita" => "NOVITA_API_KEY",

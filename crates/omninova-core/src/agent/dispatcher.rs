@@ -31,9 +31,11 @@ fn waiting_approval_reply(tool_result: &str) -> Option<String> {
     ))
 }
 
+/// Only a pending approval ends the loop. Desktop thrash is a wrong-target
+/// problem, so it is steered back into the conversation instead of aborting a
+/// long unattended run.
 fn tool_loop_interrupt(tool_result: &str) -> Option<String> {
     waiting_approval_reply(tool_result)
-        .or_else(|| crate::computer_use::hard_thrash_reply(tool_result))
 }
 
 fn has_active_skill(messages: &[ChatMessage]) -> bool {
@@ -302,6 +304,13 @@ impl<'a> AgentDispatcher<'a> {
             self.push_assistant(messages, &reply);
             return Some(reply);
         }
+        if let Some(reason) = crate::computer_use::hard_thrash_reply(tool_result) {
+            messages.push(ChatMessage::user(format!(
+                "[computer_use] {reason} 本轮任务没有结束：改用 action=snapshot 重新读控件，换一个 name/ref 或换一条路径继续。确实无路可走时用 task_checkpoint(status=blocked) 说明卡点。"
+            )));
+            self.refresh_candidate(messages);
+            return None;
+        }
         if let Some(advice) = crate::computer_use::soft_thrash_advice(tool_result) {
             messages.push(ChatMessage::user(advice));
             self.refresh_candidate(messages);
@@ -309,11 +318,23 @@ impl<'a> AgentDispatcher<'a> {
         None
     }
 
+    /// Desktop screenshots follow `desktop_vision_enabled`; the generic
+    /// `vision_enabled` switch only governs user-attached chat images. Reading
+    /// the wrong one left the agent driving the desktop blind.
+    fn desktop_vision_available(&self) -> bool {
+        let multimodal = &self.security.config.multimodal;
+        if !multimodal.desktop_vision_enabled && !multimodal.vision_enabled {
+            return false;
+        }
+        let provider = self.security.audit().context().provider.clone();
+        crate::providers::provider_accepts_openai_images(provider.as_deref())
+    }
+
     fn push_computer_use_observations(&self, messages: &mut Vec<ChatMessage>, paths: &[String]) {
         if paths.is_empty() {
             return;
         }
-        if !self.security.config.multimodal.vision_enabled {
+        if !self.desktop_vision_available() {
             messages.push(ChatMessage::user(format!(
                 "[computer_use] 当前模型未开视觉。截图已保存，请根据工具 JSON 的 nodes / path 行动，不要猜像素。paths={}",
                 paths.join(", ")
@@ -1267,6 +1288,18 @@ fn push_skill_activation_if_needed(
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn only_pending_approval_ends_the_tool_loop() {
+        let waiting = r#"{"status":"waiting_approval","approval_id":"a-1"}"#;
+        assert!(tool_loop_interrupt(waiting).is_some());
+
+        // Desktop thrash used to abort the whole run, which is exactly what
+        // stopped long unattended desktop tasks halfway through.
+        let hard_thrash = r#"{"ok":false,"action":"click","thrash":"hard","message":"same target failed"}"#;
+        assert!(tool_loop_interrupt(hard_thrash).is_none());
+        assert!(crate::computer_use::hard_thrash_reply(hard_thrash).is_some());
+    }
 
     #[test]
     fn content_filter_maps_to_specific_skill_error() {
