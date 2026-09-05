@@ -682,6 +682,7 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
         BrowserErrorKind::CommandFailed => "BrowserCommandFailed",
         BrowserErrorKind::InvalidStructuredOutput => "BrowserStructuredOutputInvalid",
         BrowserErrorKind::StaleReference => "BrowserCommandFailed",
+        BrowserErrorKind::ProfileBusy => "BrowserProfileBusy",
     };
     format!("{prefix}: {}", err.detail)
 }
@@ -1570,11 +1571,7 @@ mod tests {
         assert_eq!(backend.call_count(CallKind::Observe), 0);
         assert_eq!(backend.call_count(CallKind::OpenSession), 0);
         let err = rt
-            .act(
-                &key("s"),
-                &opts(),
-                &BrowserAction::eval_raw("1"),
-            )
+            .act(&key("s"), &opts(), &BrowserAction::eval_raw("1"))
             .await
             .unwrap_err();
         assert_eq!(err.kind, BrowserErrorKind::Rejected);
@@ -1719,6 +1716,7 @@ mod tests {
         assert!(!runtime_should_recover(BrowserErrorKind::BinaryMissing));
         assert!(!runtime_should_recover(BrowserErrorKind::Timeout));
         assert!(!runtime_should_recover(BrowserErrorKind::StaleReference));
+        assert!(!runtime_should_recover(BrowserErrorKind::ProfileBusy));
         assert!(runtime_should_recover(BrowserErrorKind::NotConnected));
     }
 
@@ -1735,6 +1733,7 @@ mod tests {
                 "BrowserStructuredOutputInvalid",
             ),
             (BrowserErrorKind::StaleReference, "BrowserCommandFailed"),
+            (BrowserErrorKind::ProfileBusy, "BrowserProfileBusy"),
         ];
         for (kind, prefix) in cases {
             let err = BrowserBackendError::new(kind, id.clone(), "detail");

@@ -37,6 +37,17 @@ pub const BROWSER_STALE_REFERENCE_DETAIL: &str =
 pub const BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL: &str =
     "BrowserCommandFailed: structured extract result exceeds source limit; narrow the extraction expression";
 
+/// Managed persistent profile is held by another live browser session.
+pub const BROWSER_PROFILE_BUSY_DETAIL: &str =
+    "BrowserProfileBusy: profile is already in use; close the browser session holding this profile before retrying";
+
+/// Same logical session cannot switch managed profile while it is bound.
+pub const BROWSER_SESSION_PROFILE_MISMATCH_DETAIL: &str =
+    "BrowserSessionConfigMismatch: browser session profile cannot change while session is active; close the session and open again";
+
+/// Logical managed-profile id: `^[a-z0-9][a-z0-9_-]{0,63}$` (1..=64).
+pub const BROWSER_PROFILE_ID_MAX_LEN: usize = 64;
+
 impl BrowserSessionKey {
     pub fn new(value: impl Into<String>) -> Result<Self, BrowserTypeError> {
         let value = value.into();
@@ -531,7 +542,12 @@ pub struct ScreenshotRequest {
     pub locator: Option<String>,
 }
 
-/// Opaque future profile slot. B3.1A always uses `None` on session options.
+/// OmniNova managed persistent profile logical identity.
+///
+/// This is not a filesystem path, not an installed Chrome profile name, and
+/// not a Personal Chrome identity. `"default"` is a logical id and must be
+/// resolved to an OmniNova-owned directory — never passed to a backend as
+/// the installed-profile token `Default`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BrowserProfileRef(String);
 
@@ -541,12 +557,31 @@ impl BrowserProfileRef {
         if value.is_empty() {
             return Err(BrowserTypeError::EmptyIdentity);
         }
+        if !is_managed_profile_logical_id(&value) {
+            return Err(BrowserTypeError::InvalidProfileId);
+        }
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn is_managed_profile_logical_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    if value.len() > BROWSER_PROFILE_ID_MAX_LEN {
+        return false;
+    }
+    value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -583,6 +618,9 @@ pub enum BrowserErrorKind {
     /// Observation-scoped element handle is no longer valid. Session may
     /// still be healthy. Not retryable; caller must re-observe.
     StaleReference,
+    /// Another live session already holds this managed persistent profile.
+    /// Not retryable; caller must close the holding session first.
+    ProfileBusy,
 }
 
 impl BrowserErrorKind {
@@ -611,6 +649,8 @@ pub fn v1_error_kind(message: &str) -> Option<BrowserErrorKind> {
         "BrowserCommandTimeout" => Some(BrowserErrorKind::Timeout),
         "BrowserUrlRejected" => Some(BrowserErrorKind::Rejected),
         "BrowserCommandFailed" | "InvalidBrowserOutput" => Some(BrowserErrorKind::CommandFailed),
+        "BrowserProfileBusy" => Some(BrowserErrorKind::ProfileBusy),
+        "BrowserSessionConfigMismatch" => Some(BrowserErrorKind::Rejected),
         _ => None,
     }
 }
@@ -703,12 +743,17 @@ impl BackendCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserTypeError {
     EmptyIdentity,
+    InvalidProfileId,
 }
 
 impl fmt::Display for BrowserTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyIdentity => write!(f, "identity value must be non-empty"),
+            Self::InvalidProfileId => write!(
+                f,
+                "browser profile id must be 1..=64 chars of [a-z0-9][a-z0-9_-]*"
+            ),
         }
     }
 }
@@ -961,6 +1006,18 @@ mod tests {
     }
 
     #[test]
+    fn managed_profile_ref_is_logical_id_not_a_path() {
+        assert_eq!(BrowserProfileRef::new("work").unwrap().as_str(), "work");
+        assert!(BrowserProfileRef::new("default").is_ok());
+        assert!(BrowserProfileRef::new("Default").is_err());
+        assert!(BrowserProfileRef::new(r"C:\Users\Hero\.omninova").is_err());
+        assert_eq!(
+            BrowserProfileRef::new("..").unwrap_err(),
+            BrowserTypeError::InvalidProfileId
+        );
+    }
+
+    #[test]
     fn capabilities_split_action_and_observation() {
         let caps = BackendCapabilities {
             navigation: true,
@@ -1014,6 +1071,11 @@ mod tests {
             ("BrowserCommandTimeout: x", BrowserErrorKind::Timeout),
             ("BrowserUrlRejected: x", BrowserErrorKind::Rejected),
             ("BrowserCommandFailed: x", BrowserErrorKind::CommandFailed),
+            ("BrowserProfileBusy: x", BrowserErrorKind::ProfileBusy),
+            (
+                "BrowserSessionConfigMismatch: x",
+                BrowserErrorKind::Rejected,
+            ),
         ];
         for (msg, kind) in cases {
             assert_eq!(v1_error_kind(msg), Some(kind), "{msg}");
@@ -1022,6 +1084,7 @@ mod tests {
         assert!(!BrowserErrorKind::Rejected.default_retryable());
         assert!(!BrowserErrorKind::InvalidStructuredOutput.default_retryable());
         assert!(!BrowserErrorKind::StaleReference.default_retryable());
+        assert!(!BrowserErrorKind::ProfileBusy.default_retryable());
         assert!(BrowserErrorKind::Timeout.default_retryable());
         assert!(BrowserErrorKind::Crashed.default_retryable());
         assert_ne!(

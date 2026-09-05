@@ -18,19 +18,26 @@ use crate::tools::browser_output::{
     parse_snapshot_refs, parse_structured_eval_wire, RawSnapshotRef, StructuredEvalWire,
     BROWSER_EXTRACT_SOURCE_CHAR_LIMIT,
 };
+use crate::tools::browser_profile::{
+    paths_refer_to_same_location, BrowserProfileError, BrowserProfileResolver,
+};
 use crate::tools::browser_types::{
     BackendAvailability, BackendCapabilities, BackendSessionHandle, BrowserAction,
     BrowserActionResult, BrowserBackendError, BrowserBackendId, BrowserElement, BrowserElementRef,
     BrowserErrorKind, BrowserEvalMode, BrowserHealth, BrowserObservation, BrowserObserveKind,
-    BrowserPageId, BrowserSessionKey, BrowserSessionOpenRequest, BrowserSessionOptions,
-    BrowserSnapshot, BrowserTab, BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest,
-    ScreenshotResult, BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL, BROWSER_STALE_REFERENCE_DETAIL,
+    BrowserPageId, BrowserProfileRef, BrowserSessionKey, BrowserSessionOpenRequest,
+    BrowserSessionOptions, BrowserSnapshot, BrowserTab, BrowserTarget, NavigateRequest,
+    ObserveRequest, ScreenshotRequest, ScreenshotResult, BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL,
+    BROWSER_PROFILE_BUSY_DETAIL, BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
+    BROWSER_STALE_REFERENCE_DETAIL,
 };
 use crate::tools::configure_background_command;
 use crate::tools::web_client::redact_secrets_in_text;
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
@@ -103,14 +110,59 @@ pub struct AgentBrowserBackend {
     search: Option<BrowserBinarySearch>,
     defaults: BrowserSessionOptions,
     last_stdout_len: Mutex<Option<usize>>,
+    profile_resolver: BrowserProfileResolver,
+    launch_by_session: Mutex<HashMap<String, BoundSessionLaunch>>,
+    #[cfg(test)]
+    cli_invocations: Mutex<Vec<CliInvocationRecord>>,
+}
+
+/// Per-session launch identity. Bound at `open_session` and reused by every
+/// later CLI spawn so open/eval cannot diverge. Profile path is argv-only
+/// and must not be logged or returned to the model.
+#[derive(Clone)]
+struct BoundSessionLaunch {
+    profile: Option<BrowserProfileRef>,
+    profile_path: Option<PathBuf>,
+    cli_profile_arg: Option<OsString>,
+    headless: bool,
+    attach_only: bool,
+    cdp_url: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct CliInvocationRecord {
+    operation: String,
+    cli_session: String,
+    namespace: String,
+    profile_present: bool,
+    profile_hash: Option<String>,
+    headless: bool,
+    #[allow(dead_code)]
+    attach_only: bool,
+    #[allow(dead_code)]
+    cdp_url_present: bool,
+    launch_fingerprint: String,
 }
 
 impl AgentBrowserBackend {
     pub fn new(search: Option<BrowserBinarySearch>, defaults: BrowserSessionOptions) -> Self {
+        Self::with_profile_resolver(search, defaults, BrowserProfileResolver::omninova_default())
+    }
+
+    pub fn with_profile_resolver(
+        search: Option<BrowserBinarySearch>,
+        defaults: BrowserSessionOptions,
+        profile_resolver: BrowserProfileResolver,
+    ) -> Self {
         Self {
             search,
             defaults,
             last_stdout_len: Mutex::new(None),
+            profile_resolver,
+            launch_by_session: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cli_invocations: Mutex::new(Vec::new()),
         }
     }
 
@@ -150,6 +202,119 @@ impl AgentBrowserBackend {
         BackendSessionHandle::new(self.id_value(), token).map_err(|err| {
             BrowserBackendError::new(BrowserErrorKind::Rejected, self.id_value(), err.to_string())
         })
+    }
+
+    fn bind_session_launch(
+        &self,
+        token: &str,
+        options: &BrowserSessionOptions,
+        profile_path: Option<PathBuf>,
+    ) -> Result<(), BrowserBackendError> {
+        let mut map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(existing) = map.get(token) {
+            if existing.profile != options.profile {
+                let mut err = BrowserBackendError::new(
+                    BrowserErrorKind::Rejected,
+                    self.id_value(),
+                    BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
+                );
+                err.retryable = false;
+                return Err(err);
+            }
+            return Ok(());
+        }
+        if let Some(path) = profile_path.as_ref() {
+            let stale: Vec<String> = map
+                .iter()
+                .filter_map(|(other, cfg)| {
+                    if other == token {
+                        return None;
+                    }
+                    let other_path = cfg.profile_path.as_ref()?;
+                    if !paths_refer_to_same_location(other_path, path) {
+                        return None;
+                    }
+                    match probe_owned_session_pid(other) {
+                        Some(false) => Some(other.clone()),
+                        _ => None,
+                    }
+                })
+                .collect();
+            for session in stale {
+                map.remove(&session);
+            }
+            let busy = map.iter().any(|(other, cfg)| {
+                other != token
+                    && cfg
+                        .profile_path
+                        .as_ref()
+                        .is_some_and(|other_path| paths_refer_to_same_location(other_path, path))
+            });
+            if busy {
+                return Err(profile_busy_error(self.id_value()));
+            }
+        }
+        let cli_profile_arg = profile_path.as_ref().map(|path| profile_path_for_cli(path));
+        map.insert(
+            token.to_string(),
+            BoundSessionLaunch {
+                profile: options.profile.clone(),
+                profile_path,
+                cli_profile_arg,
+                headless: options.headless,
+                attach_only: options.attach_only,
+                cdp_url: options.cdp_url.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn session_launch(&self, token: &str) -> Option<BoundSessionLaunch> {
+        self.launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(token)
+            .cloned()
+    }
+
+    fn session_profile_path(&self, token: &str) -> Option<PathBuf> {
+        self.session_launch(token)
+            .and_then(|cfg| cfg.profile_path)
+    }
+
+    fn unbind_session_launch(&self, token: &str) {
+        if let Ok(mut map) = self.launch_by_session.lock() {
+            map.remove(token);
+        }
+    }
+
+    fn resolve_request_profile(
+        &self,
+        profile: &BrowserProfileRef,
+    ) -> Result<PathBuf, BrowserBackendError> {
+        match self.profile_resolver.resolve(profile) {
+            Ok(resolved) => Ok(resolved.path),
+            Err(BrowserProfileError::Invalid { detail }) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                detail,
+            )),
+            Err(BrowserProfileError::EscapedRoot) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                BrowserProfileError::EscapedRoot.to_string(),
+            )),
+            Err(BrowserProfileError::Io { detail }) => Err(BrowserBackendError::new(
+                BrowserErrorKind::LaunchFailed,
+                self.id_value(),
+                format!(
+                    "BrowserLaunchFailed: failed to prepare managed browser profile directory ({detail})"
+                ),
+            )),
+        }
     }
 
     fn target_arg(&self, target: &BrowserTarget) -> Result<String, BrowserBackendError> {
@@ -213,11 +378,19 @@ impl AgentBrowserBackend {
             BrowserBackendError::new(BrowserErrorKind::Rejected, self.id_value(), detail)
         })?;
         let retryable_action = is_retryable_action(v1_action);
+        let bound = self.session_launch(cli_session);
+        let profile_path = bound.as_ref().and_then(|cfg| cfg.profile_path.clone());
         let mut recovered = false;
         let mut concurrent_followup = false;
         loop {
             match self
-                .spawn_cli(cli_session, opts, v1_action, extra_args)
+                .spawn_cli(
+                    cli_session,
+                    opts,
+                    bound.as_ref(),
+                    v1_action,
+                    extra_args,
+                )
                 .await
             {
                 Ok((exit_success, stdout, stderr, binary_path)) => {
@@ -228,6 +401,7 @@ impl AgentBrowserBackend {
                     if outcome.success {
                         if v1_action == "close" {
                             forget_owned_browser_session(cli_session);
+                            self.unbind_session_launch(cli_session);
                         }
                         return Ok(NamedSuccess {
                             output: outcome.output,
@@ -258,6 +432,9 @@ impl AgentBrowserBackend {
                         err.retryable = false;
                         return Err(err);
                     }
+                    if profile_path.is_some() && looks_like_managed_profile_busy(&diagnostic) {
+                        return Err(exhausted(profile_busy_error(self.id_value())));
+                    }
                     let kind = classify_browser_output(&diagnostic);
                     if auto_retry_allowed(
                         v1_action,
@@ -283,6 +460,7 @@ impl AgentBrowserBackend {
                     {
                         recover_owned_session(cli_session);
                         forget_owned_browser_session(cli_session);
+                        self.unbind_session_launch(cli_session);
                         return Ok(NamedSuccess {
                             output: outcome.output,
                             stdout,
@@ -322,21 +500,36 @@ impl AgentBrowserBackend {
         &self,
         cli_session: &str,
         opts: &BrowserSessionOptions,
+        bound: Option<&BoundSessionLaunch>,
         v1_action: &str,
         extra_args: &[String],
     ) -> Result<(bool, String, String, std::path::PathBuf), BrowserBackendError> {
         let resolved = self.resolve_binary()?;
+        let headless = bound.map(|cfg| cfg.headless).unwrap_or(opts.headless);
+        let attach_only = bound.map(|cfg| cfg.attach_only).unwrap_or(opts.attach_only);
+        let cdp_url = bound
+            .and_then(|cfg| cfg.cdp_url.as_deref())
+            .or(opts.cdp_url.as_deref());
+        let cli_profile_arg = bound.and_then(|cfg| cfg.cli_profile_arg.clone());
+        let daemon_alive = probe_owned_session_pid(cli_session) == Some(true);
+        let emit_profile = cli_profile_arg.is_some() && should_forward_managed_profile_flag(daemon_alive);
+
         let mut cmd = Command::new(&resolved.path);
         configure_background_command(&mut cmd);
-        if !opts.headless {
+        if !headless {
             cmd.arg("--headed");
         }
         cmd.arg("--session").arg(cli_session);
         cmd.arg("--namespace").arg(AGENT_BROWSER_NAMESPACE);
-        if opts.attach_only {
+        if emit_profile {
+            if let Some(profile_arg) = cli_profile_arg.as_ref() {
+                apply_managed_profile_cli_arg(&mut cmd, profile_arg, self.id_value())?;
+            }
+        }
+        if attach_only {
             cmd.arg("--attach-only");
         }
-        if let Some(cdp_url) = &opts.cdp_url {
+        if let Some(cdp_url) = cdp_url {
             cmd.arg("--cdp-url").arg(cdp_url);
         }
         cmd.arg("--json");
@@ -347,6 +540,16 @@ impl AgentBrowserBackend {
             cmd.arg(arg);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(test)]
+        self.record_cli_invocation(
+            v1_action,
+            cli_session,
+            emit_profile,
+            cli_profile_arg.as_ref(),
+            headless,
+            attach_only,
+            cdp_url.is_some(),
+        );
         remember_owned_browser_session(cli_session);
         match run_command_with_timeout(cmd, DEFAULT_TIMEOUT_SECS).await {
             Ok(output) => {
@@ -365,11 +568,131 @@ impl AgentBrowserBackend {
             Err(ChildRunError::Io(e)) => Err(spawn_error(self.id_value(), &resolved.path, e)),
         }
     }
+
+    #[cfg(test)]
+    fn record_cli_invocation(
+        &self,
+        operation: &str,
+        cli_session: &str,
+        profile_present: bool,
+        cli_profile_arg: Option<&OsString>,
+        headless: bool,
+        attach_only: bool,
+        cdp_url_present: bool,
+    ) {
+        let profile_hash = cli_profile_arg.map(|arg| hash_cli_profile_arg(arg));
+        let launch_fingerprint = format!(
+            "session={cli_session}|ns={AGENT_BROWSER_NAMESPACE}|profile={}|headless={headless}|attach_only={attach_only}|cdp={cdp_url_present}|exe=none",
+            profile_hash.as_deref().unwrap_or("none")
+        );
+        if let Ok(mut log) = self.cli_invocations.lock() {
+            log.push(CliInvocationRecord {
+                operation: operation.to_string(),
+                cli_session: cli_session.to_string(),
+                namespace: AGENT_BROWSER_NAMESPACE.to_string(),
+                profile_present,
+                profile_hash,
+                headless,
+                attach_only,
+                cdp_url_present,
+                launch_fingerprint,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn take_cli_invocations(&self) -> Vec<CliInvocationRecord> {
+        self.cli_invocations
+            .lock()
+            .map(|mut log| std::mem::take(&mut *log))
+            .unwrap_or_default()
+    }
 }
 
 fn exhausted(mut err: BrowserBackendError) -> BrowserBackendError {
     err.retryable = false;
     err
+}
+
+fn profile_busy_error(backend: BrowserBackendId) -> BrowserBackendError {
+    let mut err = BrowserBackendError::new(
+        BrowserErrorKind::ProfileBusy,
+        backend,
+        BROWSER_PROFILE_BUSY_DETAIL,
+    );
+    err.retryable = false;
+    err
+}
+
+/// Conservative 0.36.0 Chrome singleton signature. Not "any exit 21".
+fn looks_like_managed_profile_busy(diagnostic: &str) -> bool {
+    let lower = diagnostic.to_ascii_lowercase();
+    lower.contains("chrome exited early")
+        && lower.contains("exit code: 21")
+        && lower.contains("devtoolsactiveport")
+}
+
+fn apply_managed_profile_cli_arg(
+    cmd: &mut Command,
+    profile_arg: &OsString,
+    backend: BrowserBackendId,
+) -> Result<(), BrowserBackendError> {
+    let path = Path::new(profile_arg);
+    if !path.is_absolute() {
+        return Err(BrowserBackendError::new(
+            BrowserErrorKind::Rejected,
+            backend,
+            "BrowserProfileRejected: managed profile path must be absolute",
+        ));
+    }
+    cmd.arg("--profile");
+    cmd.arg(profile_arg);
+    Ok(())
+}
+
+/// agent-browser 0.36.0 `launch_hash` hashes the `--profile` string. Windows
+/// `canonicalize` yields `\\?\` verbatim paths; stripping that prefix keeps
+/// open/eval argv bytes identical and matches Chrome `--user-data-dir`.
+fn profile_path_for_cli(path: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        let raw = path.as_os_str().to_string_lossy();
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            if !stripped.starts_with("UNC\\") {
+                let normalized = Path::new(stripped);
+                if normalized.is_absolute() {
+                    return OsString::from(stripped);
+                }
+            }
+        }
+    }
+    path.as_os_str().to_os_string()
+}
+
+/// agent-browser 0.36.0 sends a daemon `launch` envelope whenever `--profile`
+/// is present (`should_send_local_launch_config`). A follow-up launch can
+/// relaunch Chrome onto about:blank. Once this session's sidecar is alive,
+/// omit `--profile` so later eval/observe attach instead of re-launching.
+fn should_forward_managed_profile_flag(daemon_alive: bool) -> bool {
+    !daemon_alive
+}
+
+#[cfg(test)]
+fn hash_cli_profile_arg(arg: &OsString) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(arg.to_string_lossy().as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn managed_profile_argv(profile_path: Option<&Path>) -> Vec<std::ffi::OsString> {
+    match profile_path {
+        Some(path) => vec!["--profile".into(), profile_path_for_cli(path)],
+        None => Vec::new(),
+    }
 }
 
 struct NamedSuccess {
@@ -598,7 +921,7 @@ impl BrowserBackend for AgentBrowserBackend {
             screenshot: true,
             eval: true,
             attach: true,
-            profiles: false,
+            profiles: true,
         }
     }
 
@@ -616,8 +939,13 @@ impl BrowserBackend for AgentBrowserBackend {
         &self,
         req: &BrowserSessionOpenRequest,
     ) -> Result<BackendSessionHandle, BrowserBackendError> {
-        let _ = &req.options;
-        self.handle_from_key(&req.key)
+        let handle = self.handle_from_key(&req.key)?;
+        let profile_path = match &req.options.profile {
+            Some(profile) => Some(self.resolve_request_profile(profile)?),
+            None => None,
+        };
+        self.bind_session_launch(handle.token(), &req.options, profile_path)?;
+        Ok(handle)
     }
 
     async fn session_health(&self, session: &BackendSessionHandle) -> BrowserHealth {
@@ -932,9 +1260,9 @@ fn structured_eval_action_result(
                 BrowserErrorKind::CommandFailed,
                 backend,
                 match observed_chars {
-                    Some(chars) => format!(
-                        "{BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL}; observed_chars={chars}"
-                    ),
+                    Some(chars) => {
+                        format!("{BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL}; observed_chars={chars}")
+                    }
                     None => BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL.to_string(),
                 },
             );
@@ -1066,11 +1394,14 @@ mod tests {
     use super::*;
     use crate::tools::browser_bin::bundled_agent_browser_relative_path;
     use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
-    use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy};
     use crate::tools::browser_output::BROWSER_EXTRACT_SOURCE_CHAR_LIMIT;
+    use crate::tools::browser_profile::BrowserProfileResolver;
+    use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy};
     use crate::tools::browser_types::{
         BrowserElement, BrowserElementRef, BrowserErrorKind, BrowserExtractRequest,
-        BrowserSessionKey,
+        BrowserProfileRef, BrowserSessionKey, BrowserSessionOpenRequest,
+        BrowserSessionOptions, BROWSER_PROFILE_BUSY_DETAIL,
+        BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
     };
     use serde_json::{json, Value};
 
@@ -1198,7 +1529,8 @@ mod tests {
     #[test]
     fn structured_eval_wraps_expression_as_source_body() {
         let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
-        let expression = r#""hello 'world' `tick`" || (1 ? await Promise.resolve({ok: true}) : null)"#;
+        let expression =
+            r#""hello 'world' `tick`" || (1 ? await Promise.resolve({ok: true}) : null)"#;
         let (_, args) = backend
             .act_args(&BrowserAction::eval_structured_json(expression))
             .unwrap();
@@ -1810,5 +2142,982 @@ mod tests {
             text.to_lowercase().contains("agent-browser") || text.contains("0."),
             "unexpected --version output: {text}"
         );
+    }
+
+    fn scratch_profile_backend(
+        search: Option<BrowserBinarySearch>,
+    ) -> (AgentBrowserBackend, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("omninova-b33b-backend-{}", uuid::Uuid::new_v4()));
+        let backend = AgentBrowserBackend::with_profile_resolver(
+            search,
+            BrowserSessionOptions::default(),
+            BrowserProfileResolver::new(root.clone()),
+        );
+        (backend, root)
+    }
+
+    fn profile_opts(id: &str) -> BrowserSessionOptions {
+        BrowserSessionOptions {
+            profile: Some(BrowserProfileRef::new(id).unwrap()),
+            ..BrowserSessionOptions::default()
+        }
+    }
+
+    #[test]
+    fn agent_backend_declares_profile_capability() {
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        assert!(backend.capabilities().profiles);
+    }
+
+    #[test]
+    fn ephemeral_session_does_not_emit_profile_argv() {
+        assert!(managed_profile_argv(None).is_empty());
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = BrowserSessionKey::new("ephemeral-chat").unwrap();
+        let handle = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                key,
+                BrowserSessionOptions::default(),
+            )))
+            .unwrap();
+        assert!(backend.session_profile_path(handle.token()).is_none());
+    }
+
+    #[test]
+    fn managed_profile_argv_is_two_absolute_entries() {
+        let path = if cfg!(windows) {
+            PathBuf::from(r"C:\omninova-test\browser\profiles\profile-ab12")
+        } else {
+            PathBuf::from("/tmp/omninova-test/browser/profiles/profile-ab12")
+        };
+        let args = managed_profile_argv(Some(&path));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--profile");
+        assert_eq!(Path::new(&args[1]), path.as_path());
+        assert!(Path::new(&args[1]).is_absolute());
+        assert!(
+            path.to_string_lossy().contains('\\') || path.to_string_lossy().contains('/'),
+            "absolute profile path must contain a separator so it is not an installed-profile name"
+        );
+        assert_ne!(args[1], "work");
+        assert_ne!(args[1], "default");
+    }
+
+    #[test]
+    fn profile_path_for_cli_strips_windows_verbatim_prefix() {
+        #[cfg(windows)]
+        {
+            let verbatim = PathBuf::from(r"\\?\C:\omninova-test\browser\profiles\profile-ab12");
+            assert_eq!(
+                profile_path_for_cli(&verbatim),
+                OsString::from(r"C:\omninova-test\browser\profiles\profile-ab12")
+            );
+            let unc = PathBuf::from(r"\\?\UNC\server\share\profiles\p1");
+            assert_eq!(profile_path_for_cli(&unc), unc.as_os_str());
+        }
+        let ordinary = if cfg!(windows) {
+            PathBuf::from(r"C:\omninova-test\browser\profiles\profile-ab12")
+        } else {
+            PathBuf::from("/tmp/omninova-test/browser/profiles/profile-ab12")
+        };
+        assert_eq!(profile_path_for_cli(&ordinary), ordinary.as_os_str());
+    }
+
+    #[test]
+    fn should_forward_managed_profile_flag_omits_when_daemon_alive() {
+        assert!(should_forward_managed_profile_flag(false));
+        assert!(!should_forward_managed_profile_flag(true));
+    }
+
+    #[test]
+    fn same_session_profile_mismatch_is_rejected() {
+        let (backend, root) = scratch_profile_backend(None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = BrowserSessionKey::new("mismatch-session").unwrap();
+        rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            key.clone(),
+            profile_opts("account-a"),
+        )))
+        .unwrap();
+        let err = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                key,
+                profile_opts("account-b"),
+            )))
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        assert!(!err.retryable);
+        assert_eq!(err.detail, BROWSER_SESSION_PROFILE_MISMATCH_DETAIL);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_process_profile_occupancy_is_profile_busy() {
+        let (backend, root) = scratch_profile_backend(None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            BrowserSessionKey::new("holder-a").unwrap(),
+            profile_opts("shared-x"),
+        )))
+        .unwrap();
+        let err = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("challenger-b").unwrap(),
+                profile_opts("shared-x"),
+            )))
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::ProfileBusy);
+        assert!(!err.retryable);
+        assert_eq!(err.detail, BROWSER_PROFILE_BUSY_DETAIL);
+        assert!(!err.detail.to_ascii_lowercase().contains("kill"));
+        assert!(!err.detail.to_ascii_lowercase().contains("singleton"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_session_same_profile_rebinding_is_stable() {
+        let (backend, root) = scratch_profile_backend(None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = BrowserSessionKey::new("stable-session").unwrap();
+        let first = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                key.clone(),
+                profile_opts("account-a"),
+            )))
+            .unwrap();
+        let path_first = backend.session_profile_path(first.token()).unwrap();
+        let second = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                key,
+                profile_opts("account-a"),
+            )))
+            .unwrap();
+        let path_second = backend.session_profile_path(second.token()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(path_first, path_second);
+        assert!(path_first.is_absolute());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn distinct_sessions_keep_distinct_profile_paths() {
+        let (backend, root) = scratch_profile_backend(None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let a = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("sess-a").unwrap(),
+                profile_opts("account-a"),
+            )))
+            .unwrap();
+        let b = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("sess-b").unwrap(),
+                profile_opts("account-b"),
+            )))
+            .unwrap();
+        let path_a = backend.session_profile_path(a.token()).unwrap();
+        let path_b = backend.session_profile_path(b.token()).unwrap();
+        assert_ne!(a.token(), b.token());
+        assert_ne!(path_a, path_b);
+        assert!(path_a.is_absolute());
+        assert!(path_b.is_absolute());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_dead_pid_releases_profile_occupancy() {
+        let (backend, root) = scratch_profile_backend(None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let handle_a = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new(format!("stale-holder-{nonce}")).unwrap(),
+                profile_opts("shared-stale"),
+            )))
+            .unwrap();
+        let pid_path = crate::tools::browser_lifecycle::namespace_run_dir(AGENT_BROWSER_NAMESPACE)
+            .join(format!("{}.pid", handle_a.token()));
+        if let Some(parent) = pid_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&pid_path, b"0").expect("dead pid file");
+        let opened_b = rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            BrowserSessionKey::new(format!("stale-challenger-{nonce}")).unwrap(),
+            profile_opts("shared-stale"),
+        )));
+        let _ = std::fs::remove_file(&pid_path);
+        let handle_b = opened_b.expect("dead holder must release occupancy");
+        assert_ne!(handle_a.token(), handle_b.token());
+        assert!(backend.session_profile_path(handle_b.token()).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_busy_classifier_is_conservative() {
+        let signature = "Chrome exited early (exit code: 21) without writing DevToolsActivePort";
+        assert!(looks_like_managed_profile_busy(signature));
+        assert!(!looks_like_managed_profile_busy(
+            "Chrome exited early (exit code: 21)"
+        ));
+        assert!(!looks_like_managed_profile_busy(
+            "something failed with exit code: 21 and more text"
+        ));
+        assert!(!looks_like_managed_profile_busy(
+            "DevToolsActivePort file doesn't exist"
+        ));
+    }
+
+    fn persist_fixture_html(account: &str) -> String {
+        format!(
+            r#"<!DOCTYPE html><html><head><title>waiting</title></head><body>
+<script>
+window.__omninovaPersistFixture = {{ ready: false, error: null, stage: "boot", runs: 0 }};
+document.title = "persist-boot";
+(async () => {{
+  const fixture = () => window.__omninovaPersistFixture;
+  const setStage = (stage) => {{ fixture().stage = stage; }};
+  try {{
+    fixture().runs = (fixture().runs || 0) + 1;
+    setStage("cookie");
+    document.cookie = "omninova_persist={account}; path=/; max-age=31536000; SameSite=Lax";
+    setStage("local-storage");
+    localStorage.setItem("omninova_persist", "{account}");
+    setStage("indexeddb-open");
+    await new Promise((resolve, reject) => {{
+      const req = indexedDB.open("omninova_persist_db", 1);
+      req.onupgradeneeded = () => {{ req.result.createObjectStore("kv"); }};
+      req.onerror = () => reject(req.error || new Error("indexeddb-open"));
+      req.onsuccess = () => {{
+        setStage("indexeddb-write");
+        const db = req.result;
+        const tx = db.transaction("kv", "readwrite");
+        tx.objectStore("kv").put("{account}", "account");
+        tx.oncomplete = () => {{ db.close(); resolve(); }};
+        tx.onerror = () => reject(tx.error || new Error("indexeddb-write"));
+      }};
+    }});
+    window.__omninovaPersistFixture = {{
+      ready: true,
+      error: null,
+      stage: "done",
+      runs: fixture().runs
+    }};
+    document.title = "persist-ready";
+  }} catch (err) {{
+    window.__omninovaPersistFixture = {{
+      ready: false,
+      error: String(err),
+      stage: fixture().stage,
+      runs: fixture().runs
+    }};
+    document.title = "persist-error";
+  }}
+}})();
+</script></body></html>"#
+        )
+    }
+
+    const PERSIST_READ_EXPRESSION: &str = r#"(async () => {
+  const cookie = document.cookie;
+  const ls = localStorage.getItem("omninova_persist");
+  const idb = await new Promise((resolve, reject) => {
+    const req = indexedDB.open("omninova_persist_db", 1);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("kv")) { resolve(null); return; }
+      const tx = db.transaction("kv", "readonly");
+      const get = tx.objectStore("kv").get("account");
+      get.onsuccess = () => { db.close(); resolve(get.result ?? null); };
+      get.onerror = () => reject(get.error);
+    };
+  });
+  return { cookie, ls, idb };
+})()"#;
+
+    const PERSIST_READY_POLL_EXPRESSION: &str = r#"({
+  ready: window.__omninovaPersistFixture?.ready === true,
+  error: window.__omninovaPersistFixture?.error ?? null,
+  stage: window.__omninovaPersistFixture?.stage ?? null,
+  title: document.title,
+  readyState: document.readyState,
+  href: String(location.href),
+  runs: window.__omninovaPersistFixture?.runs ?? null
+})"#;
+
+    fn bound_fixture_diag(value: &str) -> String {
+        value.chars().take(200).collect()
+    }
+
+    fn json_diag_field(value: &serde_json::Value, key: &str) -> String {
+        match value.get(key) {
+            None => "missing".into(),
+            Some(serde_json::Value::Null) => "null".into(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(other) => bound_fixture_diag(&other.to_string()),
+        }
+    }
+
+    async fn wait_persist_ready(
+        runtime: &BrowserRuntime,
+        key: &BrowserSessionKey,
+        opts: &BrowserSessionOptions,
+    ) {
+        let deadline = std::time::Duration::from_secs(15);
+        let interval = std::time::Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let mut last_stage = String::from("missing");
+        let mut last_title = String::from("missing");
+        let mut last_ready_state = String::from("missing");
+        let mut last_href = String::from("missing");
+        let mut last_eval_err: Option<String> = None;
+        let mut polls: u32 = 0;
+        let mut ok_polls: u32 = 0;
+        loop {
+            polls += 1;
+            match runtime
+                .extract_json(
+                    key,
+                    opts,
+                    &BrowserExtractRequest {
+                        expression: PERSIST_READY_POLL_EXPRESSION.into(),
+                    },
+                )
+                .await
+            {
+                Ok(extracted) => {
+                    ok_polls += 1;
+                    last_eval_err = None;
+                    let ready = extracted
+                        .value
+                        .get("ready")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let error = extracted
+                        .value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    last_stage = json_diag_field(&extracted.value, "stage");
+                    last_title = json_diag_field(&extracted.value, "title");
+                    last_ready_state = json_diag_field(&extracted.value, "readyState");
+                    last_href = json_diag_field(&extracted.value, "href");
+                    if let Some(error) = error {
+                        panic!(
+                            "persist fixture failed at {}: {}; title={}; readyState={}; href={}",
+                            last_stage,
+                            bound_fixture_diag(error),
+                            bound_fixture_diag(&last_title),
+                            bound_fixture_diag(&last_ready_state),
+                            bound_fixture_diag(&last_href)
+                        );
+                    }
+                    if ready {
+                        let runs = extracted.value.get("runs").and_then(|v| v.as_u64());
+                        assert_eq!(
+                            runs,
+                            Some(1),
+                            "fixture init must run once; stage={last_stage} title={last_title} href={last_href}"
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    last_eval_err = Some(bound_fixture_diag(&err.detail));
+                }
+            }
+            if started.elapsed() >= deadline {
+                match last_eval_err {
+                    Some(eval_err) => panic!(
+                        "persist fixture timeout after 15s: stage={last_stage}, title={}, readyState={}, href={}, polls={polls}, ok_polls={ok_polls}, eval_error={eval_err}",
+                        bound_fixture_diag(&last_title),
+                        bound_fixture_diag(&last_ready_state),
+                        bound_fixture_diag(&last_href)
+                    ),
+                    None => panic!(
+                        "persist fixture timeout after 15s: stage={last_stage}, title={}, readyState={}, href={}, polls={polls}, ok_polls={ok_polls}",
+                        bound_fixture_diag(&last_title),
+                        bound_fixture_diag(&last_ready_state),
+                        bound_fixture_diag(&last_href)
+                    ),
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    fn owned_sidecar_pid(token: &str) -> Option<u32> {
+        let pid_path = crate::tools::browser_lifecycle::namespace_run_dir(AGENT_BROWSER_NAMESPACE)
+            .join(format!("{token}.pid"));
+        std::fs::read_to_string(pid_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn child_pids(parent: u32) -> Vec<(u32, String)> {
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("wmic")
+                .args([
+                    "process",
+                    "where",
+                    &format!("ParentProcessId={parent}"),
+                    "get",
+                    "ProcessId,Name",
+                    "/FORMAT:CSV",
+                ])
+                .output();
+            let Ok(output) = output else {
+                return Vec::new();
+            };
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+                    if cols.len() < 3 {
+                        return None;
+                    }
+                    let name = cols[1];
+                    let pid = cols[2].parse::<u32>().ok()?;
+                    if name.eq_ignore_ascii_case("Name") {
+                        return None;
+                    }
+                    Some((pid, name.to_string()))
+                })
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            Vec::new()
+        }
+    }
+
+    fn chrome_pid_near(daemon_pid: Option<u32>) -> Option<u32> {
+        let parent = daemon_pid?;
+        child_pids(parent)
+            .into_iter()
+            .find(|(_, name)| {
+                let lower = name.to_ascii_lowercase();
+                lower.contains("chrome") || lower.contains("chromium")
+            })
+            .map(|(pid, _)| pid)
+            .or_else(|| {
+                child_pids(parent).into_iter().find_map(|(child, _)| {
+                    child_pids(child)
+                        .into_iter()
+                        .find(|(_, name)| {
+                            let lower = name.to_ascii_lowercase();
+                            lower.contains("chrome") || lower.contains("chromium")
+                        })
+                        .map(|(pid, _)| pid)
+                })
+            })
+    }
+
+    fn dump_cli_invocations(records: &[CliInvocationRecord]) {
+        for record in records {
+            eprintln!(
+                "OP={} cli_session={} namespace={} profile_present={} profile_hash={} headless={} attach_only={} cdp={} launch_fingerprint={}",
+                record.operation,
+                record.cli_session,
+                record.namespace,
+                record.profile_present,
+                record.profile_hash.as_deref().unwrap_or("none"),
+                record.headless,
+                record.attach_only,
+                record.cdp_url_present,
+                record.launch_fingerprint
+            );
+        }
+    }
+
+    fn kill_owned_session_tree(token: &str) {
+        let Some(pid) = owned_sidecar_pid(token) else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profile_navigation_targets_same_page() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = r#"<!DOCTYPE html><html><head><title>target-page</title></head><body><script>window.__targetMarker = "managed-profile-target";</script></body></html>"#;
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let backend = Arc::new(backend);
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let nonce = uuid::Uuid::new_v4();
+        let opts = profile_opts(&format!("b33b-nav-{nonce}"));
+        let key = BrowserSessionKey::new(format!("b33b-nav-sess-{nonce}")).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/target");
+        runtime
+            .open(&key, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open target page");
+        let token = browser_session_id(Some(key.as_str())).unwrap();
+        let daemon_pid_open = owned_sidecar_pid(&token);
+        let chrome_pid_open = chrome_pid_near(daemon_pid_open);
+        eprintln!(
+            "DAEMON_PID_OPEN={:?} CHROME_PID_OPEN={:?}",
+            daemon_pid_open, chrome_pid_open
+        );
+
+        let observed_url = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Url,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("observe url");
+        let observed_title = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Title,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("observe title");
+        let extracted = runtime
+            .extract_json(
+                &key,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: "({ href: String(document.location.href), title: String(document.title), marker: window.__targetMarker ?? null })".into(),
+                },
+            )
+            .await
+            .expect("eval target marker");
+        let daemon_pid_eval = owned_sidecar_pid(&token);
+        let chrome_pid_eval = chrome_pid_near(daemon_pid_eval);
+        eprintln!(
+            "DAEMON_PID_EVAL={:?} CHROME_PID_EVAL={:?}",
+            daemon_pid_eval, chrome_pid_eval
+        );
+
+        let invocations = backend.take_cli_invocations();
+        dump_cli_invocations(&invocations);
+        let open_inv = invocations
+            .iter()
+            .find(|row| row.operation == "open")
+            .expect("open argv record");
+        let eval_inv = invocations
+            .iter()
+            .find(|row| row.operation == "eval")
+            .expect("eval argv record");
+        eprintln!("OPEN_AGENT_BROWSER_SESSION={}", open_inv.cli_session);
+        eprintln!("EVAL_AGENT_BROWSER_SESSION={}", eval_inv.cli_session);
+        eprintln!("OPEN_NAMESPACE={}", open_inv.namespace);
+        eprintln!("EVAL_NAMESPACE={}", eval_inv.namespace);
+        eprintln!("OPEN_LAUNCH_FINGERPRINT={}", open_inv.launch_fingerprint);
+        eprintln!("EVAL_LAUNCH_FINGERPRINT={}", eval_inv.launch_fingerprint);
+        eprintln!(
+            "OPEN_PROFILE_PRESENT={} EVAL_PROFILE_PRESENT={}",
+            open_inv.profile_present, eval_inv.profile_present
+        );
+
+        let href = extracted.value["href"].as_str().unwrap_or("");
+        let title = extracted.value["title"].as_str().unwrap_or("");
+        let marker = extracted.value["marker"].as_str().unwrap_or("");
+        let observed_url_text = observed_url
+            .text
+            .as_deref()
+            .or(observed_url.url.as_deref())
+            .unwrap_or("");
+        let observed_title_text = observed_title
+            .text
+            .as_deref()
+            .or(observed_title.title.as_deref())
+            .unwrap_or("");
+        eprintln!(
+            "OBSERVE_URL={observed_url_text} OBSERVE_TITLE={observed_title_text} EVAL_HREF={href} EVAL_TITLE={title} MARKER={marker}"
+        );
+
+        let _ = runtime.close_session(&key, &opts).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(open_inv.cli_session, eval_inv.cli_session);
+        assert_eq!(open_inv.namespace, eval_inv.namespace);
+        assert_eq!(open_inv.launch_fingerprint, eval_inv.launch_fingerprint);
+        assert!(open_inv.profile_present, "first open must send --profile");
+        assert!(
+            !eval_inv.profile_present,
+            "follow-up eval must not re-send --profile while the session daemon is alive"
+        );
+        assert_eq!(daemon_pid_open, daemon_pid_eval, "daemon pid changed");
+        assert!(
+            href.contains(&url) && !href.contains("about:blank"),
+            "eval href was {href}, expected {url}"
+        );
+        assert!(
+            observed_url_text.contains(&url),
+            "observe url was {observed_url_text}"
+        );
+        assert_eq!(observed_title_text.trim(), "target-page");
+        assert_eq!(title, "target-page");
+        assert_eq!(marker, "managed-profile-target");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profile_persists_across_logical_sessions() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = persist_fixture_html("cookie-a");
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                &html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let backend = Arc::new(backend);
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let profile_id = format!("b33b-p-{}", uuid::Uuid::new_v4());
+        let opts = profile_opts(&profile_id);
+        let url = format!("http://127.0.0.1:{page_port}/persist");
+        let key_a =
+            BrowserSessionKey::new(format!("b33b-sess-a-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(&key_a, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open A");
+        wait_persist_ready(&runtime, &key_a, &opts).await;
+        runtime.close_session(&key_a, &opts).await.expect("close A");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let key_b =
+            BrowserSessionKey::new(format!("b33b-sess-b-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(&key_b, &opts, &NavigateRequest { url })
+            .await
+            .expect("open B");
+        let read = runtime
+            .extract_json(
+                &key_b,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: PERSIST_READ_EXPRESSION.into(),
+                },
+            )
+            .await
+            .expect("read B");
+        let _ = runtime.close_session(&key_b, &opts).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(read.value["ls"], json!("cookie-a"));
+        assert_eq!(read.value["idb"], json!("cookie-a"));
+        let cookie = read.value["cookie"].as_str().unwrap_or("");
+        assert!(
+            cookie.contains("omninova_persist=cookie-a"),
+            "cookie missing after clean restart: {cookie}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profiles_stay_isolated() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html_a = persist_fixture_html("account-a");
+        let html_b = persist_fixture_html("account-b");
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |req, stream| {
+            let path = req.request_line.split(' ').nth(1).unwrap_or("/");
+            let body = if path.contains("b") { &html_b } else { &html_a };
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                body,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let runtime = BrowserRuntime::new(
+            Arc::new(backend),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let nonce = uuid::Uuid::new_v4();
+        let opts_a = profile_opts(&format!("b33b-ia-{nonce}"));
+        let opts_b = profile_opts(&format!("b33b-ib-{nonce}"));
+        let key_a = BrowserSessionKey::new(format!("b33b-iso-a-{nonce}")).unwrap();
+        let key_b = BrowserSessionKey::new(format!("b33b-iso-b-{nonce}")).unwrap();
+        let url_a = format!("http://127.0.0.1:{page_port}/a");
+        let url_b = format!("http://127.0.0.1:{page_port}/b");
+
+        runtime
+            .open(&key_a, &opts_a, &NavigateRequest { url: url_a.clone() })
+            .await
+            .expect("open A");
+        wait_persist_ready(&runtime, &key_a, &opts_a).await;
+        runtime
+            .close_session(&key_a, &opts_a)
+            .await
+            .expect("close A");
+
+        runtime
+            .open(&key_b, &opts_b, &NavigateRequest { url: url_b.clone() })
+            .await
+            .expect("open B");
+        wait_persist_ready(&runtime, &key_b, &opts_b).await;
+        runtime
+            .close_session(&key_b, &opts_b)
+            .await
+            .expect("close B");
+
+        runtime
+            .open(&key_a, &opts_a, &NavigateRequest { url: url_a })
+            .await
+            .expect("reopen A");
+        let read_a = runtime
+            .extract_json(
+                &key_a,
+                &opts_a,
+                &BrowserExtractRequest {
+                    expression: PERSIST_READ_EXPRESSION.into(),
+                },
+            )
+            .await
+            .expect("read A");
+        runtime.close_session(&key_a, &opts_a).await.ok();
+
+        runtime
+            .open(&key_b, &opts_b, &NavigateRequest { url: url_b })
+            .await
+            .expect("reopen B");
+        let read_b = runtime
+            .extract_json(
+                &key_b,
+                &opts_b,
+                &BrowserExtractRequest {
+                    expression: PERSIST_READ_EXPRESSION.into(),
+                },
+            )
+            .await
+            .expect("read B");
+        runtime.close_session(&key_b, &opts_b).await.ok();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(read_a.value["ls"], json!("account-a"));
+        assert_eq!(read_a.value["idb"], json!("account-a"));
+        assert_eq!(read_b.value["ls"], json!("account-b"));
+        assert_eq!(read_b.value["idb"], json!("account-b"));
+        assert_ne!(read_a.value["ls"], read_b.value["ls"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_same_profile_concurrency_is_profile_busy() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let page_port = crate::tools::web_client::tests::spawn_test_server(|_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                "<html><head><title>hold</title></head><body>hold</body></html>",
+                &["content-type: text/html".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let runtime = BrowserRuntime::new(
+            Arc::new(backend),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let nonce = uuid::Uuid::new_v4();
+        let opts = profile_opts(&format!("b33b-cx-{nonce}"));
+        let key_a = BrowserSessionKey::new(format!("b33b-c-a-{nonce}")).unwrap();
+        let key_b = BrowserSessionKey::new(format!("b33b-c-b-{nonce}")).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/hold");
+        runtime
+            .open(&key_a, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open A");
+        let url_a = runtime
+            .observe(
+                &key_a,
+                &opts,
+                &crate::tools::browser_types::ObserveRequest {
+                    kind: crate::tools::browser_types::BrowserObserveKind::Url,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("url A");
+
+        let err = runtime
+            .open(&key_b, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect_err("B must not steal profile");
+        assert_eq!(err.kind, BrowserErrorKind::ProfileBusy);
+        assert!(!err.retryable);
+        assert!(err.detail.contains("already in use"));
+
+        let url_a_again = runtime
+            .observe(
+                &key_a,
+                &opts,
+                &crate::tools::browser_types::ObserveRequest {
+                    kind: crate::tools::browser_types::BrowserObserveKind::Url,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("A still healthy");
+        assert_eq!(url_a.text, url_a_again.text);
+
+        runtime.close_session(&key_a, &opts).await.expect("close A");
+        runtime
+            .open(&key_b, &opts, &NavigateRequest { url })
+            .await
+            .expect("B after close A");
+        let _ = runtime.close_session(&key_b, &opts).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profile_survives_owned_crash() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = persist_fixture_html("crash-a");
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                &html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let backend = Arc::new(backend);
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let nonce = uuid::Uuid::new_v4();
+        let opts = profile_opts(&format!("b33b-cr-{nonce}"));
+        let key_a = BrowserSessionKey::new(format!("b33b-crash-a-{nonce}")).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/crash");
+        runtime
+            .open(&key_a, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open A");
+        wait_persist_ready(&runtime, &key_a, &opts).await;
+        let token = browser_session_id(Some(key_a.as_str())).unwrap();
+        kill_owned_session_tree(&token);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let key_b = BrowserSessionKey::new(format!("b33b-crash-b-{nonce}")).unwrap();
+        runtime
+            .open(&key_b, &opts, &NavigateRequest { url })
+            .await
+            .expect("reopen after crash");
+        let read = runtime
+            .extract_json(
+                &key_b,
+                &opts,
+                &BrowserExtractRequest {
+                    expression: PERSIST_READ_EXPRESSION.into(),
+                },
+            )
+            .await
+            .expect("read after crash");
+        let _ = runtime.close_session(&key_b, &opts).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(read.value["ls"], json!("crash-a"));
+        let cookie = read.value["cookie"].as_str().unwrap_or("");
+        if cookie.contains("omninova_persist=crash-a") {
+            eprintln!("CRASH_COOKIE=present");
+        } else {
+            eprintln!("CRASH_COOKIE=missing_in_crash_window cookie={cookie}");
+        }
     }
 }
