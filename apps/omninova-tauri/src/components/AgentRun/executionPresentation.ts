@@ -166,7 +166,14 @@ export function getErrorPresentation(
     if (/(model_not_found|model.*not.*found|no.*model|模型不存在)/i.test(lower)) {
       return { title: "模型不存在或不可用", detail: detail };
     }
-    if (/(content_filter|content moderation|safety|内容被.*拦截)/i.test(lower)) {
+    // Context overflow is checked first, and the safety pattern below no longer
+    // matches a bare "safety": the preflight error reports safety_reserve_tokens,
+    // so an oversized request (a desktop screenshot, a long run) used to be
+    // reported to the user as a model content block.
+    if (/(contextbudgetexceeded|contextwindowexceeded|context_length_exceeded|context window|maximum context|上下文.*(超|溢出|过长))/i.test(lower)) {
+      return { title: "上下文超出模型窗口", detail: detail };
+    }
+    if (/(content_filter|content moderation|safety (filter|polic|system)|内容被.*拦截)/i.test(lower)) {
       return { title: "内容被模型安全策略拦截", detail: detail };
     }
     if (/(permission|denied|not allowed|forbidden|blocked|权限不足)/i.test(lower)) {

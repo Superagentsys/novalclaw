@@ -352,19 +352,52 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Transport ceiling for one frame handed to the model.
+///
+/// The dimension cap alone does not bound bytes: a busy multi-monitor retina
+/// desktop stays detailed after downscaling and encodes far larger than a plain
+/// window. Providers reject oversized request bodies outright, and a slightly
+/// softer screenshot the model can actually read beats a crisp one it rejects.
+const MAX_OBSERVATION_JPEG_BYTES: usize = 320 * 1024;
+
+/// Floor for the step-down loop, below which text-shaped UI stops being legible.
+const MIN_OBSERVATION_DIMENSION_PX: u32 = 640;
+
+const OBSERVATION_JPEG_QUALITY: u8 = 72;
+const MIN_OBSERVATION_JPEG_QUALITY: u8 = 45;
+
 pub fn encode_observation_jpeg(path: &Path, max_dimension_px: u32) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read screenshot failed: {e}"))?;
     let image =
         image::load_from_memory(&bytes).map_err(|e| format!("decode screenshot failed: {e}"))?;
-    let resized = resize_max_dimension(image, max_dimension_px.max(320));
-    let rgb = image::DynamicImage::ImageRgb8(resized.to_rgb8());
-    let mut buffer = Vec::new();
-    rgb.write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
-        .map_err(|e| format!("JPEG encode failed: {e}"))?;
+    let mut dimension = max_dimension_px.max(320);
+    let mut quality = OBSERVATION_JPEG_QUALITY;
+    let mut buffer = encode_jpeg(&image, dimension, quality)?;
+    while buffer.len() > MAX_OBSERVATION_JPEG_BYTES && dimension > MIN_OBSERVATION_DIMENSION_PX {
+        dimension = (dimension / 4 * 3).max(MIN_OBSERVATION_DIMENSION_PX);
+        quality = quality
+            .saturating_sub(8)
+            .max(MIN_OBSERVATION_JPEG_QUALITY);
+        buffer = encode_jpeg(&image, dimension, quality)?;
+    }
     Ok(format!(
         "data:image/jpeg;base64,{}",
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buffer)
     ))
+}
+
+fn encode_jpeg(
+    image: &image::DynamicImage,
+    max_dimension_px: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    let resized = resize_max_dimension(image.clone(), max_dimension_px);
+    let rgb = resized.to_rgb8();
+    let mut buffer = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut buffer), quality)
+        .encode_image(&rgb)
+        .map_err(|e| format!("JPEG encode failed: {e}"))?;
+    Ok(buffer)
 }
 
 fn resize_max_dimension(image: image::DynamicImage, max_dimension_px: u32) -> image::DynamicImage {

@@ -17,6 +17,30 @@ const SKILL_PROVIDER_CONTENT_FILTER_ERROR: &str =
 const PROVIDER_CONTENT_FILTER_ERROR: &str =
     "当前模型服务拒绝了本次请求内容。请调整请求或更换模型。";
 
+const DESKTOP_OBSERVATION_TEXT: &str = "[computer_use] 当前屏幕观察。优先 snapshot 后按 name/ref 点击；坐标 x,y 必须相对此图像素，原点左上角。网页请用 browser。";
+const STALE_DESKTOP_FRAME_TEXT: &str =
+    "[computer_use] 早前的屏幕观察（截图已移出上下文，只保留最新一张）。";
+
+/// Keeps only the newest desktop frame model-visible.
+///
+/// Every iteration of a desktop run appends a fresh screenshot, and an older
+/// frame shows the same desktop a few clicks earlier — it is no longer
+/// actionable. Their base64 stays cheap to hold in memory but each one costs
+/// input budget on every later request, so a long run would eventually block
+/// itself on the context preflight.
+///
+/// Only frames this dispatcher pushed are stripped; images the user attached to
+/// their own message are left alone.
+fn drop_stale_desktop_frames(messages: &mut [ChatMessage]) {
+    for message in messages.iter_mut() {
+        if message.images.is_none() || message.content != DESKTOP_OBSERVATION_TEXT {
+            continue;
+        }
+        message.images = None;
+        message.content = STALE_DESKTOP_FRAME_TEXT.to_string();
+    }
+}
+
 fn waiting_approval_reply(tool_result: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(tool_result).ok()?;
     if value.get("status").and_then(|item| item.as_str()) != Some("waiting_approval") {
@@ -334,6 +358,7 @@ impl<'a> AgentDispatcher<'a> {
         if paths.is_empty() {
             return;
         }
+        drop_stale_desktop_frames(messages);
         if !self.desktop_vision_available() {
             messages.push(ChatMessage::user(format!(
                 "[computer_use] 当前模型未开视觉。截图已保存，请根据工具 JSON 的 nodes / path 行动，不要猜像素。paths={}",
@@ -353,7 +378,7 @@ impl<'a> AgentDispatcher<'a> {
             return;
         }
         messages.push(ChatMessage::user_with_images(
-            "[computer_use] 当前屏幕观察。优先 snapshot 后按 name/ref 点击；坐标 x,y 必须相对此图像素，原点左上角。网页请用 browser。",
+            DESKTOP_OBSERVATION_TEXT,
             images,
         ));
         self.refresh_candidate(messages);
@@ -1299,6 +1324,44 @@ mod output_tests {
         let hard_thrash = r#"{"ok":false,"action":"click","thrash":"hard","message":"same target failed"}"#;
         assert!(tool_loop_interrupt(hard_thrash).is_none());
         assert!(crate::computer_use::hard_thrash_reply(hard_thrash).is_some());
+    }
+
+    #[test]
+    fn only_the_newest_desktop_frame_keeps_its_screenshot() {
+        let frame = |n: &str| {
+            ChatMessage::user_with_images(
+                DESKTOP_OBSERVATION_TEXT,
+                vec![format!("data:image/jpeg;base64,{n}")],
+            )
+        };
+        let mut messages = vec![
+            ChatMessage::user_with_images("我的截图", vec!["data:image/png;base64,USER".into()]),
+            frame("ONE"),
+            frame("TWO"),
+        ];
+
+        drop_stale_desktop_frames(&mut messages);
+        messages.push(frame("THREE"));
+
+        let carrying: Vec<_> = messages
+            .iter()
+            .filter(|message| message.images.is_some())
+            .collect();
+        assert_eq!(carrying.len(), 2, "user attachment plus the newest frame");
+        assert_eq!(carrying[0].content, "我的截图");
+        assert_eq!(carrying[1].content, DESKTOP_OBSERVATION_TEXT);
+        assert_eq!(
+            carrying[1].images.as_ref().unwrap()[0],
+            "data:image/jpeg;base64,THREE"
+        );
+        // The trail stays readable even though the pixels are gone.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content == STALE_DESKTOP_FRAME_TEXT)
+                .count(),
+            2
+        );
     }
 
     #[test]
