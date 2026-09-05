@@ -1,4 +1,7 @@
 use super::{A11yNode, DesktopDriver, ForegroundApp};
+#[cfg(target_os = "windows")]
+use super::{foreground_display_name, is_desktop_input_helper};
+#[cfg(not(target_os = "windows"))]
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -416,88 +419,170 @@ fn command_stdout(bin: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Windows desktop input used to spawn a visible `powershell.exe`, which stole
+/// the foreground from Excel and made every screenshot/click/type report the
+/// console path as `foreground_app`. Click/type/press now go through user32;
+/// PowerShell is only used for UI Automation snapshots, and even then it is
+/// created with `CREATE_NO_WINDOW`.
+#[cfg(target_os = "windows")]
+mod win32 {
+    pub const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
+    pub const MOUSEEVENTF_LEFTUP: u32 = 0x0004;
+    pub const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0008;
+    pub const MOUSEEVENTF_RIGHTUP: u32 = 0x0010;
+    pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+    pub const VK_BACK: u8 = 0x08;
+    pub const VK_TAB: u8 = 0x09;
+    pub const VK_RETURN: u8 = 0x0D;
+    pub const VK_SHIFT: u8 = 0x10;
+    pub const VK_CONTROL: u8 = 0x11;
+    pub const VK_MENU: u8 = 0x12;
+    pub const VK_ESCAPE: u8 = 0x1B;
+    pub const VK_SPACE: u8 = 0x20;
+    pub const VK_PRIOR: u8 = 0x21;
+    pub const VK_NEXT: u8 = 0x22;
+    pub const VK_END: u8 = 0x23;
+    pub const VK_HOME: u8 = 0x24;
+    pub const VK_LEFT: u8 = 0x25;
+    pub const VK_UP: u8 = 0x26;
+    pub const VK_RIGHT: u8 = 0x27;
+    pub const VK_DOWN: u8 = 0x28;
+    pub const CF_UNICODETEXT: u32 = 13;
+    pub const GMEM_MOVEABLE: u32 = 0x0002;
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    pub const GW_OWNER: u32 = 4;
+    pub const GWL_EXSTYLE: i32 = -20;
+    pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn GetForegroundWindow() -> isize;
+        pub fn GetWindowTextW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+        pub fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+        pub fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        pub fn SetCursorPos(x: i32, y: i32) -> i32;
+        pub fn mouse_event(flags: u32, dx: u32, dy: u32, data: u32, extra: usize);
+        pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+        pub fn OpenClipboard(owner: isize) -> i32;
+        pub fn CloseClipboard() -> i32;
+        pub fn EmptyClipboard() -> i32;
+        pub fn SetClipboardData(format: u32, mem: isize) -> isize;
+        pub fn IsWindowVisible(hwnd: isize) -> i32;
+        pub fn GetWindow(hwnd: isize, cmd: u32) -> isize;
+        pub fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
+        pub fn EnumWindows(
+            cb: unsafe extern "system" fn(isize, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        pub fn QueryFullProcessImageNameW(
+            proc: isize,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        pub fn CloseHandle(handle: isize) -> i32;
+        pub fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
+        pub fn GlobalLock(mem: isize) -> *mut std::ffi::c_void;
+        pub fn GlobalUnlock(mem: isize) -> i32;
+        pub fn GlobalFree(mem: isize) -> isize;
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowIdentity {
+    hwnd: isize,
+    process: String,
+    title: String,
+    class: String,
+}
+
 #[cfg(target_os = "windows")]
 fn click(x: i32, y: i32, button: &str) -> Result<(), String> {
-    let down_up = match button {
-        "right" => (0x0008, 0x0010),
-        _ => (0x0002, 0x0004),
+    let (down, up) = match button {
+        "right" => (win32::MOUSEEVENTF_RIGHTDOWN, win32::MOUSEEVENTF_RIGHTUP),
+        _ => (win32::MOUSEEVENTF_LEFTDOWN, win32::MOUSEEVENTF_LEFTUP),
     };
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({x}, {y})
-Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern void mouse_event(int f,int a,int b,int c,int d);'
-[W.U]::mouse_event({down},0,0,0,0)
-[W.U]::mouse_event({up},0,0,0,0)
-"#,
-        down = down_up.0,
-        up = down_up.1
-    );
-    run_powershell(&script)
+    unsafe {
+        if win32::SetCursorPos(x, y) == 0 {
+            return Err(format!("SetCursorPos({x},{y}) failed"));
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    unsafe {
+        win32::mouse_event(down, 0, 0, 0, 0);
+        win32::mouse_event(up, 0, 0, 0, 0);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn paste_text(text: &str) -> Result<(), String> {
-    let escaped = text.replace('\'', "''");
-    let script = format!(
-        r#"
-Set-Clipboard -Value @'
-{escaped}
-'@
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.SendKeys]::SendWait('^v')
-"#
-    );
-    run_powershell(&script)
+    set_clipboard_unicode(text)?;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    unsafe {
+        send_vk(win32::VK_CONTROL, false);
+        send_vk(b'V', false);
+        send_vk(b'V', true);
+        send_vk(win32::VK_CONTROL, true);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn press(key: &str) -> Result<(), String> {
-    let send = windows_sendkeys(key)?;
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.SendKeys]::SendWait('{send}')
-"#
-    );
-    run_powershell(&script)
+    let chord = windows_key_chord(key)?;
+    unsafe {
+        if chord.ctrl {
+            send_vk(win32::VK_CONTROL, false);
+        }
+        if chord.alt {
+            send_vk(win32::VK_MENU, false);
+        }
+        if chord.shift {
+            send_vk(win32::VK_SHIFT, false);
+        }
+        send_vk(chord.vk, false);
+        send_vk(chord.vk, true);
+        if chord.shift {
+            send_vk(win32::VK_SHIFT, true);
+        }
+        if chord.alt {
+            send_vk(win32::VK_MENU, true);
+        }
+        if chord.ctrl {
+            send_vk(win32::VK_CONTROL, true);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn scroll(direction: &str, amount: i32) -> Result<(), String> {
-    let key = match direction {
-        "up" => "{{UP}}",
-        "left" => "{{LEFT}}",
-        "right" => "{{RIGHT}}",
-        _ => "{{DOWN}}",
+    let vk = match direction {
+        "up" => win32::VK_UP,
+        "left" => win32::VK_LEFT,
+        "right" => win32::VK_RIGHT,
+        _ => win32::VK_DOWN,
     };
-    let repeated = key.repeat(amount.clamp(1, 30) as usize);
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.SendKeys]::SendWait('{repeated}')
-"#
-    );
-    run_powershell(&script)
+    for _ in 0..amount.clamp(1, 30) {
+        unsafe {
+            send_vk(vk, false);
+            send_vk(vk, true);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn foreground_app() -> Result<ForegroundApp, String> {
-    let script = r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class Fg {
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-}
-"@
-$sb = New-Object System.Text.StringBuilder 512
-[void][Fg]::GetWindowText([Fg]::GetForegroundWindow(), $sb, $sb.Capacity)
-$sb.ToString()
-"#;
-    let name = powershell_stdout(script)?;
+    let identity = target_window().ok_or_else(|| "could not read foreground window".to_string())?;
+    let name = foreground_display_name(&identity.process, &identity.title);
     if name.is_empty() {
         return Err("could not read foreground window title".into());
     }
@@ -505,10 +590,26 @@ $sb.ToString()
 }
 
 #[cfg(target_os = "windows")]
-fn windows_sendkeys(key: &str) -> Result<String, String> {
-    let mut mods = String::new();
-    // Owned: the lowercased part is a temporary that dies at the end of each
-    // match, so the key name cannot be kept as a borrow of it.
+fn target_window() -> Option<WindowIdentity> {
+    let hwnd = unsafe { win32::GetForegroundWindow() };
+    window_identity(hwnd)
+        .filter(is_interactive_app)
+        .or_else(first_interactive_window)
+}
+
+#[cfg(target_os = "windows")]
+struct KeyChord {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    vk: u8,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_key_chord(key: &str) -> Result<KeyChord, String> {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
     let mut name = String::new();
     for part in key.split(['+', '-', ' ']) {
         let part = part.trim();
@@ -516,44 +617,229 @@ fn windows_sendkeys(key: &str) -> Result<String, String> {
             continue;
         }
         match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => mods.push('^'),
-            "alt" | "option" => mods.push('%'),
-            "shift" => mods.push('+'),
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" => alt = true,
+            "shift" => shift = true,
             "cmd" | "command" | "win" => {
                 return Err("Windows computer_use 不支持 Win 组合键".into())
             }
             other => name = other.to_string(),
         }
     }
-    let token = match name.as_str() {
-        "enter" | "return" => "{ENTER}",
-        "tab" => "{TAB}",
-        "esc" | "escape" => "{ESC}",
-        "backspace" | "delete" => "{BACKSPACE}",
-        "space" | "spacebar" => " ",
-        "up" => "{UP}",
-        "down" => "{DOWN}",
-        "left" => "{LEFT}",
-        "right" => "{RIGHT}",
-        "home" => "{HOME}",
-        "end" => "{END}",
-        "pageup" => "{PGUP}",
-        "pagedown" => "{PGDN}",
-        other if other.len() == 1 => other,
+    let vk = match name.as_str() {
+        "enter" | "return" => win32::VK_RETURN,
+        "tab" => win32::VK_TAB,
+        "esc" | "escape" => win32::VK_ESCAPE,
+        "backspace" | "delete" => win32::VK_BACK,
+        "space" | "spacebar" => win32::VK_SPACE,
+        "up" => win32::VK_UP,
+        "down" => win32::VK_DOWN,
+        "left" => win32::VK_LEFT,
+        "right" => win32::VK_RIGHT,
+        "home" => win32::VK_HOME,
+        "end" => win32::VK_END,
+        "pageup" => win32::VK_PRIOR,
+        "pagedown" => win32::VK_NEXT,
+        other if other.len() == 1 => {
+            let ch = other.chars().next().unwrap();
+            if ch.is_ascii_alphabetic() {
+                ch.to_ascii_uppercase() as u8
+            } else if ch.is_ascii_digit() {
+                ch as u8
+            } else {
+                return Err(format!("unsupported key '{key}'"));
+            }
+        }
         _ => return Err(format!("unsupported key '{key}'")),
     };
-    Ok(format!("{mods}{token}"))
+    Ok(KeyChord {
+        ctrl,
+        alt,
+        shift,
+        vk,
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn run_powershell(script: &str) -> Result<(), String> {
-    powershell_stdout(script).map(|_| ())
+unsafe fn send_vk(vk: u8, up: bool) {
+    let flags = if up { win32::KEYEVENTF_KEYUP } else { 0 };
+    win32::keybd_event(vk, 0, flags, 0);
+}
+
+#[cfg(target_os = "windows")]
+fn set_clipboard_unicode(text: &str) -> Result<(), String> {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    let bytes = wide.len().saturating_mul(2);
+    for _ in 0..8 {
+        if unsafe { win32::OpenClipboard(0) } != 0 {
+            return copy_wide_to_clipboard(&wide, bytes);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err("OpenClipboard failed".into())
+}
+
+#[cfg(target_os = "windows")]
+fn copy_wide_to_clipboard(wide: &[u16], bytes: usize) -> Result<(), String> {
+    unsafe {
+        win32::EmptyClipboard();
+        let handle = win32::GlobalAlloc(win32::GMEM_MOVEABLE, bytes);
+        if handle == 0 {
+            win32::CloseClipboard();
+            return Err("GlobalAlloc failed".into());
+        }
+        let ptr = win32::GlobalLock(handle);
+        if ptr.is_null() {
+            win32::GlobalFree(handle);
+            win32::CloseClipboard();
+            return Err("GlobalLock failed".into());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, bytes);
+        win32::GlobalUnlock(handle);
+        if win32::SetClipboardData(win32::CF_UNICODETEXT, handle) == 0 {
+            win32::GlobalFree(handle);
+            win32::CloseClipboard();
+            return Err("SetClipboardData failed".into());
+        }
+        win32::CloseClipboard();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn window_identity(hwnd: isize) -> Option<WindowIdentity> {
+    if hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        if win32::IsWindowVisible(hwnd) == 0 {
+            return None;
+        }
+        if win32::GetWindow(hwnd, win32::GW_OWNER) != 0 {
+            return None;
+        }
+        let ex = win32::GetWindowLongW(hwnd, win32::GWL_EXSTYLE) as u32;
+        if ex & win32::WS_EX_TOOLWINDOW != 0 {
+            return None;
+        }
+    }
+    let title = window_text(hwnd);
+    let class = window_class(hwnd);
+    if is_skipped_window_class(&class) {
+        return None;
+    }
+    let process = window_process_path(hwnd).unwrap_or_default();
+    if title.is_empty() && process.is_empty() {
+        return None;
+    }
+    Some(WindowIdentity {
+        hwnd,
+        process,
+        title,
+        class,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn is_interactive_app(identity: &WindowIdentity) -> bool {
+    !is_skipped_window_class(&identity.class)
+        && !is_desktop_input_helper(&identity.process)
+        && !is_desktop_input_helper(&identity.title)
+}
+
+#[cfg(target_os = "windows")]
+fn is_skipped_window_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW" | "ForegroundStaging"
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn first_interactive_window() -> Option<WindowIdentity> {
+    let mut found: Option<WindowIdentity> = None;
+    unsafe {
+        win32::EnumWindows(enum_interactive, &mut found as *mut _ as isize);
+    }
+    found
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_interactive(hwnd: isize, lparam: isize) -> i32 {
+    let found = &mut *(lparam as *mut Option<WindowIdentity>);
+    if let Some(identity) = window_identity(hwnd) {
+        if is_interactive_app(&identity) {
+            *found = Some(identity);
+            return 0;
+        }
+    }
+    1
+}
+
+#[cfg(target_os = "windows")]
+fn window_text(hwnd: isize) -> String {
+    let mut buf = [0u16; 512];
+    let len = unsafe { win32::GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    wchar_to_string(&buf, len)
+}
+
+#[cfg(target_os = "windows")]
+fn window_class(hwnd: isize) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { win32::GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    wchar_to_string(&buf, len)
+}
+
+#[cfg(target_os = "windows")]
+fn window_process_path(hwnd: isize) -> Option<String> {
+    let mut pid = 0u32;
+    unsafe {
+        win32::GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { win32::OpenProcess(win32::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 {
+        return None;
+    }
+    let mut buf = [0u16; 512];
+    let mut size = buf.len() as u32;
+    let ok = unsafe { win32::QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
+    unsafe {
+        win32::CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    Some(wchar_to_string(&buf, size as i32))
+}
+
+#[cfg(target_os = "windows")]
+fn wchar_to_string(buf: &[u16], len: i32) -> String {
+    let end = (len.max(0) as usize).min(buf.len());
+    let slice = &buf[..end];
+    let nul = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    String::from_utf16_lossy(&slice[..nul])
 }
 
 #[cfg(target_os = "windows")]
 fn powershell_stdout(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
     let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NoLogo",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-STA",
+            "-Command",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .creation_flags(win32::CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("powershell: {e}"))?;
     if !output.status.success() {
@@ -731,17 +1017,21 @@ print(json.dumps(out, ensure_ascii=False))
 
 #[cfg(target_os = "windows")]
 fn snapshot_front_window(max_nodes: usize) -> Result<Vec<A11yNode>, String> {
+    let hwnd = target_window().map(|window| window.hwnd as i64).unwrap_or(0);
     let script = format!(
         r#"
 Add-Type -AssemblyName UIAutomationClient
-Add-Type @"
+$hwnd = New-Object System.IntPtr ([int64]{hwnd})
+if ($hwnd -eq [IntPtr]::Zero) {{
+  Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class FgHwnd {{
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }}
 "@
-$hwnd = [FgHwnd]::GetForegroundWindow()
+  $hwnd = [FgHwnd]::GetForegroundWindow()
+}}
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 if (-not $root) {{ '[]'; exit }}
 $els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)

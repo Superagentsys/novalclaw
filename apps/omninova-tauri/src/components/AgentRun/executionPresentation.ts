@@ -38,6 +38,7 @@ const TOOL_RUNNING_LABELS: Record<string, string> = {
   memory_recall: "正在回忆记忆",
   knowledge_search: "正在检索知识库",
   browser: "正在操作浏览器",
+  computer_use: "正在操作桌面",
   pdf_read: "正在读取 PDF",
 };
 
@@ -74,6 +75,7 @@ const TOOL_COMPLETED_LABELS: Record<string, string> = {
   memory_recall: "记忆回忆完成",
   knowledge_search: "知识库检索完成",
   browser: "浏览器操作完成",
+  computer_use: "桌面操作完成",
   pdf_read: "PDF 读取完成",
 };
 

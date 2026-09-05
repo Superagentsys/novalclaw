@@ -24,10 +24,12 @@ import {
   type StoredAvatarSession,
   type StoredChatMessage,
 } from "../../utils/chatStorage";
-import type {
-  AgentRunEvent,
-  AgentRunEventContextLifecycle,
-  AgentRunEventContextUsage,
+import {
+  toolCompletedSucceeded,
+  type AgentRunEvent,
+  type AgentRunEventContextLifecycle,
+  type AgentRunEventContextUsage,
+  type ContextUsageSnapshot,
 } from "../AgentRun/types";
 import {
   applyLifecycleToActivity,
@@ -45,7 +47,6 @@ import {
   switchContextUsageIdentity,
   type ContextUsageIdentity,
 } from "../AgentRun/contextUsageState";
-import type { ContextUsageSnapshot } from "../AgentRun/types";
 import {
   addTask,
   formatDuration,
@@ -2308,7 +2309,10 @@ export function Chat({
         });
       } else if (eventType === "tool_completed" || eventType === "toolCompleted") {
         const toolName = stringValue("tool_name", "toolName") || "工具";
-        const success = rawPayload.success === true;
+        const success = toolCompletedSucceeded({
+          success: typeof rawPayload.success === "boolean" ? rawPayload.success : undefined,
+          status: typeof rawPayload.status === "string" ? rawPayload.status : undefined,
+        });
         const summary = stringValue("result_summary", "resultSummary", "summary");
         appendTaskActivity(runId, `${toolName}${success ? "已完成" : "执行失败"}`, success ? "success" : "error", {
           kind: "tool",
