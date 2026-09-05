@@ -1524,6 +1524,10 @@ pub struct BrowserConfig {
     /// `Profile 1`). Not a filesystem path and never a tool argument.
     #[serde(default)]
     pub installed_profile: Option<String>,
+    /// Trusted OmniNova managed persistent profile id (`work`, `b33e-test`).
+    /// Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -1541,6 +1545,7 @@ impl Default for BrowserConfig {
             cdp_url: None,
             executable_path: None,
             installed_profile: None,
+            profile: None,
         }
     }
 }

@@ -930,6 +930,9 @@ mod tests {
         assert!(!props.contains_key("profile"));
         assert!(!props.contains_key("installed_profile"));
         assert!(!props.contains_key("executable_path"));
+        assert!(!props.contains_key("list_profiles"));
+        assert!(!props.contains_key("create_profile"));
+        assert!(!props.contains_key("delete_profile"));
         let description = tool.description();
         assert!(description.contains("prefer read with outline/filter"));
         assert!(!description.contains("BrowserRuntime"));

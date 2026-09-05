@@ -12,12 +12,13 @@ use std::path::{Component, Path, PathBuf};
 
 /// Same hex width as `AgentBrowserBackend` session hashing.
 const PROFILE_DIR_HASH_CHARS: usize = 20;
-const PROFILE_DIR_PREFIX: &str = "profile-";
+pub(crate) const PROFILE_DIR_PREFIX: &str = "profile-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserProfileError {
     Invalid { detail: String },
     EscapedRoot,
+    Missing,
     Io { detail: String },
 }
 
@@ -28,6 +29,10 @@ impl fmt::Display for BrowserProfileError {
             Self::EscapedRoot => write!(
                 f,
                 "BrowserProfileRejected: resolved profile path escaped the trusted profile root"
+            ),
+            Self::Missing => write!(
+                f,
+                "BrowserProfileMissing: managed profile was not found"
             ),
             Self::Io { detail } => write!(
                 f,
@@ -129,6 +134,48 @@ impl BrowserProfileResolver {
             path: canonical_child,
         })
     }
+
+    /// Resolve an existing managed profile without creating directories.
+    pub fn locate(
+        &self,
+        profile: &BrowserProfileRef,
+    ) -> Result<ResolvedBrowserProfile, BrowserProfileError> {
+        let derived = derived_profile_directory_name(profile.as_str());
+        if !is_safe_derived_directory_name(&derived) {
+            return Err(BrowserProfileError::Invalid {
+                detail: "BrowserProfileRejected: derived profile directory name is unsafe".into(),
+            });
+        }
+        if !self.root.exists() {
+            return Err(BrowserProfileError::Missing);
+        }
+        let canonical_root = std::fs::canonicalize(&self.root).map_err(io_error)?;
+        let child = canonical_root.join(&derived);
+        if child
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(BrowserProfileError::EscapedRoot);
+        }
+        if !child.exists() {
+            return Err(BrowserProfileError::Missing);
+        }
+        reject_unsafe_existing_profile_dir(&child)?;
+        let canonical_child = std::fs::canonicalize(&child).map_err(io_error)?;
+        if !path_is_within(&canonical_root, &canonical_child) {
+            return Err(BrowserProfileError::EscapedRoot);
+        }
+        if paths_refer_to_same_location(&canonical_root, &canonical_child) {
+            return Err(BrowserProfileError::Invalid {
+                detail: "BrowserProfileRejected: refusing to operate on the managed profile root"
+                    .into(),
+            });
+        }
+        Ok(ResolvedBrowserProfile {
+            id: profile.clone(),
+            path: canonical_child,
+        })
+    }
 }
 
 pub fn omninova_managed_profile_root() -> PathBuf {
@@ -188,7 +235,9 @@ fn is_safe_derived_directory_name(name: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(os) if os == name))
 }
 
-fn reject_unsafe_existing_profile_dir(path: &Path) -> Result<(), BrowserProfileError> {
+pub(crate) fn reject_unsafe_existing_profile_dir(
+    path: &Path,
+) -> Result<(), BrowserProfileError> {
     let meta = std::fs::symlink_metadata(path).map_err(io_error)?;
     if is_reparse_or_symlink(&meta) {
         return Err(BrowserProfileError::EscapedRoot);
@@ -201,7 +250,7 @@ fn reject_unsafe_existing_profile_dir(path: &Path) -> Result<(), BrowserProfileE
     Ok(())
 }
 
-fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }
@@ -215,6 +264,22 @@ fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
     {
         false
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedProfileConfigError {
+    InvalidIdentity,
+}
+
+pub fn parse_trusted_managed_profile(
+    raw: Option<&str>,
+) -> Result<Option<BrowserProfileRef>, ManagedProfileConfigError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    BrowserProfileRef::new(value).map(Some).map_err(|_| {
+        ManagedProfileConfigError::InvalidIdentity
+    })
 }
 
 fn io_error(err: std::io::Error) -> BrowserProfileError {
@@ -412,5 +477,38 @@ mod tests {
         assert!(BrowserProfileRef::new(&long).is_ok());
         let too_long = "a".repeat(65);
         assert!(BrowserProfileRef::new(too_long).is_err());
+    }
+
+    #[test]
+    fn locate_does_not_create_missing_profile() {
+        let root = scratch_root("locate-missing");
+        std::fs::create_dir_all(&root).unwrap();
+        let resolver = BrowserProfileResolver::new(root.clone());
+        let id = BrowserProfileRef::new("absent-profile").unwrap();
+        assert_eq!(resolver.locate(&id).unwrap_err(), BrowserProfileError::Missing);
+        let derived = root.join(derived_profile_directory_name(id.as_str()));
+        assert!(!derived.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trusted_config_rejects_path_like_managed_profile() {
+        assert!(parse_trusted_managed_profile(None).unwrap().is_none());
+        assert!(parse_trusted_managed_profile(Some("")).unwrap().is_none());
+        assert_eq!(
+            parse_trusted_managed_profile(Some("work"))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "work"
+        );
+        assert_eq!(
+            parse_trusted_managed_profile(Some(r"C:\Users\Hero\.omninova\browser\profiles")),
+            Err(ManagedProfileConfigError::InvalidIdentity)
+        );
+        assert_eq!(
+            parse_trusted_managed_profile(Some("Default")),
+            Err(ManagedProfileConfigError::InvalidIdentity)
+        );
     }
 }

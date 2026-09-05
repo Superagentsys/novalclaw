@@ -24,6 +24,9 @@ use crate::tools::browser_output::{
 use crate::tools::browser_profile::{
     paths_refer_to_same_location, BrowserProfileError, BrowserProfileResolver,
 };
+use crate::tools::browser_profile_manager::{
+    BrowserProfileManager, ManagedBrowserProfileState,
+};
 use crate::tools::browser_installed_profile::{
     cleanup_owned_snapshots, installed_named_profile_argv, locate_latest_snapshot_dir,
     omninova_snapshot_root, remove_snapshot_dir, validate_installed_snapshot,
@@ -123,6 +126,7 @@ pub struct AgentBrowserBackend {
     defaults: BrowserSessionOptions,
     last_stdout_len: Mutex<Option<usize>>,
     profile_resolver: BrowserProfileResolver,
+    profile_manager: BrowserProfileManager,
     executable_resolver: BrowserExecutableResolver,
     installed_profiles: BrowserInstalledProfileResolver,
     launch_by_session: Mutex<HashMap<String, BoundSessionLaunch>>,
@@ -212,7 +216,8 @@ impl AgentBrowserBackend {
             search,
             defaults,
             last_stdout_len: Mutex::new(None),
-            profile_resolver,
+            profile_resolver: profile_resolver.clone(),
+            profile_manager: BrowserProfileManager::new(profile_resolver),
             executable_resolver,
             installed_profiles: BrowserInstalledProfileResolver::discover(),
             launch_by_session: Mutex::new(HashMap::new()),
@@ -534,7 +539,10 @@ impl AgentBrowserBackend {
         profile: &BrowserProfileRef,
     ) -> Result<PathBuf, BrowserBackendError> {
         match self.profile_resolver.resolve(profile) {
-            Ok(resolved) => Ok(resolved.path),
+            Ok(resolved) => {
+                let _ = self.profile_manager.claim_if_unmarked(&resolved);
+                Ok(resolved.path)
+            }
             Err(BrowserProfileError::Invalid { detail }) => Err(BrowserBackendError::new(
                 BrowserErrorKind::Rejected,
                 self.id_value(),
@@ -545,6 +553,11 @@ impl AgentBrowserBackend {
                 self.id_value(),
                 BrowserProfileError::EscapedRoot.to_string(),
             )),
+            Err(BrowserProfileError::Missing) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                BrowserProfileError::Missing.to_string(),
+            )),
             Err(BrowserProfileError::Io { detail }) => Err(BrowserBackendError::new(
                 BrowserErrorKind::LaunchFailed,
                 self.id_value(),
@@ -552,6 +565,31 @@ impl AgentBrowserBackend {
                     "BrowserLaunchFailed: failed to prepare managed browser profile directory ({detail})"
                 ),
             )),
+        }
+    }
+
+    fn managed_profile_occupancy(&self, profile: &BrowserProfileRef) -> ManagedBrowserProfileState {
+        let map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut bound = false;
+        let mut live = false;
+        for (token, launch) in map.iter() {
+            if launch.profile.as_ref() != Some(profile) {
+                continue;
+            }
+            bound = true;
+            if probe_owned_session_pid(token) == Some(true) {
+                live = true;
+            }
+        }
+        if live {
+            ManagedBrowserProfileState::Active
+        } else if bound {
+            ManagedBrowserProfileState::Busy
+        } else {
+            ManagedBrowserProfileState::Available
         }
     }
 
@@ -1347,6 +1385,7 @@ impl BrowserBackend for AgentBrowserBackend {
         };
         self.bind_session_launch(handle.token(), &req.options, profile_path)?;
         self.cleanup_stale_snapshots();
+        let _ = self.profile_manager.cleanup_profile_trash();
         Ok(handle)
     }
 
@@ -1809,7 +1848,9 @@ mod tests {
     };
     use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
     use crate::tools::browser_output::BROWSER_EXTRACT_SOURCE_CHAR_LIMIT;
-    use crate::tools::browser_profile::BrowserProfileResolver;
+    use crate::tools::browser_profile_manager::{
+        ManagedBrowserProfileState, PROFILE_MARKER_NAME,
+    };
     use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy};
     use crate::tools::browser_types::{
         BrowserElement, BrowserElementRef, BrowserErrorKind, BrowserExtractRequest,
@@ -2662,6 +2703,36 @@ mod tests {
     fn agent_backend_declares_profile_capability() {
         let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
         assert!(backend.capabilities().profiles);
+    }
+
+    #[test]
+    fn open_session_claims_legacy_unmarked_managed_profile() {
+        let (backend, root) = scratch_profile_backend(None);
+        let id = BrowserProfileRef::new("legacy-open").unwrap();
+        let resolved = backend.profile_resolver.resolve(&id).unwrap();
+        assert!(!resolved.path.join(PROFILE_MARKER_NAME).exists());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            BrowserSessionKey::new("b33e-claim").unwrap(),
+            profile_opts("legacy-open"),
+        )))
+        .unwrap();
+        assert!(resolved.path.join(PROFILE_MARKER_NAME).exists());
+        assert_eq!(
+            backend.managed_profile_occupancy(&id),
+            ManagedBrowserProfileState::Busy
+        );
+        assert_eq!(
+            backend
+                .profile_manager
+                .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile))
+                .unwrap_err(),
+            crate::tools::browser_profile_manager::BrowserProfileManagerError::Busy
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4093,5 +4164,77 @@ document.title = "persist-boot";
         eprintln!(
             "APP_BOUND_ENCRYPTION=login reuse is not guaranteed across Chrome/CfT executables; OmniNova does not decrypt cookies"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profile_lifecycle_delete_and_gc() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = persist_fixture_html("b33e");
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                &html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let backend = Arc::new(backend);
+        let created = backend
+            .profile_manager
+            .ensure_managed_profile(&BrowserProfileRef::new("b33e-test").unwrap())
+            .unwrap();
+        assert_eq!(created.id.as_str(), "b33e-test");
+        let listed = backend.profile_manager.list_managed_profiles(|_| {
+            ManagedBrowserProfileState::Available
+        });
+        assert!(listed.iter().any(|profile| profile.id.as_str() == "b33e-test"));
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let opts = profile_opts("b33e-test");
+        let key = BrowserSessionKey::new(format!("b33e-live-{}", uuid::Uuid::new_v4())).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/persist");
+        runtime
+            .open(&key, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open managed profile");
+        wait_persist_ready(&runtime, &key, &opts).await;
+        let id = BrowserProfileRef::new("b33e-test").unwrap();
+        let active = backend
+            .profile_manager
+            .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile));
+        assert!(
+            matches!(
+                active,
+                Err(crate::tools::browser_profile_manager::BrowserProfileManagerError::Active)
+                    | Err(crate::tools::browser_profile_manager::BrowserProfileManagerError::Busy)
+            ),
+            "active/busy managed profile must not be deleted"
+        );
+        runtime.close_session(&key, &opts).await.ok();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let live = backend.profile_resolver.locate(&id).unwrap().path;
+        let trash = backend
+            .profile_manager
+            .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile))
+            .expect("closed managed profile should move to trash");
+        assert!(!live.exists());
+        assert!(trash.exists());
+        let removed = backend
+            .profile_manager
+            .cleanup_profile_trash_after(std::time::Duration::from_secs(0));
+        assert!(removed >= 1);
+        assert!(!trash.exists());
+        let _ = crate::tools::browser_installed_profile::find_chrome_user_data_dir();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

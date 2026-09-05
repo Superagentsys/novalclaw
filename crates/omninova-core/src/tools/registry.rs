@@ -374,14 +374,29 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             )
         },
         build: |ctx| {
-            let installed_profile = match crate::tools::browser_installed_profile::parse_trusted_installed_profile(
+            let (profile, installed_profile) = match crate::tools::browser_profile_manager::parse_browser_session_profile_config(
+                ctx.config.browser.profile.as_deref(),
                 ctx.config.browser.installed_profile.as_deref(),
             ) {
                 Ok(value) => value,
-                Err(_) => {
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidManaged) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid browser.profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidInstalled) => {
                     tracing::warn!(
                         target: "browser",
                         "invalid installed_profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::ConflictingModes) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "browser.profile and browser.installed_profile cannot be combined; browser tool not registered"
                     );
                     return None;
                 }
@@ -390,7 +405,7 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 headless: ctx.config.browser.native_headless,
                 attach_only: ctx.config.browser.attach_only,
                 cdp_url: ctx.config.browser.cdp_url.clone(),
-                profile: None,
+                profile,
                 installed_profile,
             };
             let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable(
