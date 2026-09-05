@@ -684,6 +684,9 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
         BrowserErrorKind::InvalidStructuredOutput => "BrowserStructuredOutputInvalid",
         BrowserErrorKind::StaleReference => "BrowserCommandFailed",
         BrowserErrorKind::ProfileBusy => "BrowserProfileBusy",
+        BrowserErrorKind::InstalledProfileSnapshotIncomplete => {
+            "BrowserInstalledProfileSnapshotIncomplete"
+        }
     };
     format!("{prefix}: {}", err.detail)
 }
@@ -1718,6 +1721,9 @@ mod tests {
         assert!(!runtime_should_recover(BrowserErrorKind::Timeout));
         assert!(!runtime_should_recover(BrowserErrorKind::StaleReference));
         assert!(!runtime_should_recover(BrowserErrorKind::ProfileBusy));
+        assert!(!runtime_should_recover(
+            BrowserErrorKind::InstalledProfileSnapshotIncomplete
+        ));
         assert!(runtime_should_recover(BrowserErrorKind::NotConnected));
     }
 
@@ -1736,6 +1742,10 @@ mod tests {
             ),
             (BrowserErrorKind::StaleReference, "BrowserCommandFailed"),
             (BrowserErrorKind::ProfileBusy, "BrowserProfileBusy"),
+            (
+                BrowserErrorKind::InstalledProfileSnapshotIncomplete,
+                "BrowserInstalledProfileSnapshotIncomplete",
+            ),
         ];
         for (kind, prefix) in cases {
             let err = BrowserBackendError::new(kind, id.clone(), "detail");

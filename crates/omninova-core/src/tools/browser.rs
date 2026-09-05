@@ -39,6 +39,7 @@ impl BrowserTool {
             attach_only,
             cdp_url,
             profile: None,
+            installed_profile: None,
         };
         Self::assemble(allowed_domains, session_opts, None, None)
     }
@@ -926,6 +927,9 @@ mod tests {
         assert!(!props.contains_key("elements"));
         assert!(!props.contains_key("extract"));
         assert!(!props.contains_key("extract_json"));
+        assert!(!props.contains_key("profile"));
+        assert!(!props.contains_key("installed_profile"));
+        assert!(!props.contains_key("executable_path"));
         let description = tool.description();
         assert!(description.contains("prefer read with outline/filter"));
         assert!(!description.contains("BrowserRuntime"));

@@ -1520,6 +1520,10 @@ pub struct BrowserConfig {
     /// Managed Browser. This is runtime configuration, never a tool argument.
     #[serde(default)]
     pub executable_path: Option<PathBuf>,
+    /// Trusted installed Chrome profile directory identity (`Default`,
+    /// `Profile 1`). Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub installed_profile: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -1536,6 +1540,7 @@ impl Default for BrowserConfig {
             attach_only: false,
             cdp_url: None,
             executable_path: None,
+            installed_profile: None,
         }
     }
 }

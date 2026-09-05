@@ -45,6 +45,11 @@ pub const BROWSER_PROFILE_BUSY_DETAIL: &str =
 pub const BROWSER_SESSION_PROFILE_MISMATCH_DETAIL: &str =
     "BrowserSessionConfigMismatch: browser session profile cannot change while session is active; close the session and open again";
 
+/// Installed Chrome profile snapshot is incomplete, commonly because the
+/// source browser is active or browser state is locked. Not retryable.
+pub const BROWSER_INSTALLED_SNAPSHOT_INCOMPLETE_DETAIL: &str =
+    "BrowserInstalledProfileSnapshotIncomplete: the installed Chrome profile could not be safely snapshotted; the source browser is commonly active or browser state is locked";
+
 /// Logical managed-profile id: `^[a-z0-9][a-z0-9_-]{0,63}$` (1..=64).
 pub const BROWSER_PROFILE_ID_MAX_LEN: usize = 64;
 
@@ -568,6 +573,53 @@ impl BrowserProfileRef {
     }
 }
 
+/// Trusted installed Chrome profile identity (directory name such as
+/// `Default` or `Profile 1`). Not a filesystem path and not a managed
+/// [`BrowserProfileRef`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InstalledBrowserProfileRef(String);
+
+impl InstalledBrowserProfileRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, BrowserTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(BrowserTypeError::EmptyIdentity);
+        }
+        if !is_installed_profile_directory_id(&value) {
+            return Err(BrowserTypeError::InvalidInstalledProfileId);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_installed_profile_directory_id(value: &str) -> bool {
+    if value.len() > BROWSER_PROFILE_ID_MAX_LEN {
+        return false;
+    }
+    if value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('~')
+        || value.contains(':')
+    {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric()) {
+        return false;
+    }
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_')
+}
+
 fn is_managed_profile_logical_id(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -585,11 +637,19 @@ fn is_managed_profile_logical_id(value: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserProfileMode {
+    Ephemeral,
+    ManagedPersistent(BrowserProfileRef),
+    InstalledSnapshot(InstalledBrowserProfileRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserSessionOptions {
     pub headless: bool,
     pub attach_only: bool,
     pub cdp_url: Option<String>,
     pub profile: Option<BrowserProfileRef>,
+    pub installed_profile: Option<InstalledBrowserProfileRef>,
 }
 
 impl Default for BrowserSessionOptions {
@@ -599,6 +659,22 @@ impl Default for BrowserSessionOptions {
             attach_only: false,
             cdp_url: None,
             profile: None,
+            installed_profile: None,
+        }
+    }
+}
+
+impl BrowserSessionOptions {
+    pub fn profile_mode(&self) -> Result<BrowserProfileMode, BrowserTypeError> {
+        match (&self.profile, &self.installed_profile) {
+            (None, None) => Ok(BrowserProfileMode::Ephemeral),
+            (Some(profile), None) => {
+                Ok(BrowserProfileMode::ManagedPersistent(profile.clone()))
+            }
+            (None, Some(installed)) => {
+                Ok(BrowserProfileMode::InstalledSnapshot(installed.clone()))
+            }
+            (Some(_), Some(_)) => Err(BrowserTypeError::InvalidInstalledProfileId),
         }
     }
 }
@@ -624,6 +700,8 @@ pub enum BrowserErrorKind {
     /// Another live session already holds this managed persistent profile.
     /// Not retryable; caller must close the holding session first.
     ProfileBusy,
+    /// Installed Chrome profile snapshot is incomplete or locked.
+    InstalledProfileSnapshotIncomplete,
 }
 
 impl BrowserErrorKind {
@@ -654,6 +732,9 @@ pub fn v1_error_kind(message: &str) -> Option<BrowserErrorKind> {
         "BrowserUrlRejected" => Some(BrowserErrorKind::Rejected),
         "BrowserCommandFailed" | "InvalidBrowserOutput" => Some(BrowserErrorKind::CommandFailed),
         "BrowserProfileBusy" => Some(BrowserErrorKind::ProfileBusy),
+        "BrowserInstalledProfileSnapshotIncomplete" => {
+            Some(BrowserErrorKind::InstalledProfileSnapshotIncomplete)
+        }
         "BrowserSessionConfigMismatch" => Some(BrowserErrorKind::Rejected),
         _ => None,
     }
@@ -748,6 +829,7 @@ impl BackendCapabilities {
 pub enum BrowserTypeError {
     EmptyIdentity,
     InvalidProfileId,
+    InvalidInstalledProfileId,
 }
 
 impl fmt::Display for BrowserTypeError {
@@ -757,6 +839,10 @@ impl fmt::Display for BrowserTypeError {
             Self::InvalidProfileId => write!(
                 f,
                 "browser profile id must be 1..=64 chars of [a-z0-9][a-z0-9_-]*"
+            ),
+            Self::InvalidInstalledProfileId => write!(
+                f,
+                "installed chrome profile identity must be a directory name such as Default or Profile 1, not a filesystem path"
             ),
         }
     }
@@ -1004,6 +1090,7 @@ mod tests {
     fn session_options_default_profile_none() {
         let opts = BrowserSessionOptions::default();
         assert!(opts.profile.is_none());
+        assert!(opts.installed_profile.is_none());
         assert!(opts.headless);
         assert!(!opts.attach_only);
         assert!(opts.cdp_url.is_none());
@@ -1081,6 +1168,10 @@ mod tests {
             ("BrowserCommandFailed: x", BrowserErrorKind::CommandFailed),
             ("BrowserProfileBusy: x", BrowserErrorKind::ProfileBusy),
             (
+                "BrowserInstalledProfileSnapshotIncomplete: x",
+                BrowserErrorKind::InstalledProfileSnapshotIncomplete,
+            ),
+            (
                 "BrowserSessionConfigMismatch: x",
                 BrowserErrorKind::Rejected,
             ),
@@ -1094,6 +1185,7 @@ mod tests {
         assert!(!BrowserErrorKind::InvalidStructuredOutput.default_retryable());
         assert!(!BrowserErrorKind::StaleReference.default_retryable());
         assert!(!BrowserErrorKind::ProfileBusy.default_retryable());
+        assert!(!BrowserErrorKind::InstalledProfileSnapshotIncomplete.default_retryable());
         assert!(BrowserErrorKind::Timeout.default_retryable());
         assert!(BrowserErrorKind::Crashed.default_retryable());
         assert_ne!(

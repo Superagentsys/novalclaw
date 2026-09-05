@@ -374,11 +374,24 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             )
         },
         build: |ctx| {
+            let installed_profile = match crate::tools::browser_installed_profile::parse_trusted_installed_profile(
+                ctx.config.browser.installed_profile.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid installed_profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+            };
             let session_opts = crate::tools::browser_types::BrowserSessionOptions {
                 headless: ctx.config.browser.native_headless,
                 attach_only: ctx.config.browser.attach_only,
                 cdp_url: ctx.config.browser.cdp_url.clone(),
                 profile: None,
+                installed_profile,
             };
             let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable(
                 &ctx.config.browser.backend,
