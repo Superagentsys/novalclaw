@@ -434,6 +434,11 @@ mod tests {
             route_v1_tool_action("close"),
             Some(V1ToolActionRoute::CloseSession)
         );
+        assert!(actions.contains(&"read".to_string()));
+        assert_eq!(
+            route_v1_tool_action("read"),
+            Some(V1ToolActionRoute::Observe)
+        );
         assert_eq!(
             route_v1_tool_action("get_text"),
             Some(V1ToolActionRoute::Observe)

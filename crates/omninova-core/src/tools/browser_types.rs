@@ -323,7 +323,7 @@ pub enum BrowserObserveKind {
         action: Option<String>,
     },
     /// Document-reading observation of the current page. Distinct from
-    /// [`Self::Text`] (page/target text). Not a V1 tool `action=read`.
+    /// [`Self::Text`] (page/target text). Tool `action=read` maps here.
     Read {
         outline: bool,
         filter: Option<String>,
@@ -359,10 +359,11 @@ pub enum V1ToolActionRoute {
     Act,
 }
 
-/// V1 BrowserTool `action` enum, frozen for the B3.1A contract tests.
+/// V1 BrowserTool `action` enum. B3.2F added `read` (25 actions).
 pub const V1_TOOL_ACTIONS: &[&str] = &[
     "open",
     "snapshot",
+    "read",
     "click",
     "fill",
     "type",
@@ -390,7 +391,7 @@ pub const V1_TOOL_ACTIONS: &[&str] = &[
 pub fn route_v1_tool_action(action: &str) -> Option<V1ToolActionRoute> {
     match action {
         "open" => Some(V1ToolActionRoute::Navigate),
-        "snapshot" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
+        "snapshot" | "read" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
         | "is_visible" | "is_enabled" | "find" => Some(V1ToolActionRoute::Observe),
         "screenshot" => Some(V1ToolActionRoute::Screenshot),
         "close" => Some(V1ToolActionRoute::CloseSession),
@@ -863,6 +864,10 @@ mod tests {
                 name: Some("Go".into()),
                 action: None,
             },
+            BrowserObserveKind::Read {
+                outline: false,
+                filter: None,
+            },
         ];
         let names: Vec<&str> = kinds
             .iter()
@@ -878,6 +883,7 @@ mod tests {
             "is_visible",
             "is_enabled",
             "find",
+            "read",
         ] {
             assert!(names.contains(&expected), "{expected}");
         }
@@ -1045,8 +1051,9 @@ mod tests {
     }
 
     #[test]
-    fn read_observe_kind_is_not_a_v1_tool_action() {
-        assert!(!V1_TOOL_ACTIONS.contains(&"read"));
+    fn read_is_a_v1_observe_action() {
+        assert!(V1_TOOL_ACTIONS.contains(&"read"));
+        assert_eq!(V1_TOOL_ACTIONS.len(), 25);
         assert_eq!(
             BrowserObserveKind::Read {
                 outline: false,
@@ -1055,6 +1062,17 @@ mod tests {
             .v1_action_name(),
             "read"
         );
-        assert_eq!(route_v1_tool_action("read"), None);
+        assert_eq!(
+            route_v1_tool_action("read"),
+            Some(V1ToolActionRoute::Observe)
+        );
+        assert_eq!(
+            route_v1_tool_action("get_text"),
+            Some(V1ToolActionRoute::Observe)
+        );
+        assert_eq!(
+            BrowserObserveKind::Text { target: None }.v1_action_name(),
+            "get_text"
+        );
     }
 }

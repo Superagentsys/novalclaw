@@ -1633,7 +1633,7 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert!(!actions.iter().any(|a| a == "tabs"));
-        assert!(!actions.iter().any(|a| a == "read"));
+        assert!(actions.iter().any(|a| a == "read"));
         assert_eq!(
             actions,
             V1_TOOL_ACTIONS

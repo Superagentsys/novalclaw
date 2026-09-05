@@ -120,6 +120,117 @@ impl BrowserTool {
             .or_else(|| obs.snapshot.map(|snap| snap.text))
             .unwrap_or_default()
     }
+
+    fn observe_request_from_v1(
+        &self,
+        action: &str,
+        args: &serde_json::Value,
+        selector: Option<&str>,
+        value: Option<&str>,
+    ) -> anyhow::Result<ObserveRequest> {
+        match action {
+            "snapshot" => Ok(ObserveRequest {
+                kind: BrowserObserveKind::Snapshot,
+                interactive_only: args
+                    .get("interactive_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                compact: args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false),
+            }),
+            "read" => Ok(read_observe_request(args)),
+            "get_text" => Ok(ObserveRequest {
+                kind: BrowserObserveKind::Text {
+                    target: selector.map(|sel| self.selector_target(sel)),
+                },
+                interactive_only: false,
+                compact: false,
+            }),
+            "get_html" => {
+                let sel = selector
+                    .ok_or_else(|| anyhow::anyhow!("'get_html' requires 'selector'"))?;
+                Ok(ObserveRequest {
+                    kind: BrowserObserveKind::Html {
+                        target: Some(self.selector_target(sel)),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                })
+            }
+            "get_url" => Ok(ObserveRequest {
+                kind: BrowserObserveKind::Url,
+                interactive_only: false,
+                compact: false,
+            }),
+            "get_title" => Ok(ObserveRequest {
+                kind: BrowserObserveKind::Title,
+                interactive_only: false,
+                compact: false,
+            }),
+            "get_value" => {
+                let sel = selector
+                    .ok_or_else(|| anyhow::anyhow!("'get_value' requires 'selector'"))?;
+                Ok(ObserveRequest {
+                    kind: BrowserObserveKind::Value {
+                        target: self.selector_target(sel),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                })
+            }
+            "is_visible" => {
+                let sel = selector
+                    .ok_or_else(|| anyhow::anyhow!("'is_visible' requires 'selector'"))?;
+                Ok(ObserveRequest {
+                    kind: BrowserObserveKind::Visibility {
+                        target: self.selector_target(sel),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                })
+            }
+            "is_enabled" => {
+                let sel = selector
+                    .ok_or_else(|| anyhow::anyhow!("'is_enabled' requires 'selector'"))?;
+                Ok(ObserveRequest {
+                    kind: BrowserObserveKind::Enabled {
+                        target: self.selector_target(sel),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                })
+            }
+            "find" => {
+                let role = args
+                    .get("find_role")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("'find' requires 'find_role'"))?;
+                Ok(ObserveRequest {
+                    kind: BrowserObserveKind::Find {
+                        role: role.to_string(),
+                        name: args
+                            .get("find_name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        action: value.map(str::to_string),
+                    },
+                    interactive_only: false,
+                    compact: false,
+                })
+            }
+            _ => unreachable!("observe_request_from_v1 called for non-observe action {action}"),
+        }
+    }
+}
+
+fn read_observe_request(args: &serde_json::Value) -> ObserveRequest {
+    let outline = args.get("outline").and_then(|v| v.as_bool()).unwrap_or(false);
+    let filter = args
+        .get("filter")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    ObserveRequest::read(outline, filter)
 }
 
 #[async_trait]
@@ -132,7 +243,12 @@ impl Tool for BrowserTool {
         "Control a real headless browser via the agent-browser CLI. Use ONLY for JavaScript-rendered \
          pages, login, clicks, forms, and typing. Do not use this to search the web (web_search), \
          read static HTML (web_fetch), or call REST APIs (http_request). \
-         Actions: open (http/https only), snapshot (@eN refs), click, fill, type, screenshot \
+         Need interactive page state and refs → snapshot. \
+         Need document or long-form content → read. \
+         Need specific element text → get_text. \
+         For long documents, prefer read with outline/filter instead of taking very large snapshots. \
+         read: Read the current page as document-oriented content. Use outline=true to return only the heading structure. Use filter to return sections matching a heading/topic. \
+         Actions: open (http/https only), snapshot, read, click, fill, type, screenshot \
          (local file path), get_text, get_html, get_url, get_title, wait, scroll, select, press, \
          eval, close. \
          Permanent errors (BrowserBinaryMissing, BrowserSessionMissing, BrowserUrlRejected) will \
@@ -146,7 +262,7 @@ impl Tool for BrowserTool {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "open", "snapshot", "click", "fill", "type", "screenshot",
+                        "open", "snapshot", "read", "click", "fill", "type", "screenshot",
                         "get_text", "get_html", "get_url", "get_title", "get_value",
                         "wait", "scroll", "select", "press", "hover", "eval",
                         "back", "forward", "reload", "close",
@@ -202,6 +318,14 @@ impl Tool for BrowserTool {
                 "find_name": {
                     "type": "string",
                     "description": "For find: accessible name filter"
+                },
+                "outline": {
+                    "type": "boolean",
+                    "description": "For read: return only the heading structure"
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "For read: return sections matching a heading/topic"
                 }
             },
             "required": ["action"]
@@ -255,101 +379,9 @@ impl Tool for BrowserTool {
                     Err(err) => return Ok(Self::fail(err)),
                 }
             }
-            "snapshot" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
+            "snapshot" | "read" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
             | "is_visible" | "is_enabled" | "find" => {
-                let req = match action {
-                    "snapshot" => ObserveRequest {
-                        kind: BrowserObserveKind::Snapshot,
-                        interactive_only: args
-                            .get("interactive_only")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        compact: args
-                            .get("compact")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                    },
-                    "get_text" => ObserveRequest {
-                        kind: BrowserObserveKind::Text {
-                            target: selector.map(|sel| self.selector_target(sel)),
-                        },
-                        interactive_only: false,
-                        compact: false,
-                    },
-                    "get_html" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'get_html' requires 'selector'"))?;
-                        ObserveRequest {
-                            kind: BrowserObserveKind::Html {
-                                target: Some(self.selector_target(sel)),
-                            },
-                            interactive_only: false,
-                            compact: false,
-                        }
-                    }
-                    "get_url" => ObserveRequest {
-                        kind: BrowserObserveKind::Url,
-                        interactive_only: false,
-                        compact: false,
-                    },
-                    "get_title" => ObserveRequest {
-                        kind: BrowserObserveKind::Title,
-                        interactive_only: false,
-                        compact: false,
-                    },
-                    "get_value" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'get_value' requires 'selector'"))?;
-                        ObserveRequest {
-                            kind: BrowserObserveKind::Value {
-                                target: self.selector_target(sel),
-                            },
-                            interactive_only: false,
-                            compact: false,
-                        }
-                    }
-                    "is_visible" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'is_visible' requires 'selector'"))?;
-                        ObserveRequest {
-                            kind: BrowserObserveKind::Visibility {
-                                target: self.selector_target(sel),
-                            },
-                            interactive_only: false,
-                            compact: false,
-                        }
-                    }
-                    "is_enabled" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'is_enabled' requires 'selector'"))?;
-                        ObserveRequest {
-                            kind: BrowserObserveKind::Enabled {
-                                target: self.selector_target(sel),
-                            },
-                            interactive_only: false,
-                            compact: false,
-                        }
-                    }
-                    "find" => {
-                        let role = args
-                            .get("find_role")
-                            .and_then(|v| v.as_str())
-                            .ok_or_else(|| anyhow::anyhow!("'find' requires 'find_role'"))?;
-                        ObserveRequest {
-                            kind: BrowserObserveKind::Find {
-                                role: role.to_string(),
-                                name: args
-                                    .get("find_name")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                action: value.map(str::to_string),
-                            },
-                            interactive_only: false,
-                            compact: false,
-                        }
-                    }
-                    _ => unreachable!(),
-                };
+                let req = self.observe_request_from_v1(action, &args, selector, value)?;
                 match self.runtime.observe(key, opts, &req).await {
                     Ok(obs) => Self::observation_output(obs),
                     Err(err) => return Ok(Self::fail(err)),
@@ -767,15 +799,24 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!actions.iter().any(|a| a == "tabs"));
-        assert!(!actions.iter().any(|a| a == "read"));
+        assert!(actions.iter().any(|a| a == "read"));
+        assert_eq!(actions.len(), 25);
+        assert!(!actions.iter().any(|a| a == "extract"));
+        assert!(!actions.iter().any(|a| a == "extract_json"));
     }
 
     #[test]
-    fn read_does_not_change_tool_schema() {
+    fn read_tool_schema_exposes_outline_and_filter() {
         let tool = BrowserTool::new(Vec::new(), true, false, None);
         let schema = tool.parameters_schema();
-        let encoded = schema.to_string();
-        assert!(!encoded.contains("\"read\""));
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(props["outline"]["type"], "boolean");
+        assert_eq!(props["filter"]["type"], "string");
+        assert!(!props["outline"].as_object().unwrap().contains_key("required"));
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required, &vec![json!("action")]);
+        assert!(!required.iter().any(|v| v.as_str() == Some("outline")));
+        assert!(!required.iter().any(|v| v.as_str() == Some("filter")));
         let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .unwrap()
@@ -783,7 +824,97 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
-        assert!(!actions.contains(&"read"));
+        assert!(actions.contains(&"read"));
+        assert!(!props.contains_key("llms"));
+        assert!(!props.contains_key("raw"));
+        assert!(!props.contains_key("require_md"));
+        assert!(!props.contains_key("content_boundaries"));
+        assert!(!props.contains_key("max_output"));
+    }
+
+    #[test]
+    fn read_routes_to_document_observe_kind_not_text() {
+        let tool = BrowserTool::new(Vec::new(), true, false, None);
+        let read = tool
+            .observe_request_from_v1("read", &json!({}), None, None)
+            .unwrap();
+        assert_eq!(
+            read.kind,
+            BrowserObserveKind::Read {
+                outline: false,
+                filter: None,
+            }
+        );
+        let outline = tool
+            .observe_request_from_v1("read", &json!({"outline": true}), None, None)
+            .unwrap();
+        assert_eq!(
+            outline.kind,
+            BrowserObserveKind::Read {
+                outline: true,
+                filter: None,
+            }
+        );
+        let filtered = tool
+            .observe_request_from_v1("read", &json!({"filter": "security"}), None, None)
+            .unwrap();
+        assert_eq!(
+            filtered.kind,
+            BrowserObserveKind::Read {
+                outline: false,
+                filter: Some("security".into()),
+            }
+        );
+        let both = tool
+            .observe_request_from_v1(
+                "read",
+                &json!({"outline": true, "filter": "security"}),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            both.kind,
+            BrowserObserveKind::Read {
+                outline: true,
+                filter: Some("security".into()),
+            }
+        );
+        let text = tool
+            .observe_request_from_v1("get_text", &json!({}), None, None)
+            .unwrap();
+        assert!(matches!(text.kind, BrowserObserveKind::Text { target: None }));
+        let snap = tool
+            .observe_request_from_v1("snapshot", &json!({}), None, None)
+            .unwrap();
+        assert_eq!(snap.kind, BrowserObserveKind::Snapshot);
+    }
+
+    #[test]
+    fn tool_schema_and_output_do_not_expose_elements_or_extract() {
+        let tool = BrowserTool::new(Vec::new(), true, false, None);
+        let schema = tool.parameters_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(!props.contains_key("elements"));
+        assert!(!props.contains_key("extract"));
+        assert!(!props.contains_key("extract_json"));
+        let description = tool.description();
+        assert!(description.contains("prefer read with outline/filter"));
+        assert!(!description.contains("BrowserRuntime"));
+        assert!(!description.contains("extract_json"));
+        let out = BrowserTool::observation_output(BrowserObservation {
+            url: None,
+            title: None,
+            text: Some("--- BEGIN WEB CONTENT ---\nhello\n--- END WEB CONTENT ---".into()),
+            snapshot: Some(crate::tools::browser_types::BrowserSnapshot {
+                text: "snap".into(),
+                elements: Vec::new(),
+            }),
+            truncated: true,
+        });
+        assert!(out.contains("BEGIN WEB CONTENT"));
+        assert!(!out.contains("elements"));
+        assert!(!out.contains("\"truncated\": true"));
     }
 
     #[test]
@@ -1519,5 +1650,129 @@ mod tests {
         );
 
         let _ = runtime.close_session(&key, &opts).await;
+    }
+
+    /// Tool exposure: `action=read` must go BrowserTool → Runtime → Backend.
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_browser_tool_read_outline_and_filter() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+
+        let mut article = String::from(
+            "<html><head><title>B32F Long Article</title></head><body><article>\
+             <h1>Security Handbook</h1>",
+        );
+        for index in 0..8 {
+            article.push_str(&format!(
+                "<p>Security paragraph {index}: authentication, credentials, and access control. {}</p>",
+                "token ".repeat(20)
+            ));
+        }
+        article.push_str("<h2>Cooking</h2>");
+        for index in 0..60 {
+            article.push_str(&format!(
+                "<p>Cooking paragraph {index}: pasta recipes and unrelated filler. {}</p>",
+                "food ".repeat(30)
+            ));
+        }
+        article.push_str("</article></body></html>");
+
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                &article,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+
+        let session = format!("b32f-{}", uuid::Uuid::new_v4());
+        let tool = BrowserTool::new(vec!["127.0.0.1".to_string()], true, false, None)
+            .with_session(session)
+            .with_binary_search(search);
+        let open = tool
+            .execute(json!({
+                "action": "open",
+                "url": format!("http://127.0.0.1:{page_port}/article")
+            }))
+            .await
+            .unwrap();
+        assert!(open.success, "open failed: {:?}", open.error);
+        let _ = tool
+            .execute(json!({"action": "wait", "timeout_ms": 800}))
+            .await;
+
+        let read = tool.execute(json!({"action": "read"})).await.unwrap();
+        assert!(read.success, "read failed: {:?}", read.error);
+        assert!(
+            read.output.contains("BEGIN WEB CONTENT"),
+            "read must reuse WEB CONTENT bounds: {}",
+            read.output
+        );
+        assert!(
+            read.output.to_ascii_lowercase().contains("security")
+                || read.output.to_ascii_lowercase().contains("authentication"),
+            "read missing article body: {}",
+            read.output
+        );
+        assert!(!read.output.contains("\"elements\""));
+        assert!(!read.output.contains("extract_json"));
+
+        let outline = tool
+            .execute(json!({"action": "read", "outline": true}))
+            .await
+            .unwrap();
+        assert!(outline.success, "outline failed: {:?}", outline.error);
+        assert!(
+            outline.output.to_ascii_lowercase().contains("outline")
+                || outline.output.contains("Security Handbook")
+                || outline.output.contains("Cooking"),
+            "outline missing headings: {}",
+            outline.output
+        );
+
+        let filtered = tool
+            .execute(json!({"action": "read", "filter": "security"}))
+            .await
+            .unwrap();
+        assert!(filtered.success, "filter failed: {:?}", filtered.error);
+        assert!(
+            filtered.output.to_ascii_lowercase().contains("security"),
+            "filter should keep security sections: {}",
+            filtered.output
+        );
+
+        let both = tool
+            .execute(json!({"action": "read", "outline": true, "filter": "security"}))
+            .await
+            .unwrap();
+        assert!(
+            both.success,
+            "outline+filter combination failed: {:?}",
+            both.error
+        );
+
+        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        assert!(snapshot.success, "snapshot failed: {:?}", snapshot.error);
+        let get_text = tool.execute(json!({"action": "get_text"})).await.unwrap();
+        assert!(get_text.success, "get_text failed: {:?}", get_text.error);
+
+        eprintln!(
+            "B3.2F_CONTEXT snapshot={} get_text={} read={} outline={} filter={}",
+            snapshot.output.chars().count(),
+            get_text.output.chars().count(),
+            read.output.chars().count(),
+            outline.output.chars().count(),
+            filtered.output.chars().count()
+        );
+        assert!(
+            outline.output.chars().count() < snapshot.output.chars().count(),
+            "outline should be smaller than snapshot"
+        );
+
+        let _ = tool.execute(json!({"action": "close"})).await;
     }
 }
