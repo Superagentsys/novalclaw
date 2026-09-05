@@ -16,12 +16,13 @@ import {
   isContextUsageEvent,
   type ContextOperationView,
 } from "./contextLifecycle";
-import type {
-  AgentRunChangedFile,
-  AgentRunEvent,
-  AgentRunEventContextLifecycle,
-  AgentRunStep,
-  RunEvent,
+import {
+  toolCompletedSucceeded,
+  type AgentRunChangedFile,
+  type AgentRunEvent,
+  type AgentRunEventContextLifecycle,
+  type AgentRunStep,
+  type RunEvent,
 } from "./types";
 
 export type RawEvent = RunEvent | AgentRunEvent | Record<string, unknown>;
@@ -48,11 +49,6 @@ function stringField(event: RawEvent, key: string): string {
 function numberField(event: RawEvent, key: string): number {
   const value = payloadOf(event)[key];
   return typeof value === "number" ? value : 0;
-}
-
-function boolField(event: RawEvent, key: string, fallback = false): boolean {
-  const value = payloadOf(event)[key];
-  return typeof value === "boolean" ? value : fallback;
 }
 
 function diffField(event: RawEvent): { additions: number; deletions: number } | null {
@@ -396,7 +392,10 @@ export function aggregateSteps(events: RawEvent[], options: AggregateStepsOption
     if (type === "tool_completed" || type === "toolCompleted") {
       const id = stepIdFor(event, index);
       const step = ensureStep(id, toolName, "");
-      const success = boolField(event, "success", true);
+      const success = toolCompletedSucceeded({
+        success: typeof payloadOf(event).success === "boolean" ? (payloadOf(event).success as boolean) : undefined,
+        status: stringField(event, "status") || undefined,
+      });
       const resultSummary = stringField(event, "result_summary");
       const diff = diffField(event);
       step.status = success ? "success" : "error";

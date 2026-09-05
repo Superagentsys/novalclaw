@@ -120,10 +120,25 @@ export interface AgentRunEventToolCompleted {
   run_id: string;
   tool_call_id: string;
   tool_name: string;
-  success: boolean;
+  status?: "pending" | "running" | "success" | "error";
+  success?: boolean;
   duration_ms: number;
   result_summary: string;
   diff_stats: RunDiffStats | null;
+}
+
+/** Core emits `status`, some older streams still emit `success`. */
+export function toolCompletedSucceeded(event: {
+  success?: boolean;
+  status?: string;
+}): boolean {
+  if (typeof event.success === "boolean") {
+    return event.success;
+  }
+  if (typeof event.status === "string" && event.status.length > 0) {
+    return event.status === "success";
+  }
+  return true;
 }
 
 export interface AgentRunEventSkillActivated {
@@ -468,7 +483,7 @@ export interface RunEventFileChanged {
 }
 
 export function getEventStatusLabel(
-  event: RunEvent | AgentRunEvent | { type?: string; success?: boolean }
+  event: RunEvent | AgentRunEvent | { type?: string; success?: boolean; status?: string }
 ): string {
   switch (event.type) {
     case "run_started":
@@ -503,7 +518,7 @@ export function getEventStatusLabel(
       return "error";
     case "tool_completed":
     case "toolCompleted":
-      return event.success ? "success" : "error";
+      return toolCompletedSucceeded(event) ? "success" : "error";
     default:
       return "unknown";
   }
@@ -543,6 +558,7 @@ export function getToolLabel(toolName: string): string {
     memory_recall: "回忆记忆",
     knowledge_search: "检索知识库",
     browser: "浏览器",
+    computer_use: "桌面操作",
     pdf_read: "读取 PDF",
   };
   return labels[toolName] ?? toolName;

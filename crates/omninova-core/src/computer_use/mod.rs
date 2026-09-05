@@ -155,6 +155,66 @@ fn normalize_app_name(name: &str) -> String {
         .collect()
 }
 
+/// File stem of a process path or window identity, e.g. `EXCEL.EXE` → `EXCEL`.
+/// Splits on both `/` and `\` so Windows paths still parse on Unix test hosts.
+pub fn app_process_stem(name: &str) -> String {
+    let trimmed = name.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let file = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed);
+    Path::new(file)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file)
+        .to_string()
+}
+
+/// Console hosts used to drive the desktop. They must not steal the
+/// allowlist / a11y target from the app the user actually asked for.
+pub fn is_desktop_input_helper(name: &str) -> bool {
+    matches!(
+        normalize_app_name(&app_process_stem(name)).as_str(),
+        "powershell"
+            | "pwsh"
+            | "conhost"
+            | "cmd"
+            | "windowsterminal"
+            | "openconsole"
+            | "powershell_ise"
+    )
+}
+
+/// Prefer a human/app identity (`Excel` / `工作簿1 - Excel`) over a raw exe path.
+pub fn foreground_display_name(process: &str, title: &str) -> String {
+    let stem = app_process_stem(process);
+    let title = title.trim();
+    if is_desktop_input_helper(process) || is_desktop_input_helper(title) {
+        if !title.is_empty() && !is_desktop_input_helper(title) {
+            return title.to_string();
+        }
+        return if stem.is_empty() {
+            process.trim().to_string()
+        } else {
+            stem
+        };
+    }
+    if stem.is_empty() {
+        return title.to_string();
+    }
+    if title.is_empty() {
+        return stem;
+    }
+    if normalize_app_name(title).contains(&normalize_app_name(&stem)) {
+        title.to_string()
+    } else {
+        format!("{stem}: {title}")
+    }
+}
+
 pub fn is_blocked_hotkey(key: &str) -> bool {
     let normalized = normalize_hotkey(key);
     BLOCKED_HOTKEYS
@@ -1278,6 +1338,37 @@ mod tests {
         assert!(!app_is_allowed(&[], "钉钉"));
         assert!(app_is_allowed(&["*".into()], "Finder"));
         assert!(app_is_allowed(&["all".into()], "Excel"));
+        assert!(app_is_allowed(
+            &["Excel".into()],
+            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
+        ));
+        assert!(app_is_allowed(&["Excel".into()], "工作簿1 - Excel"));
+        assert!(!app_is_allowed(
+            &["Excel".into()],
+            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+    }
+
+    #[test]
+    fn powershell_console_is_an_input_helper_not_excel() {
+        assert!(is_desktop_input_helper(
+            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(is_desktop_input_helper("pwsh"));
+        assert!(!is_desktop_input_helper(
+            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
+        ));
+        assert_eq!(
+            foreground_display_name(
+                r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
+                "工作簿1 - Excel"
+            ),
+            "工作簿1 - Excel"
+        );
+        assert_eq!(
+            foreground_display_name("EXCEL.EXE", "Book1"),
+            "EXCEL: Book1"
+        );
     }
 
     #[test]
