@@ -1,5 +1,6 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listenAgentRunEvents } from "../../utils/events";
+import { invokeTauri, isTauriEnvironment } from "../../utils/tauri";
 import { aggregateSteps, dedupeEvents, eventType, type RawEvent } from "./agentRunSteps";
 import type { AgentRunEvent, AgentRunEventContextLifecycle, AgentRunStep, RunEvent } from "./types";
 import { AgentRunEventCard } from "./AgentRunEventCard";
@@ -273,6 +274,82 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
       setCollapsed((value) => !value);
     }, []);
 
+    const [logExport, setLogExport] = useState<"idle" | "saving" | "done" | "error">("idle");
+    const downloadLog = useCallback(
+      async (event: React.SyntheticEvent) => {
+        event.stopPropagation();
+        event.preventDefault();
+        if (logExport === "saving" || rawEvents.length === 0) return;
+        setLogExport("saving");
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const fileName = `omninova-run-${liveSessionId ?? "log"}-${stamp}.log`;
+        const meta = {
+          run_id: liveSessionId ?? null,
+          session_id: sessionId ?? null,
+          status: status.type,
+          elapsed_sec: Math.round(elapsed),
+          steps: steps.length,
+        };
+        try {
+          if (isTauriEnvironment()) {
+            const { save } = await import("@tauri-apps/plugin-dialog");
+            const destination = await save({
+              title: "下载运行日志",
+              defaultPath: fileName,
+              filters: [{ name: "日志文件", extensions: ["log", "txt"] }],
+            });
+            if (!destination) {
+              setLogExport("idle");
+              return;
+            }
+            await invokeTauri("export_agent_run_log", {
+              destination,
+              events: rawEvents,
+              meta,
+            });
+          } else {
+            // Web fallback: download a client-side rendered log via Blob.
+            const lines = [
+              "OmniNova Claw 智能体运行日志",
+              `运行信息: ${JSON.stringify(meta)}`,
+              `事件总数: ${rawEvents.length}`,
+              "=".repeat(40),
+              "",
+              ...rawEvents.map(
+                (item, index) =>
+                  `[#${String(index + 1).padStart(3, "0")}] ${eventType(item)}\n${JSON.stringify(item, null, 2)}\n`
+              ),
+            ];
+            const blob = new Blob(["\uFEFF" + lines.join("\n")], {
+              type: "text/plain;charset=utf-8",
+            });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement("a");
+            anchor.href = url;
+            anchor.download = fileName;
+            anchor.click();
+            URL.revokeObjectURL(url);
+          }
+          setLogExport("done");
+        } catch (error) {
+          console.error("export run log failed", error);
+          setLogExport("error");
+        } finally {
+          window.setTimeout(() => setLogExport("idle"), 3000);
+        }
+      },
+      [logExport, rawEvents, liveSessionId, sessionId, status.type, elapsed, steps.length]
+    );
+
+    const logButtonText =
+      logExport === "saving"
+        ? "导出中…"
+        : logExport === "done"
+          ? "已保存 ✓"
+          : logExport === "error"
+            ? "导出失败"
+            : "下载日志";
+
     return (
       <section className={`agent-run-panel agent-run-panel--${status.type}`} aria-label="Agent 执行过程">
         <button type="button" className="agent-run-summary" onClick={toggleCollapsed}>
@@ -281,6 +358,24 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
           {(totalDiff.additions > 0 || totalDiff.deletions > 0) && (
             <span className="agent-run-diff-badge">
               +{totalDiff.additions} -{totalDiff.deletions}
+            </span>
+          )}
+          {rawEvents.length > 0 && (
+            <span
+              role="button"
+              tabIndex={0}
+              className={`agent-run-log-download agent-run-log-download--${logExport}`}
+              title="下载本次运行的完整日志"
+              onClick={(event) => {
+                void downloadLog(event);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  void downloadLog(event);
+                }
+              }}
+            >
+              {logButtonText}
             </span>
           )}
           <span className="agent-run-summary-toggle">{collapsed ? "展开" : "收起"}</span>

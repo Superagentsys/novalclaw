@@ -195,8 +195,9 @@ fn append_computer_use_policy(system_prompt: &mut Option<String>, tools: &[Box<d
         return;
     }
     let note = "\n[桌面操作 computer_use]\n\
-- 原生桌面应用（钉钉/飞书客户端/Excel/用友/金蝶等）用 computer_use；网页用 browser；公开检索用 web_search/web_fetch。\n\
-- 先 snapshot 看控件，再 click name 或 ref（如 @e1）。坐标 x,y 只是后备，且必须相对最近一张截图像素，原点左上角。\n\
+- 原生桌面应用（钉钉/飞书客户端/Word/Excel/用友/金蝶等）用 computer_use；网页用 browser；公开检索用 web_search/web_fetch。\n\
+- 启动软件或打开文件：优先 action=launch，target 填应用名（word/excel/钉钉）、工作区文件（report.docx）、桌面/任务栏快捷方式名或绝对路径；会自动搜索工作区、桌面、任务栏、开始菜单和已安装应用。launch 失败再退回 press win + type 名称 + enter。\n\
+- 启动后先 snapshot 看控件，再 click name 或 ref（如 @e1）继续操作：Word/Excel 新建文档按 ctrl+n 或点击“空白文档”，保存按 ctrl+s。坐标 x,y 只是后备，且必须相对最近一张截图像素，原点左上角。\n\
 - 同一按钮连点无效时不要死磕：换 snapshot / 换 name。连续失败会被熔断。\n\
 - type 通过剪贴板粘贴，适合中文。不要用 computer_use 去点浏览器窗口。\n\
 - 长任务拆成多回合：todo_write 列步骤，task_checkpoint 记录进度（evidence 必须带截图路径）后结束本回合。\n\

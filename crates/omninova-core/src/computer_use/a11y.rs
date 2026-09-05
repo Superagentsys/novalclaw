@@ -40,6 +40,10 @@ impl A11yNode {
 
 pub fn finalize_nodes(mut nodes: Vec<A11yNode>, max_nodes: usize) -> Vec<A11yNode> {
     nodes.retain(is_useful);
+    // Interactive controls first: big apps (Word/Excel ribbons) produce far
+    // more raw nodes than max_nodes, and a plain truncation would drop the
+    // buttons the agent actually needs in favor of named text/panels.
+    nodes.sort_by_key(|node| !is_interactive_role(&node.role));
     nodes.truncate(max_nodes.max(1));
     for (index, node) in nodes.iter_mut().enumerate() {
         node.id = format!("@e{}", index + 1);
@@ -238,20 +242,24 @@ const HANDOFF_BANNERS: &[(&str, &str)] = &[
     ("disconnected", "network_or_session"),
 ];
 
+fn is_interactive_role(role: &str) -> bool {
+    let role = role.to_ascii_lowercase();
+    INTERACTIVE_HINTS
+        .iter()
+        .any(|hint| role.contains(hint))
+}
+
 fn is_useful(node: &A11yNode) -> bool {
     if node.width <= 0 || node.height <= 0 {
         return false;
     }
-    let role = node.role.to_ascii_lowercase();
-    if INTERACTIVE_HINTS
-        .iter()
-        .any(|hint| role.contains(hint))
-    {
+    if is_interactive_role(&node.role) {
         return true;
     }
     if node.name.trim().is_empty() {
         return false;
     }
+    let role = node.role.to_ascii_lowercase();
     !NOISE_ROLES.iter().any(|hint| role.contains(hint))
 }
 

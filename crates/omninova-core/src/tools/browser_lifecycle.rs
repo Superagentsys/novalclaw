@@ -43,9 +43,7 @@ pub(crate) enum BrowserFailureKind {
 pub(crate) fn action_kind(action: &str) -> BrowserActionKind {
     match action {
         "snapshot" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
-        | "is_visible" | "is_enabled" | "screenshot" | "find" | "read" => {
-            BrowserActionKind::ReadOnly
-        }
+        | "is_visible" | "is_enabled" | "screenshot" | "find" => BrowserActionKind::ReadOnly,
         "open" | "reload" | "wait" | "back" | "forward" | "close" => BrowserActionKind::Idempotent,
         _ => BrowserActionKind::Mutating,
     }
@@ -65,7 +63,6 @@ pub(crate) fn is_retryable_action(action: &str) -> bool {
             | "is_enabled"
             | "wait"
             | "reload"
-            | "read"
     )
 }
 
@@ -235,18 +232,6 @@ fn close_session_blocking(binary: &Path, session: &str) {
 
 pub(crate) fn recover_owned_session(session: &str) -> bool {
     clear_stale_session_sidecars_in(&namespace_run_dir(AGENT_BROWSER_NAMESPACE), session)
-}
-
-/// Sidecar pid probe only. Does not spawn a daemon or clear files.
-/// `None` = no pid file, `Some(true)` = process alive, `Some(false)` = stale.
-pub(crate) fn probe_owned_session_pid(session: &str) -> Option<bool> {
-    if !is_safe_sidecar_token(session) {
-        return None;
-    }
-    let pid_path = namespace_run_dir(AGENT_BROWSER_NAMESPACE).join(format!("{session}.pid"));
-    let text = std::fs::read_to_string(pid_path).ok()?;
-    let pid = text.trim().parse::<u32>().ok()?;
-    Some(pid_is_alive(pid))
 }
 
 pub(crate) fn clear_stale_session_sidecars(namespace: &str, session: &str) -> bool {

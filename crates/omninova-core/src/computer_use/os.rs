@@ -1,10 +1,10 @@
 use super::{A11yNode, DesktopDriver, ForegroundApp};
-#[cfg(target_os = "windows")]
-use super::{foreground_display_name, is_desktop_input_helper};
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::Stdio;
 
 pub struct OsDesktopDriver;
 
@@ -35,6 +35,14 @@ impl DesktopDriver for OsDesktopDriver {
 
     fn accessibility_snapshot(&self, max_nodes: usize) -> Result<Vec<A11yNode>, String> {
         snapshot_front_window(max_nodes)
+    }
+
+    fn launch(&self, target: &str, workspace: &Path) -> Result<String, String> {
+        launch(target, workspace)
+    }
+
+    fn invoke_at(&self, x: i32, y: i32) -> Result<(), String> {
+        invoke_at(x, y)
     }
 }
 
@@ -419,197 +427,132 @@ fn command_stdout(bin: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Windows desktop input used to spawn a visible `powershell.exe`, which stole
-/// the foreground from Excel and made every screenshot/click/type report the
-/// console path as `foreground_app`. Click/type/press now go through user32;
-/// PowerShell is only used for UI Automation snapshots, and even then it is
-/// created with `CREATE_NO_WINDOW`.
-#[cfg(target_os = "windows")]
-mod win32 {
-    pub const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
-    pub const MOUSEEVENTF_LEFTUP: u32 = 0x0004;
-    pub const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0008;
-    pub const MOUSEEVENTF_RIGHTUP: u32 = 0x0010;
-    pub const KEYEVENTF_KEYUP: u32 = 0x0002;
-    pub const VK_BACK: u8 = 0x08;
-    pub const VK_TAB: u8 = 0x09;
-    pub const VK_RETURN: u8 = 0x0D;
-    pub const VK_SHIFT: u8 = 0x10;
-    pub const VK_CONTROL: u8 = 0x11;
-    pub const VK_MENU: u8 = 0x12;
-    pub const VK_ESCAPE: u8 = 0x1B;
-    pub const VK_SPACE: u8 = 0x20;
-    pub const VK_PRIOR: u8 = 0x21;
-    pub const VK_NEXT: u8 = 0x22;
-    pub const VK_END: u8 = 0x23;
-    pub const VK_HOME: u8 = 0x24;
-    pub const VK_LEFT: u8 = 0x25;
-    pub const VK_UP: u8 = 0x26;
-    pub const VK_RIGHT: u8 = 0x27;
-    pub const VK_DOWN: u8 = 0x28;
-    pub const CF_UNICODETEXT: u32 = 13;
-    pub const GMEM_MOVEABLE: u32 = 0x0002;
-    pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    pub const GW_OWNER: u32 = 4;
-    pub const GWL_EXSTYLE: i32 = -20;
-    pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
-    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    #[link(name = "user32")]
-    extern "system" {
-        pub fn GetForegroundWindow() -> isize;
-        pub fn GetWindowTextW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
-        pub fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
-        pub fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
-        pub fn SetCursorPos(x: i32, y: i32) -> i32;
-        pub fn mouse_event(flags: u32, dx: u32, dy: u32, data: u32, extra: usize);
-        pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
-        pub fn OpenClipboard(owner: isize) -> i32;
-        pub fn CloseClipboard() -> i32;
-        pub fn EmptyClipboard() -> i32;
-        pub fn SetClipboardData(format: u32, mem: isize) -> isize;
-        pub fn IsWindowVisible(hwnd: isize) -> i32;
-        pub fn GetWindow(hwnd: isize, cmd: u32) -> isize;
-        pub fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
-        pub fn EnumWindows(
-            cb: unsafe extern "system" fn(isize, isize) -> i32,
-            lparam: isize,
-        ) -> i32;
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-        pub fn QueryFullProcessImageNameW(
-            proc: isize,
-            flags: u32,
-            name: *mut u16,
-            size: *mut u32,
-        ) -> i32;
-        pub fn CloseHandle(handle: isize) -> i32;
-        pub fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
-        pub fn GlobalLock(mem: isize) -> *mut std::ffi::c_void;
-        pub fn GlobalUnlock(mem: isize) -> i32;
-        pub fn GlobalFree(mem: isize) -> isize;
-    }
-}
-
-#[cfg(target_os = "windows")]
-struct WindowIdentity {
-    hwnd: isize,
-    process: String,
-    title: String,
-    class: String,
-}
-
 #[cfg(target_os = "windows")]
 fn click(x: i32, y: i32, button: &str) -> Result<(), String> {
-    let (down, up) = match button {
-        "right" => (win32::MOUSEEVENTF_RIGHTDOWN, win32::MOUSEEVENTF_RIGHTUP),
-        _ => (win32::MOUSEEVENTF_LEFTDOWN, win32::MOUSEEVENTF_LEFTUP),
+    let down_up = match button {
+        "right" => (0x0008, 0x0010),
+        _ => (0x0002, 0x0004),
     };
-    unsafe {
-        if win32::SetCursorPos(x, y) == 0 {
-            return Err(format!("SetCursorPos({x},{y}) failed"));
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(15));
-    unsafe {
-        win32::mouse_event(down, 0, 0, 0, 0);
-        win32::mouse_event(up, 0, 0, 0, 0);
-    }
-    Ok(())
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({x}, {y})
+Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern void mouse_event(int f,int a,int b,int c,int d);'
+[W.U]::mouse_event({down},0,0,0,0)
+[W.U]::mouse_event({up},0,0,0,0)
+"#,
+        down = down_up.0,
+        up = down_up.1
+    );
+    run_powershell(&script)
 }
+
+/// Shared P/Invoke preamble for keyboard/mouse input on Windows. `keybd_event`
+/// / `mouse_event` accept virtual-key codes directly, so unlike SendKeys they
+/// support the Win key and never misparse brace or modifier characters.
+#[cfg(target_os = "windows")]
+const WIN_INPUT_PREAMBLE: &str = r#"
+Add-Type -Namespace W -Name Inp -MemberDefinition '[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, System.UIntPtr extra); [DllImport("user32.dll")] public static extern void mouse_event(int f, int a, int b, int c, int d);'
+"#;
 
 #[cfg(target_os = "windows")]
 fn paste_text(text: &str) -> Result<(), String> {
-    set_clipboard_unicode(text)?;
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    unsafe {
-        send_vk(win32::VK_CONTROL, false);
-        send_vk(b'V', false);
-        send_vk(b'V', true);
-        send_vk(win32::VK_CONTROL, true);
-    }
-    Ok(())
+    // Base64 round-trip: here-strings corrupt apostrophes and any line that
+    // looks like a terminator; base64 survives every character including CJK.
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes());
+    let script = format!(
+        r#"
+{preamble}
+$text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64}'))
+Set-Clipboard -Value $text
+Start-Sleep -Milliseconds 120
+[W.Inp]::keybd_event(0x11, 0, 0, [System.UIntPtr]::Zero)
+[W.Inp]::keybd_event(0x56, 0, 0, [System.UIntPtr]::Zero)
+[W.Inp]::keybd_event(0x56, 0, 2, [System.UIntPtr]::Zero)
+[W.Inp]::keybd_event(0x11, 0, 2, [System.UIntPtr]::Zero)
+"#,
+        preamble = WIN_INPUT_PREAMBLE,
+        b64 = b64
+    );
+    run_powershell(&script)
 }
 
 #[cfg(target_os = "windows")]
 fn press(key: &str) -> Result<(), String> {
-    let chord = windows_key_chord(key)?;
-    unsafe {
-        if chord.ctrl {
-            send_vk(win32::VK_CONTROL, false);
-        }
-        if chord.alt {
-            send_vk(win32::VK_MENU, false);
-        }
-        if chord.shift {
-            send_vk(win32::VK_SHIFT, false);
-        }
-        send_vk(chord.vk, false);
-        send_vk(chord.vk, true);
-        if chord.shift {
-            send_vk(win32::VK_SHIFT, true);
-        }
-        if chord.alt {
-            send_vk(win32::VK_MENU, true);
-        }
-        if chord.ctrl {
-            send_vk(win32::VK_CONTROL, true);
-        }
+    let sequence = windows_key_vks(key)?;
+    let mut body = String::new();
+    for vk in &sequence {
+        body.push_str(&format!(
+            "[W.Inp]::keybd_event(0x{vk:02X}, 0, 0, [System.UIntPtr]::Zero)\n"
+        ));
     }
-    Ok(())
+    for vk in sequence.iter().rev() {
+        body.push_str(&format!(
+            "[W.Inp]::keybd_event(0x{vk:02X}, 0, 2, [System.UIntPtr]::Zero)\n"
+        ));
+    }
+    let script = format!("{}\n{}", WIN_INPUT_PREAMBLE, body);
+    run_powershell(&script)
 }
 
 #[cfg(target_os = "windows")]
 fn scroll(direction: &str, amount: i32) -> Result<(), String> {
-    let vk = match direction {
-        "up" => win32::VK_UP,
-        "left" => win32::VK_LEFT,
-        "right" => win32::VK_RIGHT,
-        _ => win32::VK_DOWN,
+    // Real wheel events scroll the control under the cursor (Excel grids,
+    // Word pages); arrow keys only move a selection/caret.
+    const WHEEL: i32 = 0x0800;
+    const HWHEEL: i32 = 0x01000;
+    let step = 120 * amount.clamp(1, 30);
+    let (flag, delta) = match direction {
+        "up" => (WHEEL, step),
+        "left" => (HWHEEL, -step),
+        "right" => (HWHEEL, step),
+        _ => (WHEEL, -step),
     };
-    for _ in 0..amount.clamp(1, 30) {
-        unsafe {
-            send_vk(vk, false);
-            send_vk(vk, true);
-        }
-    }
-    Ok(())
+    let script = format!(
+        "{}\n[W.Inp]::mouse_event({flag}, 0, 0, {delta}, 0)\n",
+        WIN_INPUT_PREAMBLE
+    );
+    run_powershell(&script)
 }
 
 #[cfg(target_os = "windows")]
 fn foreground_app() -> Result<ForegroundApp, String> {
-    let identity = target_window().ok_or_else(|| "could not read foreground window".to_string())?;
-    let name = foreground_display_name(&identity.process, &identity.title);
+    let script = r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class Fg {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+}
+"@
+$hwnd = [Fg]::GetForegroundWindow()
+$sb = New-Object System.Text.StringBuilder 512
+[void][Fg]::GetWindowText($hwnd, $sb, $sb.Capacity)
+$title = $sb.ToString()
+if (-not [string]::IsNullOrWhiteSpace($title)) { $title; exit }
+# Desktop / shell windows have no title; fall back to the process name so the
+# allowlist guard still has something stable to match (e.g. "explorer").
+$procId = 0
+[void][Fg]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+$proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+if ($proc) { $proc.ProcessName } else { '' }
+"#;
+    let name = powershell_stdout(script)?;
     if name.is_empty() {
         return Err("could not read foreground window title".into());
     }
     Ok(ForegroundApp { name })
 }
 
+/// Map a key spec like "ctrl+shift+s" or "win+r" to ordered virtual-key codes
+/// (modifiers first, main key last). The caller presses them down in order and
+/// releases in reverse.
 #[cfg(target_os = "windows")]
-fn target_window() -> Option<WindowIdentity> {
-    let hwnd = unsafe { win32::GetForegroundWindow() };
-    window_identity(hwnd)
-        .filter(is_interactive_app)
-        .or_else(first_interactive_window)
-}
-
-#[cfg(target_os = "windows")]
-struct KeyChord {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    vk: u8,
-}
-
-#[cfg(target_os = "windows")]
-fn windows_key_chord(key: &str) -> Result<KeyChord, String> {
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
+fn windows_key_vks(key: &str) -> Result<Vec<u8>, String> {
+    let mut modifiers: Vec<u8> = Vec::new();
     let mut name = String::new();
     for part in key.split(['+', '-', ' ']) {
         let part = part.trim();
@@ -617,229 +560,71 @@ fn windows_key_chord(key: &str) -> Result<KeyChord, String> {
             continue;
         }
         match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => ctrl = true,
-            "alt" | "option" => alt = true,
-            "shift" => shift = true,
-            "cmd" | "command" | "win" => {
-                return Err("Windows computer_use 不支持 Win 组合键".into())
-            }
+            "ctrl" | "control" => modifiers.push(0x11),
+            "alt" | "option" | "opt" => modifiers.push(0x12),
+            "shift" => modifiers.push(0x10),
+            "cmd" | "command" | "meta" | "win" | "windows" => modifiers.push(0x5B),
             other => name = other.to_string(),
         }
     }
-    let vk = match name.as_str() {
-        "enter" | "return" => win32::VK_RETURN,
-        "tab" => win32::VK_TAB,
-        "esc" | "escape" => win32::VK_ESCAPE,
-        "backspace" | "delete" => win32::VK_BACK,
-        "space" | "spacebar" => win32::VK_SPACE,
-        "up" => win32::VK_UP,
-        "down" => win32::VK_DOWN,
-        "left" => win32::VK_LEFT,
-        "right" => win32::VK_RIGHT,
-        "home" => win32::VK_HOME,
-        "end" => win32::VK_END,
-        "pageup" => win32::VK_PRIOR,
-        "pagedown" => win32::VK_NEXT,
+    let main: u8 = match name.as_str() {
+        "" if !modifiers.is_empty() => {
+            // Modifier-only press (e.g. "win" opens the Start menu): drop the
+            // last modifier into the main slot so it still gets tapped.
+            modifiers.pop().expect("non-empty")
+        }
+        "" => return Err("missing key".into()),
+        "enter" | "return" => 0x0D,
+        "tab" => 0x09,
+        "esc" | "escape" => 0x1B,
+        "backspace" => 0x08,
+        "delete" => 0x2E,
+        "space" | "spacebar" => 0x20,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
         other if other.len() == 1 => {
-            let ch = other.chars().next().unwrap();
-            if ch.is_ascii_alphabetic() {
-                ch.to_ascii_uppercase() as u8
-            } else if ch.is_ascii_digit() {
-                ch as u8
-            } else {
-                return Err(format!("unsupported key '{key}'"));
+            let ch = other.chars().next().unwrap().to_ascii_uppercase();
+            match ch {
+                'A'..='Z' | '0'..='9' => ch as u8,
+                _ => return Err(format!("unsupported key '{key}'")),
+            }
+        }
+        other if other.len() <= 3 => {
+            let digits = other
+                .strip_prefix('f')
+                .and_then(|rest| rest.parse::<u8>().ok());
+            match digits {
+                Some(n @ 1..=12) => 0x70 + (n - 1),
+                _ => return Err(format!("unsupported key '{key}'")),
             }
         }
         _ => return Err(format!("unsupported key '{key}'")),
     };
-    Ok(KeyChord {
-        ctrl,
-        alt,
-        shift,
-        vk,
-    })
+    modifiers.dedup();
+    modifiers.push(main);
+    Ok(modifiers)
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn send_vk(vk: u8, up: bool) {
-    let flags = if up { win32::KEYEVENTF_KEYUP } else { 0 };
-    win32::keybd_event(vk, 0, flags, 0);
-}
-
-#[cfg(target_os = "windows")]
-fn set_clipboard_unicode(text: &str) -> Result<(), String> {
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    wide.push(0);
-    let bytes = wide.len().saturating_mul(2);
-    for _ in 0..8 {
-        if unsafe { win32::OpenClipboard(0) } != 0 {
-            return copy_wide_to_clipboard(&wide, bytes);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    Err("OpenClipboard failed".into())
-}
-
-#[cfg(target_os = "windows")]
-fn copy_wide_to_clipboard(wide: &[u16], bytes: usize) -> Result<(), String> {
-    unsafe {
-        win32::EmptyClipboard();
-        let handle = win32::GlobalAlloc(win32::GMEM_MOVEABLE, bytes);
-        if handle == 0 {
-            win32::CloseClipboard();
-            return Err("GlobalAlloc failed".into());
-        }
-        let ptr = win32::GlobalLock(handle);
-        if ptr.is_null() {
-            win32::GlobalFree(handle);
-            win32::CloseClipboard();
-            return Err("GlobalLock failed".into());
-        }
-        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, bytes);
-        win32::GlobalUnlock(handle);
-        if win32::SetClipboardData(win32::CF_UNICODETEXT, handle) == 0 {
-            win32::GlobalFree(handle);
-            win32::CloseClipboard();
-            return Err("SetClipboardData failed".into());
-        }
-        win32::CloseClipboard();
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn window_identity(hwnd: isize) -> Option<WindowIdentity> {
-    if hwnd == 0 {
-        return None;
-    }
-    unsafe {
-        if win32::IsWindowVisible(hwnd) == 0 {
-            return None;
-        }
-        if win32::GetWindow(hwnd, win32::GW_OWNER) != 0 {
-            return None;
-        }
-        let ex = win32::GetWindowLongW(hwnd, win32::GWL_EXSTYLE) as u32;
-        if ex & win32::WS_EX_TOOLWINDOW != 0 {
-            return None;
-        }
-    }
-    let title = window_text(hwnd);
-    let class = window_class(hwnd);
-    if is_skipped_window_class(&class) {
-        return None;
-    }
-    let process = window_process_path(hwnd).unwrap_or_default();
-    if title.is_empty() && process.is_empty() {
-        return None;
-    }
-    Some(WindowIdentity {
-        hwnd,
-        process,
-        title,
-        class,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn is_interactive_app(identity: &WindowIdentity) -> bool {
-    !is_skipped_window_class(&identity.class)
-        && !is_desktop_input_helper(&identity.process)
-        && !is_desktop_input_helper(&identity.title)
-}
-
-#[cfg(target_os = "windows")]
-fn is_skipped_window_class(class: &str) -> bool {
-    matches!(
-        class,
-        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW" | "ForegroundStaging"
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn first_interactive_window() -> Option<WindowIdentity> {
-    let mut found: Option<WindowIdentity> = None;
-    unsafe {
-        win32::EnumWindows(enum_interactive, &mut found as *mut _ as isize);
-    }
-    found
-}
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn enum_interactive(hwnd: isize, lparam: isize) -> i32 {
-    let found = &mut *(lparam as *mut Option<WindowIdentity>);
-    if let Some(identity) = window_identity(hwnd) {
-        if is_interactive_app(&identity) {
-            *found = Some(identity);
-            return 0;
-        }
-    }
-    1
-}
-
-#[cfg(target_os = "windows")]
-fn window_text(hwnd: isize) -> String {
-    let mut buf = [0u16; 512];
-    let len = unsafe { win32::GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-    wchar_to_string(&buf, len)
-}
-
-#[cfg(target_os = "windows")]
-fn window_class(hwnd: isize) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { win32::GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-    wchar_to_string(&buf, len)
-}
-
-#[cfg(target_os = "windows")]
-fn window_process_path(hwnd: isize) -> Option<String> {
-    let mut pid = 0u32;
-    unsafe {
-        win32::GetWindowThreadProcessId(hwnd, &mut pid);
-    }
-    if pid == 0 {
-        return None;
-    }
-    let handle = unsafe { win32::OpenProcess(win32::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle == 0 {
-        return None;
-    }
-    let mut buf = [0u16; 512];
-    let mut size = buf.len() as u32;
-    let ok = unsafe { win32::QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
-    unsafe {
-        win32::CloseHandle(handle);
-    }
-    if ok == 0 {
-        return None;
-    }
-    Some(wchar_to_string(&buf, size as i32))
-}
-
-#[cfg(target_os = "windows")]
-fn wchar_to_string(buf: &[u16], len: i32) -> String {
-    let end = (len.max(0) as usize).min(buf.len());
-    let slice = &buf[..end];
-    let nul = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    String::from_utf16_lossy(&slice[..nul])
+fn run_powershell(script: &str) -> Result<(), String> {
+    powershell_stdout(script).map(|_| ())
 }
 
 #[cfg(target_os = "windows")]
 fn powershell_stdout(script: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW: a visible console would briefly steal foreground focus
+    // and corrupt the very foreground-app detection these scripts feed.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NoLogo",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-STA",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::null())
-        .creation_flags(win32::CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("powershell: {e}"))?;
     if !output.status.success() {
@@ -849,6 +634,261 @@ fn powershell_stdout(script: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Launch an app or open a file on Windows. Resolution order: direct path
+/// (absolute, or relative to the workspace) → desktop shortcuts → pinned
+/// taskbar shortcuts → Start Menu shortcuts → registered Start apps
+/// (covers UWP) → executables on PATH.
+#[cfg(target_os = "windows")]
+fn launch(target: &str, workspace: &Path) -> Result<String, String> {
+    let b64 = |s: &str| {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s.as_bytes())
+    };
+    let ws = workspace.to_string_lossy().to_string();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$target = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{target_b64}'))
+$workspace = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{ws_b64}'))
+$needle = [System.Management.Automation.WildcardPattern]::Escape($target)
+
+# Apps launched from a background process do not always take foreground.
+# Actively focus the new window: by PID when we have one, else by title.
+function Focus-App($procId, $name) {{
+  $wsh = New-Object -ComObject WScript.Shell
+  for ($i = 0; $i -lt 16; $i++) {{
+    Start-Sleep -Milliseconds 500
+    try {{ if ($procId -and $wsh.AppActivate($procId)) {{ return }} }} catch {{}}
+    try {{ if ($name -and $wsh.AppActivate($name)) {{ return }} }} catch {{}}
+  }}
+}}
+
+function Start-Target($path) {{
+  $baseName = [System.IO.Path]::GetFileNameWithoutExtension($path)
+  $proc = Start-Process -FilePath $path -PassThru
+  Focus-App $proc.Id $baseName
+  Write-Output "started: $path"
+  exit 0
+}}
+
+# 1. Direct path: absolute, workspace-relative, or desktop file name.
+$pathCandidates = @()
+if ($target -match '[\\/]' -or $target -match '^[A-Za-z]:' -or $target -match '\.[A-Za-z0-9]{{1,6}}$') {{
+  $pathCandidates += $target
+  if ($workspace) {{ $pathCandidates += (Join-Path $workspace $target) }}
+  $pathCandidates += (Join-Path ([Environment]::GetFolderPath('Desktop')) $target)
+  $pathCandidates += (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $target)
+}}
+foreach ($candidate in $pathCandidates) {{
+  if (Test-Path -LiteralPath $candidate) {{ Start-Target (Resolve-Path -LiteralPath $candidate).Path }}
+}}
+
+# 2. Shortcut / exe search by name: desktop, taskbar pins, start menu.
+$dirs = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory'),
+  (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'),
+  (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'),
+  (Join-Path ([Environment]::GetFolderPath('CommonStartMenu')) 'Programs')
+)
+$found = @()
+foreach ($dir in $dirs) {{
+  if (Test-Path -LiteralPath $dir) {{
+    $found += Get-ChildItem -LiteralPath $dir -Recurse -Include *.lnk,*.url,*.exe -ErrorAction SilentlyContinue |
+      Where-Object {{ $_.BaseName -like "*$needle*" }}
+  }}
+}}
+if ($found.Count -gt 0) {{
+  $exact = $found | Where-Object {{ $_.BaseName -ieq $target }} | Select-Object -First 1
+  $best = if ($exact) {{ $exact }} else {{ $found | Sort-Object {{ $_.BaseName.Length }} | Select-Object -First 1 }}
+  Start-Target $best.FullName
+}}
+
+# 3. Registered Start apps (covers UWP / store apps) via the
+# IApplicationActivationManager COM API. explorer.exe shell:AppsFolder opens
+# a stray Documents window on some builds, and Start-Process cannot resolve
+# the shell: protocol — the activation manager is the supported API and
+# returns the new process id for foregrounding.
+# Exact name first: a substring match on "计算器" would otherwise launch
+# "计算机管理" (Computer Management) — same prefix, very different tool.
+$apps = @(Get-StartApps | Where-Object {{ $_.Name -like "*$needle*" }})
+$app = $apps | Where-Object {{ $_.Name -ieq $target }} | Select-Object -First 1
+if (-not $app) {{ $app = $apps | Sort-Object {{ $_.Name.Length }} | Select-Object -First 1 }}
+if ($app) {{
+  $uwpSrc = @'
+using System;
+using System.Runtime.InteropServices;
+public static class UwpLauncher {{
+    [ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IApplicationActivationManager {{
+        int ActivateApplication(string appUserModelId, string arguments, uint options, out uint processId);
+    }}
+    public static uint Launch(string appId) {{
+        var type = Type.GetTypeFromCLSID(new Guid("45ba127d-10a8-46ea-8ab7-56ea9078943c"));
+        var mgr = (IApplicationActivationManager)Activator.CreateInstance(type);
+        uint pid;
+        int hr = mgr.ActivateApplication(appId, null, 0, out pid);
+        if (hr != 0) throw new System.ComponentModel.Win32Exception(hr);
+        return pid;
+    }}
+}}
+'@
+  Add-Type -TypeDefinition $uwpSrc
+  $uwpPid = [UwpLauncher]::Launch($app.AppID)
+  Focus-App $uwpPid $app.Name
+  Write-Output "started: $($app.Name) (pid $uwpPid)"
+  exit 0
+}}
+
+# 4. Executable on PATH.
+$exeName = $target
+if ($exeName -notmatch '\.exe$') {{ $exeName = "$exeName.exe" }}
+$cmd = Get-Command $exeName -ErrorAction SilentlyContinue
+if ($cmd) {{ Start-Target $cmd.Source }}
+
+Write-Error "找不到应用或文件: $target"
+exit 1
+"#,
+        target_b64 = b64(target),
+        ws_b64 = b64(&ws)
+    );
+    powershell_stdout(&script)
+}
+
+/// Invoke the control at a screen point via UI Automation (InvokePattern,
+/// walking up to ancestors; LegacyIAccessible as last resort). Avoids the
+/// physical mouse entirely, so occluded or hard-to-hit controls still work.
+#[cfg(target_os = "windows")]
+fn invoke_at(x: i32, y: i32) -> Result<(), String> {
+    let script = format!(
+        r#"
+Add-Type -AssemblyName UIAutomationClient,WindowsBase
+function Try-Activate($el) {{
+  # Button/menu item: Invoke. Tab/list item: Select. Checkbox: Toggle.
+  # Combo box / collapsible group: Expand or Collapse.
+  try {{
+    $p = $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($p) {{ $p.Invoke(); return $true }}
+  }} catch {{}}
+  try {{
+    $p = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($p) {{ $p.Select(); return $true }}
+  }} catch {{}}
+  try {{
+    $p = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($p) {{ $p.Toggle(); return $true }}
+  }} catch {{}}
+  try {{
+    $p = $el.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($p) {{
+      if ($p.Current.ExpandCollapseState -eq 'Collapsed') {{ $p.Expand() }} else {{ $p.Collapse() }}
+      return $true
+    }}
+  }} catch {{}}
+  return $false
+}}
+$pt = New-Object System.Windows.Point({x}, {y})
+try {{
+  $el = [System.Windows.Automation.AutomationElement]::FromPoint($pt)
+}} catch {{
+  Write-Error "FromPoint failed: $_"
+  exit 1
+}}
+if (-not $el) {{ Write-Error 'no element at point'; exit 1 }}
+$cur = $el
+for ($i = 0; $i -lt 6 -and $cur; $i++) {{
+  if (Try-Activate $cur) {{ Write-Output 'invoked'; exit 0 }}
+  try {{
+    $cur = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($cur)
+  }} catch {{ $cur = $null }}
+}}
+try {{
+  $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+  if ($legacy) {{ $legacy.DoDefaultAction(); Write-Output 'legacy-invoked'; exit 0 }}
+}} catch {{}}
+Write-Error 'no invokable pattern at point'
+exit 1
+"#
+    );
+    powershell_stdout(&script).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn launch(target: &str, workspace: &Path) -> Result<String, String> {
+    let path = Path::new(target);
+    let workspace_path = workspace.join(target);
+    if path.is_absolute() && path.exists() {
+        Command::new("open")
+            .arg(path)
+            .status()
+            .map_err(|e| format!("open: {e}"))?;
+        return Ok(format!("started: {target}"));
+    }
+    if workspace_path.exists() {
+        Command::new("open")
+            .arg(&workspace_path)
+            .status()
+            .map_err(|e| format!("open: {e}"))?;
+        return Ok(format!("started: {}", workspace_path.display()));
+    }
+    let status = Command::new("open")
+        .args(["-a", target])
+        .status()
+        .map_err(|e| format!("open -a: {e}"))?;
+    if status.success() {
+        Ok(format!("started app: {target}"))
+    } else {
+        Err(format!("找不到应用或文件: {target}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn launch(target: &str, workspace: &Path) -> Result<String, String> {
+    let path = Path::new(target);
+    let workspace_path = workspace.join(target);
+    let file = if path.is_absolute() && path.exists() {
+        Some(path.to_path_buf())
+    } else if workspace_path.exists() {
+        Some(workspace_path)
+    } else {
+        None
+    };
+    if let Some(file) = file {
+        Command::new("xdg-open")
+            .arg(&file)
+            .status()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+        return Ok(format!("started: {}", file.display()));
+    }
+    if Command::new("gtk-launch")
+        .arg(target)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Ok(format!("started app: {target}"));
+    }
+    if Command::new(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+    {
+        return Ok(format!("started: {target}"));
+    }
+    Err(format!("找不到应用或文件: {target}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn launch(_target: &str, _workspace: &Path) -> Result<String, String> {
+    Err("unsupported platform for computer_use".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn invoke_at(_x: i32, _y: i32) -> Result<(), String> {
+    Err("invoke is only implemented on Windows".into())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1017,41 +1057,62 @@ print(json.dumps(out, ensure_ascii=False))
 
 #[cfg(target_os = "windows")]
 fn snapshot_front_window(max_nodes: usize) -> Result<Vec<A11yNode>, String> {
-    let hwnd = target_window().map(|window| window.hwnd as i64).unwrap_or(0);
+    // Collect extra raw nodes because finalize_nodes drops noise roles (pane,
+    // group, ...); capping the raw walk at exactly max_nodes left Word/Excel
+    // windows with almost nothing usable.
+    let raw_cap = max_nodes.max(1).saturating_mul(8).clamp(64, 600);
     let script = format!(
         r#"
 Add-Type -AssemblyName UIAutomationClient
-$hwnd = New-Object System.IntPtr ([int64]{hwnd})
-if ($hwnd -eq [IntPtr]::Zero) {{
-  Add-Type @"
+Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class FgHwnd {{
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }}
 "@
-  $hwnd = [FgHwnd]::GetForegroundWindow()
+$hwnd = [FgHwnd]::GetForegroundWindow()
+if ($hwnd -eq [IntPtr]::Zero) {{ '[]'; exit }}
+try {{
+  $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+}} catch {{
+  Write-Error "UIA FromHandle failed: $_"
+  exit 1
 }}
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 if (-not $root) {{ '[]'; exit }}
-$els = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
 $items = New-Object System.Collections.Generic.List[object]
-foreach ($el in $els) {{
-  if ($items.Count -ge {max_nodes}) {{ break }}
-  $ct = $el.Current.ControlType.ProgrammaticName
-  $name = $el.Current.Name
-  $rect = $el.Current.BoundingRectangle
-  if ($rect.Width -le 0 -or $rect.Height -le 0) {{ continue }}
-  $items.Add(@{{
-    id = ''
-    role = $ct
-    name = $name
-    x = [int]$rect.X
-    y = [int]$rect.Y
-    width = [int]$rect.Width
-    height = [int]$rect.Height
-    enabled = [bool]$el.Current.IsEnabled
-  }})
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+# Bounded breadth-first walk: FindAll(Descendants) on a full Office document
+# tree enumerates thousands of elements and can stall for minutes.
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue(@($root, 0))
+while ($queue.Count -gt 0 -and $items.Count -lt {raw_cap}) {{
+  $pair = $queue.Dequeue()
+  $el = $pair[0]
+  $depth = [int]$pair[1]
+  try {{
+    $rect = $el.Current.BoundingRectangle
+    if ($rect.Width -gt 0 -and $rect.Height -gt 0) {{
+      $items.Add(@{{
+        id = ''
+        role = $el.Current.ControlType.ProgrammaticName
+        name = $el.Current.Name
+        x = [int]$rect.X
+        y = [int]$rect.Y
+        width = [int]$rect.Width
+        height = [int]$rect.Height
+        enabled = [bool]$el.Current.IsEnabled
+      }})
+    }}
+  }} catch {{}}
+  if ($depth -ge 8) {{ continue }}
+  try {{
+    $child = $walker.GetFirstChild($el)
+    while ($child) {{
+      $queue.Enqueue(@($child, $depth + 1))
+      $child = $walker.GetNextSibling($child)
+    }}
+  }} catch {{}}
 }}
 ConvertTo-Json -InputObject @($items.ToArray()) -Compress -Depth 5
 "#
@@ -1063,4 +1124,26 @@ ConvertTo-Json -InputObject @($items.ToArray()) -Compress -Depth 5
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn snapshot_front_window(_max_nodes: usize) -> Result<Vec<A11yNode>, String> {
     Err("unsupported platform for computer_use".into())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::windows_key_vks;
+
+    #[test]
+    fn key_specs_map_to_virtual_key_sequences() {
+        assert_eq!(windows_key_vks("enter").unwrap(), vec![0x0D]);
+        assert_eq!(windows_key_vks("ctrl+v").unwrap(), vec![0x11, 0x56]);
+        assert_eq!(
+            windows_key_vks("ctrl+shift+s").unwrap(),
+            vec![0x11, 0x10, 0x53]
+        );
+        assert_eq!(windows_key_vks("win+r").unwrap(), vec![0x5B, 0x52]);
+        // Modifier-only taps (win opens the Start menu) still emit one key.
+        assert_eq!(windows_key_vks("win").unwrap(), vec![0x5B]);
+        assert_eq!(windows_key_vks("f5").unwrap(), vec![0x74]);
+        assert_eq!(windows_key_vks("cmd+c").unwrap(), vec![0x5B, 0x43]);
+        assert!(windows_key_vks("").is_err());
+        assert!(windows_key_vks("notakey").is_err());
+    }
 }

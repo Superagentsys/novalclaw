@@ -5090,6 +5090,75 @@ fn save_task_artifact_as(
     Ok(destination.to_string_lossy().to_string())
 }
 
+/// Export one agent run's events as a readable, downloadable log file.
+/// The frontend passes the exact events shown in the run timeline, so the
+/// log always matches what the user saw on screen.
+#[tauri::command]
+async fn export_agent_run_log(
+    destination: String,
+    events: Vec<serde_json::Value>,
+    meta: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let destination = expand_tilde_path(destination.trim());
+    if destination.as_os_str().is_empty() {
+        return Err("没有选择保存位置。".to_string());
+    }
+    if destination.is_dir() {
+        return Err("保存位置必须包含文件名。".to_string());
+    }
+    if let Some(parent) = destination.parent() {
+        if !parent.is_dir() {
+            return Err(format!("保存目录不存在：{}", parent.display()));
+        }
+    }
+
+    let mut out = String::new();
+    // BOM so Notepad/Excel on Windows read the UTF-8 Chinese text correctly.
+    out.push('\u{FEFF}');
+    out.push_str("OmniNova Claw 智能体运行日志\n");
+    let exported_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    out.push_str(&format!("导出时间(epoch ms): {exported_ms}\n"));
+    if let Some(meta) = &meta {
+        out.push_str(&format!(
+            "运行信息: {}\n",
+            serde_json::to_string_pretty(meta).unwrap_or_default()
+        ));
+    }
+    out.push_str(&format!("事件总数: {}\n", events.len()));
+    out.push_str("========================================\n\n");
+
+    for (index, event) in events.iter().enumerate() {
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let ts = event
+            .get("ts")
+            .or_else(|| event.get("timestamp"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        out.push_str(&format!("[#{:03}] [{}] {}\n", index + 1, ts, event_type));
+        match serde_json::to_string_pretty(event) {
+            Ok(pretty) => {
+                for line in pretty.lines() {
+                    out.push_str("    ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Err(_) => out.push_str("    <unserializable event>\n"),
+        }
+        out.push('\n');
+    }
+
+    std::fs::write(&destination, out).map_err(|error| format!("写入日志文件失败：{error}"))?;
+    Ok(destination.to_string_lossy().to_string())
+}
+
 fn parse_gateway_url(value: &str) -> Result<(String, u16), String> {
     let normalized = value
         .trim()
@@ -5327,6 +5396,7 @@ pub fn run() {
             skillhub_remove_skill,
             task_artifact_preview,
             open_task_artifact,
+            export_agent_run_log,
             save_task_artifact_as,
             collect_task_artifacts,
             validate_docx_artifact,

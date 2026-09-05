@@ -18,7 +18,7 @@ impl ComputerUseTool {
             workspace.join(".omninova").join("computer_use")
         };
         Self {
-            session: Arc::new(ComputerUseSession::os(captures_dir, config)),
+            session: Arc::new(ComputerUseSession::os(captures_dir, config).with_workspace(workspace)),
         }
     }
 
@@ -39,8 +39,11 @@ impl Tool for ComputerUseTool {
     fn description(&self) -> &str {
         "Operate the local OS desktop (native apps: 钉钉, 飞书 client, Excel, 用友, 金蝶). \
          Do NOT use this for websites — use browser. Do NOT use this to search the web — use web_search. \
-         Prefer action=snapshot then click by name or ref (@e1). Coordinate x,y on the screenshot is fallback. \
-         type pastes via clipboard (CJK safe). Long tasks: todo_write + task_checkpoint with a screenshot in evidence. \
+         To open an app or file use action=launch with target = app name (word, excel), workspace file (report.docx), \
+         desktop/taskbar shortcut name, or absolute path — it searches workspace, desktop, taskbar, start menu and installed apps. \
+         After launch, snapshot to read controls, then click by name or ref (@e1); coordinate x,y on the screenshot is fallback. \
+         Word/Excel: press ctrl+n for a new document, ctrl+s to save. type pastes via clipboard (CJK safe). \
+         Long tasks: todo_write + task_checkpoint with a screenshot in evidence. \
          Never click payment, shutdown, or password dialogs."
     }
 
@@ -50,8 +53,16 @@ impl Tool for ComputerUseTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["screenshot", "snapshot", "click", "type", "press", "scroll", "wait"],
-                    "description": "snapshot reads the accessibility tree (observe). screenshot/wait also observe. click/type/press/scroll change the desktop."
+                    "enum": ["screenshot", "snapshot", "click", "type", "press", "scroll", "wait", "launch"],
+                    "description": "snapshot reads the accessibility tree (observe). screenshot/wait also observe. click/type/press/scroll change the desktop. launch opens an app or file."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "For launch: app name (e.g. word, excel, 钉钉), workspace-relative file (report.docx), desktop/taskbar shortcut name, or absolute path."
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "description": "For launch: how long to wait for the app window to appear (default 6000, max 20000)"
                 },
                 "x": {
                     "type": "integer",

@@ -1,236 +1,270 @@
-//! Browser tool adapter: frozen V1 schema → `BrowserRuntime` domain calls.
-//!
-//! Vendor CLI details live in `browser_agent_backend`. This module must not
-//! spawn processes or classify vendor diagnostics.
-
-use crate::tools::browser_agent_backend::{browser_session_missing_error, AgentBrowserBackend};
-use crate::tools::browser_bin::BrowserBinarySearch;
-use crate::tools::browser_runtime::{present_backend_error, BrowserRuntime, BrowserRuntimePolicy};
-use crate::tools::browser_types::{
-    route_v1_tool_action, BrowserAction, BrowserBackendError, BrowserElementRef,
-    BrowserObservation, BrowserObserveKind, BrowserSessionKey, BrowserSessionOptions,
-    BrowserTarget, NavigateRequest, ObserveRequest, ScreenshotRequest, ScrollDirection,
+use crate::tools::browser_bin::{AgentBrowserBinaryResolved, BrowserBinarySearch};
+use crate::tools::browser_lifecycle::{
+    auto_retry_allowed, classify_browser_output, failure_prefix, forget_owned_browser_session,
+    is_retryable_action, recover_owned_session, remember_owned_browser_session,
+    run_command_with_timeout, BrowserFailureKind, ChildRunError, AGENT_BROWSER_NAMESPACE,
 };
+use crate::tools::browser_output::{cli_max_output_for_action, parse_action_outcome};
+use crate::tools::configure_background_command;
 use crate::tools::traits::{Tool, ToolResult};
+use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::process::Stdio;
+use tokio::process::Command;
+#[cfg(test)]
+use tokio::time::{timeout, Duration};
+use url::Url;
 
-pub use crate::tools::browser_agent_backend::{
-    browser_session_id, BROWSER_SESSION_HASH_CHARS, BROWSER_SESSION_PREFIX,
-};
-pub use crate::tools::browser_runtime::{browser_host_allowed, parse_browser_open_url};
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Prefix used for every agent-browser session created by OmniNova.
+const BROWSER_SESSION_PREFIX: &str = "omninova";
+/// Number of hex characters taken from the SHA-256 digest.
+const BROWSER_SESSION_HASH_CHARS: usize = 20;
+
+/// Map an OmniNova session id to a stable, shell-safe agent-browser session id.
+///
+/// `None` / blank ids are a hard error. There is no default, anonymous, or
+/// shared-session fallback — those would collapse every session-less agent
+/// onto the same agent-browser session.
+pub fn browser_session_id(session_id: Option<&str>) -> Result<String, String> {
+    let Some(raw) = session_id else {
+        return Err(browser_session_missing_error());
+    };
+    if raw.trim().is_empty() {
+        return Err(browser_session_missing_error());
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(raw.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let hex = &hex[..BROWSER_SESSION_HASH_CHARS.min(hex.len())];
+    Ok(format!("{BROWSER_SESSION_PREFIX}-{hex}"))
+}
+
+fn browser_session_missing_error() -> String {
+    "BrowserSessionMissing: OmniNova session id is required; refusing to use a default or shared agent-browser session. Do not retry this call without a valid session."
+        .to_string()
+}
+
+/// Only http(s) navigation is allowed. Bare hosts like `example.com` are
+/// treated as `https://example.com`. `file:`, `javascript:`, `data:`,
+/// `chrome:`, `chrome-extension:`, and `about:` are rejected.
+fn parse_browser_open_url(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("BrowserUrlRejected: URL is empty".into());
+    }
+    let parsed = match Url::parse(trimmed) {
+        Ok(url) => url,
+        Err(_) => Url::parse(&format!("https://{trimmed}"))
+            .map_err(|e| format!("BrowserUrlRejected: invalid URL ({e})"))?,
+    };
+    match parsed.scheme() {
+        "http" | "https" => {
+            if parsed.host_str().is_none() {
+                return Err("BrowserUrlRejected: URL has no host".into());
+            }
+            Ok(parsed)
+        }
+        other => Err(format!(
+            "BrowserUrlRejected: scheme '{other}' is not allowed; only http/https"
+        )),
+    }
+}
+
+const BROWSER_SESSION_MAX_LEN: usize = 64;
+
+/// Reject names that would fall back to agent-browser's default session or
+/// that are unsafe to pass as a CLI argument.
+fn validate_cli_session_name(session: &str) -> Result<(), String> {
+    if session.is_empty() {
+        return Err(
+            "BrowserSessionInvalid: session name is empty; refusing to use the agent-browser default session"
+                .into(),
+        );
+    }
+    if session.eq_ignore_ascii_case("default") {
+        return Err(
+            "BrowserSessionInvalid: refusing to use the agent-browser default session".into(),
+        );
+    }
+    if session.len() > BROWSER_SESSION_MAX_LEN {
+        return Err(format!(
+            "BrowserSessionInvalid: session name exceeds {BROWSER_SESSION_MAX_LEN} characters"
+        ));
+    }
+    if !session
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "BrowserSessionInvalid: session name contains characters that are not safe to pass to the agent-browser CLI"
+                .into(),
+        );
+    }
+    Ok(())
+}
 
 pub struct BrowserTool {
-    runtime: BrowserRuntime,
-    session_key: Option<BrowserSessionKey>,
-    session_opts: BrowserSessionOptions,
+    allowed_domains: Vec<String>,
+    headless: bool,
+    attach_only: bool,
+    cdp_url: Option<String>,
+    session: Option<String>,
+    search: Option<BrowserBinarySearch>,
+}
+
+fn spawn_error_message(path: &Path, e: std::io::Error) -> String {
+    let requested = path.to_string_lossy();
+    match e.kind() {
+        ErrorKind::NotFound => format!(
+            "BrowserBinaryMissing: requested_binary={requested} resolution_source=launch checked_candidates={requested}"
+        ),
+        ErrorKind::PermissionDenied => format!(
+            "BrowserBinaryNotExecutable: requested_binary={requested} detail={e}"
+        ),
+        _ => format!("BrowserLaunchFailed: requested_binary={requested} detail={e}"),
+    }
 }
 
 impl BrowserTool {
+    async fn readable_page_after_timeout(&self, target: &str) -> Option<ToolResult> {
+        // Fixed read-only probe. Never replay clicks, submits, or arbitrary model JS.
+        const PROBE: &str = "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,text:document.body?document.body.innerText.slice(0,6000):''})";
+        let (ok, stdout, _, _) = self.run_agent_browser("_navigation_probe", &["eval", PROBE]).await.ok()?;
+        if !ok { return None; }
+        readable_navigation_probe(target, &stdout)
+    }
+
     pub fn new(
         allowed_domains: Vec<String>,
         headless: bool,
         attach_only: bool,
         cdp_url: Option<String>,
     ) -> Self {
-        let session_opts = BrowserSessionOptions {
+        Self {
+            allowed_domains,
             headless,
             attach_only,
             cdp_url,
-            profile: None,
-        };
-        Self::assemble(allowed_domains, session_opts, None, None)
-    }
-
-    pub fn from_runtime(
-        runtime: BrowserRuntime,
-        session_opts: BrowserSessionOptions,
-        session_key: Option<BrowserSessionKey>,
-    ) -> Self {
-        Self {
-            runtime,
-            session_key,
-            session_opts,
-        }
-    }
-
-    fn assemble(
-        allowed_domains: Vec<String>,
-        session_opts: BrowserSessionOptions,
-        search: Option<BrowserBinarySearch>,
-        session_key: Option<BrowserSessionKey>,
-    ) -> Self {
-        let backend = Arc::new(AgentBrowserBackend::new(search, session_opts.clone()));
-        let policy = BrowserRuntimePolicy {
-            allowed_domains,
-            ..BrowserRuntimePolicy::default()
-        };
-        Self {
-            runtime: BrowserRuntime::new(backend, policy),
-            session_key,
-            session_opts,
+            session: None,
+            search: None,
         }
     }
 
     #[cfg(test)]
-    fn with_binary_search(self, search: BrowserBinarySearch) -> Self {
-        Self::assemble(
-            self.runtime.policy().allowed_domains.clone(),
-            self.session_opts,
-            Some(search),
-            self.session_key,
-        )
+    fn with_binary_search(mut self, search: BrowserBinarySearch) -> Self {
+        self.search = Some(search);
+        self
     }
 
     pub fn with_session(mut self, session: impl Into<String>) -> Self {
-        let raw = session.into();
-        let trimmed = raw.trim();
-        self.session_key = if trimmed.is_empty() {
-            None
-        } else {
-            BrowserSessionKey::new(trimmed).ok()
-        };
+        self.session = Some(session.into());
         self
     }
 
     #[cfg(test)]
     pub(crate) fn session_id(&self) -> Option<&str> {
-        self.session_key.as_ref().map(|key| key.as_str())
+        self.session.as_deref()
     }
 
-    fn selector_target(&self, selector: &str) -> BrowserTarget {
-        if selector.starts_with('@') {
-            BrowserTarget::Element(BrowserElementRef::new(self.runtime.backend_id(), selector))
-        } else {
-            BrowserTarget::Css(selector.to_string())
-        }
+    fn is_domain_allowed(&self, url: &Url) -> bool {
+        url.host_str()
+            .is_some_and(|host| host_matches_allowlist(host, &self.allowed_domains))
     }
 
-    fn fail(err: BrowserBackendError) -> ToolResult {
-        ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(present_backend_error(&err)),
-        }
+    fn resolve_binary(&self) -> Result<AgentBrowserBinaryResolved, String> {
+        let search = self
+            .search
+            .clone()
+            .unwrap_or_else(BrowserBinarySearch::from_process);
+        search.resolve().map_err(|missing| missing.to_string())
     }
 
-    fn observation_output(obs: BrowserObservation) -> String {
-        obs.text
-            .or_else(|| obs.snapshot.map(|snap| snap.text))
-            .unwrap_or_default()
-    }
-
-    fn observe_request_from_v1(
+    async fn run_agent_browser(
         &self,
         action: &str,
-        args: &serde_json::Value,
-        selector: Option<&str>,
-        value: Option<&str>,
-    ) -> anyhow::Result<ObserveRequest> {
-        match action {
-            "snapshot" => Ok(ObserveRequest {
-                kind: BrowserObserveKind::Snapshot,
-                interactive_only: args
-                    .get("interactive_only")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                compact: args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false),
-            }),
-            "read" => Ok(read_observe_request(args)),
-            "get_text" => Ok(ObserveRequest {
-                kind: BrowserObserveKind::Text {
-                    target: selector.map(|sel| self.selector_target(sel)),
-                },
-                interactive_only: false,
-                compact: false,
-            }),
-            "get_html" => {
-                let sel = selector
-                    .ok_or_else(|| anyhow::anyhow!("'get_html' requires 'selector'"))?;
-                Ok(ObserveRequest {
-                    kind: BrowserObserveKind::Html {
-                        target: Some(self.selector_target(sel)),
-                    },
-                    interactive_only: false,
-                    compact: false,
-                })
-            }
-            "get_url" => Ok(ObserveRequest {
-                kind: BrowserObserveKind::Url,
-                interactive_only: false,
-                compact: false,
-            }),
-            "get_title" => Ok(ObserveRequest {
-                kind: BrowserObserveKind::Title,
-                interactive_only: false,
-                compact: false,
-            }),
-            "get_value" => {
-                let sel = selector
-                    .ok_or_else(|| anyhow::anyhow!("'get_value' requires 'selector'"))?;
-                Ok(ObserveRequest {
-                    kind: BrowserObserveKind::Value {
-                        target: self.selector_target(sel),
-                    },
-                    interactive_only: false,
-                    compact: false,
-                })
-            }
-            "is_visible" => {
-                let sel = selector
-                    .ok_or_else(|| anyhow::anyhow!("'is_visible' requires 'selector'"))?;
-                Ok(ObserveRequest {
-                    kind: BrowserObserveKind::Visibility {
-                        target: self.selector_target(sel),
-                    },
-                    interactive_only: false,
-                    compact: false,
-                })
-            }
-            "is_enabled" => {
-                let sel = selector
-                    .ok_or_else(|| anyhow::anyhow!("'is_enabled' requires 'selector'"))?;
-                Ok(ObserveRequest {
-                    kind: BrowserObserveKind::Enabled {
-                        target: self.selector_target(sel),
-                    },
-                    interactive_only: false,
-                    compact: false,
-                })
-            }
-            "find" => {
-                let role = args
-                    .get("find_role")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("'find' requires 'find_role'"))?;
-                Ok(ObserveRequest {
-                    kind: BrowserObserveKind::Find {
-                        role: role.to_string(),
-                        name: args
-                            .get("find_name")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        action: value.map(str::to_string),
-                    },
-                    interactive_only: false,
-                    compact: false,
-                })
-            }
-            _ => unreachable!("observe_request_from_v1 called for non-observe action {action}"),
-        }
-    }
-}
+        args: &[&str],
+    ) -> anyhow::Result<(bool, String, String, std::path::PathBuf)> {
+        let session = self
+            .session
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!(browser_session_missing_error()))?;
+        validate_cli_session_name(session).map_err(anyhow::Error::msg)?;
+        let resolved = self.resolve_binary().map_err(anyhow::Error::msg)?;
+        let mut cmd = Command::new(&resolved.path);
+        configure_background_command(&mut cmd);
 
-fn read_observe_request(args: &serde_json::Value) -> ObserveRequest {
-    let outline = args.get("outline").and_then(|v| v.as_bool()).unwrap_or(false);
-    let filter = args
-        .get("filter")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    ObserveRequest::read(outline, filter)
+        if !self.attach_only && self.cdp_url.is_none() {
+            if let Some(browser) = super::browser_executable::installed_browser() {
+                cmd.arg("--executable-path").arg(browser);
+            }
+        }
+
+        if self.headless {
+            // headless is the default for agent-browser, no flag needed
+        } else {
+            cmd.arg("--headed");
+        }
+
+        cmd.arg("--session").arg(session);
+        cmd.arg("--namespace").arg(AGENT_BROWSER_NAMESPACE);
+
+        tracing::debug!(
+            target: "browser",
+            browser_session = session,
+            "spawning agent-browser command"
+        );
+
+        if self.attach_only {
+            cmd.arg("--attach-only");
+        }
+
+        if let Some(cdp_url) = &self.cdp_url {
+            cmd.arg("--cdp-url").arg(cdp_url);
+        }
+
+        cmd.arg("--json");
+
+        if let Some(max_output) = cli_max_output_for_action(action) {
+            cmd.arg("--max-output").arg(max_output);
+        }
+
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        remember_owned_browser_session(session);
+
+        let timeout_secs = if action == "_navigation_probe" { 5 } else { DEFAULT_TIMEOUT_SECS };
+        let output = match run_command_with_timeout(cmd, timeout_secs).await {
+            Ok(output) => output,
+            Err(ChildRunError::Timeout { .. }) => {
+                return Err(anyhow::anyhow!(
+                    "BrowserCommandTimeout: requested_binary={} timeout_secs={DEFAULT_TIMEOUT_SECS}. Browser startup or navigation timed out; this is not proof that network/shell access is forbidden. If no local Edge/Chrome is installed, install Chromium via browser setup; otherwise check the destination site's connectivity.",
+                    resolved.path.display()
+                ));
+            }
+            Err(ChildRunError::Io(e)) => {
+                return Err(anyhow::anyhow!(spawn_error_message(&resolved.path, e)));
+            }
+        };
+
+        // stdout carries the JSON payload; stderr is diagnostics only and is
+        // never merged into successful model content (W2.5).
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok((output.status.success(), stdout, stderr, resolved.path))
+    }
 }
 
 #[async_trait]
@@ -244,12 +278,7 @@ impl Tool for BrowserTool {
          pages, login, clicks, forms, and typing. Do not use this to search the web (web_search), \
          read static HTML (web_fetch), call REST APIs (http_request), or operate native OS apps \
          (computer_use). \
-         Need interactive page state and refs → snapshot. \
-         Need document or long-form content → read. \
-         Need specific element text → get_text. \
-         For long documents, prefer read with outline/filter instead of taking very large snapshots. \
-         read: Read the current page as document-oriented content. Use outline=true to return only the heading structure. Use filter to return sections matching a heading/topic. \
-         Actions: open (http/https only), snapshot, read, click, fill, type, screenshot \
+         Actions: open (http/https only), snapshot (@eN refs), click, fill, type, screenshot \
          (local file path), get_text, get_html, get_url, get_title, wait, scroll, select, press, \
          eval, close. \
          Permanent errors (BrowserBinaryMissing, BrowserSessionMissing, BrowserUrlRejected) will \
@@ -263,7 +292,7 @@ impl Tool for BrowserTool {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "open", "snapshot", "read", "click", "fill", "type", "screenshot",
+                        "open", "snapshot", "click", "fill", "type", "screenshot",
                         "get_text", "get_html", "get_url", "get_title", "get_value",
                         "wait", "scroll", "select", "press", "hover", "eval",
                         "back", "forward", "reload", "close",
@@ -319,14 +348,6 @@ impl Tool for BrowserTool {
                 "find_name": {
                     "type": "string",
                     "description": "For find: accessible name filter"
-                },
-                "outline": {
-                    "type": "boolean",
-                    "description": "For read: return only the heading structure"
-                },
-                "filter": {
-                    "type": "string",
-                    "description": "For read: return sections matching a heading/topic"
                 }
             },
             "required": ["action"]
@@ -339,169 +360,192 @@ impl Tool for BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
 
-        if route_v1_tool_action(action).is_none() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Unknown browser action: {action}")),
-            });
-        }
-
-        let Some(key) = self.session_key.as_ref() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(browser_session_missing_error()),
-            });
-        };
-
         let selector = args.get("selector").and_then(|v| v.as_str());
         let value = args.get("value").and_then(|v| v.as_str());
         let url = args.get("url").and_then(|v| v.as_str());
-        let opts = &self.session_opts;
 
-        let output = match action {
+        let cli_args: Vec<String> = match action {
             "open" => {
                 let target_url = url
                     .or(value)
                     .ok_or_else(|| anyhow::anyhow!("'open' requires 'url' parameter"))?;
-                match self
-                    .runtime
-                    .open(
-                        key,
-                        opts,
-                        &NavigateRequest {
-                            url: target_url.to_string(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(result) => result.detail,
-                    Err(err) => return Ok(Self::fail(err)),
-                }
-            }
-            "snapshot" | "read" | "get_text" | "get_html" | "get_url" | "get_title" | "get_value"
-            | "is_visible" | "is_enabled" | "find" => {
-                let req = self.observe_request_from_v1(action, &args, selector, value)?;
-                match self.runtime.observe(key, opts, &req).await {
-                    Ok(obs) => Self::observation_output(obs),
-                    Err(err) => return Ok(Self::fail(err)),
-                }
-            }
-            "click" | "fill" | "type" | "press" | "scroll" | "select" | "hover" | "eval"
-            | "wait" | "back" | "forward" | "reload" => {
-                let mapped = match action {
-                    "click" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'click' requires 'selector'"))?;
-                        BrowserAction::Click {
-                            target: self.selector_target(sel),
-                        }
+                let parsed = match parse_browser_open_url(target_url) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(err),
+                        });
                     }
-                    "fill" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'fill' requires 'selector'"))?;
-                        let val =
-                            value.ok_or_else(|| anyhow::anyhow!("'fill' requires 'value'"))?;
-                        BrowserAction::Fill {
-                            target: self.selector_target(sel),
-                            value: val.to_string(),
-                        }
-                    }
-                    "type" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'type' requires 'selector'"))?;
-                        let val =
-                            value.ok_or_else(|| anyhow::anyhow!("'type' requires 'value'"))?;
-                        BrowserAction::Type {
-                            target: self.selector_target(sel),
-                            text: val.to_string(),
-                        }
-                    }
-                    "press" => {
-                        let key_name = args
-                            .get("key")
-                            .and_then(|v| v.as_str())
-                            .or(value)
-                            .ok_or_else(|| anyhow::anyhow!("'press' requires 'key'"))?;
-                        BrowserAction::Press {
-                            key: key_name.to_string(),
-                        }
-                    }
-                    "scroll" => {
-                        let dir = args
-                            .get("direction")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("down");
-                        let direction = match dir {
-                            "up" => ScrollDirection::Up,
-                            "left" => ScrollDirection::Left,
-                            "right" => ScrollDirection::Right,
-                            _ => ScrollDirection::Down,
-                        };
-                        let pixels = args
-                            .get("pixels")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32);
-                        BrowserAction::Scroll {
-                            direction,
-                            pixels,
-                            target: selector.map(|sel| self.selector_target(sel)),
-                        }
-                    }
-                    "select" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'select' requires 'selector'"))?;
-                        let val =
-                            value.ok_or_else(|| anyhow::anyhow!("'select' requires 'value'"))?;
-                        BrowserAction::Select {
-                            target: self.selector_target(sel),
-                            value: val.to_string(),
-                        }
-                    }
-                    "hover" => {
-                        let sel = selector
-                            .ok_or_else(|| anyhow::anyhow!("'hover' requires 'selector'"))?;
-                        BrowserAction::Hover {
-                            target: self.selector_target(sel),
-                        }
-                    }
-                    "eval" => {
-                        let js = value.ok_or_else(|| {
-                            anyhow::anyhow!("'eval' requires 'value' (JavaScript code)")
-                        })?;
-                        BrowserAction::eval_raw(js.to_string())
-                    }
-                    "wait" => BrowserAction::Wait {
-                        timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
-                        text: args
-                            .get("wait_text")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        target: selector.map(|sel| self.selector_target(sel)),
-                    },
-                    "back" => BrowserAction::Back,
-                    "forward" => BrowserAction::Forward,
-                    "reload" => BrowserAction::Reload,
-                    _ => unreachable!(),
                 };
-                match self.runtime.act(key, opts, &mapped).await {
-                    Ok(result) => result.detail,
-                    Err(err) => return Ok(Self::fail(err)),
+                if !self.is_domain_allowed(&parsed) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "BrowserUrlRejected: Domain not in allowed list: {}",
+                            redact_secrets_in_text(parsed.as_str())
+                        )),
+                    });
+                }
+                vec!["open".into(), parsed.to_string()]
+            }
+
+            "snapshot" => {
+                let mut a = vec!["snapshot".to_string()];
+                if args
+                    .get("interactive_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    a.push("-i".into());
+                }
+                if args
+                    .get("compact")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    a.push("-c".into());
+                }
+                a
+            }
+
+            "click" => {
+                let sel = selector.ok_or_else(|| anyhow::anyhow!("'click' requires 'selector'"))?;
+                vec!["click".into(), sel.into()]
+            }
+
+            "fill" => {
+                let sel = selector.ok_or_else(|| anyhow::anyhow!("'fill' requires 'selector'"))?;
+                let val = value.ok_or_else(|| anyhow::anyhow!("'fill' requires 'value'"))?;
+                vec!["fill".into(), sel.into(), val.into()]
+            }
+
+            "type" => {
+                let sel = selector.ok_or_else(|| anyhow::anyhow!("'type' requires 'selector'"))?;
+                let val = value.ok_or_else(|| anyhow::anyhow!("'type' requires 'value'"))?;
+                vec!["type".into(), sel.into(), val.into()]
+            }
+
+            "screenshot" => {
+                vec!["screenshot".into()]
+            }
+
+            "get_text" => match selector {
+                Some(sel) => vec!["get".into(), "text".into(), sel.into()],
+                // No selector: whole-page readable text via agent-browser's
+                // built-in extraction (works for JS-rendered pages).
+                None => vec!["read".into()],
+            },
+
+            "get_html" => {
+                let sel =
+                    selector.ok_or_else(|| anyhow::anyhow!("'get_html' requires 'selector'"))?;
+                vec!["get".into(), "html".into(), sel.into()]
+            }
+
+            "get_value" => {
+                let sel =
+                    selector.ok_or_else(|| anyhow::anyhow!("'get_value' requires 'selector'"))?;
+                vec!["get".into(), "value".into(), sel.into()]
+            }
+
+            "get_url" => vec!["get".into(), "url".into()],
+
+            "get_title" => vec!["get".into(), "title".into()],
+
+            "wait" => {
+                if let Some(text) = args.get("wait_text").and_then(|v| v.as_str()) {
+                    vec!["wait".into(), "--text".into(), text.into()]
+                } else if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
+                    vec!["wait".into(), ms.to_string()]
+                } else if let Some(sel) = selector {
+                    vec!["wait".into(), sel.into()]
+                } else {
+                    vec!["wait".into(), "1000".into()]
                 }
             }
-            "screenshot" => match self
-                .runtime
-                .screenshot(key, opts, &ScreenshotRequest { locator: None })
-                .await
-            {
-                Ok(result) => result.locator,
-                Err(err) => return Ok(Self::fail(err)),
-            },
-            "close" => match self.runtime.close_session(key, opts).await {
-                Ok(()) => "Browser session closed.".to_string(),
-                Err(err) => return Ok(Self::fail(err)),
-            },
+
+            "scroll" => {
+                let dir = args
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("down");
+                let px = args
+                    .get("pixels")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string());
+                let mut a = vec!["scroll".into(), dir.into()];
+                if let Some(px) = px {
+                    a.push(px);
+                }
+                a
+            }
+
+            "select" => {
+                let sel =
+                    selector.ok_or_else(|| anyhow::anyhow!("'select' requires 'selector'"))?;
+                let val = value.ok_or_else(|| anyhow::anyhow!("'select' requires 'value'"))?;
+                vec!["select".into(), sel.into(), val.into()]
+            }
+
+            "press" => {
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .or(value)
+                    .ok_or_else(|| anyhow::anyhow!("'press' requires 'key'"))?;
+                vec!["press".into(), key.into()]
+            }
+
+            "hover" => {
+                let sel = selector.ok_or_else(|| anyhow::anyhow!("'hover' requires 'selector'"))?;
+                vec!["hover".into(), sel.into()]
+            }
+
+            "eval" => {
+                let js = value
+                    .ok_or_else(|| anyhow::anyhow!("'eval' requires 'value' (JavaScript code)"))?;
+                vec!["eval".into(), js.into()]
+            }
+
+            "back" => vec!["back".into()],
+            "forward" => vec!["forward".into()],
+            "reload" => vec!["reload".into()],
+            "close" => vec!["close".into()],
+
+            "is_visible" => {
+                let sel =
+                    selector.ok_or_else(|| anyhow::anyhow!("'is_visible' requires 'selector'"))?;
+                vec!["is".into(), "visible".into(), sel.into()]
+            }
+
+            "is_enabled" => {
+                let sel =
+                    selector.ok_or_else(|| anyhow::anyhow!("'is_enabled' requires 'selector'"))?;
+                vec!["is".into(), "enabled".into(), sel.into()]
+            }
+
+            "find" => {
+                let role = args
+                    .get("find_role")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("'find' requires 'find_role'"))?;
+                let find_action = value.unwrap_or("text");
+                let mut a = vec![
+                    "find".into(),
+                    "role".into(),
+                    role.into(),
+                    find_action.into(),
+                ];
+                if let Some(name) = args.get("find_name").and_then(|v| v.as_str()) {
+                    a.push("--name".into());
+                    a.push(name.into());
+                }
+                a
+            }
+
             _ => {
                 return Ok(ToolResult {
                     success: false,
@@ -511,11 +555,109 @@ impl Tool for BrowserTool {
             }
         };
 
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
+        let retryable = is_retryable_action(action);
+        let mut recovered = false;
+        let mut concurrent_followup = false;
+        loop {
+            match self.run_agent_browser(action, &str_args).await {
+                Ok((exit_success, stdout, stderr, binary_path)) => {
+                    let outcome = parse_action_outcome(action, &stdout, &stderr, exit_success);
+                    if outcome.success {
+                        if action == "close" {
+                            if let Some(session) = self.session.as_deref() {
+                                forget_owned_browser_session(session);
+                            }
+                        }
+                        return Ok(ToolResult {
+                            success: true,
+                            output: outcome.output,
+                            error: None,
+                        });
+                    }
+
+                    // Classification and recovery run on the error text plus
+                    // stderr diagnostics, not on normalized content.
+                    let diagnostic = format!(
+                        "{} {}",
+                        outcome.error_text.as_deref().unwrap_or_default(),
+                        stderr
+                    );
+                    if action == "open" && diagnostic.to_ascii_lowercase().contains("timed out") {
+                        if let Some(result) = self.readable_page_after_timeout(&cli_args[1]).await {
+                            return Ok(result);
+                        }
+                    }
+                    let kind = classify_browser_output(&diagnostic);
+                    if auto_retry_allowed(action, recovered, concurrent_followup, kind, &diagnostic)
+                    {
+                        if !recovered {
+                            if let Some(session) = self.session.as_deref() {
+                                recover_owned_session(session);
+                            }
+                            recovered = true;
+                        } else {
+                            concurrent_followup = true;
+                        }
+                        continue;
+                    }
+
+                    if action == "close"
+                        && matches!(
+                            kind,
+                            BrowserFailureKind::DaemonUnavailable
+                                | BrowserFailureKind::SessionUnavailable
+                        )
+                    {
+                        if let Some(session) = self.session.as_deref() {
+                            recover_owned_session(session);
+                            forget_owned_browser_session(session);
+                        }
+                        return Ok(ToolResult {
+                            success: true,
+                            output: outcome.output,
+                            error: None,
+                        });
+                    }
+
+                    let prefix = failure_prefix(kind);
+                    let detail = outcome
+                        .error_text
+                        .unwrap_or_else(|| "command failed".to_string());
+                    let summary: String =
+                        redact_secrets_in_text(&detail).chars().take(1200).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "{prefix}: requested_binary={} summary={summary}",
+                            binary_path.display(),
+                        )),
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if action == "open" && msg.starts_with("BrowserCommandTimeout:") {
+                        if let Some(result) = self.readable_page_after_timeout(&cli_args[1]).await {
+                            return Ok(result);
+                        }
+                    }
+                    if retryable && !recovered && msg.starts_with("BrowserCommandTimeout:") {
+                        if let Some(session) = self.session.as_deref() {
+                            if recover_owned_session(session) {
+                                recovered = true;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(msg),
+                    });
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -524,17 +666,42 @@ impl Tool for BrowserTool {
     }
 }
 
+fn readable_navigation_probe(target: &str, stdout: &str) -> Option<ToolResult> {
+    let envelope: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    if envelope.get("success")?.as_bool()? != true { return None; }
+    let data: serde_json::Value = serde_json::from_str(envelope.get("data")?.get("result")?.as_str()?).ok()?;
+    let current = Url::parse(data.get("url")?.as_str()?).ok()?;
+    let requested = Url::parse(target).ok()?;
+    // Do not mistake a previous page, redirect to another site, or Chrome error page for success.
+    if current.origin() != requested.origin() || current.path() != requested.path()
+        || current.query() != requested.query()
+        || !matches!(data.get("readyState")?.as_str()?, "interactive" | "complete") { return None; }
+    let body = data.get("text")?.as_str()?.trim();
+    if body.is_empty() { return None; }
+    Some(ToolResult {
+        success: true,
+        output: format!("Navigation warning: the load wait timed out, but the requested page is readable. Some resources may be incomplete; use snapshot for interactive controls.\nURL: {}\n--- BEGIN WEB CONTENT ---\nTitle: {}\n{}\n--- END WEB CONTENT ---",
+            redact_secrets_in_text(current.as_str()), data.get("title")?.as_str()?, body.chars().take(6000).collect::<String>()),
+        error: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::browser_agent_backend::validate_cli_session_name;
     use crate::tools::browser_bin::{bundled_agent_browser_relative_path, BrowserBinarySearch};
-    use crate::tools::browser_lifecycle::{
-        forget_owned_browser_session, recover_owned_session, remember_owned_browser_session,
-    };
-    use crate::tools::browser_output::parse_action_outcome;
-    use crate::tools::browser_types::{BrowserErrorKind, BrowserHealth, V1_TOOL_ACTIONS};
     use serde_json::json;
+
+    #[test]
+    fn navigation_timeout_probe_requires_readable_requested_page() {
+        let response = |url: &str, state: &str, text: &str| json!({"success":true,"data":{"result":json!({
+            "url":url,"title":"Fixture","readyState":state,"text":text
+        }).to_string()}}).to_string();
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/", "complete", "正文")).is_some());
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/old", "complete", "旧页面")).is_none());
+        assert!(readable_navigation_probe("https://example.com/", &response("https://example.com/", "loading", "正文")).is_none());
+        assert!(readable_navigation_probe("https://example.com/", &response("chrome-error://chromewebdata/", "complete", "错误")).is_none());
+    }
 
     #[tokio::test]
     #[ignore = "requires installed browser runtime; manually run smoke test"]
@@ -618,6 +785,44 @@ mod tests {
         assert!(error.contains("requested_binary="), "error={error}");
         assert!(error.contains("resolution_source="), "error={error}");
         assert!(error.contains("checked_candidates="), "error={error}");
+    }
+
+    #[tokio::test]
+    async fn resolved_native_version_does_not_hang_under_create_no_window() {
+        let Ok(resolved) = BrowserBinarySearch::from_process().resolve() else {
+            eprintln!("skip: agent-browser unavailable");
+            return;
+        };
+        let ext = resolved
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        assert!(
+            !ext.eq_ignore_ascii_case("cmd") && !ext.eq_ignore_ascii_case("bat"),
+            "resolver must return a native binary, got {}",
+            resolved.path.display()
+        );
+
+        let mut cmd = Command::new(&resolved.path);
+        configure_background_command(&mut cmd);
+        cmd.arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = timeout(Duration::from_secs(15), cmd.output())
+            .await
+            .expect("native --version must not hang under CREATE_NO_WINDOW")
+            .expect("spawn native --version");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.to_lowercase().contains("agent-browser") || text.contains("0."),
+            "unexpected --version output: {text}"
+        );
     }
 
     #[tokio::test]
@@ -763,8 +968,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_session_names_are_rejected_before_binary() {
-        for name in ["", "   "] {
+    async fn unsafe_or_default_session_names_are_rejected() {
+        for name in ["default", "Default", "foo;rm", "bad name", ""] {
             let mut tool = BrowserTool::new(Vec::new(), true, false, None)
                 .with_binary_search(isolated_missing_search());
             if !name.is_empty() {
@@ -777,7 +982,8 @@ mod tests {
             assert!(!result.success, "name={name:?} should fail");
             let error = result.error.expect("must set error");
             assert!(
-                error.starts_with("BrowserSessionMissing:"),
+                error.starts_with("BrowserSessionMissing:")
+                    || error.starts_with("BrowserSessionInvalid:"),
                 "name={name:?} error={error}"
             );
             assert!(
@@ -785,219 +991,6 @@ mod tests {
                 "session guard should run before binary resolution: {error}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn default_logical_session_returns_session_invalid_before_binary() {
-        for name in ["default", "Default"] {
-            let tool = BrowserTool::new(Vec::new(), true, false, None)
-                .with_session(name)
-                .with_binary_search(isolated_missing_search());
-            let result = tool
-                .execute(json!({"action": "open", "url": "https://example.com"}))
-                .await
-                .unwrap();
-            assert!(!result.success, "name={name:?} should fail");
-            let error = result.error.expect("must set error");
-            assert!(
-                error.starts_with("BrowserSessionInvalid:"),
-                "name={name:?} error={error}"
-            );
-            assert!(
-                !error.contains("BrowserBinaryMissing"),
-                "logical default must fail before binary resolution: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn tool_schema_remains_frozen() {
-        let tool = BrowserTool::new(Vec::new(), true, false, None);
-        let actions = tool.parameters_schema()["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actions,
-            V1_TOOL_ACTIONS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<Vec<_>>()
-        );
-        assert!(!actions.iter().any(|a| a == "tabs"));
-        assert!(actions.iter().any(|a| a == "read"));
-        assert_eq!(actions.len(), 25);
-        assert!(!actions.iter().any(|a| a == "extract"));
-        assert!(!actions.iter().any(|a| a == "extract_json"));
-    }
-
-    #[test]
-    fn read_tool_schema_exposes_outline_and_filter() {
-        let tool = BrowserTool::new(Vec::new(), true, false, None);
-        let schema = tool.parameters_schema();
-        let props = schema["properties"].as_object().unwrap();
-        assert_eq!(props["outline"]["type"], "boolean");
-        assert_eq!(props["filter"]["type"], "string");
-        assert!(!props["outline"].as_object().unwrap().contains_key("required"));
-        let required = schema["required"].as_array().unwrap();
-        assert_eq!(required, &vec![json!("action")]);
-        assert!(!required.iter().any(|v| v.as_str() == Some("outline")));
-        assert!(!required.iter().any(|v| v.as_str() == Some("filter")));
-        let actions = schema["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
-        assert!(actions.contains(&"read"));
-        assert!(!props.contains_key("llms"));
-        assert!(!props.contains_key("raw"));
-        assert!(!props.contains_key("require_md"));
-        assert!(!props.contains_key("content_boundaries"));
-        assert!(!props.contains_key("max_output"));
-    }
-
-    #[test]
-    fn read_routes_to_document_observe_kind_not_text() {
-        let tool = BrowserTool::new(Vec::new(), true, false, None);
-        let read = tool
-            .observe_request_from_v1("read", &json!({}), None, None)
-            .unwrap();
-        assert_eq!(
-            read.kind,
-            BrowserObserveKind::Read {
-                outline: false,
-                filter: None,
-            }
-        );
-        let outline = tool
-            .observe_request_from_v1("read", &json!({"outline": true}), None, None)
-            .unwrap();
-        assert_eq!(
-            outline.kind,
-            BrowserObserveKind::Read {
-                outline: true,
-                filter: None,
-            }
-        );
-        let filtered = tool
-            .observe_request_from_v1("read", &json!({"filter": "security"}), None, None)
-            .unwrap();
-        assert_eq!(
-            filtered.kind,
-            BrowserObserveKind::Read {
-                outline: false,
-                filter: Some("security".into()),
-            }
-        );
-        let both = tool
-            .observe_request_from_v1(
-                "read",
-                &json!({"outline": true, "filter": "security"}),
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            both.kind,
-            BrowserObserveKind::Read {
-                outline: true,
-                filter: Some("security".into()),
-            }
-        );
-        let text = tool
-            .observe_request_from_v1("get_text", &json!({}), None, None)
-            .unwrap();
-        assert!(matches!(text.kind, BrowserObserveKind::Text { target: None }));
-        let snap = tool
-            .observe_request_from_v1("snapshot", &json!({}), None, None)
-            .unwrap();
-        assert_eq!(snap.kind, BrowserObserveKind::Snapshot);
-    }
-
-    #[test]
-    fn tool_schema_and_output_do_not_expose_elements_or_extract() {
-        let tool = BrowserTool::new(Vec::new(), true, false, None);
-        let schema = tool.parameters_schema();
-        let props = schema["properties"].as_object().unwrap();
-        assert!(!props.contains_key("elements"));
-        assert!(!props.contains_key("extract"));
-        assert!(!props.contains_key("extract_json"));
-        let description = tool.description();
-        assert!(description.contains("prefer read with outline/filter"));
-        assert!(!description.contains("BrowserRuntime"));
-        assert!(!description.contains("extract_json"));
-        let out = BrowserTool::observation_output(BrowserObservation {
-            url: None,
-            title: None,
-            text: Some("--- BEGIN WEB CONTENT ---\nhello\n--- END WEB CONTENT ---".into()),
-            snapshot: Some(crate::tools::browser_types::BrowserSnapshot {
-                text: "snap".into(),
-                elements: Vec::new(),
-            }),
-            truncated: true,
-        });
-        assert!(out.contains("BEGIN WEB CONTENT"));
-        assert!(!out.contains("elements"));
-        assert!(!out.contains("\"truncated\": true"));
-    }
-
-    #[test]
-    fn extract_does_not_change_tool_schema() {
-        let tool = BrowserTool::new(Vec::new(), true, false, None);
-        let schema = tool.parameters_schema();
-        let encoded = schema.to_string();
-        let props = schema["properties"].as_object().unwrap();
-        assert!(!props.contains_key("eval_mode"));
-        assert!(!props.contains_key("extract"));
-        assert!(!props.contains_key("extract_json"));
-        assert!(!props.contains_key("structured"));
-        assert!(!encoded.contains("eval_mode"));
-        assert!(!encoded.contains("extract_json"));
-        assert!(!encoded.contains("BrowserEvalMode"));
-        let actions = schema["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(actions, V1_TOOL_ACTIONS.to_vec());
-        assert!(!actions.contains(&"extract"));
-    }
-
-    #[test]
-    fn v1_normalizer_still_owns_clicked_ref_and_truncation_markers() {
-        let click = parse_action_outcome(
-            "click",
-            r#"{"success":true,"data":{"clicked":"@e2"},"error":null}"#,
-            "",
-            true,
-        );
-        assert_eq!(click.output, "Clicked @e2.");
-        let url = parse_action_outcome(
-            "get_url",
-            r#"{"success":true,"data":{"url":"https://example.com/"},"error":null}"#,
-            "",
-            true,
-        );
-        assert!(url.output.contains("https://example.com/"));
-        let title = parse_action_outcome(
-            "get_title",
-            r#"{"success":true,"data":{"title":"Example"},"error":null}"#,
-            "",
-            true,
-        );
-        assert!(title.output.contains("Example"));
-        let shot = parse_action_outcome(
-            "screenshot",
-            r#"{"success":true,"data":{"path":"C:\\tmp\\shot.png"},"error":null}"#,
-            "",
-            true,
-        );
-        assert_eq!(shot.output, "Screenshot saved to: C:\\tmp\\shot.png");
     }
 
     /// Live CLI isolation. Ignored by default: `cargo test` in this environment
@@ -1013,19 +1006,17 @@ mod tests {
         };
 
         let nonce = uuid::Uuid::new_v4();
-        let logical_a = format!("w22-iso-a-{nonce}");
-        let logical_b = format!("w22-iso-b-{nonce}");
-        let mapped_a = browser_session_id(Some(&logical_a)).unwrap();
-        let mapped_b = browser_session_id(Some(&logical_b)).unwrap();
+        let mapped_a = browser_session_id(Some(&format!("w22-iso-a-{nonce}"))).unwrap();
+        let mapped_b = browser_session_id(Some(&format!("w22-iso-b-{nonce}"))).unwrap();
         assert_ne!(mapped_a, mapped_b);
         validate_cli_session_name(&mapped_a).unwrap();
         validate_cli_session_name(&mapped_b).unwrap();
 
         let tool_a = BrowserTool::new(Vec::new(), true, false, None)
-            .with_session(logical_a.clone())
+            .with_session(mapped_a.clone())
             .with_binary_search(search.clone());
         let tool_b = BrowserTool::new(Vec::new(), true, false, None)
-            .with_session(logical_b.clone())
+            .with_session(mapped_b.clone())
             .with_binary_search(search.clone());
 
         let open_a = tool_a
@@ -1038,7 +1029,7 @@ mod tests {
             .unwrap();
 
         let rebuilt_a = BrowserTool::new(Vec::new(), true, false, None)
-            .with_session(logical_a)
+            .with_session(mapped_a.clone())
             .with_binary_search(search);
         let url_a = rebuilt_a
             .execute(json!({"action": "get_url"}))
@@ -1152,7 +1143,9 @@ mod tests {
             fetched.output
         );
 
-        let session = format!("w25-dynamic-{}", uuid::Uuid::new_v4());
+        // Dynamic view: browser renders and executes the script.
+        let session = browser_session_id(Some(&format!("w25-dynamic-{}", uuid::Uuid::new_v4())))
+            .expect("mapped session");
         let tool = BrowserTool::new(vec!["127.0.0.1".to_string()], true, false, None)
             .with_session(session)
             .with_binary_search(search);
@@ -1184,6 +1177,7 @@ mod tests {
             title.output
         );
 
+        // Snapshot refs survive normalization and drive interaction.
         let snapshot = tool
             .execute(json!({"action": "snapshot", "interactive_only": true}))
             .await
@@ -1211,594 +1205,6 @@ mod tests {
             url_after.output.contains("/after-click"),
             "click must navigate: {}",
             url_after.output
-        );
-
-        let _ = tool.execute(json!({"action": "close"})).await;
-    }
-
-    /// Domain-level structured snapshot: `data.refs` → `BrowserElement` → act.
-    /// Ignored by default; run with `--ignored` when Chromium is available.
-    #[tokio::test]
-    #[ignore = "requires a live agent-browser + Chromium runtime"]
-    async fn real_browser_structured_snapshot_elements_and_act() {
-        let Some(search) = native_cli_search() else {
-            eprintln!("skip runtime-dependent test: agent-browser unavailable");
-            return;
-        };
-
-        let page_port = crate::tools::web_client::tests::spawn_test_server(|req, stream| {
-            let path = req.request_line.split(' ').nth(1).unwrap_or("/");
-            if path.starts_with("/pay") {
-                crate::tools::web_client::tests::write_response(
-                    stream,
-                    "HTTP/1.1 200 OK",
-                    "<html><body>\
-                     <label>Card number <input type=\"text\" name=\"card\"></label>\
-                     <button>Pay</button>\
-                     </body></html>",
-                    &["content-type: text/html".to_string()],
-                );
-            } else {
-                crate::tools::web_client::tests::write_response(
-                    stream,
-                    "HTTP/1.1 200 OK",
-                    "<html><head><title>B32B</title></head><body>\
-                     <h1>Example</h1>\
-                     <label><input type=\"checkbox\"> Remember me</label>\
-                     <button>Submit</button>\
-                     <button>Submit</button>\
-                     <iframe src=\"/pay\" title=\"checkout\"></iframe>\
-                     </body></html>",
-                    &["content-type: text/html".to_string()],
-                );
-            }
-        });
-
-        let backend = Arc::new(AgentBrowserBackend::new(
-            Some(search),
-            BrowserSessionOptions::default(),
-        ));
-        let runtime = BrowserRuntime::new(
-            backend,
-            BrowserRuntimePolicy {
-                allowed_domains: vec!["127.0.0.1".into()],
-                ..BrowserRuntimePolicy::default()
-            },
-        );
-        let key = BrowserSessionKey::new(format!("b32b-{}", uuid::Uuid::new_v4())).unwrap();
-        let opts = BrowserSessionOptions::default();
-        let open = runtime
-            .open(
-                &key,
-                &opts,
-                &NavigateRequest {
-                    url: format!("http://127.0.0.1:{page_port}/page"),
-                },
-            )
-            .await;
-        assert!(open.is_ok(), "open failed: {open:?}");
-        let _ = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Wait {
-                    timeout_ms: Some(800),
-                    text: None,
-                    target: None,
-                },
-            )
-            .await;
-
-        let obs = runtime
-            .observe(&key, &opts, &ObserveRequest::snapshot())
-            .await
-            .expect("snapshot observe");
-        let snap = obs.snapshot.expect("snapshot payload");
-        assert!(
-            !snap.elements.is_empty(),
-            "structured elements must be non-empty; text={}",
-            snap.text
-        );
-        let buttons: Vec<_> = snap
-            .elements
-            .iter()
-            .filter(|el| el.role.as_deref() == Some("button"))
-            .collect();
-        assert!(
-            buttons
-                .iter()
-                .any(|el| el.reference.as_str().starts_with('e')),
-            "button refs should be opaque eN handles: {:?}",
-            buttons
-                .iter()
-                .map(|el| el.reference.as_str())
-                .collect::<Vec<_>>()
-        );
-        let submits: Vec<_> = snap
-            .elements
-            .iter()
-            .filter(|el| {
-                el.role.as_deref() == Some("button")
-                    && el
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.contains("Submit"))
-            })
-            .collect();
-        assert_eq!(
-            submits.len(),
-            2,
-            "two Submit buttons must stay distinct; elements={:?}",
-            snap.elements
-                .iter()
-                .map(|el| (
-                    el.reference.as_str(),
-                    el.role.as_deref(),
-                    el.name.as_deref()
-                ))
-                .collect::<Vec<_>>()
-        );
-        assert_ne!(submits[0].reference, submits[1].reference);
-        assert!(submits.iter().all(|el| el.interactive));
-
-        let clicked = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Click {
-                    target: BrowserTarget::Element(submits[0].reference.clone()),
-                },
-            )
-            .await
-            .expect("click via BrowserElement.reference");
-        assert!(
-            clicked.detail.to_lowercase().contains("click")
-                || clicked.detail.contains('@')
-                || !clicked.detail.is_empty(),
-            "click detail={}",
-            clicked.detail
-        );
-
-        let card = snap
-            .elements
-            .iter()
-            .find(|el| {
-                el.role.as_deref() == Some("textbox")
-                    && el.name.as_deref().is_some_and(|name| name.contains("Card"))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "iframe textbox must be a normal element ref; elements={:?}",
-                    snap.elements
-                        .iter()
-                        .map(|el| (
-                            el.reference.as_str(),
-                            el.role.as_deref(),
-                            el.name.as_deref()
-                        ))
-                        .collect::<Vec<_>>()
-                )
-            });
-        let filled = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Fill {
-                    target: BrowserTarget::Element(card.reference.clone()),
-                    value: "4242".into(),
-                },
-            )
-            .await
-            .expect("iframe fill via ordinary element ref");
-        assert!(
-            filled.detail.to_lowercase().contains("fill")
-                || filled.detail.contains('@')
-                || !filled.detail.is_empty(),
-            "fill detail={}",
-            filled.detail
-        );
-
-        let _ = runtime.close_session(&key, &opts).await;
-    }
-
-    /// Live Chromium: document Read + stale element-ref diagnostic + re-observe.
-    #[tokio::test]
-    #[ignore = "requires a live agent-browser + Chromium runtime"]
-    async fn real_browser_read_and_stale_ref_diagnostics() {
-        let Some(search) = native_cli_search() else {
-            eprintln!("skip runtime-dependent test: agent-browser unavailable");
-            return;
-        };
-
-        let page_port = crate::tools::web_client::tests::spawn_test_server(|req, stream| {
-            let path = req.request_line.split(' ').nth(1).unwrap_or("/");
-            if path.starts_with("/after-click") {
-                crate::tools::web_client::tests::write_response(
-                    stream,
-                    "HTTP/1.1 200 OK",
-                    "<html><body><p>after click</p></body></html>",
-                    &["content-type: text/html".to_string()],
-                );
-            } else {
-                crate::tools::web_client::tests::write_response(
-                    stream,
-                    "HTTP/1.1 200 OK",
-                    "<html><head><title>B32C Readable</title></head><body>\
-                     <article>\
-                     <h1>Security Handbook</h1>\
-                     <p>This article discusses authentication and security practices.</p>\
-                     <h2>Auth section</h2>\
-                     <p>Use unique credentials on every service.</p>\
-                     <h2>Cooking</h2>\
-                     <p>Pasta recipes are unrelated filler text.</p>\
-                     </article>\
-                     <button id=\"delete-me\">DeleteMeUniqueB32C</button>\
-                     <a id=\"keep-me\" href=\"/after-click\">KeepMeUniqueB32C</a>\
-                     </body></html>",
-                    &["content-type: text/html".to_string()],
-                );
-            }
-        });
-
-        let backend = Arc::new(AgentBrowserBackend::new(
-            Some(search),
-            BrowserSessionOptions::default(),
-        ));
-        let runtime = BrowserRuntime::new(
-            backend,
-            BrowserRuntimePolicy {
-                allowed_domains: vec!["127.0.0.1".into()],
-                ..BrowserRuntimePolicy::default()
-            },
-        );
-        let key = BrowserSessionKey::new(format!("b32c-{}", uuid::Uuid::new_v4())).unwrap();
-        let opts = BrowserSessionOptions::default();
-        let open = runtime
-            .open(
-                &key,
-                &opts,
-                &NavigateRequest {
-                    url: format!("http://127.0.0.1:{page_port}/page"),
-                },
-            )
-            .await;
-        assert!(open.is_ok(), "open failed: {open:?}");
-        let _ = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Wait {
-                    timeout_ms: Some(800),
-                    text: None,
-                    target: None,
-                },
-            )
-            .await;
-
-        let read = runtime
-            .observe(&key, &opts, &ObserveRequest::read(false, None))
-            .await
-            .expect("read observe");
-        let read_text = read.text.as_deref().unwrap_or("");
-        assert!(
-            read_text.contains("BEGIN WEB CONTENT"),
-            "read must reuse WEB CONTENT bounds: {read_text}"
-        );
-        assert!(
-            read_text.to_ascii_lowercase().contains("security")
-                || read_text.to_ascii_lowercase().contains("authentication"),
-            "read content missing article body: {read_text}"
-        );
-        assert!(read.snapshot.is_none());
-        assert!(
-            read.url
-                .as_deref()
-                .is_some_and(|url| url.contains("127.0.0.1")),
-            "read should prefer page url, got {:?}",
-            read.url
-        );
-
-        let outline = runtime
-            .observe(&key, &opts, &ObserveRequest::read(true, None))
-            .await
-            .expect("read outline");
-        let outline_text = outline.text.as_deref().unwrap_or("");
-        assert!(
-            outline_text.to_ascii_lowercase().contains("outline")
-                || outline_text.contains("Security Handbook")
-                || outline_text.contains("Auth"),
-            "outline missing headings: {outline_text}"
-        );
-
-        let filtered = runtime
-            .observe(
-                &key,
-                &opts,
-                &ObserveRequest::read(false, Some("security".into())),
-            )
-            .await
-            .expect("read filter");
-        let filtered_text = filtered.text.as_deref().unwrap_or("");
-        assert!(
-            filtered_text.to_ascii_lowercase().contains("security"),
-            "filtered read should keep the filter term: {filtered_text}"
-        );
-
-        let snap = runtime
-            .observe(&key, &opts, &ObserveRequest::snapshot())
-            .await
-            .expect("snapshot")
-            .snapshot
-            .expect("structured snapshot");
-        let delete = snap
-            .elements
-            .iter()
-            .find(|el| {
-                el.name
-                    .as_deref()
-                    .is_some_and(|name| name.contains("DeleteMeUniqueB32C"))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "DeleteMeUniqueB32C missing; elements={:?}",
-                    snap.elements
-                        .iter()
-                        .map(|el| (el.reference.as_str(), el.name.as_deref()))
-                        .collect::<Vec<_>>()
-                )
-            });
-        let old_ref = delete.reference.clone();
-
-        let removed = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::eval_raw(
-                    "document.getElementById('delete-me').remove(); true",
-                ),
-            )
-            .await;
-        assert!(removed.is_ok(), "eval remove failed: {removed:?}");
-        let _ = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Wait {
-                    timeout_ms: Some(400),
-                    text: None,
-                    target: None,
-                },
-            )
-            .await;
-
-        let stale = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Click {
-                    target: BrowserTarget::Element(old_ref.clone()),
-                },
-            )
-            .await
-            .expect_err("old ref must fail after DOM removal");
-        assert_eq!(
-            stale.kind,
-            BrowserErrorKind::StaleReference,
-            "stale click classified as {:?}: {}",
-            stale.kind,
-            stale.detail
-        );
-        assert_ne!(stale.kind, BrowserErrorKind::SessionNotFound);
-        assert!(!stale.retryable);
-        let presented = present_backend_error(&stale);
-        assert!(
-            presented.starts_with("BrowserCommandFailed:"),
-            "model prefix changed: {presented}"
-        );
-        assert!(
-            presented.contains("snapshot again"),
-            "re-observe guidance missing: {presented}"
-        );
-        let health = runtime.session_health(&key, &opts).await;
-        assert!(
-            matches!(health, BrowserHealth::Healthy),
-            "session must stay healthy after stale ref: {health:?}"
-        );
-
-        let snap2 = runtime
-            .observe(&key, &opts, &ObserveRequest::snapshot())
-            .await
-            .expect("re-observe snapshot")
-            .snapshot
-            .expect("re-observe payload");
-        assert!(
-            snap2.elements.iter().all(|el| el.reference != old_ref || {
-                !el.name
-                    .as_deref()
-                    .is_some_and(|name| name.contains("DeleteMeUniqueB32C"))
-            }),
-            "removed unique button must not reappear under the old handle"
-        );
-        let keep = snap2
-            .elements
-            .iter()
-            .find(|el| {
-                el.name
-                    .as_deref()
-                    .is_some_and(|name| name.contains("KeepMeUniqueB32C"))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "KeepMeUniqueB32C missing after re-observe; elements={:?}",
-                    snap2
-                        .elements
-                        .iter()
-                        .map(|el| (el.reference.as_str(), el.name.as_deref()))
-                        .collect::<Vec<_>>()
-                )
-            });
-        let clicked = runtime
-            .act(
-                &key,
-                &opts,
-                &BrowserAction::Click {
-                    target: BrowserTarget::Element(keep.reference.clone()),
-                },
-            )
-            .await
-            .expect("click via fresh ref after re-observe");
-        assert!(
-            clicked.detail.to_lowercase().contains("click")
-                || clicked.detail.contains('@')
-                || !clicked.detail.is_empty(),
-            "click detail={}",
-            clicked.detail
-        );
-        let url_after = runtime
-            .observe(
-                &key,
-                &opts,
-                &ObserveRequest {
-                    kind: BrowserObserveKind::Url,
-                    interactive_only: false,
-                    compact: false,
-                },
-            )
-            .await
-            .expect("get url after re-observe click");
-        assert!(
-            url_after
-                .text
-                .as_deref()
-                .or(url_after.url.as_deref())
-                .is_some_and(|url| url.contains("/after-click")),
-            "fresh ref click should navigate: text={:?} url={:?}",
-            url_after.text,
-            url_after.url
-        );
-
-        let _ = runtime.close_session(&key, &opts).await;
-    }
-
-    /// Tool exposure: `action=read` must go BrowserTool → Runtime → Backend.
-    #[tokio::test]
-    #[ignore = "requires a live agent-browser + Chromium runtime"]
-    async fn real_browser_tool_read_outline_and_filter() {
-        let Some(search) = native_cli_search() else {
-            eprintln!("skip runtime-dependent test: agent-browser unavailable");
-            return;
-        };
-
-        let mut article = String::from(
-            "<html><head><title>B32F Long Article</title></head><body><article>\
-             <h1>Security Handbook</h1>",
-        );
-        for index in 0..8 {
-            article.push_str(&format!(
-                "<p>Security paragraph {index}: authentication, credentials, and access control. {}</p>",
-                "token ".repeat(20)
-            ));
-        }
-        article.push_str("<h2>Cooking</h2>");
-        for index in 0..60 {
-            article.push_str(&format!(
-                "<p>Cooking paragraph {index}: pasta recipes and unrelated filler. {}</p>",
-                "food ".repeat(30)
-            ));
-        }
-        article.push_str("</article></body></html>");
-
-        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
-            crate::tools::web_client::tests::write_response(
-                stream,
-                "HTTP/1.1 200 OK",
-                &article,
-                &["content-type: text/html; charset=utf-8".to_string()],
-            );
-        });
-
-        let session = format!("b32f-{}", uuid::Uuid::new_v4());
-        let tool = BrowserTool::new(vec!["127.0.0.1".to_string()], true, false, None)
-            .with_session(session)
-            .with_binary_search(search);
-        let open = tool
-            .execute(json!({
-                "action": "open",
-                "url": format!("http://127.0.0.1:{page_port}/article")
-            }))
-            .await
-            .unwrap();
-        assert!(open.success, "open failed: {:?}", open.error);
-        let _ = tool
-            .execute(json!({"action": "wait", "timeout_ms": 800}))
-            .await;
-
-        let read = tool.execute(json!({"action": "read"})).await.unwrap();
-        assert!(read.success, "read failed: {:?}", read.error);
-        assert!(
-            read.output.contains("BEGIN WEB CONTENT"),
-            "read must reuse WEB CONTENT bounds: {}",
-            read.output
-        );
-        assert!(
-            read.output.to_ascii_lowercase().contains("security")
-                || read.output.to_ascii_lowercase().contains("authentication"),
-            "read missing article body: {}",
-            read.output
-        );
-        assert!(!read.output.contains("\"elements\""));
-        assert!(!read.output.contains("extract_json"));
-
-        let outline = tool
-            .execute(json!({"action": "read", "outline": true}))
-            .await
-            .unwrap();
-        assert!(outline.success, "outline failed: {:?}", outline.error);
-        assert!(
-            outline.output.to_ascii_lowercase().contains("outline")
-                || outline.output.contains("Security Handbook")
-                || outline.output.contains("Cooking"),
-            "outline missing headings: {}",
-            outline.output
-        );
-
-        let filtered = tool
-            .execute(json!({"action": "read", "filter": "security"}))
-            .await
-            .unwrap();
-        assert!(filtered.success, "filter failed: {:?}", filtered.error);
-        assert!(
-            filtered.output.to_ascii_lowercase().contains("security"),
-            "filter should keep security sections: {}",
-            filtered.output
-        );
-
-        let both = tool
-            .execute(json!({"action": "read", "outline": true, "filter": "security"}))
-            .await
-            .unwrap();
-        assert!(
-            both.success,
-            "outline+filter combination failed: {:?}",
-            both.error
-        );
-
-        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
-        assert!(snapshot.success, "snapshot failed: {:?}", snapshot.error);
-        let get_text = tool.execute(json!({"action": "get_text"})).await.unwrap();
-        assert!(get_text.success, "get_text failed: {:?}", get_text.error);
-
-        eprintln!(
-            "B3.2F_CONTEXT snapshot={} get_text={} read={} outline={} filter={}",
-            snapshot.output.chars().count(),
-            get_text.output.chars().count(),
-            read.output.chars().count(),
-            outline.output.chars().count(),
-            filtered.output.chars().count()
-        );
-        assert!(
-            outline.output.chars().count() < snapshot.output.chars().count(),
-            "outline should be smaller than snapshot"
         );
 
         let _ = tool.execute(json!({"action": "close"})).await;

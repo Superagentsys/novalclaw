@@ -3466,6 +3466,38 @@
   font-size: 11px;
 }
 
+.agent-run-log-download {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(80, 92, 140, 0.25);
+  color: #4c5578;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  user-select: none;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.agent-run-log-download:hover {
+  background: rgba(80, 92, 140, 0.1);
+}
+
+.agent-run-log-download--saving {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.agent-run-log-download--done {
+  color: #22a06b;
+  border-color: rgba(34, 160, 107, 0.4);
+}
+
+.agent-run-log-download--error {
+  color: #c2410c;
+  border-color: rgba(194, 65, 12, 0.4);
+}
+
 .agent-run-diff-badge {
   display: inline-flex;
   align-items: center;

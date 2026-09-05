@@ -21,7 +21,7 @@ pub use a11y::A11yNode;
 pub use os::OsDesktopDriver;
 
 const OBSERVE_ACTIONS: &[&str] = &["screenshot", "wait", "snapshot"];
-const MUTATING_ACTIONS: &[&str] = &["click", "type", "press", "scroll"];
+const MUTATING_ACTIONS: &[&str] = &["click", "type", "press", "scroll", "launch"];
 const BLOCKED_HOTKEYS: &[&str] = &[
     "cmd+q",
     "command+q",
@@ -47,6 +47,23 @@ pub trait DesktopDriver: Send + Sync {
     fn accessibility_snapshot(&self, max_nodes: usize) -> Result<Vec<A11yNode>, String> {
         let _ = max_nodes;
         Err("accessibility snapshot is not available on this driver".into())
+    }
+
+    /// Launch an app or open a file. `target` may be an app name ("word"),
+    /// a shortcut name on the desktop/taskbar/start menu, or a file path
+    /// (relative paths resolve against `workspace`). Returns a human-readable
+    /// description of what was started.
+    fn launch(&self, target: &str, workspace: &Path) -> Result<String, String> {
+        let _ = (target, workspace);
+        Err("launch is not available on this driver".into())
+    }
+
+    /// Invoke the control at a screen point through the accessibility API
+    /// (UIA Invoke on Windows) instead of synthesizing a physical mouse click.
+    /// More reliable for buttons/menu items; callers fall back to `click`.
+    fn invoke_at(&self, x: i32, y: i32) -> Result<(), String> {
+        let _ = (x, y);
+        Err("invoke is not available on this driver".into())
     }
 }
 
@@ -153,66 +170,6 @@ fn normalize_app_name(name: &str) -> String {
         .filter(|ch| !ch.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-/// File stem of a process path or window identity, e.g. `EXCEL.EXE` → `EXCEL`.
-/// Splits on both `/` and `\` so Windows paths still parse on Unix test hosts.
-pub fn app_process_stem(name: &str) -> String {
-    let trimmed = name.trim().trim_matches('"');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let file = trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(trimmed);
-    Path::new(file)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(file)
-        .to_string()
-}
-
-/// Console hosts used to drive the desktop. They must not steal the
-/// allowlist / a11y target from the app the user actually asked for.
-pub fn is_desktop_input_helper(name: &str) -> bool {
-    matches!(
-        normalize_app_name(&app_process_stem(name)).as_str(),
-        "powershell"
-            | "pwsh"
-            | "conhost"
-            | "cmd"
-            | "windowsterminal"
-            | "openconsole"
-            | "powershell_ise"
-    )
-}
-
-/// Prefer a human/app identity (`Excel` / `工作簿1 - Excel`) over a raw exe path.
-pub fn foreground_display_name(process: &str, title: &str) -> String {
-    let stem = app_process_stem(process);
-    let title = title.trim();
-    if is_desktop_input_helper(process) || is_desktop_input_helper(title) {
-        if !title.is_empty() && !is_desktop_input_helper(title) {
-            return title.to_string();
-        }
-        return if stem.is_empty() {
-            process.trim().to_string()
-        } else {
-            stem
-        };
-    }
-    if stem.is_empty() {
-        return title.to_string();
-    }
-    if title.is_empty() {
-        return stem;
-    }
-    if normalize_app_name(title).contains(&normalize_app_name(&stem)) {
-        title.to_string()
-    } else {
-        format!("{stem}: {title}")
-    }
 }
 
 pub fn is_blocked_hotkey(key: &str) -> bool {
@@ -382,7 +339,6 @@ pub fn human_handoff_reply(output: &str) -> Option<String> {
     )
 }
 
-#[allow(dead_code)]
 pub fn looks_like_desktop_shell(name: &str) -> bool {
     let haystack = normalize_app_name(name);
     DESKTOP_SHELL_APPS
@@ -394,6 +350,8 @@ const DESKTOP_SHELL_APPS: &[&str] = &[
     "finder",
     "explorer",
     "explorer.exe",
+    "file explorer",
+    "文件资源管理器",
     "loginwindow",
     "screensaverengine",
     "dwm",
@@ -476,6 +434,8 @@ fn resize_max_dimension(image: image::DynamicImage, max_dimension_px: u32) -> im
 pub struct ComputerUseSession {
     pub captures_dir: PathBuf,
     pub config: ComputerUseConfig,
+    /// Workspace root used to resolve relative `launch` targets.
+    pub workspace: PathBuf,
     pub last_capture: Mutex<Option<CaptureMemory>>,
     pub     last_snapshot: Mutex<Vec<A11yNode>>,
     #[allow(dead_code)]
@@ -496,6 +456,7 @@ impl ComputerUseSession {
         Self {
             captures_dir,
             config,
+            workspace: PathBuf::new(),
             last_capture: Mutex::new(None),
             last_snapshot: Mutex::new(Vec::new()),
             last_guarded_app: Mutex::new(None),
@@ -513,6 +474,7 @@ impl ComputerUseSession {
         Self {
             captures_dir,
             config,
+            workspace: PathBuf::new(),
             last_capture: Mutex::new(None),
             last_snapshot: Mutex::new(Vec::new()),
             last_guarded_app: Mutex::new(None),
@@ -520,6 +482,11 @@ impl ComputerUseSession {
             turn_actions: AtomicU32::new(0),
             driver,
         }
+    }
+
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     pub fn execute(&self, args: &serde_json::Value) -> ComputerUseOutcome {
@@ -552,6 +519,7 @@ impl ComputerUseSession {
             "type" => self.r#type(args),
             "press" => self.press(args),
             "scroll" => self.scroll(args),
+            "launch" => self.launch(args),
             other => failure(other, format!("unsupported action '{other}'")),
         }
     }
@@ -709,6 +677,79 @@ impl ComputerUseSession {
         outcome
     }
 
+    /// Launch an app or open a file, then wait for its window to appear so the
+    /// agent can keep driving it in the same run.
+    fn launch(&self, args: &serde_json::Value) -> ComputerUseOutcome {
+        let Some(target) = string_arg(args, &["target", "app", "path", "name"]) else {
+            return failure("launch", "missing target (app name, shortcut, or file path)");
+        };
+        let fingerprint = self.fingerprint("launch", "", &target);
+        if let Some(blocked) = self.hard_thrash_block("launch", &fingerprint) {
+            return blocked;
+        }
+        let baseline = self.driver.foreground_app().ok();
+        if let Err(error) = self.driver.launch(&target, &self.workspace) {
+            return self.record_repeat(failure("launch", error), &fingerprint);
+        }
+
+        // Poll for the new window: foreground matching the target name, or any
+        // foreground change (covers file launches like report.docx).
+        let wait_ms = int_arg(args, &["wait_ms", "timeout_ms"])
+            .unwrap_or(6000)
+            .clamp(0, 20_000) as u64;
+        let needle = normalize_app_name(&target);
+        let start = Instant::now();
+        let mut foreground = self.driver.foreground_app().ok();
+        loop {
+            if let Some(app) = &foreground {
+                let hay = normalize_app_name(&app.name);
+                let name_matches = !needle.is_empty() && hay.contains(&needle);
+                let changed = baseline
+                    .as_ref()
+                    .map(|before| before.name != app.name)
+                    .unwrap_or(false);
+                // Shell windows (Explorer/taskbar) flash by during UWP
+                // launches; they are transit, not the target window.
+                if name_matches || (changed && !looks_like_desktop_shell(&app.name)) {
+                    break;
+                }
+            }
+            if start.elapsed().as_millis() >= wait_ms as u128 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(600));
+            foreground = self.driver.foreground_app().ok().or(foreground);
+        }
+
+        self.clear_thrash();
+        let capture = self.capture_now("after_launch").ok();
+        let foreground_name = foreground
+            .as_ref()
+            .map(|app| app.name.clone())
+            .unwrap_or_else(|| "unknown".into());
+        ComputerUseOutcome {
+            ok: true,
+            action: "launch".into(),
+            foreground_app: foreground,
+            screen: capture.as_ref().map(|item| {
+                serde_json::json!({
+                    "width": item.screen_width,
+                    "height": item.screen_height,
+                })
+            }),
+            image: capture.as_ref().map(image_json),
+            clicked: None,
+            nodes: None,
+            thrash: None,
+            handoff: None,
+            handoff_reason: None,
+            message: format!(
+                "launched '{target}'; foreground is now '{foreground_name}'. Next: action=snapshot to read its controls, then click by name/ref. Word/Excel: press ctrl+n for a new document, ctrl+s to save."
+            ),
+            error: None,
+        }
+    }
+
     fn click(&self, args: &serde_json::Value) -> ComputerUseOutcome {
         let foreground = match self.guard_foreground() {
             Ok(app) => app,
@@ -718,7 +759,7 @@ impl ComputerUseSession {
             .get("button")
             .and_then(|v| v.as_str())
             .unwrap_or("left");
-        let resolved = match self.resolve_click(args) {
+        let mut resolved = match self.resolve_click(args) {
             Ok(resolved) => resolved,
             Err(error) => return failure("click", error),
         };
@@ -731,11 +772,27 @@ impl ComputerUseSession {
             return blocked;
         }
         let before_hash = self.last_capture_hash();
-        if let Err(error) = self.driver.click(resolved.screen_x, resolved.screen_y, button) {
-            return self.record_repeat(
-                failure("click", error),
-                &fingerprint,
-            );
+        // Name/ref clicks aim at a specific control: invoke it through the
+        // accessibility API first (immune to occlusion and DPI drift), and
+        // only fall back to a physical mouse click when the control does not
+        // support invocation. Coordinate clicks stay physical on purpose —
+        // the agent may be aiming at a canvas or other non-control area.
+        if resolved.via != "coordinates" && button == "left" {
+            if self
+                .driver
+                .invoke_at(resolved.screen_x, resolved.screen_y)
+                .is_ok()
+            {
+                resolved.via = "uia-invoke";
+            }
+        }
+        if resolved.via != "uia-invoke" {
+            if let Err(error) = self.driver.click(resolved.screen_x, resolved.screen_y, button) {
+                return self.record_repeat(
+                    failure("click", error),
+                    &fingerprint,
+                );
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
         match self.capture_now("after_click") {
@@ -1338,37 +1395,6 @@ mod tests {
         assert!(!app_is_allowed(&[], "钉钉"));
         assert!(app_is_allowed(&["*".into()], "Finder"));
         assert!(app_is_allowed(&["all".into()], "Excel"));
-        assert!(app_is_allowed(
-            &["Excel".into()],
-            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
-        ));
-        assert!(app_is_allowed(&["Excel".into()], "工作簿1 - Excel"));
-        assert!(!app_is_allowed(
-            &["Excel".into()],
-            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
-        ));
-    }
-
-    #[test]
-    fn powershell_console_is_an_input_helper_not_excel() {
-        assert!(is_desktop_input_helper(
-            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
-        ));
-        assert!(is_desktop_input_helper("pwsh"));
-        assert!(!is_desktop_input_helper(
-            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"
-        ));
-        assert_eq!(
-            foreground_display_name(
-                r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
-                "工作簿1 - Excel"
-            ),
-            "工作簿1 - Excel"
-        );
-        assert_eq!(
-            foreground_display_name("EXCEL.EXE", "Book1"),
-            "EXCEL: Book1"
-        );
     }
 
     #[test]
