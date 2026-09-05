@@ -380,10 +380,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 cdp_url: ctx.config.browser.cdp_url.clone(),
                 profile: None,
             };
-            let backend = match crate::tools::browser_agent_backend::backend_from_config(
+            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable(
                 &ctx.config.browser.backend,
                 None,
                 session_opts.clone(),
+                ctx.config.browser.executable_path.clone(),
             ) {
                 Ok(backend) => backend,
                 Err(err) => {

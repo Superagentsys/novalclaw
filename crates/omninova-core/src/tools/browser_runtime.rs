@@ -673,6 +673,7 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
     }
     let prefix = match err.kind {
         BrowserErrorKind::BinaryMissing => "BrowserBinaryMissing",
+        BrowserErrorKind::BrowserUnavailable => "BrowserUnavailable",
         BrowserErrorKind::LaunchFailed => "BrowserLaunchFailed",
         BrowserErrorKind::NotConnected => "BrowserDaemonUnavailable",
         BrowserErrorKind::SessionNotFound => "BrowserSessionUnavailable",
@@ -1725,6 +1726,7 @@ mod tests {
         let id = BrowserBackendId::new("fake");
         let cases = [
             (BrowserErrorKind::BinaryMissing, "BrowserBinaryMissing"),
+            (BrowserErrorKind::BrowserUnavailable, "BrowserUnavailable"),
             (BrowserErrorKind::NotConnected, "BrowserDaemonUnavailable"),
             (BrowserErrorKind::Timeout, "BrowserCommandTimeout"),
             (BrowserErrorKind::Rejected, "BrowserUrlRejected"),

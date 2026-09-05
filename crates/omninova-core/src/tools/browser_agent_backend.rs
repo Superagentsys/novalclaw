@@ -7,6 +7,9 @@ use crate::tools::browser_backend::{planned_backend_id_from_config, BrowserBacke
 use crate::tools::browser_bin::{
     AgentBrowserBinaryResolved, AgentBrowserResolveError, BrowserBinarySearch,
 };
+use crate::tools::browser_executable::{
+    browser_executable_argv, BrowserExecutable, BrowserExecutableResolver,
+};
 use crate::tools::browser_lifecycle::{
     auto_retry_allowed, classify_browser_output, failure_prefix, forget_owned_browser_session,
     is_retryable_action, probe_owned_session_pid, recover_owned_session,
@@ -111,6 +114,7 @@ pub struct AgentBrowserBackend {
     defaults: BrowserSessionOptions,
     last_stdout_len: Mutex<Option<usize>>,
     profile_resolver: BrowserProfileResolver,
+    executable_resolver: BrowserExecutableResolver,
     launch_by_session: Mutex<HashMap<String, BoundSessionLaunch>>,
     #[cfg(test)]
     cli_invocations: Mutex<Vec<CliInvocationRecord>>,
@@ -127,6 +131,7 @@ struct BoundSessionLaunch {
     headless: bool,
     attach_only: bool,
     cdp_url: Option<String>,
+    executable: Option<BrowserExecutable>,
 }
 
 #[cfg(test)]
@@ -142,12 +147,29 @@ struct CliInvocationRecord {
     attach_only: bool,
     #[allow(dead_code)]
     cdp_url_present: bool,
+    executable_present: bool,
+    executable_source: Option<&'static str>,
     launch_fingerprint: String,
 }
 
 impl AgentBrowserBackend {
     pub fn new(search: Option<BrowserBinarySearch>, defaults: BrowserSessionOptions) -> Self {
-        Self::with_profile_resolver(search, defaults, BrowserProfileResolver::omninova_default())
+        Self::new_with_executable_path(search, defaults, None)
+    }
+
+    pub fn new_with_executable_path(
+        search: Option<BrowserBinarySearch>,
+        defaults: BrowserSessionOptions,
+        executable_path: Option<PathBuf>,
+    ) -> Self {
+        let executable_resolver =
+            BrowserExecutableResolver::from_process(search.clone(), executable_path);
+        Self::with_resolvers(
+            search,
+            defaults,
+            BrowserProfileResolver::omninova_default(),
+            executable_resolver,
+        )
     }
 
     pub fn with_profile_resolver(
@@ -155,11 +177,22 @@ impl AgentBrowserBackend {
         defaults: BrowserSessionOptions,
         profile_resolver: BrowserProfileResolver,
     ) -> Self {
+        let executable_resolver = BrowserExecutableResolver::from_process(search.clone(), None);
+        Self::with_resolvers(search, defaults, profile_resolver, executable_resolver)
+    }
+
+    fn with_resolvers(
+        search: Option<BrowserBinarySearch>,
+        defaults: BrowserSessionOptions,
+        profile_resolver: BrowserProfileResolver,
+        executable_resolver: BrowserExecutableResolver,
+    ) -> Self {
         Self {
             search,
             defaults,
             last_stdout_len: Mutex::new(None),
             profile_resolver,
+            executable_resolver,
             launch_by_session: Mutex::new(HashMap::new()),
             #[cfg(test)]
             cli_invocations: Mutex::new(Vec::new()),
@@ -267,9 +300,57 @@ impl AgentBrowserBackend {
                 headless: options.headless,
                 attach_only: options.attach_only,
                 cdp_url: options.cdp_url.clone(),
+                executable: None,
             },
         );
         Ok(())
+    }
+
+    async fn ensure_session_executable(
+        &self,
+        token: &str,
+        v1_action: &str,
+    ) -> Result<BoundSessionLaunch, BrowserBackendError> {
+        let Some(bound) = self.session_launch(token) else {
+            return Err(BrowserBackendError::new(
+                BrowserErrorKind::SessionNotFound,
+                self.id_value(),
+                "BrowserSessionUnavailable: launch configuration is not bound",
+            ));
+        };
+        if bound.attach_only || bound.cdp_url.is_some() || v1_action == "close" {
+            return Ok(bound);
+        }
+        if bound.executable.is_some() {
+            return Ok(bound);
+        }
+        if !cfg!(windows) && !self.executable_resolver.has_explicit() {
+            return Ok(bound);
+        }
+        let executable = self.executable_resolver.resolve().await.map_err(|error| {
+            let mut backend_error = BrowserBackendError::new(
+                BrowserErrorKind::BrowserUnavailable,
+                self.id_value(),
+                error.detail,
+            );
+            backend_error.retryable = false;
+            backend_error
+        })?;
+        let mut map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(current) = map.get_mut(token) else {
+            return Err(BrowserBackendError::new(
+                BrowserErrorKind::SessionNotFound,
+                self.id_value(),
+                "BrowserSessionUnavailable: launch configuration was released",
+            ));
+        };
+        if current.executable.is_none() {
+            current.executable = Some(executable);
+        }
+        Ok(current.clone())
     }
 
     fn session_launch(&self, token: &str) -> Option<BoundSessionLaunch> {
@@ -378,8 +459,10 @@ impl AgentBrowserBackend {
             BrowserBackendError::new(BrowserErrorKind::Rejected, self.id_value(), detail)
         })?;
         let retryable_action = is_retryable_action(v1_action);
-        let bound = self.session_launch(cli_session);
-        let profile_path = bound.as_ref().and_then(|cfg| cfg.profile_path.clone());
+        let bound = self
+            .ensure_session_executable(cli_session, v1_action)
+            .await?;
+        let profile_path = bound.profile_path.clone();
         let mut recovered = false;
         let mut concurrent_followup = false;
         loop {
@@ -387,7 +470,7 @@ impl AgentBrowserBackend {
                 .spawn_cli(
                     cli_session,
                     opts,
-                    bound.as_ref(),
+                    Some(&bound),
                     v1_action,
                     extra_args,
                 )
@@ -511,8 +594,11 @@ impl AgentBrowserBackend {
             .and_then(|cfg| cfg.cdp_url.as_deref())
             .or(opts.cdp_url.as_deref());
         let cli_profile_arg = bound.and_then(|cfg| cfg.cli_profile_arg.clone());
+        let executable = bound.and_then(|cfg| cfg.executable.as_ref());
         let daemon_alive = probe_owned_session_pid(cli_session) == Some(true);
-        let emit_profile = cli_profile_arg.is_some() && should_forward_managed_profile_flag(daemon_alive);
+        let emit_launch_config = should_forward_local_launch_config(daemon_alive);
+        let emit_profile = cli_profile_arg.is_some() && emit_launch_config;
+        let emit_executable = executable.is_some() && emit_launch_config;
 
         let mut cmd = Command::new(&resolved.path);
         configure_background_command(&mut cmd);
@@ -524,6 +610,15 @@ impl AgentBrowserBackend {
         if emit_profile {
             if let Some(profile_arg) = cli_profile_arg.as_ref() {
                 apply_managed_profile_cli_arg(&mut cmd, profile_arg, self.id_value())?;
+            }
+        }
+        if emit_executable {
+            if let Some(executable) = executable {
+                apply_browser_executable_cli_arg(
+                    &mut cmd,
+                    &executable.path,
+                    self.id_value(),
+                )?;
             }
         }
         if attach_only {
@@ -549,6 +644,8 @@ impl AgentBrowserBackend {
             headless,
             attach_only,
             cdp_url.is_some(),
+            emit_executable,
+            executable,
         );
         remember_owned_browser_session(cli_session);
         match run_command_with_timeout(cmd, DEFAULT_TIMEOUT_SECS).await {
@@ -579,11 +676,15 @@ impl AgentBrowserBackend {
         headless: bool,
         attach_only: bool,
         cdp_url_present: bool,
+        executable_present: bool,
+        executable: Option<&BrowserExecutable>,
     ) {
         let profile_hash = cli_profile_arg.map(|arg| hash_cli_profile_arg(arg));
+        let executable_hash = executable.map(|value| hash_path(&value.path));
         let launch_fingerprint = format!(
-            "session={cli_session}|ns={AGENT_BROWSER_NAMESPACE}|profile={}|headless={headless}|attach_only={attach_only}|cdp={cdp_url_present}|exe=none",
-            profile_hash.as_deref().unwrap_or("none")
+            "session={cli_session}|ns={AGENT_BROWSER_NAMESPACE}|profile={}|headless={headless}|attach_only={attach_only}|cdp={cdp_url_present}|exe={}",
+            profile_hash.as_deref().unwrap_or("none"),
+            executable_hash.as_deref().unwrap_or("none")
         );
         if let Ok(mut log) = self.cli_invocations.lock() {
             log.push(CliInvocationRecord {
@@ -595,6 +696,8 @@ impl AgentBrowserBackend {
                 headless,
                 attach_only,
                 cdp_url_present,
+                executable_present,
+                executable_source: executable.map(|value| value.source.as_str()),
                 launch_fingerprint,
             });
         }
@@ -650,6 +753,24 @@ fn apply_managed_profile_cli_arg(
     Ok(())
 }
 
+fn apply_browser_executable_cli_arg(
+    cmd: &mut Command,
+    executable_path: &Path,
+    backend: BrowserBackendId,
+) -> Result<(), BrowserBackendError> {
+    if !executable_path.is_absolute() {
+        return Err(BrowserBackendError::new(
+            BrowserErrorKind::Rejected,
+            backend,
+            "BrowserUnavailable: configured browser executable path must be absolute",
+        ));
+    }
+    for arg in browser_executable_argv(Some(executable_path)) {
+        cmd.arg(arg);
+    }
+    Ok(())
+}
+
 /// agent-browser 0.36.0 `launch_hash` hashes the `--profile` string. Windows
 /// `canonicalize` yields `\\?\` verbatim paths; stripping that prefix keeps
 /// open/eval argv bytes identical and matches Chrome `--user-data-dir`.
@@ -670,10 +791,10 @@ fn profile_path_for_cli(path: &Path) -> OsString {
 }
 
 /// agent-browser 0.36.0 sends a daemon `launch` envelope whenever `--profile`
-/// is present (`should_send_local_launch_config`). A follow-up launch can
-/// relaunch Chrome onto about:blank. Once this session's sidecar is alive,
-/// omit `--profile` so later eval/observe attach instead of re-launching.
-fn should_forward_managed_profile_flag(daemon_alive: bool) -> bool {
+/// or `--executable-path` is present (`should_send_local_launch_config`). A
+/// follow-up launch can relaunch Chrome onto about:blank. Once this session's
+/// sidecar is alive, omit launch-affecting flags so later commands attach.
+fn should_forward_local_launch_config(daemon_alive: bool) -> bool {
     !daemon_alive
 }
 
@@ -681,6 +802,17 @@ fn should_forward_managed_profile_flag(daemon_alive: bool) -> bool {
 fn hash_cli_profile_arg(arg: &OsString) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(arg.to_string_lossy().as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+fn hash_path(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.as_os_str().to_string_lossy().as_bytes());
     digest
         .iter()
         .take(6)
@@ -873,6 +1005,15 @@ pub fn backend_from_config(
     search: Option<BrowserBinarySearch>,
     defaults: BrowserSessionOptions,
 ) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_executable(backend_name, search, defaults, None)
+}
+
+pub fn backend_from_config_with_executable(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
     let trimmed = backend_name.trim();
     let id = planned_backend_id_from_config(Some(trimmed))?;
     if id == BrowserBackendId::agent_browser() {
@@ -882,7 +1023,11 @@ pub fn backend_from_config(
                 "legacy backend 'playwright' mapped to 'agent-browser'"
             );
         }
-        return Ok(Arc::new(AgentBrowserBackend::new(search, defaults)));
+        return Ok(Arc::new(AgentBrowserBackend::new_with_executable_path(
+            search,
+            defaults,
+            executable_path,
+        )));
     }
     Err(BrowserBackendError::new(
         BrowserErrorKind::Rejected,
@@ -1393,6 +1538,9 @@ fn parse_tabs_output(stdout: &str, normalized: &str) -> Vec<BrowserTab> {
 mod tests {
     use super::*;
     use crate::tools::browser_bin::bundled_agent_browser_relative_path;
+    use crate::tools::browser_executable::{
+        BrowserExecutableProbe, BrowserExecutableProbeResult, BrowserExecutableSource,
+    };
     use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
     use crate::tools::browser_output::BROWSER_EXTRACT_SOURCE_CHAR_LIMIT;
     use crate::tools::browser_profile::BrowserProfileResolver;
@@ -1404,6 +1552,21 @@ mod tests {
         BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
     };
     use serde_json::{json, Value};
+
+    struct PassingExecutableProbe {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BrowserExecutableProbe for PassingExecutableProbe {
+        async fn probe(&self, _candidate: &Path) -> BrowserExecutableProbeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            BrowserExecutableProbeResult {
+                usable: true,
+                diagnostic: "ok",
+            }
+        }
+    }
 
     fn native_cli_search() -> Option<BrowserBinarySearch> {
         let resource_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2157,6 +2320,32 @@ mod tests {
         (backend, root)
     }
 
+    fn scratch_executable_backend() -> (AgentBrowserBackend, PathBuf, Arc<PassingExecutableProbe>) {
+        let root =
+            std::env::temp_dir().join(format!("omninova-b33c-backend-{}", uuid::Uuid::new_v4()));
+        let executable = root.join("runtime/chrome.exe");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"test executable").unwrap();
+        let probe = Arc::new(PassingExecutableProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executable_resolver = BrowserExecutableResolver::for_test(
+            vec![(
+                executable,
+                BrowserExecutableSource::SystemChrome,
+                false,
+            )],
+            probe.clone(),
+        );
+        let backend = AgentBrowserBackend::with_resolvers(
+            None,
+            BrowserSessionOptions::default(),
+            BrowserProfileResolver::new(root.join("profiles")),
+            executable_resolver,
+        );
+        (backend, root, probe)
+    }
+
     fn profile_opts(id: &str) -> BrowserSessionOptions {
         BrowserSessionOptions {
             profile: Some(BrowserProfileRef::new(id).unwrap()),
@@ -2229,9 +2418,78 @@ mod tests {
     }
 
     #[test]
-    fn should_forward_managed_profile_flag_omits_when_daemon_alive() {
-        assert!(should_forward_managed_profile_flag(false));
-        assert!(!should_forward_managed_profile_flag(true));
+    fn should_forward_local_launch_config_omits_when_daemon_alive() {
+        assert!(should_forward_local_launch_config(false));
+        assert!(!should_forward_local_launch_config(true));
+    }
+
+    #[tokio::test]
+    async fn executable_is_bound_for_ephemeral_and_persistent_sessions() {
+        let (backend, root, probe) = scratch_executable_backend();
+        let ephemeral = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33c-ephemeral").unwrap(),
+                BrowserSessionOptions::default(),
+            ))
+            .await
+            .unwrap();
+        let ephemeral_bound = backend
+            .ensure_session_executable(ephemeral.token(), "open")
+            .await
+            .unwrap();
+        assert!(ephemeral_bound.profile_path.is_none());
+        assert_eq!(
+            ephemeral_bound.executable.as_ref().map(|value| value.source),
+            Some(BrowserExecutableSource::SystemChrome)
+        );
+
+        let persistent = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33c-persistent").unwrap(),
+                profile_opts("account-c"),
+            ))
+            .await
+            .unwrap();
+        let persistent_bound = backend
+            .ensure_session_executable(persistent.token(), "open")
+            .await
+            .unwrap();
+        assert!(persistent_bound.profile_path.is_some());
+        assert_eq!(
+            persistent_bound.executable.as_ref().map(|value| value.source),
+            Some(BrowserExecutableSource::SystemChrome)
+        );
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "backend selection must be launch-probed once and shared across sessions"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cdp_attach_does_not_select_or_forward_local_executable() {
+        let (backend, root, probe) = scratch_executable_backend();
+        let options = BrowserSessionOptions {
+            attach_only: true,
+            cdp_url: Some("http://127.0.0.1:9222".into()),
+            ..BrowserSessionOptions::default()
+        };
+        let session = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33c-cdp").unwrap(),
+                options,
+            ))
+            .await
+            .unwrap();
+        let bound = backend
+            .ensure_session_executable(session.token(), "open")
+            .await
+            .unwrap();
+        assert!(bound.executable.is_none());
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(browser_executable_argv(bound.executable.as_ref().map(|value| value.path.as_path())).is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2640,12 +2898,14 @@ document.title = "persist-boot";
     fn dump_cli_invocations(records: &[CliInvocationRecord]) {
         for record in records {
             eprintln!(
-                "OP={} cli_session={} namespace={} profile_present={} profile_hash={} headless={} attach_only={} cdp={} launch_fingerprint={}",
+                "OP={} cli_session={} namespace={} profile_present={} profile_hash={} executable_present={} executable_source={} headless={} attach_only={} cdp={} launch_fingerprint={}",
                 record.operation,
                 record.cli_session,
                 record.namespace,
                 record.profile_present,
                 record.profile_hash.as_deref().unwrap_or("none"),
+                record.executable_present,
+                record.executable_source.unwrap_or("none"),
                 record.headless,
                 record.attach_only,
                 record.cdp_url_present,
@@ -2675,13 +2935,112 @@ document.title = "persist-boot";
     }
 
     #[tokio::test]
+    #[ignore = "requires a live agent-browser + System Chrome runtime"]
+    async fn real_system_chrome_ephemeral_open_snapshot_read() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b33c-ephemeral</title></head><body><h1>Ephemeral browser fixture</h1><p>Local read passed.</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let options = BrowserSessionOptions::default();
+        let key = BrowserSessionKey::new(format!(
+            "b33c-ephemeral-live-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        runtime
+            .open(
+                &key,
+                &options,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open local fixture with selected System Chrome");
+        let snapshot = runtime
+            .observe(
+                &key,
+                &options,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Snapshot,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("snapshot local fixture");
+        let read = runtime
+            .observe(
+                &key,
+                &options,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Read {
+                        outline: false,
+                        filter: None,
+                    },
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("read local fixture");
+        let invocations = backend.take_cli_invocations();
+        let open = invocations
+            .iter()
+            .find(|record| record.operation == "open")
+            .expect("open invocation");
+        let snapshot_invocation = invocations
+            .iter()
+            .find(|record| record.operation == "snapshot")
+            .expect("snapshot invocation");
+        assert!(!open.profile_present);
+        assert!(open.executable_present);
+        assert_eq!(open.executable_source, Some("system_chrome"));
+        assert!(!snapshot_invocation.executable_present);
+        assert!(
+            snapshot
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Ephemeral browser fixture")
+        );
+        assert!(
+            read.text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Local read passed")
+        );
+        runtime.close_session(&key, &options).await.ok();
+    }
+
+    #[tokio::test]
     #[ignore = "requires a live agent-browser + Chromium runtime"]
     async fn real_managed_profile_navigation_targets_same_page() {
         let Some(search) = native_cli_search() else {
             eprintln!("skip runtime-dependent test: agent-browser unavailable");
             return;
         };
-        let html = r#"<!DOCTYPE html><html><head><title>target-page</title></head><body><script>window.__targetMarker = "managed-profile-target";</script></body></html>"#;
+        let html = r#"<!DOCTYPE html><html><head><title>target-page</title></head><body><main><h1>Managed browser fixture</h1><p>Deterministic local read.</p></main><script>window.__targetMarker = "managed-profile-target";</script></body></html>"#;
         let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
             crate::tools::web_client::tests::write_response(
                 stream,
@@ -2739,6 +3098,33 @@ document.title = "persist-boot";
             )
             .await
             .expect("observe title");
+        let snapshot = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Snapshot,
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("snapshot local fixture");
+        let read = runtime
+            .observe(
+                &key,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Read {
+                        outline: false,
+                        filter: None,
+                    },
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .expect("read local fixture");
         let extracted = runtime
             .extract_json(
                 &key,
@@ -2802,9 +3188,19 @@ document.title = "persist-boot";
         assert_eq!(open_inv.launch_fingerprint, eval_inv.launch_fingerprint);
         assert!(open_inv.profile_present, "first open must send --profile");
         assert!(
+            open_inv.executable_present,
+            "first open must send the selected --executable-path"
+        );
+        assert!(
             !eval_inv.profile_present,
             "follow-up eval must not re-send --profile while the session daemon is alive"
         );
+        assert!(
+            !eval_inv.executable_present,
+            "follow-up eval must not re-send --executable-path while the session daemon is alive"
+        );
+        assert_eq!(open_inv.executable_source, Some("system_chrome"));
+        assert_eq!(eval_inv.executable_source, Some("system_chrome"));
         assert_eq!(daemon_pid_open, daemon_pid_eval, "daemon pid changed");
         assert!(
             href.contains(&url) && !href.contains("about:blank"),
@@ -2815,6 +3211,19 @@ document.title = "persist-boot";
             "observe url was {observed_url_text}"
         );
         assert_eq!(observed_title_text.trim(), "target-page");
+        assert!(
+            snapshot
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Managed browser fixture")
+        );
+        assert!(
+            read.text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Deterministic local read")
+        );
         assert_eq!(title, "target-page");
         assert_eq!(marker, "managed-profile-target");
     }

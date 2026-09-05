@@ -1511,6 +1511,10 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub attach_only: bool,
     pub cdp_url: Option<String>,
+    /// Trusted local override for the Chrome-compatible executable used by
+    /// Managed Browser. This is runtime configuration, never a tool argument.
+    #[serde(default)]
+    pub executable_path: Option<PathBuf>,
 }
 
 fn default_browser_backend() -> String {
@@ -1526,6 +1530,7 @@ impl Default for BrowserConfig {
             native_headless: false,
             attach_only: false,
             cdp_url: None,
+            executable_path: None,
         }
     }
 }

@@ -606,6 +606,9 @@ impl Default for BrowserSessionOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserErrorKind {
     BinaryMissing,
+    /// No launch-probed Chrome-compatible executable is available for a
+    /// locally managed browser session.
+    BrowserUnavailable,
     LaunchFailed,
     NotConnected,
     SessionNotFound,
@@ -640,6 +643,7 @@ pub fn v1_error_kind(message: &str) -> Option<BrowserErrorKind> {
         "BrowserBinaryMissing" | "BrowserBinaryNotExecutable" => {
             Some(BrowserErrorKind::BinaryMissing)
         }
+        "BrowserUnavailable" => Some(BrowserErrorKind::BrowserUnavailable),
         "BrowserLaunchFailed" => Some(BrowserErrorKind::LaunchFailed),
         "BrowserDaemonUnavailable" => Some(BrowserErrorKind::NotConnected),
         "BrowserSessionUnavailable" | "BrowserSessionInvalid" | "BrowserSessionMissing" => {
@@ -1050,6 +1054,10 @@ mod tests {
                 "BrowserBinaryNotExecutable: x",
                 BrowserErrorKind::BinaryMissing,
             ),
+            (
+                "BrowserUnavailable: x",
+                BrowserErrorKind::BrowserUnavailable,
+            ),
             ("BrowserLaunchFailed: x", BrowserErrorKind::LaunchFailed),
             (
                 "BrowserDaemonUnavailable: x",
@@ -1081,6 +1089,7 @@ mod tests {
             assert_eq!(v1_error_kind(msg), Some(kind), "{msg}");
         }
         assert!(!BrowserErrorKind::BinaryMissing.default_retryable());
+        assert!(!BrowserErrorKind::BrowserUnavailable.default_retryable());
         assert!(!BrowserErrorKind::Rejected.default_retryable());
         assert!(!BrowserErrorKind::InvalidStructuredOutput.default_retryable());
         assert!(!BrowserErrorKind::StaleReference.default_retryable());
