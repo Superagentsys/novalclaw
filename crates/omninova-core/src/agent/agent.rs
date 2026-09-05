@@ -70,6 +70,8 @@ pub struct Agent {
     messages: Vec<ChatMessage>,
     /// Consumed by the next logical `process_message*` run. Not persisted.
     run_generation_limit_override: Option<u32>,
+    /// Desktop / checkpoint screenshots for the next user turn.
+    pending_user_images: Vec<String>,
 }
 
 impl Agent {
@@ -90,6 +92,7 @@ impl Agent {
             security,
             messages: Vec::new(),
             run_generation_limit_override: None,
+            pending_user_images: Vec::new(),
         }
     }
 
@@ -101,6 +104,29 @@ impl Agent {
 
     fn take_request_generation_limit(&mut self) -> Option<u32> {
         self.run_generation_limit_override.take().filter(|value| *value > 0)
+    }
+
+    pub fn set_pending_user_images(&mut self, images: Vec<String>) {
+        self.pending_user_images = images
+            .into_iter()
+            .filter(|image| !image.trim().is_empty())
+            .collect();
+    }
+
+    fn push_user_turn(&mut self, message: &str, extra_images: &[String]) {
+        let mut images = std::mem::take(&mut self.pending_user_images);
+        images.extend(
+            extra_images
+                .iter()
+                .filter(|image| !image.trim().is_empty())
+                .cloned(),
+        );
+        if images.is_empty() {
+            self.messages.push(ChatMessage::user(message));
+        } else {
+            self.messages
+                .push(ChatMessage::user_with_images(message, images));
+        }
     }
 
 
@@ -128,12 +154,7 @@ impl Agent {
 
         self.compact_context_if_needed(request_max_output_tokens).await;
 
-        if images.is_empty() {
-            self.messages.push(ChatMessage::user(message));
-        } else {
-            self.messages
-                .push(ChatMessage::user_with_images(message, images.to_vec()));
-        }
+        self.push_user_turn(message, images);
         self.refresh_candidate(request_max_output_tokens);
 
         // One budget spans the whole request: planner, executor and reflector
@@ -170,7 +191,7 @@ impl Agent {
             .await;
 
         self.compact_context_if_needed(request_max_output_tokens).await;
-        self.messages.push(ChatMessage::user(message));
+        self.push_user_turn(message, &[]);
         self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
@@ -261,7 +282,7 @@ impl Agent {
                     self.provider.exact_tokenizer().map(str::to_string),
                 );
                 self.compact_context_if_needed(request_max_output_tokens).await;
-                self.messages.push(ChatMessage::user(message));
+                self.push_user_turn(message, &[]);
                 self.refresh_candidate(request_max_output_tokens);
                 crate::observability::emit_candidate_usage(
                     &self.messages,
@@ -340,7 +361,7 @@ impl Agent {
             .await;
 
         self.compact_context_if_needed(request_max_output_tokens).await;
-        self.messages.push(ChatMessage::user(message));
+        self.push_user_turn(message, &[]);
         self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());

@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
 import { writeClipboardText } from "../../utils/clipboard";
@@ -534,6 +535,26 @@ interface ModifyDocxResult {
   failed: string[];
 }
 
+function placeComposerMenu(
+  trigger: HTMLElement | null,
+  width: number
+): CSSProperties | undefined {
+  if (!trigger) return undefined;
+  const rect = trigger.getBoundingClientRect();
+  const nextWidth = Math.min(width, window.innerWidth - 24);
+  const left = Math.min(
+    Math.max(12, rect.left),
+    Math.max(12, window.innerWidth - nextWidth - 12)
+  );
+  return {
+    position: "fixed",
+    left,
+    bottom: Math.max(12, window.innerHeight - rect.top + 8),
+    width: nextWidth,
+    zIndex: 80,
+  };
+}
+
 export function Chat({
   initialSidebarTab = "avatars",
   isActive = true,
@@ -646,6 +667,12 @@ export function Chat({
     Record<string, PendingToolApproval>
   >({});
   const approvalMenuRef = useRef<HTMLDivElement>(null);
+  const approvalTriggerRef = useRef<HTMLButtonElement>(null);
+  const approvalPanelRef = useRef<HTMLDivElement>(null);
+  const [approvalMenuStyle, setApprovalMenuStyle] = useState<CSSProperties>();
+  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspacePanelRef = useRef<HTMLDivElement>(null);
+  const [workspaceMenuStyle, setWorkspaceMenuStyle] = useState<CSSProperties>();
   /**
    * Session-level temporary workspace. Set by the chat-page Workspace button
    * without modifying the agent's default workspace. This takes the highest
@@ -1716,12 +1743,32 @@ export function Chat({
     void loadSessionHistory(activeAvatarId, sessionId, true);
   }, [activeAvatarId, sessionId, gatewayStatus, loadSessionHistory]);
 
+  useLayoutEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const place = () => {
+      setWorkspaceMenuStyle(placeComposerMenu(workspaceTriggerRef.current, 240));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [workspaceMenuOpen]);
+
   useEffect(() => {
     if (!workspaceMenuOpen) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
-      if (target && workspaceMenuRef.current?.contains(target)) return;
+      if (
+        target &&
+        (workspaceMenuRef.current?.contains(target) ||
+          workspacePanelRef.current?.contains(target))
+      ) {
+        return;
+      }
       setWorkspaceMenuOpen(false);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1736,12 +1783,32 @@ export function Chat({
     };
   }, [workspaceMenuOpen]);
 
+  useLayoutEffect(() => {
+    if (!approvalMenuOpen) return;
+    const place = () => {
+      setApprovalMenuStyle(placeComposerMenu(approvalTriggerRef.current, 370));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [approvalMenuOpen]);
+
   useEffect(() => {
     if (!approvalMenuOpen) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
-      if (target && approvalMenuRef.current?.contains(target)) return;
+      if (
+        target &&
+        (approvalMenuRef.current?.contains(target) ||
+          approvalPanelRef.current?.contains(target))
+      ) {
+        return;
+      }
       setApprovalMenuOpen(false);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -4511,6 +4578,7 @@ export function Chat({
                   <div ref={approvalMenuRef} className="chat-approval-actions">
                     <button
                       type="button"
+                      ref={approvalTriggerRef}
                       className={`chat-composer-permission${approvalMenuOpen ? " is-open" : ""}`}
                       title={approvalProfile.description}
                       aria-haspopup="menu"
@@ -4522,41 +4590,53 @@ export function Chat({
                       <span>{approvalSaving ? "保存中…" : approvalProfile.label}</span>
                       <span className="chat-permission-chevron" aria-hidden />
                     </button>
-                    {approvalMenuOpen ? (
-                      <div className="chat-permission-menu" role="menu" aria-label="工具权限模式">
-                        <button
-                          type="button"
-                          role="menuitemradio"
-                          aria-checked={approvalProfile.profile === "request_approval"}
-                          className={approvalProfile.profile === "request_approval" ? "is-selected" : ""}
-                          onClick={() => void handleApprovalProfileChange("request_approval")}
-                          disabled={approvalSaving}
-                        >
-                          <span className="chat-permission-option-icon"><UiIcon name="safety" size={16} /></span>
-                          <span className="chat-permission-option-copy">
-                            <strong>请求批准</strong>
-                            <small>编辑文件、运行命令和使用互联网时始终询问</small>
-                          </span>
-                          {approvalProfile.profile === "request_approval" ? <UiIcon name="check" size={14} /> : null}
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitemradio"
-                          aria-checked={approvalProfile.profile === "risk_based"}
-                          className={approvalProfile.profile === "risk_based" ? "is-selected" : ""}
-                          onClick={() => void handleApprovalProfileChange("risk_based")}
-                          disabled={approvalSaving}
-                        >
-                          <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
-                          <span className="chat-permission-option-copy">
-                            <strong>帮我批准</strong>
-                            <small>自动执行常规操作，仅对检测到的风险操作进行限制</small>
-                          </span>
-                          {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
-                        </button>
-                        <p>危险命令和禁止路径仍会被安全策略拦截。</p>
-                      </div>
-                    ) : null}
+                    {approvalMenuOpen
+                      ? createPortal(
+                          <div
+                            ref={approvalPanelRef}
+                            className="chat-permission-menu"
+                            role="menu"
+                            aria-label="工具权限模式"
+                            style={{
+                              ...approvalMenuStyle,
+                              visibility: approvalMenuStyle ? "visible" : "hidden",
+                            }}
+                          >
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "request_approval"}
+                              className={approvalProfile.profile === "request_approval" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("request_approval")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="safety" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>请求批准</strong>
+                                <small>编辑文件、运行命令和使用互联网时始终询问</small>
+                              </span>
+                              {approvalProfile.profile === "request_approval" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "risk_based"}
+                              className={approvalProfile.profile === "risk_based" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("risk_based")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>帮我批准</strong>
+                                <small>自动执行常规操作，仅对检测到的风险操作进行限制</small>
+                              </span>
+                              {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <p>危险命令和禁止路径仍会被安全策略拦截。</p>
+                          </div>,
+                          document.body
+                        )
+                      : null}
                   </div>
                   <div
                     ref={workspaceMenuRef}
@@ -4564,6 +4644,7 @@ export function Chat({
                   >
                     <button
                       type="button"
+                      ref={workspaceTriggerRef}
                       className="chat-workspace-pill"
                       title={
                         activeWorkspaceDir
@@ -4582,26 +4663,37 @@ export function Chat({
                       {activeWorkspaceDir ? <span className="chat-workspace-pill-scope">{workspaceLabel}</span> : null}
                       <span className="chat-workspace-pill-path">{workspaceSummary}</span>
                     </button>
-                    {workspaceMenuOpen ? (
-                      <div className="chat-workspace-menu" role="menu">
-                        <button type="button" role="menuitem" onClick={(e) => void handleChooseWorkspace(e)}>
-                          重新选择 Workspace
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => void handleOpenWorkspace()}
-                          disabled={!activeWorkspaceDir}
-                        >
-                          打开当前 Workspace 文件夹
-                        </button>
-                        {sessionWorkspaceDir ? (
-                          <button type="button" role="menuitem" onClick={handleClearSessionWorkspace}>
-                            清除当前会话临时 Workspace
-                          </button>
-                        ) : null}
-                      </div>
-                    ) : null}
+                    {workspaceMenuOpen
+                      ? createPortal(
+                          <div
+                            ref={workspacePanelRef}
+                            className="chat-workspace-menu"
+                            role="menu"
+                            style={{
+                              ...workspaceMenuStyle,
+                              visibility: workspaceMenuStyle ? "visible" : "hidden",
+                            }}
+                          >
+                            <button type="button" role="menuitem" onClick={(e) => void handleChooseWorkspace(e)}>
+                              重新选择 Workspace
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => void handleOpenWorkspace()}
+                              disabled={!activeWorkspaceDir}
+                            >
+                              打开当前 Workspace 文件夹
+                            </button>
+                            {sessionWorkspaceDir ? (
+                              <button type="button" role="menuitem" onClick={handleClearSessionWorkspace}>
+                                清除当前会话临时 Workspace
+                              </button>
+                            ) : null}
+                          </div>,
+                          document.body
+                        )
+                      : null}
                   </div>
                 </div>
 

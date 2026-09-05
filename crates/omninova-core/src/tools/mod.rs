@@ -8,6 +8,7 @@ pub mod browser_output;
 pub mod browser_profile;
 pub mod browser_runtime;
 pub mod browser_types;
+pub mod computer_use;
 pub mod content_search;
 pub mod delegate;
 pub mod file_edit;
@@ -47,6 +48,7 @@ pub use browser_lifecycle::{
     cleanup_owned_browser_sessions, forget_owned_browser_session, remember_owned_browser_session,
     AGENT_BROWSER_NAMESPACE,
 };
+pub use computer_use::ComputerUseTool;
 pub use content_search::ContentSearchTool;
 pub use delegate::{AgentInvoker, DelegateRequest, DelegateTool};
 pub use file_edit::FileEditTool;

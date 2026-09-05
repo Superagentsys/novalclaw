@@ -413,6 +413,34 @@ fn default_desktop_vision_max_dimension_px() -> u32 {
     1280
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupComputerUseConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_computer_use_allowed_apps")]
+    allowed_apps: Vec<String>,
+    #[serde(default = "default_true_computer_use_screenshot")]
+    require_screenshot_before_click: bool,
+}
+
+impl Default for SetupComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_apps: default_computer_use_allowed_apps(),
+            require_screenshot_before_click: true,
+        }
+    }
+}
+
+fn default_computer_use_allowed_apps() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn default_true_computer_use_screenshot() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SetupObservabilityConfig {
     #[serde(default)]
@@ -450,6 +478,7 @@ const APPROVAL_CONTROLLED_TOOLS: &[&str] = &[
     "apply_patch",
     "git_operations",
     "browser",
+    "computer_use",
     "http_request",
 ];
 
@@ -608,6 +637,8 @@ struct SetupAppConfig {
     channels: Option<SetupChannelsConfig>,
     #[serde(default)]
     multimodal: SetupMultimodalConfig,
+    #[serde(default)]
+    computer_use: SetupComputerUseConfig,
     #[serde(default)]
     observability: SetupObservabilityConfig,
     #[serde(default)]
@@ -1302,7 +1333,12 @@ async fn open_knowledge_store(
 }
 
 async fn spawn_desktop_automation_scheduler(runtime: GatewayRuntime) {
-    let workspace = runtime.get_config().await.workspace_dir;
+    let cfg = runtime.get_config().await;
+    if !cfg.scheduler.enabled && !cfg.computer_use.enabled {
+        eprintln!("[automation] scheduler skipped (scheduler.enabled=false)");
+        return;
+    }
+    let workspace = cfg.workspace_dir;
     let store = match CronStore::open(workspace.join("cron.json")).await {
         Ok(store) => store,
         Err(error) => {
@@ -1543,7 +1579,9 @@ struct KnowledgeUpsertInput {
 #[serde(rename_all = "camelCase")]
 struct KnowledgeImportFile {
     name: String,
+    #[serde(default)]
     content: String,
+    content_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1568,6 +1606,18 @@ async fn knowledge_collections(
 ) -> Result<Vec<String>, String> {
     let store = open_knowledge_store(&state).await?;
     Ok(store.collections().await)
+}
+
+#[tauri::command]
+async fn knowledge_collection_update(
+    name: String,
+    replacement: Option<String>,
+    delete: Option<bool>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    open_knowledge_store(&state).await?.update_collection(
+        &name, replacement.as_deref(), delete.unwrap_or(false),
+    ).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1624,9 +1674,14 @@ async fn knowledge_import(
         );
     }
     for file in files.unwrap_or_default() {
+        let bytes = match file.content_base64 {
+            Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)
+                .map_err(|e| format!("{}: invalid base64: {e}", file.name))?,
+            None => file.content.into_bytes(),
+        };
         imported.push(
             store
-                .import_bytes(&file.name, file.content.as_bytes(), collection.as_deref(), tags.clone())
+                .import_bytes(&file.name, &bytes, collection.as_deref(), tags.clone())
                 .await
                 .map_err(|error| format!("{}: {error}", file.name))?,
         );
@@ -3267,6 +3322,11 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
             desktop_vision_enabled: config.multimodal.desktop_vision_enabled,
             desktop_vision_max_dimension_px: config.multimodal.desktop_vision_max_dimension_px,
         },
+        computer_use: SetupComputerUseConfig {
+            enabled: config.computer_use.enabled,
+            allowed_apps: config.computer_use.allowed_apps.clone(),
+            require_screenshot_before_click: config.computer_use.require_screenshot_before_click,
+        },
         observability: SetupObservabilityConfig {
             prometheus_enabled: config.observability.prometheus_enabled,
             prometheus_port: config.observability.prometheus_port,
@@ -3447,6 +3507,7 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        "omnirun" => Some("http://localhost:28090/v1".to_string()),
         "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
         _ => None,
     }
@@ -3613,6 +3674,24 @@ fn setup_config_to_core(
         .multimodal
         .desktop_vision_max_dimension_px
         .max(320);
+
+    current.computer_use.enabled = setup.computer_use.enabled;
+    current.computer_use.allowed_apps = setup
+        .computer_use
+        .allowed_apps
+        .into_iter()
+        .map(|app| app.trim().to_string())
+        .filter(|app| !app.is_empty())
+        .collect();
+    current.computer_use.require_screenshot_before_click =
+        setup.computer_use.require_screenshot_before_click;
+    // Approval handling for `computer_use` belongs to the approval profile
+    // applied by `ensure_desktop_automation_capabilities`. Force-adding it to
+    // `require_approval` here also contradicted the auto-approve list and made
+    // every click wait for a human, so a desktop task could never run through.
+    if current.computer_use.enabled {
+        current.scheduler.enabled = true;
+    }
 
     current.observability.prometheus_enabled = setup.observability.prometheus_enabled;
     current.observability.prometheus_port = setup.observability.prometheus_port;
@@ -4941,11 +5020,23 @@ fn open_task_artifact(
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer does not accept Rust canonicalize's verbatim path prefix.
+        let raw = resolved.to_string_lossy();
+        let shell_path = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+        };
+        if shell_path.contains('"') || shell_path.contains(['\r', '\n']) {
+            return Err("文件路径包含无效字符".into());
+        }
         let mut command = StdCommand::new("explorer.exe");
         if resolved.is_dir() {
-            command.arg(&resolved);
+            command.arg(&shell_path);
         } else {
-            command.arg(format!("/select,{}", resolved.display()));
+            // Quote the path, NOT the /select, switch (Explorer's own grammar).
+            command.raw_arg(format!("/select,\"{shell_path}\""));
         }
         hide_std_command_window(&mut command);
         command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
@@ -5049,6 +5140,7 @@ fn display_provider_name(id: &str) -> String {
         "openrouter" => "OpenRouter".to_string(),
         "ollama" => "Ollama (Local)".to_string(),
         "lmstudio" => "LM Studio (Local)".to_string(),
+        "omnirun" => "OmniRun (Local)".to_string(),
         "xai" => "xAI".to_string(),
         "mistral" => "Mistral".to_string(),
         other => other.to_string(),
@@ -5202,6 +5294,7 @@ pub fn run() {
             automation_clear_runs,
             knowledge_list,
             knowledge_collections,
+            knowledge_collection_update,
             knowledge_get,
             knowledge_upsert,
             knowledge_import,

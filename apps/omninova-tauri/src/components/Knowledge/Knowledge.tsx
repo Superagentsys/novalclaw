@@ -67,6 +67,7 @@ export function Knowledge() {
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [collections, setCollections] = useState<string[]>([]);
   const [collection, setCollection] = useState("all");
+  const [collectionForm, setCollectionForm] = useState<{ oldName?: string; name: string } | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<KnowledgeHit[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -283,7 +284,7 @@ export function Knowledge() {
           multiple: true,
           title: "导入到知识库",
           filters: [
-            { name: "Documents", extensions: ["md", "txt", "markdown", "json", "csv", "html", "pdf"] },
+            { name: "Documents", extensions: ["md", "txt", "markdown", "json", "csv", "html", "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "rtf", "odt"] },
           ],
         });
         if (selected == null) return;
@@ -298,16 +299,25 @@ export function Knowledge() {
   };
 
   const handleWebFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
+    const files = Array.from(event.target.files ?? []);
     event.target.value = "";
     if (!files?.length) return;
     setBusy("import");
     try {
+      if (files.reduce((sum, file) => sum + file.size, 0) > 50 * 1024 * 1024) {
+        throw new Error("单次上传总量不能超过 50 MB，请分批导入");
+      }
       const payloads = await Promise.all(
-        Array.from(files).map(async (file) => ({
-          name: file.name,
-          content: await file.text(),
-        }))
+        files.map(async (file) => {
+          if (file.size > 50 * 1024 * 1024) throw new Error(`${file.name} 超过 50 MB，请拆分后导入`);
+          const contentBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+            reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+            reader.readAsDataURL(file);
+          });
+          return { name: file.name, contentBase64 };
+        })
       );
       await invokeTauri("knowledge_import", {
         files: payloads,
@@ -485,10 +495,7 @@ export function Knowledge() {
   const renameCollection = async (oldName: string, newName: string) => {
     setBusy(`rename:${oldName}`);
     try {
-      const docsInCollection = await invokeTauri<KnowledgeDocument[]>("knowledge_list", {
-        collection: oldName,
-      });
-      await moveDocumentsToCollection(docsInCollection, newName);
+      await invokeTauri("knowledge_collection_update", { name: oldName, replacement: newName });
       if (collection === oldName) {
         setCollection(newName);
       }
@@ -505,10 +512,7 @@ export function Knowledge() {
   const deleteCollection = async (name: string) => {
     setBusy(`delete:${name}`);
     try {
-      const docsInCollection = await invokeTauri<KnowledgeDocument[]>("knowledge_list", {
-        collection: name,
-      });
-      await moveDocumentsToCollection(docsInCollection, "default");
+      await invokeTauri("knowledge_collection_update", { name, delete: true });
       if (collection === name) {
         setCollection("all");
       }
@@ -589,7 +593,7 @@ export function Knowledge() {
           type="file"
           multiple
           hidden
-          accept=".md,.txt,.markdown,.json,.csv,.html,text/plain"
+          accept=".md,.txt,.markdown,.json,.csv,.html,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.rtf,.odt,text/plain"
           onChange={(event) => void handleWebFiles(event)}
         />
       </div>
@@ -611,16 +615,13 @@ export function Knowledge() {
             >
               {name}
             </button>
-            <div className="knowledge-collection-actions">
+            {name !== "default" && <div className="knowledge-collection-actions">
               <button
                 type="button"
                 className="knowledge-collection-btn"
                 onClick={(e) => {
                   e.stopPropagation();
-                  const newName = window.prompt("重命名分类：", name);
-                  if (newName?.trim() && newName !== name) {
-                    void renameCollection(name, newName.trim());
-                  }
+                  setCollectionForm({ oldName: name, name });
                 }}
                 title="重命名"
               >
@@ -639,23 +640,45 @@ export function Knowledge() {
               >
                 <UiIcon name="delete" size={10} />
               </button>
-            </div>
+            </div>}
           </div>
         ))}
         <button
           type="button"
           className="knowledge-tab-add"
-          onClick={() => {
-            const name = window.prompt("输入新分类名称：");
-            if (name?.trim()) {
-              setCollection(name.trim());
-            }
-          }}
+          onClick={() => setCollectionForm({ name: "" })}
           title="新建分类"
         >
           <UiIcon name="plus" size={14} />
         </button>
       </div>
+
+      {collectionForm && (
+        <form className="knowledge-collection-form" onSubmit={async (event) => {
+          event.preventDefault();
+          const name = collectionForm.name.trim();
+          if (!name || busy) return;
+          if (collectionForm.oldName) {
+            await renameCollection(collectionForm.oldName, name);
+            setCollectionForm(null);
+          } else {
+            setBusy("collection");
+            try {
+              await invokeTauri("knowledge_collection_update", { name });
+              setCollections(await invokeTauri<string[]>("knowledge_collections"));
+              setCollection(name);
+              setCollectionForm(null);
+            } catch (reason) { setError(String(reason)); }
+            finally { setBusy(null); }
+          }
+        }}>
+          <label htmlFor="knowledge-collection-name">{collectionForm.oldName ? "重命名分类" : "新建分类"}</label>
+          <input id="knowledge-collection-name" autoFocus maxLength={100} required value={collectionForm.name}
+            onChange={(event) => setCollectionForm({ ...collectionForm, name: event.target.value })} />
+          <button type="submit" className="knowledge-primary" disabled={!!busy || !collectionForm.name.trim()}>保存分类</button>
+          <button type="button" onClick={() => setCollectionForm(null)}>取消</button>
+        </form>
+      )}
 
       {visibleHits.length > 0 ? (
         <section className="knowledge-search-panel" aria-label="检索结果" aria-live="polite">
@@ -694,7 +717,7 @@ export function Knowledge() {
                 <UiIcon name="knowledge" size={36} />
               </div>
               <h2>还没有文档</h2>
-              <p>新建一条笔记，或导入 Markdown / TXT / PDF。</p>
+                <p>新建一条笔记，或导入 Word / Excel / PPT / PDF / Markdown / TXT。</p>
               <button type="button" className="knowledge-primary" onClick={() => openEditor(blankEditor(collection))}>
                 <UiIcon name="plus" size={14} />
                 创建第一个文档

@@ -155,7 +155,7 @@
 # enabled = true
 # mode = "supervised"
 # auto_approve = ["file_read", "memory_recall"]
-# require_approval = ["shell", "file_write", "file_edit", "git_operations", "browser", "http_request"]
+# require_approval = ["shell", "file_write", "file_edit", "git_operations", "browser", "computer_use", "http_request"]
 
 # --- Runtime ---
 # [runtime]
@@ -266,6 +266,28 @@
 # cdp_url = "http://127.0.0.1:9222"
 # allowed_domains = []
 
+# --- Computer Use (OS desktop) ---
+# 操作本机原生窗口（钉钉/飞书客户端/Excel/用友等）。网页请用 [browser]。
+# 默认关闭。开启后 screenshot/wait/snapshot 可自动执行；click/type/press 默认要审批。
+# allowed_apps 默认 ["*"]，允许前台任意应用。设为 [] 则只能观察；也可写成具体名单。
+# macOS 需屏幕录制 + 辅助功能权限。
+# [computer_use]
+# enabled = false
+# allowed_apps = ["*"]              # 默认全部应用；或 [] 禁止键鼠；或 ["钉钉", "飞书"]
+# require_screenshot_before_click = true
+# max_actions_per_turn = 0          # 单次任务的键鼠次数；0 = 不限，桌面长跑用 0
+# max_actions_per_hour = 0          # 每小时键鼠限速；0 = 不限，与 autonomy.max_actions_per_hour 独立
+# max_tool_iterations = 200         # 桌面任务一轮里 snapshot+click 很费迭代，别给太小
+# max_dimension_px = 1280
+# thrash_soft_limit = 3             # 同控件连续失败后提示改用 snapshot/name
+# thrash_hard_limit = 5             # 再失败则拒绝该目标，但任务继续，不会整轮中止
+# max_snapshot_nodes = 80
+
+# --- Scheduler ---
+# 网关启动时会拉起 cron 轮询。长程 task_checkpoint(continue) 依赖它按时唤醒。
+# [scheduler]
+# enabled = true
+
 # --- HTTP Request Tool ---
 # [http_request]
 # enabled = false
@@ -274,13 +296,15 @@
 # timeout_secs = 30
 
 # --- Web Fetch Tool ---
+# 公开网页转正文。新闻/文档优先用这个，不要开浏览器。
 # [web_fetch]
-# enabled = false
+# enabled = true
 # allowed_domains = []
 # max_response_size = 1048576
 # timeout_secs = 30
 
 # --- Web Search Tool ---
+# 检索用 web_search，读静态页用 web_fetch，不要为搜索去操作 browser。
 # [web_search]
 # enabled = false
 # provider = "brave"

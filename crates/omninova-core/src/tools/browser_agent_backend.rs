@@ -44,8 +44,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use url::Url;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const NAVIGATION_PROBE_TIMEOUT_SECS: u64 = 5;
+const READABLE_NAVIGATION_PROBE: &str = "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,text:document.body?document.body.innerText.slice(0,6000):''})";
 pub const BROWSER_SESSION_PREFIX: &str = "omninova";
 pub const BROWSER_SESSION_HASH_CHARS: usize = 20;
 const BROWSER_SESSION_MAX_LEN: usize = 64;
@@ -436,6 +439,24 @@ impl AgentBrowserBackend {
         }
     }
 
+    async fn readable_page_after_timeout(
+        &self,
+        session: &BackendSessionHandle,
+        target: &str,
+    ) -> Option<BrowserActionResult> {
+        // Fixed read-only probe. Never replay clicks, submits, or model-provided JavaScript.
+        let result = self
+            .run_named(
+                session,
+                &self.defaults,
+                "_navigation_probe",
+                &["eval".into(), READABLE_NAVIGATION_PROBE.into()],
+            )
+            .await
+            .ok()?;
+        readable_navigation_probe(target, &result.stdout)
+    }
+
     async fn run_named(
         &self,
         session: &BackendSessionHandle,
@@ -648,7 +669,12 @@ impl AgentBrowserBackend {
             executable,
         );
         remember_owned_browser_session(cli_session);
-        match run_command_with_timeout(cmd, DEFAULT_TIMEOUT_SECS).await {
+        let timeout_secs = if v1_action == "_navigation_probe" {
+            NAVIGATION_PROBE_TIMEOUT_SECS
+        } else {
+            DEFAULT_TIMEOUT_SECS
+        };
+        match run_command_with_timeout(cmd, timeout_secs).await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -658,7 +684,7 @@ impl AgentBrowserBackend {
                 BrowserErrorKind::Timeout,
                 self.id_value(),
                 format!(
-                    "BrowserCommandTimeout: requested_binary={} timeout_secs={DEFAULT_TIMEOUT_SECS}",
+                    "BrowserCommandTimeout: requested_binary={} timeout_secs={timeout_secs}. Browser startup or navigation timed out; this is not proof that network or shell access is forbidden.",
                     resolved.path.display()
                 ),
             )),
@@ -977,6 +1003,37 @@ fn action_result(output: String) -> BrowserActionResult {
     }
 }
 
+fn readable_navigation_probe(target: &str, stdout: &str) -> Option<BrowserActionResult> {
+    let envelope: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    if envelope.get("success")?.as_bool()? != true {
+        return None;
+    }
+    let data: serde_json::Value =
+        serde_json::from_str(envelope.get("data")?.get("result")?.as_str()?).ok()?;
+    let current = Url::parse(data.get("url")?.as_str()?).ok()?;
+    let requested = Url::parse(target).ok()?;
+    if current.origin() != requested.origin()
+        || current.path() != requested.path()
+        || current.query() != requested.query()
+        || !matches!(
+            data.get("readyState")?.as_str()?,
+            "interactive" | "complete"
+        )
+    {
+        return None;
+    }
+    let body = data.get("text")?.as_str()?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let title = data.get("title")?.as_str().unwrap_or_default();
+    Some(action_result(format!(
+        "Navigation warning: the load wait timed out, but the requested page is readable. Some resources may be incomplete; use snapshot for interactive controls.\nURL: {}\n--- BEGIN WEB CONTENT ---\nTitle: {title}\n{}\n--- END WEB CONTENT ---",
+        redact_secrets_in_text(current.as_str()),
+        body.chars().take(6000).collect::<String>()
+    )))
+}
+
 fn read_cli_args(outline: bool, filter: Option<&str>) -> Vec<String> {
     let mut args = vec!["read".into()];
     if outline {
@@ -1129,16 +1186,25 @@ impl BrowserBackend for AgentBrowserBackend {
         session: &BackendSessionHandle,
         req: &NavigateRequest,
     ) -> Result<BrowserActionResult, BrowserBackendError> {
-        let output = self
+        let result = self
             .run_named(
                 session,
                 &self.defaults,
                 "open",
                 &["open".into(), req.url.clone()],
             )
-            .await?
-            .output;
-        Ok(action_result(output))
+            .await;
+        match result {
+            Ok(result) => Ok(action_result(result.output)),
+            Err(err) if err.kind == BrowserErrorKind::Timeout => {
+                if let Some(readable) = self.readable_page_after_timeout(session, &req.url).await {
+                    Ok(readable)
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn observe(
@@ -1552,6 +1618,45 @@ mod tests {
         BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn navigation_timeout_probe_requires_readable_requested_page() {
+        let response = |url: &str, state: &str, text: &str| {
+            json!({
+                "success": true,
+                "data": {
+                    "result": json!({
+                        "url": url,
+                        "title": "Fixture",
+                        "readyState": state,
+                        "text": text
+                    })
+                    .to_string()
+                }
+            })
+            .to_string()
+        };
+        assert!(readable_navigation_probe(
+            "https://example.com/",
+            &response("https://example.com/", "complete", "readable")
+        )
+        .is_some());
+        assert!(readable_navigation_probe(
+            "https://example.com/",
+            &response("https://example.com/old", "complete", "stale page")
+        )
+        .is_none());
+        assert!(readable_navigation_probe(
+            "https://example.com/",
+            &response("https://example.com/", "loading", "not ready")
+        )
+        .is_none());
+        assert!(readable_navigation_probe(
+            "https://example.com/",
+            &response("chrome-error://chromewebdata/", "complete", "error")
+        )
+        .is_none());
+    }
 
     struct PassingExecutableProbe {
         calls: std::sync::atomic::AtomicUsize,

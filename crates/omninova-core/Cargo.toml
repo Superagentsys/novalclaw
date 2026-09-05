@@ -60,6 +60,7 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
 pdf-extract = "0.10.0"
+anydoc = "=0.2.4"
 serde_yaml = "0.9.34"
 qrcode.workspace = true
 ratatui = "0.29"

@@ -6,7 +6,7 @@ pub mod validation;
 
 pub use schema::{
     AgentConfig, AgentsIpcConfig, ArduinoConfig, AuditConfig, AudioConfig, AutonomyConfig,
-    BrowserConfig, CameraConfig, ChannelEntry, ChannelsConfig, ComposioConfig, Config,
+    BrowserConfig, CameraConfig, ChannelEntry, ChannelsConfig, ComposioConfig, ComputerUseConfig, Config,
     CoordinationConfig, CostConfig, CronConfig, CronJobConfig, DelegateAgentConfig, DriveConfig,
     EmbeddingConfig, EmbeddingRouteConfig, Esp32Config, EstopConfig, GatewayConfig,
     GatewayDingtalkConfig, GatewayPublicConfig, GatewayPublicMode, GoalLoopConfig, HardwareConfig,

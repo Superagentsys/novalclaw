@@ -16,6 +16,22 @@ pub use store::{
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn empty_collection_survives_reopen_rename_and_delete() {
+        let dir = std::env::temp_dir().join(format!("omninova-kb-categories-{}", uuid::Uuid::new_v4()));
+        let store = KnowledgeStore::open_in(&dir).await.unwrap();
+        store.update_collection("测试分类", None, false).await.unwrap();
+        let reopened = KnowledgeStore::open_in(&dir).await.unwrap();
+        assert!(reopened.collections().await.contains(&"测试分类".into()));
+        reopened.update_collection("测试分类", Some("新分类"), false).await.unwrap();
+        assert!(!reopened.collections().await.contains(&"测试分类".into()));
+        assert!(reopened.collections().await.contains(&"新分类".into()));
+        reopened.update_collection("新分类", None, true).await.unwrap();
+        assert_eq!(reopened.collections().await, vec!["default"]);
+        assert!(reopened.update_collection("default", None, true).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn splits_markdown_sections_and_long_paragraphs() {
         let text = "# Intro\n\nshort\n\n# Details\n\n".to_string() + &"word ".repeat(400);

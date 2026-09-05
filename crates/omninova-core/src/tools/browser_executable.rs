@@ -336,8 +336,18 @@ fn unavailable_error(
 }
 
 fn process_candidates(configured: Option<PathBuf>) -> Vec<BrowserExecutableCandidate> {
+    let environment = std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    process_candidates_with_environment(configured, environment)
+}
+
+fn process_candidates_with_environment(
+    configured: Option<PathBuf>,
+    environment: Option<PathBuf>,
+) -> Vec<BrowserExecutableCandidate> {
     let mut candidates = Vec::new();
-    if let Some(path) = configured {
+    if let Some(path) = configured.or(environment) {
         candidates.push(BrowserExecutableCandidate {
             path,
             source: BrowserExecutableSource::Configured,
@@ -604,7 +614,8 @@ mod tests {
         } else {
             PathBuf::from("/trusted/chrome")
         };
-        let configured_candidates = process_candidates(Some(configured.clone()));
+        let configured_candidates =
+            process_candidates_with_environment(Some(configured.clone()), None);
         assert_eq!(configured_candidates.len(), 1);
         assert_eq!(configured_candidates[0].path, configured);
         assert_eq!(
@@ -613,7 +624,7 @@ mod tests {
         );
         assert!(configured_candidates[0].explicit);
 
-        let automatic = process_candidates(None);
+        let automatic = process_candidates_with_environment(None, None);
         assert!(automatic.iter().all(|candidate| {
             !candidate
                 .path
@@ -645,5 +656,24 @@ executable_path = "C:/trusted/Chrome/chrome.exe"
             config.executable_path,
             Some(PathBuf::from("C:/trusted/Chrome/chrome.exe"))
         );
+    }
+
+    #[test]
+    fn trusted_config_precedes_environment_and_environment_is_fail_closed() {
+        let configured = PathBuf::from(r"C:\trusted\configured\chrome.exe");
+        let environment = PathBuf::from(r"C:\trusted\environment\chrome.exe");
+        let from_config = process_candidates_with_environment(
+            Some(configured.clone()),
+            Some(environment.clone()),
+        );
+        assert_eq!(from_config.len(), 1);
+        assert_eq!(from_config[0].path, configured);
+        assert!(from_config[0].explicit);
+
+        let from_environment =
+            process_candidates_with_environment(None, Some(environment.clone()));
+        assert_eq!(from_environment.len(), 1);
+        assert_eq!(from_environment[0].path, environment);
+        assert!(from_environment[0].explicit);
     }
 }

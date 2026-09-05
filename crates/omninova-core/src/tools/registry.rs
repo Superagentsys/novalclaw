@@ -13,10 +13,10 @@ use crate::tools::web_client::{
     WebToolSettings, DEFAULT_WEB_MAX_RESPONSE_BYTES, DEFAULT_WEB_REQUEST_TIMEOUT_SECS,
 };
 use crate::tools::{
-    BrowserTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool, FileReadTool,
-    FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool,
-    MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool, ShellTool,
-    TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
+    BrowserTool, ComputerUseTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool,
+    FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
+    KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool,
+    ShellTool, TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -414,6 +414,23 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             )))
         },
     },
+    ToolDef {
+        name: "computer_use",
+        capabilities: ToolCapabilities {
+            read_only: false,
+            writes: WriteScope::Workspace,
+            network: false,
+            spawns_process: true,
+        },
+        aliases: &["computer", "desktop_use", "os_use"],
+        enabled: |config| config.computer_use.enabled,
+        build: |ctx| {
+            Some(Box::new(ComputerUseTool::new(
+                ctx.workspace.to_path_buf(),
+                ctx.config.computer_use.clone(),
+            )))
+        },
+    },
 ];
 
 /// Tools attached outside the registry because they need a runtime handle the
@@ -680,12 +697,24 @@ mod tests {
         config.web_fetch.enabled = false;
         config.http_request.enabled = false;
         config.browser.enabled = false;
+        config.computer_use.enabled = false;
+        config.web_search.enabled = false;
 
         let names = built_names(&config, None);
 
         assert!(!contains(&names, "web_fetch"), "names={names:?}");
         assert!(!contains(&names, "http_request"), "names={names:?}");
         assert!(!contains(&names, "browser"), "names={names:?}");
+        assert!(!contains(&names, "computer_use"), "names={names:?}");
+        assert!(!contains(&names, "web_search"), "names={names:?}");
+    }
+
+    #[test]
+    fn computer_use_is_built_when_enabled() {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        let names = built_names(&config, None);
+        assert!(contains(&names, "computer_use"), "names={names:?}");
     }
 
     #[test]
@@ -753,6 +782,7 @@ mod tests {
             "file_patch",
             "git_operations",
             "browser",
+            "computer_use",
             "http_request",
         ] {
             assert!(
@@ -777,6 +807,7 @@ mod tests {
             "http_request",
             "web_search",
             "browser",
+            "computer_use",
             "todo_write",
             "task_checkpoint",
         ] {

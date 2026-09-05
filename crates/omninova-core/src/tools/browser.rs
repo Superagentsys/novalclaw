@@ -242,7 +242,8 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Control a real headless browser via the agent-browser CLI. Use ONLY for JavaScript-rendered \
          pages, login, clicks, forms, and typing. Do not use this to search the web (web_search), \
-         read static HTML (web_fetch), or call REST APIs (http_request). \
+         read static HTML (web_fetch), call REST APIs (http_request), or operate native OS apps \
+         (computer_use). \
          Need interactive page state and refs → snapshot. \
          Need document or long-form content → read. \
          Need specific element text → get_text. \
@@ -534,6 +535,33 @@ mod tests {
     use crate::tools::browser_output::parse_action_outcome;
     use crate::tools::browser_types::{BrowserErrorKind, BrowserHealth, V1_TOOL_ACTIONS};
     use serde_json::json;
+
+    #[tokio::test]
+    #[ignore = "requires installed browser runtime; manually run smoke test"]
+    async fn browser_live_smoke() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8;4096];
+                    let _ = stream.read(&mut request).await;
+                    let body = "<!doctype html><title>OmniNova Browser QA</title><h1>Browser working</h1><p>Independent test session.</p>";
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                });
+            }
+        });
+        let tool = BrowserTool::new(vec!["127.0.0.1".into()], true, false, None)
+            .with_session(format!("omninova-qa-{}",uuid::Uuid::new_v4().simple()));
+        let result = tool.execute(json!({"action":"open","url":format!("http://{addr}/")})).await.unwrap();
+        let snapshot = tool.execute(json!({"action":"snapshot","compact":true})).await.unwrap();
+        let _ = tool.execute(json!({"action":"close"})).await;
+        server.abort();
+        assert!(result.success, "{:?}", result.error);
+        assert!(snapshot.success && snapshot.output.contains("Browser working"), "{:?} {}",snapshot.error,snapshot.output);
+    }
 
     fn isolated_missing_search() -> BrowserBinarySearch {
         let root = std::env::temp_dir().join(format!(

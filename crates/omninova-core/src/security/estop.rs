@@ -69,6 +69,7 @@ impl EstopController {
             updated_at: Some(now_ts()),
         };
         self.save(&state).await?;
+        crate::computer_use::set_desktop_input_paused(true);
         Ok(state)
     }
 
@@ -85,6 +86,7 @@ impl EstopController {
             updated_at: Some(now_ts()),
         };
         self.save(&state).await?;
+        crate::computer_use::set_desktop_input_paused(false);
         Ok(state)
     }
 

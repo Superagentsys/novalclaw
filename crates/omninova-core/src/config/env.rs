@@ -162,6 +162,20 @@ pub fn apply_env_overrides(cfg: &mut Config) {
             cfg.web_search.brave_api_key = Some(v);
         }
     });
+    env_opt("OMNINOVA_WEB_FETCH_ENABLED", |v| {
+        cfg.web_fetch.enabled = v == "true" || v == "1";
+    });
+
+    env_opt("OMNINOVA_COMPUTER_USE_ENABLED", |v| {
+        cfg.computer_use.enabled = v == "true" || v == "1";
+    });
+    env_opt("OMNINOVA_COMPUTER_USE_ALLOWED_APPS", |v| {
+        cfg.computer_use.allowed_apps = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    });
 
     // --- Storage ---
     env_opt("OMNINOVA_STORAGE_PROVIDER", |v| {

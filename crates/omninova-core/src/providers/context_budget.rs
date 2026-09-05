@@ -36,6 +36,15 @@ pub const MAX_MAINTENANCE_PASSES: usize = 2;
 /// Cap for source text handed to the summarizer if the old prefix is huge.
 pub const MAX_SUMMARY_SOURCE_CHARS: usize = 200_000;
 
+/// Budget cost charged for one image part, independent of how many transport
+/// bytes its data URL carries.
+///
+/// A vision model bills an image by tiles, not by the base64 characters that
+/// happen to move it over the wire. A single 1280px desktop frame is roughly
+/// 250KB of base64, so counting those characters as text overstates one
+/// screenshot by about two orders of magnitude.
+pub const IMAGE_BUDGET_TOKENS: u64 = 1_024;
+
 /// Conservative per-tool-result soft cap used when no model context window is
 /// known. It is deliberately not a "context window": it only prevents a single
 /// oversized historical tool result from remaining fully model-visible when
@@ -379,8 +388,17 @@ impl TokenEstimator {
     /// Final request envelope estimate: serialize the actual native body and
     /// count it conservatively. This measures system/user/assistant/tool
     /// messages, tool schemas, and all model-visible fields in one step.
+    ///
+    /// Inline image payloads are charged at [`IMAGE_BUDGET_TOKENS`] each rather
+    /// than by their base64 length, which keeps this envelope estimate on the
+    /// same scale as [`Self::estimate_messages_with_tools`]. Measuring the two
+    /// differently let proactive maintenance see a harmless context while C1
+    /// blocked the very same request.
     pub fn estimate_request(&self, body: &str) -> u64 {
-        self.estimate_text(body) + 8
+        let (text, images) = strip_inline_image_payloads(body);
+        self.estimate_text(&text)
+            .saturating_add(images.saturating_mul(IMAGE_BUDGET_TOKENS))
+            .saturating_add(8)
     }
 
     /// Estimate an Agent context candidate: all messages plus tool schemas.
@@ -395,7 +413,8 @@ impl TokenEstimator {
         for message in messages {
             total = total.saturating_add(self.estimate_text(&message.content));
             if let Some(images) = &message.images {
-                total = total.saturating_add((images.len() as u64).saturating_mul(1_024));
+                total = total
+                    .saturating_add((images.len() as u64).saturating_mul(IMAGE_BUDGET_TOKENS));
             }
         }
         for tool in tools {
@@ -404,6 +423,32 @@ impl TokenEstimator {
         }
         total.saturating_add(8)
     }
+}
+
+/// Removes inline `data:` image payloads from a serialized request body and
+/// reports how many were found, so the caller can charge each one a fixed
+/// budget cost instead of its transport length.
+///
+/// Base64 inside a JSON string needs no escaping, so each payload runs from the
+/// `data:` scheme to the closing quote. Bodies without an inline image are
+/// returned untouched.
+fn strip_inline_image_payloads(body: &str) -> (std::borrow::Cow<'_, str>, u64) {
+    const SCHEME: &str = "data:image/";
+    if !body.contains(SCHEME) {
+        return (std::borrow::Cow::Borrowed(body), 0);
+    }
+    let mut kept = String::with_capacity(body.len());
+    let mut images = 0u64;
+    let mut rest = body;
+    while let Some(start) = rest.find(SCHEME) {
+        kept.push_str(&rest[..start]);
+        let payload = &rest[start..];
+        let end = payload.find('"').unwrap_or(payload.len());
+        images += 1;
+        rest = &payload[end..];
+    }
+    kept.push_str(rest);
+    (std::borrow::Cow::Owned(kept), images)
 }
 
 /// Returns the largest estimated tool-result payload currently present in the
@@ -664,6 +709,67 @@ mod tests {
         assert_eq!(budget.model_max_output_tokens, None);
         assert_eq!(budget.output_reserve_tokens, 32_000);
         assert_eq!(budget.max_input_tokens, 1_000_000 - 32_000 - 32_768);
+    }
+
+    #[test]
+    fn a_desktop_frame_costs_a_fixed_image_budget_not_its_base64_length() {
+        let estimator = TokenEstimator::new();
+        // A 1280px screenshot is roughly this much base64.
+        let payload = "A".repeat(250_000);
+        let body =
+            format!(r#"{{"messages":[{{"image_url":{{"url":"data:image/jpeg;base64,{payload}"}}}}]}}"#);
+
+        let estimated = estimator.estimate_request(&body);
+
+        assert!(
+            estimated < 4 * IMAGE_BUDGET_TOKENS,
+            "one frame must not be billed by transport length: {estimated}"
+        );
+        let budget = ContextBudget::new(128_000, Some(8_192), ContextBudgetSource::ExplicitConfig);
+        assert!(
+            estimated <= budget.max_input_tokens,
+            "a single screenshot must not trip the preflight on a 128K model"
+        );
+    }
+
+    #[test]
+    fn request_and_candidate_estimates_agree_on_image_cost() {
+        let estimator = TokenEstimator::new();
+        let payload = "A".repeat(250_000);
+        let messages = vec![ChatMessage::user_with_images(
+            "look",
+            vec![format!("data:image/jpeg;base64,{payload}")],
+        )];
+        let body = crate::providers::native_request::native_context_view_json(&messages, &[]);
+
+        let candidate = estimator.estimate_messages_with_tools(&messages, &[]);
+        let request = estimator.estimate_request(&body);
+
+        // Proactive maintenance measures the candidate while C1 measures the
+        // envelope. When those disagreed, maintenance saw a healthy context and
+        // C1 still blocked the identical request.
+        assert!(
+            request.abs_diff(candidate) < IMAGE_BUDGET_TOKENS,
+            "candidate={candidate} request={request}"
+        );
+    }
+
+    #[test]
+    fn every_inline_image_payload_is_counted_and_removed() {
+        let body = r#"[{"url":"data:image/jpeg;base64,AAAA"},{"url":"data:image/png;base64,BBBB"},{"text":"plain"}]"#;
+
+        let (text, images) = strip_inline_image_payloads(body);
+
+        assert_eq!(images, 2);
+        assert!(!text.contains("AAAA") && !text.contains("BBBB"));
+        assert!(text.contains("plain"), "surrounding JSON must survive: {text}");
+    }
+
+    #[test]
+    fn bodies_without_images_are_not_reallocated() {
+        let (text, images) = strip_inline_image_payloads(r#"{"content":"no pictures here"}"#);
+        assert_eq!(images, 0);
+        assert!(matches!(text, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

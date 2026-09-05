@@ -36,9 +36,15 @@ const PROVIDER_TRANSPORT_OPTIONS: { value: ProviderTransportMode; label: string 
 function isLocalProvider(provider: ProviderConfig): boolean {
   const preset = PROVIDER_PRESETS.find((item) => item.id === provider.id);
   if (preset) return preset.category === "local";
-  return ["ollama", "lmstudio", "vllm", "sglang", "llamacpp", "local"].includes(
-    provider.type
-  );
+  return [
+    "ollama",
+    "lmstudio",
+    "omnirun",
+    "vllm",
+    "sglang",
+    "llamacpp",
+    "local",
+  ].includes(provider.type);
 }
 
 function slugifyProviderId(name: string, existing: string[]): string {

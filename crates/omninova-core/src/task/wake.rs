@@ -52,7 +52,7 @@ pub fn prepare_wake(task: &mut Task) -> WakeDecision {
         task.checkpoint.next.join("；")
     };
     let prompt = format!(
-        "{}\n{}\n\n目标：{}\n上一检查点：{}\n已完成：{}\n下一步：{}\n证据：{}\n阻塞：{}\n\n本回合最多做一小段工作（大约十几步工具）。结束前必须调用 task_checkpoint，status 为 continue、complete 或 blocked。不要声称全部完成除非目标已达成。",
+        "{}\n{}\n\n目标：{}\n上一检查点：{}\n已完成：{}\n下一步：{}\n证据：{}\n阻塞：{}\n\n本回合最多做一小段工作（大约十几步工具）。结束前必须调用 task_checkpoint，status 为 continue、complete 或 blocked。不要声称全部完成除非目标已达成。若这是桌面操作任务：先 computer_use screenshot，对照上一张证据图，网页用 browser。",
         crate::agent::history::TASK_MARKER,
         crate::agent::history::CHECKPOINT_MARKER,
         task.goal,

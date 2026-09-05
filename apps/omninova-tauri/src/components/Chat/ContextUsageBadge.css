@@ -9,7 +9,7 @@
   width: max-content;
   min-width: 0;
   min-height: 28px;
-  max-width: min(250px, 30vw);
+  max-width: min(280px, 42vw);
   align-items: center;
   gap: 5px;
   padding: 2px 6px;

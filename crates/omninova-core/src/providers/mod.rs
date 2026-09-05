@@ -28,3 +28,13 @@ pub use model_capabilities::{
     resolve_model_capabilities, ModelCapabilities, ProviderCountApiKind, TokenMeasurement,
     TokenStrategy,
 };
+
+/// Whether a provider takes images as OpenAI-style `image_url` content parts.
+/// Anthropic and Gemini need their own encodings, so callers must not attach
+/// screenshots for them. An unnamed provider is assumed OpenAI-compatible.
+pub fn provider_accepts_openai_images(provider: Option<&str>) -> bool {
+    let Some(name) = provider.map(str::to_ascii_lowercase) else {
+        return true;
+    };
+    !matches!(name.as_str(), "anthropic" | "gemini" | "mock")
+}

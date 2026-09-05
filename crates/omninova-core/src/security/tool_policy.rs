@@ -172,6 +172,10 @@ pub fn evaluate_tool_call(
         return ToolPolicyDecision::Allow;
     }
 
+    if computer_use_action_is_observe(tool_name, arguments) {
+        return ToolPolicyDecision::Allow;
+    }
+
     if is_tool_auto_approved(config, tool_name) {
         return ToolPolicyDecision::Allow;
     }
@@ -228,6 +232,20 @@ fn is_high_risk_tool(tool_name: &str) -> bool {
 
 fn is_read_only_workspace_tool(tool_name: &str) -> bool {
     capabilities_or_unknown(tool_name).is_read_only_workspace()
+}
+
+fn computer_use_action_is_observe(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    if !tool_name.eq_ignore_ascii_case("computer_use")
+        && !tool_name.eq_ignore_ascii_case("computer")
+        && !tool_name.eq_ignore_ascii_case("desktop_use")
+        && !tool_name.eq_ignore_ascii_case("os_use")
+    {
+        return false;
+    }
+    arguments
+        .get("action")
+        .and_then(|value| value.as_str())
+        .is_some_and(crate::computer_use::is_observe_action)
 }
 
 fn git_operation_is_read_only(arguments: &serde_json::Value) -> bool {
@@ -333,6 +351,51 @@ mod tests {
                 "git {operation} should be read-only and allowed"
             );
         }
+    }
+
+    #[test]
+    fn computer_use_screenshot_is_allowed_without_approval() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "screenshot"}),
+        );
+        assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[test]
+    fn computer_use_snapshot_is_allowed_without_approval() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "snapshot"}),
+        );
+        assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[test]
+    fn computer_use_click_requires_approval_under_supervised() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "click", "x": 10, "y": 10}),
+        );
+        assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
     }
 
     #[test]
