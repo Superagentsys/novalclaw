@@ -1,5 +1,5 @@
 use super::catalog::{
-    list_skill_catalog, normalize_skill_id, source_badge_label, SKILL_ID_PREFIX, SYSTEM_ID_PREFIX,
+    cached_skill_catalog, normalize_skill_id, source_badge_label, SKILL_ID_PREFIX, SYSTEM_ID_PREFIX,
 };
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ pub fn system_command_items() -> Vec<CommandPaletteItem> {
 }
 
 pub fn list_command_palette(config: &Config) -> CommandPalette {
-    let catalog = list_skill_catalog(config);
+    let catalog = cached_skill_catalog(config);
     let skills = if !catalog.open_skills_enabled {
         Vec::new()
     } else {

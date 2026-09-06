@@ -1731,12 +1731,27 @@ fn default_open_skills_enabled() -> bool {
     DEFAULT_OPEN_SKILLS_ENABLED
 }
 
+fn default_catalog_prompt_limit() -> usize {
+    crate::skills::catalog::DEFAULT_CATALOG_PROMPT_LIMIT
+}
+
+fn default_catalog_description_limit() -> usize {
+    crate::skills::catalog::DEFAULT_CATALOG_DESCRIPTION_LIMIT
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsConfig {
     #[serde(default = "default_open_skills_enabled")]
     pub open_skills_enabled: bool,
     pub open_skills_dir: Option<String>,
     pub prompt_injection_mode: Option<String>,
+    /// Entries inlined into the system prompt; 0 = unlimited. Entries past the
+    /// cap remain reachable through `use_skill`'s `query` search.
+    #[serde(default = "default_catalog_prompt_limit")]
+    pub catalog_prompt_limit: usize,
+    /// Per-entry description characters in the system prompt; 0 = unlimited.
+    #[serde(default = "default_catalog_description_limit")]
+    pub catalog_description_limit: usize,
 }
 
 impl Default for SkillsConfig {
@@ -1745,6 +1760,8 @@ impl Default for SkillsConfig {
             open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
             open_skills_dir: None,
             prompt_injection_mode: None,
+            catalog_prompt_limit: default_catalog_prompt_limit(),
+            catalog_description_limit: default_catalog_description_limit(),
         }
     }
 }

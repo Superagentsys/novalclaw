@@ -19,7 +19,8 @@ pub use activation::{
     SkillInvocation, SkillRuntimePromptResult,
 };
 pub use catalog::{
-    estimate_prompt_tokens, is_safe_skill_locator, list_skill_catalog, normalize_skill_id,
+    cached_skill_catalog, estimate_prompt_tokens, invalidate_skill_catalog_cache,
+    is_safe_skill_locator, list_skill_catalog, normalize_skill_id, search_skill_catalog,
     source_badge_label, SkillCatalog, SkillCatalogEntry, SkillResource, MAX_ACTIVE_SKILLS,
 };
 pub use commands::{

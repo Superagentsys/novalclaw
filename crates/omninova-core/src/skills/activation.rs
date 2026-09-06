@@ -1,6 +1,6 @@
 use super::catalog::{
-    catalog_prompt_section, is_safe_skill_locator, list_skill_catalog, load_skill_instructions,
-    normalize_skill_id, SkillCatalogEntry, MAX_ACTIVE_SKILLS,
+    cached_skill_catalog, catalog_prompt_section_with_limits, is_safe_skill_locator,
+    load_skill_instructions, normalize_skill_id, SkillCatalogEntry, MAX_ACTIVE_SKILLS,
 };
 use super::prompt::{parse_skill_prompt, SkillPromptValidation};
 use crate::config::Config;
@@ -72,7 +72,7 @@ pub fn resolve_skill_from_store(
     if !is_safe_skill_locator(skill_id) {
         return Err("unknown skill".to_string());
     }
-    let catalog = list_skill_catalog(config);
+    let catalog = cached_skill_catalog(config);
     let Some(entry) = catalog.get(skill_id).cloned() else {
         return Err("unknown skill".to_string());
     };
@@ -140,8 +140,12 @@ pub fn apply_skill_runtime_prompt(
     if !config.skills.open_skills_enabled {
         return SkillRuntimePromptResult::default();
     }
-    let catalog = list_skill_catalog(config);
-    let catalog_section = catalog_prompt_section(&catalog);
+    let catalog = cached_skill_catalog(config);
+    let catalog_section = catalog_prompt_section_with_limits(
+        &catalog,
+        config.skills.catalog_prompt_limit,
+        config.skills.catalog_description_limit,
+    );
     let mut activated = Vec::new();
     let mut errors = Vec::new();
     for invocation in invocations.iter().take(MAX_ACTIVE_SKILLS) {
