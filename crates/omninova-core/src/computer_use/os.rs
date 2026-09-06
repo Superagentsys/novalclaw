@@ -39,11 +39,16 @@ impl DesktopDriver for OsDesktopDriver {
 }
 
 fn capture_png(dest: &Path) -> Result<(u32, u32), String> {
-    if let Ok(dims) = capture_via_screenshots_crate(dest) {
-        return Ok(dims);
+    let primary = match capture_via_screenshots_crate(dest) {
+        Ok(dims) => return Ok(dims),
+        Err(error) => error,
+    };
+    // Keep the primary error: on Windows the fallback is a stub, so dropping
+    // it would report "fallback unavailable" and hide the real cause.
+    match capture_via_os_tool(dest) {
+        Ok(()) => png_dimensions(dest),
+        Err(fallback) => Err(format!("{fallback}（底层错误：{primary}）")),
     }
-    capture_via_os_tool(dest)?;
-    png_dimensions(dest)
 }
 
 fn capture_via_screenshots_crate(dest: &Path) -> Result<(u32, u32), String> {
@@ -114,7 +119,10 @@ fn capture_via_os_tool(dest: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn capture_via_os_tool(_dest: &Path) -> Result<(), String> {
-    Err("Windows screenshot fallback unavailable; screenshots crate failed".into())
+    // Capture goes through the cross-platform path (DXGI/GDI); there is no
+    // second Windows route worth shelling out to. Explain what breaks it.
+    Err("Windows 截图失败：需要有交互式桌面会话。以服务/计划任务方式运行、\
+锁屏或 RDP 会话断开时都拿不到画面。".into())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
