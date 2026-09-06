@@ -5697,8 +5697,10 @@ pub fn run() {
         }
     }
 
+    let gateway_runtime = GatewayRuntime::new(config);
+    let personal_chrome_runtime = gateway_runtime.clone();
     let state = Arc::new(Mutex::new(AppState {
-        runtime: GatewayRuntime::new(config),
+        runtime: gateway_runtime,
         gateway_task: None,
         last_gateway_started_at: None,
         last_gateway_error: None,
@@ -5802,7 +5804,7 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             configure_embedded_agent_browser_env(app.handle());
 
             let app_data_dir = app
@@ -5818,6 +5820,14 @@ pub fn run() {
                     format!("personal chrome transport: {}", error.code()),
                 )
             })?;
+            personal_chrome_runtime
+                .install_personal_chrome_bridge(bridge.clone())
+                .map_err(|code| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("personal chrome runtime bridge: {code}"),
+                    )
+                })?;
             app.manage(bridge);
             let webview_user_data_dir = resolve_webview_user_data_dir();
             std::fs::create_dir_all(&webview_user_data_dir).map_err(|error| {

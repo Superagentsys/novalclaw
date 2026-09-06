@@ -32,6 +32,9 @@ pub(crate) struct AssembledAgent {
 pub(crate) struct AgentAssemblyRequest<'a> {
     pub route: &'a RouteDecision,
     pub channel: &'a ChannelKind,
+    /// Exact active Agent run identity. Non-executing projection/enumeration
+    /// callers leave this unset, so Personal Chrome cannot be authorized.
+    pub run_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub workspace: &'a Path,
     pub spawn_depth: u32,
@@ -58,12 +61,14 @@ impl GatewayRuntime {
 
         let memory = self.memory().await;
         let browser_takeover_slot = Arc::new(Mutex::new(None));
+        let personal_chrome = self.personal_chrome_factory_context(request.run_id);
         let mut tools = build_tools(&ToolBuildContext {
             config: cfg,
             workspace: request.workspace,
             memory: Some(&memory),
             session_id: request.session_id,
             browser_takeover_slot: Some(&browser_takeover_slot),
+            personal_chrome: personal_chrome.as_ref(),
         });
         apply_agent_tool_allowlist(cfg, agent_name, &mut tools);
 

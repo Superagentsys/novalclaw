@@ -48,6 +48,30 @@ pub struct AuthorizedTab {
     pub authorization_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonalChromeAuthorizationError {
+    TransportUnavailable,
+    ProtocolMismatch,
+    NotAuthorized,
+    TabUnavailable,
+}
+
+/// Run-scoped Desktop authorization. Production backends retain this handle
+/// and re-read it before attach, health checks, and every page operation so a
+/// revoke or run cleanup takes effect without rebuilding the backend.
+#[async_trait]
+pub trait PersonalChromeAuthorizationProvider: Send + Sync {
+    async fn current_grant(
+        &self,
+    ) -> Result<AuthorizedTab, PersonalChromeAuthorizationError>;
+}
+
+#[derive(Clone)]
+pub struct PersonalChromeFactoryContext {
+    pub bridge: omninova_browser_host::PersonalChromeBridge,
+    pub authorization: Arc<dyn PersonalChromeAuthorizationProvider>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersonalTransportView {
     pub connected: bool,
@@ -93,6 +117,7 @@ struct BoundSession {
 
 pub struct PersonalChromeBackend {
     port: Arc<dyn PersonalChromePort>,
+    authorization: Option<Arc<dyn PersonalChromeAuthorizationProvider>>,
     sessions: Mutex<HashMap<String, BoundSession>>,
     keys: Mutex<HashMap<String, String>>,
 }
@@ -101,6 +126,7 @@ impl PersonalChromeBackend {
     pub fn new(port: Arc<dyn PersonalChromePort>) -> Self {
         Self {
             port,
+            authorization: None,
             sessions: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
         }
@@ -108,6 +134,27 @@ impl PersonalChromeBackend {
 
     pub fn from_bridge(bridge: omninova_browser_host::PersonalChromeBridge) -> Self {
         Self::new(Arc::new(BridgePersonalChromePort { bridge }))
+    }
+
+    pub fn from_authorized_factory(context: PersonalChromeFactoryContext) -> Self {
+        Self::new_authorized(
+            Arc::new(BridgePersonalChromePort {
+                bridge: context.bridge,
+            }),
+            context.authorization,
+        )
+    }
+
+    pub(crate) fn new_authorized(
+        port: Arc<dyn PersonalChromePort>,
+        authorization: Arc<dyn PersonalChromeAuthorizationProvider>,
+    ) -> Self {
+        Self {
+            port,
+            authorization: Some(authorization),
+            sessions: Mutex::new(HashMap::new()),
+            keys: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn grant_test_authorization(
@@ -282,6 +329,54 @@ impl PersonalChromeBackend {
             ));
         }
         Ok(view)
+    }
+
+    async fn require_run_authorization(&self) -> Result<Option<AuthorizedTab>, BrowserBackendError> {
+        let Some(provider) = &self.authorization else {
+            return Ok(None);
+        };
+        provider.current_grant().await.map(Some).map_err(|error| match error {
+            PersonalChromeAuthorizationError::TransportUnavailable => Self::fail(
+                BrowserErrorKind::NotConnected,
+                PERSONAL_CHROME_UNAVAILABLE,
+                "Personal Chrome transport is unavailable",
+            ),
+            PersonalChromeAuthorizationError::ProtocolMismatch => Self::fail(
+                BrowserErrorKind::Rejected,
+                PROTOCOL_MISMATCH,
+                "extension protocol version is incompatible",
+            ),
+            PersonalChromeAuthorizationError::NotAuthorized => Self::fail(
+                BrowserErrorKind::Rejected,
+                PERSONAL_CHROME_NOT_AUTHORIZED,
+                "the exact active Agent run is not authorized",
+            ),
+            PersonalChromeAuthorizationError::TabUnavailable => Self::fail(
+                BrowserErrorKind::SessionNotFound,
+                TAB_UNAVAILABLE,
+                "the authorized tab is unavailable",
+            ),
+        })
+    }
+
+    async fn validate_bound_authorization(
+        &self,
+        bound: &BoundSession,
+    ) -> Result<(), BrowserBackendError> {
+        let Some(grant) = self.require_run_authorization().await? else {
+            return Ok(());
+        };
+        if grant.window_id != bound.window_id
+            || grant.tab_id != bound.tab_id
+            || grant.authorization_generation != bound.authorization_generation
+        {
+            return Err(Self::fail(
+                BrowserErrorKind::Rejected,
+                PERSONAL_CHROME_NOT_AUTHORIZED,
+                "the extension grant no longer matches this Agent run",
+            ));
+        }
+        Ok(())
     }
 
     fn lookup<'a>(
@@ -461,41 +556,60 @@ impl BrowserBackend for PersonalChromeBackend {
         req: &BrowserSessionOpenRequest,
     ) -> Result<BackendSessionHandle, BrowserBackendError> {
         self.reject_launch_options(req)?;
-        if let Some(token) = self.keys.lock().expect("keys").get(req.key.as_str()).cloned() {
-            if self.sessions.lock().expect("sessions").contains_key(&token) {
+        let existing_token = {
+            self.keys
+                .lock()
+                .expect("keys")
+                .get(req.key.as_str())
+                .cloned()
+        };
+        if let Some(token) = existing_token {
+            let bound = self.sessions.lock().expect("sessions").get(&token).cloned();
+            if let Some(bound) = bound {
+                self.validate_bound_authorization(&bound).await?;
                 return BackendSessionHandle::new(Self::id_value(), token).map_err(|err| {
                     Self::fail(BrowserErrorKind::Rejected, PERSONAL_CHROME_UNAVAILABLE, err.to_string())
                 });
             }
         }
         let view = self.require_transport().await?;
-        let listed = self.rpc("", "tab_list_authorized", json!({})).await?;
-        let tabs = listed
-            .get("tabs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if tabs.is_empty() {
-            return Err(Self::fail(
-                BrowserErrorKind::Rejected,
-                PERSONAL_CHROME_NOT_AUTHORIZED,
-                "no authorized tab; backend cannot attach",
-            ));
-        }
-        if tabs.len() != 1 {
-            return Err(Self::fail(
-                BrowserErrorKind::Rejected,
-                PERSONAL_CHROME_NOT_AUTHORIZED,
-                "exactly one authorized tab is required to attach",
-            ));
-        }
-        let tab = &tabs[0];
-        let window_id = tab.get("window_id").and_then(Value::as_i64).unwrap_or(0) as i32;
-        let tab_id = tab.get("tab_id").and_then(Value::as_i64).unwrap_or(0) as i32;
-        let authorization_generation = tab
-            .get("authorization_generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let (window_id, tab_id, authorization_generation) =
+            if let Some(grant) = self.require_run_authorization().await? {
+                (
+                    grant.window_id,
+                    grant.tab_id,
+                    grant.authorization_generation,
+                )
+            } else {
+                let listed = self.rpc("", "tab_list_authorized", json!({})).await?;
+                let tabs = listed
+                    .get("tabs")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if tabs.is_empty() {
+                    return Err(Self::fail(
+                        BrowserErrorKind::Rejected,
+                        PERSONAL_CHROME_NOT_AUTHORIZED,
+                        "no authorized tab; backend cannot attach",
+                    ));
+                }
+                if tabs.len() != 1 {
+                    return Err(Self::fail(
+                        BrowserErrorKind::Rejected,
+                        PERSONAL_CHROME_NOT_AUTHORIZED,
+                        "exactly one authorized tab is required to attach",
+                    ));
+                }
+                let tab = &tabs[0];
+                (
+                    tab.get("window_id").and_then(Value::as_i64).unwrap_or(0) as i32,
+                    tab.get("tab_id").and_then(Value::as_i64).unwrap_or(0) as i32,
+                    tab.get("authorization_generation")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+            };
         let attached = self
             .rpc(
                 "",
@@ -573,6 +687,12 @@ impl BrowserBackend for PersonalChromeBackend {
                 detail: format!("{PROTOCOL_MISMATCH}: extension generation changed"),
             };
         }
+        if let Err(err) = self.validate_bound_authorization(&bound).await {
+            return BrowserHealth::Unhealthy {
+                kind: err.kind,
+                detail: err.detail,
+            };
+        }
         match self
             .rpc(
                 &bound.token,
@@ -626,6 +746,7 @@ impl BrowserBackend for PersonalChromeBackend {
             let sessions = self.sessions.lock().expect("sessions");
             Self::lookup(&sessions, session)?.clone()
         };
+        self.validate_bound_authorization(&bound).await?;
         let payload = self
             .rpc(
                 &bound.token,
@@ -662,6 +783,7 @@ impl BrowserBackend for PersonalChromeBackend {
             let sessions = self.sessions.lock().expect("sessions");
             Self::lookup(&sessions, session)?.clone()
         };
+        self.validate_bound_authorization(&bound).await?;
         let mut payload = json!({
             "window_id": bound.window_id,
             "tab_id": bound.tab_id,
@@ -699,6 +821,7 @@ impl BrowserBackend for PersonalChromeBackend {
             let sessions = self.sessions.lock().expect("sessions");
             Self::lookup(&sessions, session)?.clone()
         };
+        self.validate_bound_authorization(&bound).await?;
         let mut payload = json!({
             "window_id": bound.window_id,
             "tab_id": bound.tab_id,
@@ -804,6 +927,7 @@ impl BrowserBackend for PersonalChromeBackend {
             let sessions = self.sessions.lock().expect("sessions");
             Self::lookup(&sessions, session)?.clone()
         };
+        self.validate_bound_authorization(&bound).await?;
         let listed = self
             .rpc(
                 &bound.token,
@@ -1438,6 +1562,105 @@ mod tests {
         let backend = PersonalChromeBackend::new(port.clone());
         backend.grant_test_authorization(1, 11).await.unwrap();
         (backend, port)
+    }
+
+    struct MutableAuthorization {
+        grant: Mutex<Result<AuthorizedTab, PersonalChromeAuthorizationError>>,
+    }
+
+    #[async_trait]
+    impl PersonalChromeAuthorizationProvider for MutableAuthorization {
+        async fn current_grant(
+            &self,
+        ) -> Result<AuthorizedTab, PersonalChromeAuthorizationError> {
+            self.grant.lock().expect("authorization").clone()
+        }
+    }
+
+    async fn run_authorized_backend() -> (
+        PersonalChromeBackend,
+        Arc<MockPersonalChromePort>,
+        Arc<MutableAuthorization>,
+    ) {
+        let port = MockPersonalChromePort::connected_fixture();
+        PersonalChromeBackend::new(port.clone())
+            .grant_test_authorization(1, 11)
+            .await
+            .unwrap();
+        let extension_generation = port
+            .inner
+            .lock()
+            .expect("mock")
+            .authorized
+            .get(&11)
+            .expect("authorized tab")
+            .authorization_generation;
+        let authorization = Arc::new(MutableAuthorization {
+            grant: Mutex::new(Ok(AuthorizedTab {
+                window_id: 1,
+                tab_id: 11,
+                authorization_generation: extension_generation,
+            })),
+        });
+        let backend = PersonalChromeBackend::new_authorized(
+            port.clone(),
+            authorization.clone(),
+        );
+        (backend, port, authorization)
+    }
+
+    #[tokio::test]
+    async fn production_authorization_is_revalidated_after_attach() {
+        let (backend, port, authorization) = run_authorized_backend().await;
+        let session = backend.open_session(&open_req("run-scoped")).await.unwrap();
+        assert!(matches!(
+            backend.session_health(&session).await,
+            BrowserHealth::Healthy
+        ));
+
+        *authorization.grant.lock().expect("authorization") =
+            Err(PersonalChromeAuthorizationError::NotAuthorized);
+        assert!(matches!(
+            backend.session_health(&session).await,
+            BrowserHealth::Unhealthy {
+                kind: BrowserErrorKind::Rejected,
+                ..
+            }
+        ));
+        let err = backend
+            .act(
+                &session,
+                &BrowserAction::Click {
+                    target: BrowserTarget::Css("#go".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.detail.contains(PERSONAL_CHROME_NOT_AUTHORIZED));
+        assert!(port.chrome_alive());
+    }
+
+    #[tokio::test]
+    async fn mismatched_run_grant_cannot_attach_or_reuse_a_session() {
+        let (backend, _, authorization) = run_authorized_backend().await;
+        let session = backend.open_session(&open_req("exact-run")).await.unwrap();
+        let previous = authorization
+            .grant
+            .lock()
+            .expect("authorization")
+            .as_ref()
+            .unwrap()
+            .clone();
+        *authorization.grant.lock().expect("authorization") = Ok(AuthorizedTab {
+            authorization_generation: previous.authorization_generation.saturating_add(1),
+            ..previous
+        });
+        let err = backend.open_session(&open_req("exact-run")).await.unwrap_err();
+        assert!(err.detail.contains(PERSONAL_CHROME_NOT_AUTHORIZED));
+        assert!(matches!(
+            backend.session_health(&session).await,
+            BrowserHealth::Unhealthy { .. }
+        ));
     }
 
     #[test]

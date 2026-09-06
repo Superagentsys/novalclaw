@@ -1308,6 +1308,40 @@ pub fn backend_from_config_with_executable(
     defaults: BrowserSessionOptions,
     executable_path: Option<PathBuf>,
 ) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_executable_and_personal_chrome(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        None,
+    )
+}
+
+pub fn backend_from_config_with_executable_and_personal_chrome(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_factory_gate(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        personal_chrome,
+        crate::tools::browser_personal_chrome::personal_chrome_production_enabled(),
+    )
+}
+
+fn backend_from_config_with_factory_gate(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+    personal_chrome_release_enabled: bool,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
     let trimmed = backend_name.trim();
     let id = planned_backend_id_from_config(Some(trimmed))?;
     if id == BrowserBackendId::agent_browser() {
@@ -1324,10 +1358,24 @@ pub fn backend_from_config_with_executable(
         )));
     }
     if id == BrowserBackendId::personal_chrome() {
-        return Err(BrowserBackendError::new(
-            BrowserErrorKind::Rejected,
-            id,
-            "BrowserBackendUnsupported: personal-chrome production activation is blocked until B3.5-D authorization UX; extension install alone does not grant Agent control",
+        if !personal_chrome_release_enabled {
+            return Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                id,
+                "BrowserBackendUnsupported: personal-chrome authorization release gate is closed",
+            ));
+        }
+        let context = personal_chrome.ok_or_else(|| {
+            BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                id.clone(),
+                "PersonalChromeNotAuthorized: no exact active-run authorization provider",
+            )
+        })?;
+        return Ok(Arc::new(
+            crate::tools::browser_personal_chrome::PersonalChromeBackend::from_authorized_factory(
+                context,
+            ),
         ));
     }
     Err(BrowserBackendError::new(
@@ -1348,6 +1396,7 @@ pub fn browser_backend_enabled(configured_enabled: bool, backend_name: &str) -> 
                 crate::tools::browser_bin::agent_browser_runtime_available(),
             )
         }
+        Ok(id) if id == BrowserBackendId::personal_chrome() => true,
         _ => false,
     }
 }
@@ -2465,6 +2514,23 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.detail.contains("BrowserBackendUnsupported"));
+    }
+
+    #[test]
+    fn personal_chrome_factory_requires_exact_run_authorization_context() {
+        let err = match backend_from_config_with_factory_gate(
+            "personal-chrome",
+            None,
+            BrowserSessionOptions::default(),
+            None,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("personal-chrome must not construct without run authorization"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        assert!(err.detail.contains("PersonalChromeNotAuthorized"));
     }
 
     #[test]

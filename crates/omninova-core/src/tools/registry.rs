@@ -140,6 +140,10 @@ pub struct ToolBuildContext<'a> {
     /// by this toolset. Enumeration callers leave it unset.
     pub browser_takeover_slot:
         Option<&'a Arc<std::sync::Mutex<Option<crate::tools::browser_runtime::BrowserTakeoverHandle>>>>,
+    /// Exact active-run Personal Chrome authorization. Enumeration and
+    /// non-run callers leave this unset, keeping Personal Chrome fail-closed.
+    pub personal_chrome:
+        Option<&'a crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
 }
 
 /// One row of the registry.
@@ -412,11 +416,12 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 profile,
                 installed_profile,
             };
-            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable(
+            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable_and_personal_chrome(
                 &ctx.config.browser.backend,
                 None,
                 session_opts.clone(),
                 ctx.config.browser.executable_path.clone(),
+                ctx.personal_chrome.cloned(),
             ) {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -556,6 +561,7 @@ mod tests {
             memory,
             session_id: None,
             browser_takeover_slot: None,
+            personal_chrome: None,
         })
         .iter()
         .map(|tool| tool.name().to_string())
@@ -637,6 +643,7 @@ mod tests {
                 memory: Some(&memory),
                 session_id: session,
                 browser_takeover_slot: None,
+                personal_chrome: None,
             });
             let browser = tools
                 .iter_mut()
@@ -729,6 +736,7 @@ mod tests {
             memory: Some(&memory),
             session_id: Some("takeover-session"),
             browser_takeover_slot: Some(&slot),
+            personal_chrome: None,
         });
         let handle = slot
             .lock()

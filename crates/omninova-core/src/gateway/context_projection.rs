@@ -218,6 +218,7 @@ impl GatewayRuntime {
         let assembly_request = AgentAssemblyRequest {
             route: &route,
             channel,
+            run_id: None,
             session_id: Some(session_id),
             workspace: &workspace,
             spawn_depth: 0,
