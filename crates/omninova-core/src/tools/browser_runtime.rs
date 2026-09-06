@@ -96,6 +96,86 @@ pub struct BrowserRuntime {
     control: Arc<BrowserControlRegistry>,
 }
 
+/// Minimal, backend-neutral control surface retained by an active Agent run.
+///
+/// The handle intentionally exposes neither backend/session handles nor
+/// executable/profile details. It points at the exact runtime used by the
+/// model-visible BrowserTool, so BrowserControlRegistry remains authoritative.
+#[derive(Clone)]
+pub struct BrowserTakeoverHandle {
+    runtime: Arc<BrowserRuntime>,
+    session_key: BrowserSessionKey,
+    session_opts: BrowserSessionOptions,
+}
+
+impl std::fmt::Debug for BrowserTakeoverHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserTakeoverHandle")
+            .field("session_id_present", &true)
+            .field("headless", &self.session_opts.headless)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrowserTakeoverHandle {
+    pub fn new(
+        runtime: Arc<BrowserRuntime>,
+        session_key: BrowserSessionKey,
+        session_opts: BrowserSessionOptions,
+    ) -> Self {
+        Self {
+            runtime,
+            session_key,
+            session_opts,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session_key.as_str()
+    }
+
+    pub fn headless(&self) -> bool {
+        self.session_opts.headless
+    }
+
+    pub fn request(
+        &self,
+        reason: TakeoverReason,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime
+            .request_human_takeover(&self.session_key, &self.session_opts, reason)
+    }
+
+    pub fn state(&self) -> BrowserControlState {
+        self.runtime.get_takeover_state(&self.session_key)
+    }
+
+    pub fn release(&self) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.release_human_takeover(&self.session_key)
+    }
+
+    pub fn cancel(&self) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.cancel_human_takeover(&self.session_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_runtime_with(&self, runtime: &Arc<BrowserRuntime>) -> bool {
+        Arc::ptr_eq(&self.runtime, runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_browser_lost_for_test(&self) {
+        self.runtime.control.note_browser_lost(&self.session_key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_timeout_for_test(
+        &self,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.force_human_takeover_timeout(&self.session_key)
+    }
+}
+
 impl BrowserRuntime {
     pub fn new(backend: Arc<dyn BrowserBackend>, policy: BrowserRuntimePolicy) -> Self {
         Self {

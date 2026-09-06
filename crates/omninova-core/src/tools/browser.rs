@@ -22,7 +22,7 @@ pub use crate::tools::browser_agent_backend::{
 pub use crate::tools::browser_runtime::{browser_host_allowed, parse_browser_open_url};
 
 pub struct BrowserTool {
-    runtime: BrowserRuntime,
+    runtime: Arc<BrowserRuntime>,
     session_key: Option<BrowserSessionKey>,
     session_opts: BrowserSessionOptions,
 }
@@ -49,6 +49,14 @@ impl BrowserTool {
         session_opts: BrowserSessionOptions,
         session_key: Option<BrowserSessionKey>,
     ) -> Self {
+        Self::from_shared_runtime(Arc::new(runtime), session_opts, session_key)
+    }
+
+    pub fn from_shared_runtime(
+        runtime: Arc<BrowserRuntime>,
+        session_opts: BrowserSessionOptions,
+        session_key: Option<BrowserSessionKey>,
+    ) -> Self {
         Self {
             runtime,
             session_key,
@@ -68,7 +76,7 @@ impl BrowserTool {
             ..BrowserRuntimePolicy::default()
         };
         Self {
-            runtime: BrowserRuntime::new(backend, policy),
+            runtime: Arc::new(BrowserRuntime::new(backend, policy)),
             session_key,
             session_opts,
         }

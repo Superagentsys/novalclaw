@@ -40,6 +40,17 @@ pub enum AgentRunEvent {
         parent_step_id: Option<String>,
     },
 
+    /// Notification only. Desktop must re-query BrowserRuntime state before
+    /// updating controls because events can be missed or arrive out of order.
+    browser_takeover_state_changed {
+        run_id: String,
+        session_id: String,
+        phase: String,
+        generation: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// A named step (group of tools) has started.
     step_started {
         run_id: String,
@@ -298,6 +309,7 @@ impl AgentRunEvent {
     pub fn run_id(&self) -> &str {
         match self {
             Self::run_started { run_id, .. } => run_id,
+            Self::browser_takeover_state_changed { run_id, .. } => run_id,
             Self::step_started { run_id, .. } => run_id,
             Self::model_started { run_id, .. } => run_id,
             Self::model_delta { run_id, .. } => run_id,
@@ -328,6 +340,7 @@ impl AgentRunEvent {
     pub fn step_id(&self) -> Option<&str> {
         match self {
             Self::run_started { .. } => None,
+            Self::browser_takeover_state_changed { .. } => None,
             Self::step_started { step_id, .. } => Some(step_id),
             Self::model_started { step_id, .. } => Some(step_id),
             Self::model_delta { step_id, .. } => Some(step_id),

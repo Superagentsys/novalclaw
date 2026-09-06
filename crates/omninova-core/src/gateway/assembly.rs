@@ -20,6 +20,12 @@ use crate::skills::SkillInvocation;
 use crate::tools::{build_tools, Tool, ToolBuildContext};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+pub(crate) struct AssembledAgent {
+    pub agent: Agent,
+    pub browser_takeover: Option<crate::tools::browser_runtime::BrowserTakeoverHandle>,
+}
 
 /// Everything that varies between entry points. Anything not listed here is
 /// derived from config so it stays identical across paths.
@@ -39,7 +45,7 @@ impl GatewayRuntime {
         cfg: &Config,
         request: &AgentAssemblyRequest<'_>,
         steps: &mut Vec<ExecutionStep>,
-    ) -> anyhow::Result<Agent> {
+    ) -> anyhow::Result<AssembledAgent> {
         let agent_name = request.route.agent_name.as_str();
 
         let provider = build_provider_with_selection(
@@ -51,11 +57,13 @@ impl GatewayRuntime {
         );
 
         let memory = self.memory().await;
+        let browser_takeover_slot = Arc::new(Mutex::new(None));
         let mut tools = build_tools(&ToolBuildContext {
             config: cfg,
             workspace: request.workspace,
             memory: Some(&memory),
             session_id: request.session_id,
+            browser_takeover_slot: Some(&browser_takeover_slot),
         });
         apply_agent_tool_allowlist(cfg, agent_name, &mut tools);
 
@@ -133,13 +141,21 @@ impl GatewayRuntime {
             steps.push(ExecutionStep::done("飞书聊天模式", "已注入 chat_only 限制"));
         }
 
-        Ok(Agent::new(
+        let agent = Agent::new(
             provider,
             tools,
             memory,
             agent_cfg,
             request.security.clone(),
-        ))
+        );
+        let browser_takeover = browser_takeover_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        Ok(AssembledAgent {
+            agent,
+            browser_takeover,
+        })
     }
 }
 

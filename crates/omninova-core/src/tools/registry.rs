@@ -136,6 +136,10 @@ pub struct ToolBuildContext<'a> {
     /// the `/api/tools` endpoint. Memory-backed tools are skipped then.
     pub memory: Option<&'a Arc<dyn Memory>>,
     pub session_id: Option<&'a str>,
+    /// Optional assembly-owned slot for the exact BrowserRuntime handle used
+    /// by this toolset. Enumeration callers leave it unset.
+    pub browser_takeover_slot:
+        Option<&'a Arc<std::sync::Mutex<Option<crate::tools::browser_runtime::BrowserTakeoverHandle>>>>,
 }
 
 /// One row of the registry.
@@ -429,13 +433,22 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 allowed_domains: ctx.config.browser.allowed_domains.clone(),
                 ..crate::tools::browser_runtime::BrowserRuntimePolicy::default()
             };
-            let runtime = crate::tools::browser_runtime::BrowserRuntime::new(backend, policy);
+            let runtime = Arc::new(crate::tools::browser_runtime::BrowserRuntime::new(backend, policy));
             let session_key = ctx
                 .session_id
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .and_then(|s| crate::tools::browser_types::BrowserSessionKey::new(s).ok());
-            Some(Box::new(BrowserTool::from_runtime(
+            if let (Some(slot), Some(key)) = (ctx.browser_takeover_slot, session_key.clone()) {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                    crate::tools::browser_runtime::BrowserTakeoverHandle::new(
+                        Arc::clone(&runtime),
+                        key,
+                        session_opts.clone(),
+                    ),
+                );
+            }
+            Some(Box::new(BrowserTool::from_shared_runtime(
                 runtime,
                 session_opts,
                 session_key,
@@ -542,6 +555,7 @@ mod tests {
             workspace: Path::new("/fake/workspace"),
             memory,
             session_id: None,
+            browser_takeover_slot: None,
         })
         .iter()
         .map(|tool| tool.name().to_string())
@@ -622,6 +636,7 @@ mod tests {
                 workspace: Path::new("/fake/workspace"),
                 memory: Some(&memory),
                 session_id: session,
+                browser_takeover_slot: None,
             });
             let browser = tools
                 .iter_mut()
@@ -696,6 +711,33 @@ mod tests {
             mapped_unicode,
             crate::tools::browser::browser_session_id(Some(&logical_unicode)).unwrap()
         );
+    }
+
+    #[test]
+    fn browser_takeover_slot_captures_exact_runtime_for_active_session() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        if !crate::tools::browser_bin::agent_browser_runtime_available() {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        }
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let _tools = build_tools(&ToolBuildContext {
+            config: &config,
+            workspace: Path::new("/fake/workspace"),
+            memory: Some(&memory),
+            session_id: Some("takeover-session"),
+            browser_takeover_slot: Some(&slot),
+        });
+        let handle = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active session must register a takeover handle");
+        assert_eq!(handle.session_id(), "takeover-session");
+        assert_eq!(handle.headless(), config.browser.native_headless);
+        assert_eq!(handle.state().generation, 0);
     }
 
     #[test]

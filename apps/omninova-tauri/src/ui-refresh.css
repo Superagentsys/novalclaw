@@ -1537,6 +1537,44 @@
   color: var(--ui-text-muted) !important;
 }
 
+.agent-run-takeover {
+  border-bottom-color: var(--ui-border) !important;
+}
+
+.agent-run-takeover-copy strong {
+  color: var(--ui-text) !important;
+}
+
+.agent-run-takeover-copy small {
+  color: var(--ui-text-muted) !important;
+}
+
+.agent-run-takeover-actions button {
+  background: var(--ui-accent) !important;
+  color: #fff !important;
+}
+
+.agent-run-takeover-secondary {
+  background: var(--ui-surface-2) !important;
+  color: var(--ui-text-secondary) !important;
+}
+
+.agent-run-takeover--waiting {
+  background: var(--ui-accent-soft) !important;
+}
+
+.agent-run-takeover--human {
+  background: var(--ui-success-soft) !important;
+}
+
+.agent-run-takeover--warn {
+  background: var(--ui-warning-soft) !important;
+}
+
+.agent-run-takeover--error {
+  background: var(--ui-danger-soft) !important;
+}
+
 .agent-run-step--running .agent-run-step-title,
 .agent-run-output-toggle {
   color: var(--ui-accent-strong) !important;

@@ -40,4 +40,26 @@ describe("tool_completed status vs success", () => {
       "success"
     );
   });
+
+  it("does not turn browser takeover notifications into timeline steps", () => {
+    const steps = aggregateSteps([
+      {
+        type: "browser_takeover_state_changed",
+        run_id: "run-a",
+        session_id: "session-a",
+        phase: "human_controlled",
+        generation: 1,
+      },
+      {
+        type: "tool_started",
+        run_id: "run-a",
+        step_id: "s1",
+        tool_call_id: "c1",
+        tool_name: "browser",
+        title: "开始执行工具：browser",
+      },
+    ]);
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0]?.tool_name, "browser");
+  });
 });

@@ -1299,6 +1299,66 @@ async fn reject_tool_request(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_browser_takeover_state(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .get_browser_takeover_state(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn request_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .request_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn release_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .release_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .cancel_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn workspace_dir_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> PathBuf {
     let runtime = {
         let app_state = state.lock().await;
@@ -2063,6 +2123,67 @@ mod browser_dep_tests {
             chromium_status_from_doctor(unrelated)
                 .unwrap_err()
                 .contains("did not report Chromium")
+        );
+    }
+}
+
+#[cfg(test)]
+mod browser_takeover_command_tests {
+    use omninova_core::gateway::{BrowserTakeoverRouteError, BrowserTakeoverStateDto};
+
+    #[test]
+    fn takeover_dto_and_errors_serialize_without_runtime_construction() {
+        let dto = BrowserTakeoverStateDto {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            phase: "human_controlled".into(),
+            owner: "human".into(),
+            generation: 2,
+            reason: Some("explicit_user_request".into()),
+            since_ms: 1,
+            eligible: true,
+            headless: false,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["run_id"], "run-1");
+        assert_eq!(value["phase"], "human_controlled");
+        assert!(value.get("pid").is_none());
+        assert!(value.get("hwnd").is_none());
+        assert!(value.get("cdp_url").is_none());
+        let missing = BrowserTakeoverRouteError::RunNotFound.to_string();
+        assert!(missing.starts_with("BrowserTakeoverRunNotFound"));
+        let unavailable = BrowserTakeoverRouteError::Unavailable.to_string();
+        assert!(unavailable.starts_with("BrowserTakeoverUnavailable"));
+        let headless = BrowserTakeoverRouteError::Runtime {
+            code: "BrowserTakeoverUnsupportedHeadless".into(),
+            message: "headed required".into(),
+        }
+        .to_string();
+        assert!(headless.contains("BrowserTakeoverUnsupportedHeadless"));
+    }
+
+    #[test]
+    fn takeover_commands_are_registered_by_name() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "get_browser_takeover_state",
+            "request_browser_takeover",
+            "release_browser_takeover",
+            "cancel_browser_takeover",
+        ] {
+            assert!(
+                registered.contains(command),
+                "missing command {command}"
+            );
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(
+            !registered.contains(&runtime_ctor),
+            "Tauri must not construct BrowserRuntime"
         );
     }
 }
@@ -5285,6 +5406,10 @@ pub fn run() {
             cancel_agent_run,
             approve_tool_request,
             reject_tool_request,
+            get_browser_takeover_state,
+            request_browser_takeover,
+            release_browser_takeover,
+            cancel_browser_takeover,
             automation_list_jobs,
             automation_upsert_job,
             automation_delete_job,
