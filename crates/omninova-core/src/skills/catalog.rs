@@ -3,6 +3,8 @@ use crate::config::{resolve_configured_skills_dir, Config};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const MAX_ACTIVE_SKILLS: usize = 1;
 pub const SKILL_ID_PREFIX: &str = "skill:";
@@ -54,8 +56,91 @@ impl SkillCatalog {
     }
 }
 
-/// Rebuild the catalog from the canonical Skill Store. No session state.
+/// Upper bound on how long a cached catalog may serve edits made outside the
+/// app. In-app installs, removals, rollbacks, imports and skills-config saves
+/// all bump [`skills_generation`], which is part of the cache key, so those are
+/// reflected immediately and never wait for this.
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(PartialEq, Eq)]
+struct CatalogCacheKey {
+    skills_dir: PathBuf,
+    enabled: bool,
+    generation: u64,
+}
+
+struct CachedCatalog {
+    key: CatalogCacheKey,
+    loaded_at: Instant,
+    catalog: Arc<SkillCatalog>,
+}
+
+impl CachedCatalog {
+    /// Whether this entry may still answer for `key`. `now` is a parameter so
+    /// the TTL edge is testable without sleeping.
+    fn serves(&self, key: &CatalogCacheKey, now: Instant) -> bool {
+        self.key == *key && now.duration_since(self.loaded_at) < CATALOG_CACHE_TTL
+    }
+}
+
+/// Single slot: production has one skills store, and a mirrored marketplace
+/// catalog is tens of megabytes, so keeping a map keyed by directory would
+/// trade a rare hit for unbounded memory.
+fn catalog_cache() -> &'static Mutex<Option<CachedCatalog>> {
+    static CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Drops the cached catalog so the next read walks the store again. For paths
+/// that change skills without going through a generation bump, such as a
+/// user-triggered refresh after editing the directory by hand.
+pub fn invalidate_skill_catalog_cache() {
+    if let Ok(mut slot) = catalog_cache().lock() {
+        *slot = None;
+    }
+}
+
+/// Catalog for the configured store, reused across calls.
+///
+/// Walking a mirrored marketplace is expensive and unavoidable: 11k skills
+/// means ~89k directory entries and ~7s on APFS, most of it in the walk rather
+/// than the frontmatter parse. The catalog is rebuilt several times per agent
+/// turn (prompt assembly, `use_skill`, command palette), so it is cached whole.
+pub fn cached_skill_catalog(config: &Config) -> Arc<SkillCatalog> {
+    let key = CatalogCacheKey {
+        skills_dir: resolve_configured_skills_dir(config),
+        enabled: config.skills.open_skills_enabled,
+        generation: skills_generation(),
+    };
+    if let Ok(slot) = catalog_cache().lock() {
+        if let Some(cached) = slot.as_ref() {
+            if cached.serves(&key, Instant::now()) {
+                return Arc::clone(&cached.catalog);
+            }
+        }
+    }
+    // Built without the lock held: a 7s rebuild must not block unrelated
+    // readers, and a duplicated concurrent build is harmless.
+    let catalog = Arc::new(build_skill_catalog(config));
+    if let Ok(mut slot) = catalog_cache().lock() {
+        *slot = Some(CachedCatalog {
+            key,
+            loaded_at: Instant::now(),
+            catalog: Arc::clone(&catalog),
+        });
+    }
+    catalog
+}
+
+/// Owned catalog for callers that need to mutate or serialize it. Prefer
+/// [`cached_skill_catalog`] on read-only paths: cloning 11k entries costs
+/// ~30ms, which is cheap next to a rebuild but not free.
 pub fn list_skill_catalog(config: &Config) -> SkillCatalog {
+    (*cached_skill_catalog(config)).clone()
+}
+
+/// Rebuild the catalog from the canonical Skill Store. No session state.
+fn build_skill_catalog(config: &Config) -> SkillCatalog {
     let skills_dir = resolve_configured_skills_dir(config);
     let enabled = config.skills.open_skills_enabled;
     let mut entries = Vec::new();
@@ -89,7 +174,35 @@ pub fn list_skill_catalog(config: &Config) -> SkillCatalog {
     }
 }
 
+/// Ceiling on catalog entries written into the system prompt. A mirrored skill
+/// marketplace can hold tens of thousands of entries; listing every one grew
+/// the system prompt to 3.2 MB (~4.1M estimated tokens), which on its own
+/// exceeded every provider's input budget and made the session unusable.
+/// Entries past the cap stay reachable through `use_skill`'s `query` search.
+pub const DEFAULT_CATALOG_PROMPT_LIMIT: usize = 150;
+
+/// Ceiling on each entry's description in the prompt. Skill descriptions are
+/// authored for humans and run past 2000 characters in practice.
+pub const DEFAULT_CATALOG_DESCRIPTION_LIMIT: usize = 160;
+
+/// Cap on matches returned by a single `use_skill` catalog search.
+pub const CATALOG_SEARCH_LIMIT: usize = 25;
+
 pub fn catalog_prompt_section(catalog: &SkillCatalog) -> String {
+    catalog_prompt_section_with_limits(
+        catalog,
+        DEFAULT_CATALOG_PROMPT_LIMIT,
+        DEFAULT_CATALOG_DESCRIPTION_LIMIT,
+    )
+}
+
+/// `entry_limit` / `description_limit` of 0 mean unlimited, matching how the
+/// rest of the config treats budget ceilings.
+pub fn catalog_prompt_section_with_limits(
+    catalog: &SkillCatalog,
+    entry_limit: usize,
+    description_limit: usize,
+) -> String {
     if !catalog.open_skills_enabled {
         return String::new();
     }
@@ -99,23 +212,125 @@ You have a catalog of installed skills. Do not assume their full instructions ye
 To load one skill's instructions, call the `use_skill` tool with its `skill_id`.\n\
 At most one skill may be active at a time. Prefer matching the user task; if none match, continue without a skill.\n\n",
     );
-    if catalog.entries.is_empty() {
+    let visible = prompt_ordered_entries(catalog);
+    if visible.is_empty() {
         prompt.push_str("No runtime-visible skills are currently installed.\n");
         return prompt;
     }
-    for entry in &catalog.entries {
-        if !entry.runtime_visible {
-            continue;
-        }
+    let listed = if entry_limit == 0 {
+        visible.len()
+    } else {
+        entry_limit.min(visible.len())
+    };
+    for entry in &visible[..listed] {
         prompt.push_str(&format!(
             "- `{id}` / `{alias}` — {name}: {description}\n",
             id = entry.id,
             alias = entry.command_alias,
             name = entry.display_name,
-            description = one_line(&entry.description),
+            description = truncate_description(&one_line(&entry.description), description_limit),
+        ));
+    }
+    let hidden = visible.len() - listed;
+    if hidden > 0 {
+        prompt.push_str(&format!(
+            "\n{hidden} more installed skills are not listed above. \
+The catalog is too large to inline, so search it instead of guessing an id: \
+call `use_skill` with a `query` such as {{\"query\": \"pdf table extraction\"}}, \
+then call `use_skill` again with a `skill_id` from the results.\n"
         ));
     }
     prompt
+}
+
+/// Personal and system skills come before mirrored marketplace entries so a
+/// truncated listing keeps the skills a user actually authored.
+fn prompt_ordered_entries(catalog: &SkillCatalog) -> Vec<&SkillCatalogEntry> {
+    let mut visible: Vec<&SkillCatalogEntry> = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.runtime_visible)
+        .collect();
+    visible.sort_by_key(|entry| source_prompt_rank(&entry.source));
+    visible
+}
+
+fn source_prompt_rank(source: &str) -> u8 {
+    match source {
+        "system" => 0,
+        "personal" => 1,
+        _ => 2,
+    }
+}
+
+/// Search the whole catalog, including entries the prompt had to omit.
+/// Ranks exact id/slug hits first, then name matches, then description matches.
+pub fn search_skill_catalog<'a>(
+    catalog: &'a SkillCatalog,
+    query: &str,
+    limit: usize,
+) -> Vec<&'a SkillCatalogEntry> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let terms: Vec<&str> = needle.split_whitespace().collect();
+    let mut scored: Vec<(u32, &'a SkillCatalogEntry)> = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.runtime_visible)
+        .filter_map(|entry| {
+            let score = score_entry(entry, &needle, &terms);
+            (score > 0).then_some((score, entry))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.display_name.cmp(&b.1.display_name))
+            .then(a.1.id.cmp(&b.1.id))
+    });
+    scored
+        .into_iter()
+        .take(if limit == 0 { CATALOG_SEARCH_LIMIT } else { limit })
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
+fn score_entry(entry: &SkillCatalogEntry, needle: &str, terms: &[&str]) -> u32 {
+    let slug = entry.slug.to_lowercase();
+    let name = entry.display_name.to_lowercase();
+    let description = entry.description.to_lowercase();
+    if slug == needle || entry.id.to_lowercase() == needle {
+        return u32::MAX;
+    }
+    let mut score = 0u32;
+    if slug.contains(needle) {
+        score += 200;
+    }
+    if name.contains(needle) {
+        score += 150;
+    }
+    for term in terms {
+        if slug.contains(term) {
+            score += 30;
+        }
+        if name.contains(term) {
+            score += 20;
+        }
+        if description.contains(term) {
+            score += 5;
+        }
+    }
+    score
+}
+
+/// Truncates on a character boundary so multi-byte descriptions stay valid.
+fn truncate_description(text: &str, limit: usize) -> String {
+    if limit == 0 || text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{}…", kept.trim_end())
 }
 
 pub fn normalize_skill_id(raw: &str) -> String {
@@ -350,5 +565,64 @@ pub fn source_badge_label(source: &str) -> &'static str {
         "personal" => "个人",
         "installed" => "已安装",
         _ => "已安装",
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn key(dir: &str, enabled: bool, generation: u64) -> CatalogCacheKey {
+        CatalogCacheKey {
+            skills_dir: PathBuf::from(dir),
+            enabled,
+            generation,
+        }
+    }
+
+    fn cached(key: CatalogCacheKey, loaded_at: Instant) -> CachedCatalog {
+        CachedCatalog {
+            key,
+            loaded_at,
+            catalog: Arc::new(SkillCatalog {
+                generation: 1,
+                open_skills_enabled: true,
+                skills_dir: PathBuf::from("/store"),
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_key_is_served_from_cache() {
+        let now = Instant::now();
+        let entry = cached(key("/store", true, 7), now);
+        assert!(entry.serves(&key("/store", true, 7), now));
+    }
+
+    #[test]
+    fn a_skill_mutation_is_never_served_from_cache() {
+        let now = Instant::now();
+        let entry = cached(key("/store", true, 7), now);
+        // bump_skills_generation() moves this, so installs and removals are
+        // visible on the next read rather than after the TTL.
+        assert!(!entry.serves(&key("/store", true, 8), now));
+    }
+
+    #[test]
+    fn another_store_or_toggle_is_never_served_from_cache() {
+        let now = Instant::now();
+        let entry = cached(key("/store", true, 7), now);
+        assert!(!entry.serves(&key("/other-store", true, 7), now));
+        assert!(!entry.serves(&key("/store", false, 7), now));
+    }
+
+    #[test]
+    fn an_expired_entry_is_rebuilt() {
+        let loaded_at = Instant::now();
+        let entry = cached(key("/store", true, 7), loaded_at);
+        let wanted = key("/store", true, 7);
+        assert!(entry.serves(&wanted, loaded_at + CATALOG_CACHE_TTL - Duration::from_millis(1)));
+        assert!(!entry.serves(&wanted, loaded_at + CATALOG_CACHE_TTL));
     }
 }

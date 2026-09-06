@@ -104,10 +104,17 @@
 # max_iterations = 8
 
 # --- Skills ---
+# 系统提示词只内联前 catalog_prompt_limit 条技能目录，其余靠
+# `use_skill {"query": "..."}` 检索，所以镜像整个技能市场（上万个 SKILL.md）
+# 也不会把提示词撑爆。0 = 不限，等于全量内联：11000 个技能会产生约 3MB、
+# 400 万 token 的系统提示词，单靠它就超出任何模型的输入预算。
+# catalog_description_limit 是每条目录项的描述字符上限，0 = 不截断。
 # [skills]
 # open_skills_enabled = true
 # open_skills_dir = "~/.omninova/skills"
 # prompt_injection_mode = "full"
+# catalog_prompt_limit = 150
+# catalog_description_limit = 160
 
 # --- Autonomy ---
 # [autonomy]

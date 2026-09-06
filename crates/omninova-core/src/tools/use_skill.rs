@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::skills::activation::activate_skill;
-use crate::skills::catalog::MAX_ACTIVE_SKILLS;
+use crate::skills::catalog::{
+    cached_skill_catalog, search_skill_catalog, CATALOG_SEARCH_LIMIT, MAX_ACTIVE_SKILLS,
+};
 use crate::tools::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -59,6 +61,62 @@ impl UseSkillTool {
     pub fn new(config: Config, gate: Arc<SkillActivationGate>) -> Self {
         Self { config, gate }
     }
+
+    /// Keyword search over the whole catalog. The system prompt only inlines
+    /// the first `skills.catalog_prompt_limit` entries, so this is how the
+    /// model reaches the rest without a multi-megabyte prompt.
+    fn search(&self, query: &str) -> ToolResult {
+        let catalog = cached_skill_catalog(&self.config);
+        let matches = search_skill_catalog(&catalog, query, CATALOG_SEARCH_LIMIT);
+        let total_visible = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.runtime_visible)
+            .count();
+        let results: Vec<serde_json::Value> = matches
+            .iter()
+            .map(|entry| {
+                json!({
+                    "skill_id": entry.id,
+                    "display_name": entry.display_name,
+                    "description": entry.description,
+                    "source": entry.source,
+                })
+            })
+            .collect();
+        ToolResult {
+            success: true,
+            output: json!({
+                "ok": true,
+                "mode": "search",
+                "query": query,
+                "catalog_size": total_visible,
+                "match_count": results.len(),
+                "results": results,
+                "next_step": if results.is_empty() {
+                    "No skill matched. Continue without a skill rather than guessing an id."
+                } else {
+                    "Call use_skill again with one skill_id from results to load its instructions."
+                },
+            })
+            .to_string(),
+            error: None,
+        }
+    }
+
+    /// Suggestions attached to a failed load so a guessed id can self-correct
+    /// in one extra turn instead of retrying the same bad id.
+    fn nearest_ids(&self, skill_id: &str) -> Vec<String> {
+        let catalog = cached_skill_catalog(&self.config);
+        let probe = skill_id
+            .trim()
+            .trim_start_matches("skill:")
+            .replace(['/', '_'], " ");
+        search_skill_catalog(&catalog, &probe, 5)
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -68,7 +126,7 @@ impl Tool for UseSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Load the full instructions for one installed skill from the catalog. Pass the catalog `skill_id` (for example skill:baichen-legal). Do not execute skill scripts."
+        "Load the full instructions for one installed skill, or search the catalog for one. Pass `skill_id` (for example skill:baichen-legal) to load it, or `query` to search by keyword when the id is unknown or the system prompt's catalog was truncated. Do not execute skill scripts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,9 +136,12 @@ impl Tool for UseSkillTool {
                 "skill_id": {
                     "type": "string",
                     "description": "Catalog skill id such as skill:baichen-legal or the skill slug"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Keywords to search the full catalog, including skills omitted from the system prompt. Returns candidate skill_ids to load; does not activate anything."
                 }
-            },
-            "required": ["skill_id"]
+            }
         })
     }
 
@@ -92,11 +153,20 @@ impl Tool for UseSkillTool {
             .unwrap_or("")
             .trim()
             .to_string();
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if skill_id.is_empty() {
+            if !query.is_empty() {
+                return Ok(self.search(&query));
+            }
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("skill_id is required".to_string()),
+                error: Some("skill_id or query is required".to_string()),
             });
         }
         match activate_skill(&self.config, &skill_id, "auto_use_skill") {
@@ -157,6 +227,8 @@ impl Tool for UseSkillTool {
                     "ok": false,
                     "error": "skill unavailable",
                     "detail": error,
+                    "did_you_mean": self.nearest_ids(&skill_id),
+                    "next_step": "Search the catalog with use_skill {\"query\": \"...\"} instead of guessing another id.",
                 })
                 .to_string(),
                 error: Some("skill unavailable".to_string()),
