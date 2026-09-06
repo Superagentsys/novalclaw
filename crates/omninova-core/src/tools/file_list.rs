@@ -1,4 +1,4 @@
-use crate::security::sandbox::resolve_workspace_relative;
+use crate::security::sandbox::resolve_tool_path;
 use crate::tools::traits::{Tool, ToolResult};
 use crate::tools::workspace_walk::{
     canonical_workspace, is_gitignored, is_noise_dir, normalized_relative, root_gitignore,
@@ -15,13 +15,20 @@ const MAX_DEPTH: usize = 32;
 
 pub struct FileListTool {
     workspace_dir: PathBuf,
+    full_access: bool,
 }
 
 impl FileListTool {
     pub fn new(workspace_dir: impl Into<PathBuf>) -> Self {
         Self {
             workspace_dir: workspace_dir.into(),
+            full_access: false,
         }
+    }
+
+    pub fn with_full_access(mut self, full_access: bool) -> Self {
+        self.full_access = full_access;
+        self
     }
 }
 
@@ -79,7 +86,7 @@ impl Tool for FileListTool {
             .unwrap_or(DEFAULT_DEPTH)
             .clamp(1, MAX_DEPTH);
 
-        let resolved = match resolve_workspace_relative(&self.workspace_dir, relative).await {
+        let resolved = match resolve_tool_path(&self.workspace_dir, relative, self.full_access).await {
             Ok(p) => p,
             Err(e) => return Ok(ToolResult::failure(e.to_string())),
         };
@@ -98,9 +105,15 @@ impl Tool for FileListTool {
         }
 
         let workspace = self.workspace_dir.clone();
+        let full_access = self.full_access;
         let scan = tokio::task::spawn_blocking(move || {
-            let root = canonical_workspace(workspace)?;
             let target = std::fs::canonicalize(resolved)?;
+            let workspace = canonical_workspace(workspace)?;
+            let root = if full_access && !target.starts_with(&workspace) {
+                target.clone()
+            } else {
+                workspace
+            };
             let ignored = root_gitignore(&root);
             let mut seen = 0usize;
             let mut entries = Vec::with_capacity(limit);

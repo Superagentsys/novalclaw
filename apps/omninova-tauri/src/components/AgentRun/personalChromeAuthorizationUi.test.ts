@@ -21,6 +21,7 @@ function dto(
     desktop_run_granted: false,
     authorization_generation: null,
     production_factory_enabled: false,
+    full_access: false,
     ready: false,
     error_code: null,
     ...extra,
@@ -81,6 +82,20 @@ describe("Personal Chrome authorization UI projection", () => {
       ready: true,
     });
     assert.equal(personalChromeAuthorizationCopy(status).tone, "ready");
+  });
+
+  it("does not request a run approval in full access mode", () => {
+    const status = dto({
+      state: "ready",
+      extension_tab_granted: true,
+      desktop_run_granted: true,
+      authorization_generation: 11,
+      production_factory_enabled: true,
+      full_access: true,
+      ready: true,
+    });
+    assert.equal(personalChromeAuthorizationAction(status), "none");
+    assert.match(personalChromeAuthorizationCopy(status).detail, /完全访问模式/);
   });
 
   it("uses backend status on remount instead of remembered UI state", () => {

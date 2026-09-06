@@ -157,7 +157,7 @@ function resizeMessageEditor(textarea: HTMLTextAreaElement) {
   textarea.style.overflowY = textarea.scrollHeight > MESSAGE_EDIT_MAX_HEIGHT ? "auto" : "hidden";
 }
 
-type ApprovalProfile = "request_approval" | "risk_based";
+type ApprovalProfile = "request_approval" | "risk_based" | "full_access";
 
 interface ApprovalProfilePayload {
   profile: ApprovalProfile;
@@ -878,7 +878,10 @@ export function Chat({
     gatewayStatus,
     sessionId,
   ]);
-  const activeToolApproval = activeRunId ? pendingToolApprovals[activeRunId] : undefined;
+  const activeToolApproval =
+    approvalProfile.profile === "full_access" || !activeRunId
+      ? undefined
+      : pendingToolApprovals[activeRunId];
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
   const selectedSkill = selectedSkills[activeAvatarId];
@@ -1907,6 +1910,9 @@ export function Chat({
           profile,
         });
         setApprovalProfile(saved);
+        if (saved.profile === "full_access") {
+          setPendingToolApprovals({});
+        }
         setApprovalMenuOpen(false);
         setCopyNotice(`权限模式已切换为“${saved.label}”，新任务立即生效。`);
         window.setTimeout(() => setCopyNotice(null), 2400);
@@ -4636,7 +4642,26 @@ export function Chat({
                               </span>
                               {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
                             </button>
-                            <p>危险命令和禁止路径仍会被安全策略拦截。</p>
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "full_access"}
+                              className={approvalProfile.profile === "full_access" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("full_access")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>Full Access（完全访问）</strong>
+                                <small>无需确认即可访问文件、运行命令、控制浏览器和使用网络</small>
+                              </span>
+                              {approvalProfile.profile === "full_access" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <p>
+                              {approvalProfile.profile === "full_access"
+                                ? "仅使用 OmniNova 进程已有的系统权限；接管状态与运行时锁仍然有效。"
+                                : "危险命令和禁止路径仍会被安全策略拦截。"}
+                            </p>
                           </div>,
                           document.body
                         )

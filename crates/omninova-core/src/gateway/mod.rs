@@ -946,6 +946,7 @@ struct RunScopedPersonalChromeAuthorization {
     run_id: String,
     registry: AgentRunRegistry,
     bridge: omninova_browser_host::PersonalChromeBridge,
+    full_access: bool,
 }
 
 #[async_trait::async_trait]
@@ -962,12 +963,6 @@ impl crate::tools::browser_personal_chrome::PersonalChromeAuthorizationProvider
             AuthorizedTab, PersonalChromeAuthorizationError,
         };
 
-        let desktop = self
-            .registry
-            .personal_chrome_grant(&self.run_id)
-            .await
-            .map_err(|_| PersonalChromeAuthorizationError::NotAuthorized)?
-            .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?;
         let response = self
             .bridge
             .request("tab_list_authorized", "", serde_json::json!({}))
@@ -1016,6 +1011,15 @@ impl crate::tools::browser_personal_chrome::PersonalChromeAuthorizationProvider
                 .and_then(serde_json::Value::as_u64)
                 .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?,
         };
+        if self.full_access {
+            return Ok(extension);
+        }
+        let desktop = self
+            .registry
+            .personal_chrome_grant(&self.run_id)
+            .await
+            .map_err(|_| PersonalChromeAuthorizationError::NotAuthorized)?
+            .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?;
         if desktop.window_id != extension.window_id
             || desktop.tab_id != extension.tab_id
             || desktop.authorization_generation != extension.authorization_generation
@@ -1391,6 +1395,7 @@ impl GatewayRuntime {
     pub(super) fn personal_chrome_factory_context(
         &self,
         run_id: Option<&str>,
+        full_access: bool,
     ) -> Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext> {
         let run_id = run_id?.trim();
         if run_id.is_empty() {
@@ -1404,6 +1409,7 @@ impl GatewayRuntime {
                     run_id: run_id.to_string(),
                     registry: self.run_registry.clone(),
                     bridge,
+                    full_access,
                 }),
             },
         )

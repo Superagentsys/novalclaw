@@ -6,8 +6,8 @@ use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
     resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
-    GatewayPublicMode, ModelProviderConfig, ProviderConfig, ProviderTransportConfig, RobotConfig,
-    DEFAULT_OPEN_SKILLS_ENABLED,
+    GatewayPublicMode, ModelProviderConfig, PermissionMode, ProviderConfig,
+    ProviderTransportConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -466,6 +466,7 @@ struct SetupWorkspaceStatus {
 
 const APPROVAL_PROFILE_REQUEST: &str = "request_approval";
 const APPROVAL_PROFILE_RISK_BASED: &str = "risk_based";
+const APPROVAL_PROFILE_FULL_ACCESS: &str = "full_access";
 
 /// Tools whose normal use can mutate the workspace or contact an external
 /// service. Both legacy `[autonomy]` and the newer `[approvals]` table must
@@ -499,7 +500,13 @@ struct ApprovalProfilePayload {
 }
 
 fn approval_profile_payload(profile: &str) -> ApprovalProfilePayload {
-    if profile == APPROVAL_PROFILE_RISK_BASED {
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        ApprovalProfilePayload {
+            profile: APPROVAL_PROFILE_FULL_ACCESS.to_string(),
+            label: "Full Access".to_string(),
+            description: "无需确认即可访问文件、运行命令、控制浏览器和使用网络。".to_string(),
+        }
+    } else if profile == APPROVAL_PROFILE_RISK_BASED {
         ApprovalProfilePayload {
             profile: APPROVAL_PROFILE_RISK_BASED.to_string(),
             label: "帮我批准".to_string(),
@@ -540,6 +547,13 @@ fn ensure_tool_entries(list: &mut Vec<String>, tools: &[&str]) {
 /// was contradictory. Treat that legacy shape as the risk-based profile so an
 /// upgrade does not unexpectedly block edits meant to run automatically.
 fn configured_approval_profile(config: &Config) -> &'static str {
+    if config.permissions.is_full_access() {
+        return APPROVAL_PROFILE_FULL_ACCESS;
+    }
+    configured_restricted_approval_profile(config)
+}
+
+fn configured_restricted_approval_profile(config: &Config) -> &'static str {
     if config.approvals.mode.as_deref() == Some(APPROVAL_PROFILE_RISK_BASED) {
         return APPROVAL_PROFILE_RISK_BASED;
     }
@@ -560,11 +574,28 @@ fn configured_approval_profile(config: &Config) -> &'static str {
 }
 
 fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, String> {
-    if profile != APPROVAL_PROFILE_REQUEST && profile != APPROVAL_PROFILE_RISK_BASED {
+    if profile != APPROVAL_PROFILE_REQUEST
+        && profile != APPROVAL_PROFILE_RISK_BASED
+        && profile != APPROVAL_PROFILE_FULL_ACCESS
+    {
         return Err("未知的权限策略。".to_string());
     }
 
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        let changed = !config.permissions.is_full_access();
+        config.permissions.mode = PermissionMode::FullAccess;
+        return Ok(changed);
+    }
+
+    if config.permissions.is_full_access()
+        && configured_restricted_approval_profile(config) == profile
+    {
+        config.permissions.mode = PermissionMode::Restricted;
+        return Ok(true);
+    }
+
     let before = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -574,6 +605,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
         config.approvals.require_approval.clone(),
     );
 
+    config.permissions.mode = PermissionMode::Restricted;
     config.autonomy.level = "supervised".to_string();
     // Shell commands still pass through the explicit allowlist and dangerous
     // command deny list. Keep medium-risk commands available so the approval
@@ -605,6 +637,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
     }
 
     let after = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -1407,6 +1440,7 @@ struct PersonalChromeAuthorizationStatusDto {
     desktop_run_granted: bool,
     authorization_generation: Option<u64>,
     production_factory_enabled: bool,
+    full_access: bool,
     ready: bool,
     error_code: Option<String>,
 }
@@ -1460,6 +1494,7 @@ async fn personal_chrome_authorization_status(
 ) -> PersonalChromeAuthorizationStatusDto {
     let transport = bridge.status().await;
     let config = runtime.get_config().await;
+    let full_access = config.permissions.is_full_access();
     let configured = config.browser.enabled
         && config.browser.backend.trim().eq_ignore_ascii_case("personal-chrome");
     let extension = if transport.connected {
@@ -1469,10 +1504,18 @@ async fn personal_chrome_authorization_status(
     };
     let desktop = runtime.personal_chrome_grant_for_run(run_id).await;
     let extension_tab_granted = matches!(extension, Ok(Some(_)));
-    let desktop_run_granted = matches!(desktop, Ok(Some(_)));
-    let authorization_generation = personal_chrome_grant_matches(&extension, &desktop);
+    let desktop_run_granted = full_access || matches!(desktop, Ok(Some(_)));
+    let authorization_generation = if full_access {
+        extension
+            .as_ref()
+            .ok()
+            .and_then(|grant| grant.as_ref().map(|(_, _, generation)| *generation))
+    } else {
+        personal_chrome_grant_matches(&extension, &desktop)
+    };
     let production_factory_enabled =
-        omninova_core::tools::browser_personal_chrome::personal_chrome_production_enabled();
+        full_access
+            || omninova_core::tools::browser_personal_chrome::personal_chrome_production_enabled();
     let ready = transport.connected
         && extension_tab_granted
         && desktop_run_granted
@@ -1482,7 +1525,11 @@ async fn personal_chrome_authorization_status(
         .as_ref()
         .err()
         .cloned()
-        .or_else(|| desktop.as_ref().err().map(ToString::to_string));
+        .or_else(|| {
+            (!full_access)
+                .then(|| desktop.as_ref().err().map(ToString::to_string))
+                .flatten()
+        });
     let state = if !transport.connected {
         transport.state.clone()
     } else if error_code.is_some() {
@@ -1508,6 +1555,7 @@ async fn personal_chrome_authorization_status(
         desktop_run_granted,
         authorization_generation,
         production_factory_enabled,
+        full_access,
         ready,
         error_code,
     }
@@ -2467,6 +2515,7 @@ mod personal_chrome_bridge_command_tests {
             desktop_run_granted: false,
             authorization_generation: None,
             production_factory_enabled: false,
+            full_access: false,
             ready: false,
             error_code: None,
         };
@@ -6124,6 +6173,43 @@ mod approval_profile_tests {
         let mut config = Config::default();
         assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
         assert!(!apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
+    }
+
+    #[test]
+    fn full_access_is_additive_and_preserves_granular_permissions() {
+        let mut config = Config::default();
+        config.autonomy.allowed_commands = vec!["custom-command".into()];
+        config.security.tool_policy.denied_tools = vec!["custom-tool".into()];
+        config.approvals.require_approval = vec!["custom-approval".into()];
+        let granular = (
+            config.autonomy.allowed_commands.clone(),
+            config.security.tool_policy.denied_tools.clone(),
+            config.approvals.require_approval.clone(),
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_FULL_ACCESS).unwrap());
+        assert!(config.permissions.is_full_access());
+        assert_eq!(configured_approval_profile(&config), APPROVAL_PROFILE_FULL_ACCESS);
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            )
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_REQUEST).unwrap());
+        assert!(!config.permissions.is_full_access());
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            ),
+            "leaving full access for the pre-existing restricted profile must not rewrite granular settings"
+        );
     }
 }
 

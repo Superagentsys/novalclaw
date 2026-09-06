@@ -21,6 +21,7 @@ export function shouldShowPersonalChromeAuthorization(
 export function personalChromeAuthorizationAction(
   status: PersonalChromeAuthorizationStatusDto
 ): PersonalChromeAuthorizationAction {
+  if (status.full_access) return "none";
   if (status.extension_tab_granted && !status.desktop_run_granted) return "approve";
   if (status.extension_tab_granted || status.desktop_run_granted) return "revoke";
   return "none";
@@ -51,6 +52,13 @@ export function personalChromeAuthorizationCopy(
       title: "等待 Chrome 标签页授权",
       detail: "在 OmniNova 扩展中选择当前标签页并点击“允许当前标签页”。",
       tone: "waiting",
+    };
+  }
+  if (status.full_access && status.ready) {
+    return {
+      title: "Personal Chrome 已就绪",
+      detail: "完全访问模式已免除任务级批准；Chrome 扩展权限和浏览器运行状态仍受保护。",
+      tone: "ready",
     };
   }
   if (!status.desktop_run_granted) {

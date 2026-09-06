@@ -33,7 +33,7 @@ pub const WEB_MAX_REDIRECTS: usize = 10;
 /// True when `host` is `domain` or a subdomain of `domain` (dot-delimited).
 /// `evil-example.com` does **not** match `example.com`.
 pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
-    if allowed.is_empty() {
+    if allowed.is_empty() || allowed.iter().any(|entry| entry.trim() == "*") {
         return true;
     }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -330,7 +330,9 @@ fn private_blocked(host: String) -> WebClientError {
 /// in the tool's `allowed_domains`. This is the existing explicit opt-in
 /// mechanism; no new permission surface is introduced.
 fn host_is_explicitly_allowed(host_forms: &[String], allowed: &[String]) -> bool {
-    allowed.iter().any(|a| host_forms.iter().any(|f| f == a))
+    allowed
+        .iter()
+        .any(|a| a.trim() == "*" || host_forms.iter().any(|f| f == a))
 }
 
 fn check_host_literal(host: Host<&str>, allowed: &[String]) -> Result<(), WebClientError> {
@@ -405,6 +407,13 @@ pub async fn check_destination(
     };
 
     check_host_literal(Host::Domain(host.as_str()), allowed_private_hosts)?;
+
+    if allowed_private_hosts
+        .iter()
+        .any(|entry| entry.trim() == "*")
+    {
+        return Ok(());
+    }
 
     if via_proxy {
         // With a proxy the remote hop resolves DNS and owns the connection;
@@ -865,6 +874,32 @@ pub(crate) mod tests {
             &allowed
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn full_access_wildcard_allows_private_network_without_weakening_default() {
+        let url = Url::parse("http://127.0.0.1:9/").unwrap();
+        assert!(check_destination(&url, &[], false).await.is_err());
+        assert!(check_destination(&url, &["*".to_string()], false)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_access_wildcard_executes_local_network_request() {
+        let port = spawn_test_server(|_req, stream| {
+            write_response(stream, "HTTP/1.1 200 OK", "full-access-network-ok", &[]);
+        });
+        let tool = HttpRequestTool::new(vec!["*".to_string()], default_tool_settings());
+
+        let result = tool
+            .execute(json!({"url": format!("http://127.0.0.1:{port}/health")}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "request failed: {:?}", result.error);
+        assert!(result.output.starts_with("HTTP 200"));
+        assert!(result.output.contains("full-access-network-ok"));
     }
 
     #[test]

@@ -169,14 +169,24 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["read_file"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileReadTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileReadTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_write",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileWriteTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileWriteTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "office_create",
@@ -190,21 +200,36 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileEditTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileEditTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_patch",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &["apply_patch"],
         enabled: always,
-        build: |ctx| Some(Box::new(FilePatchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FilePatchTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_list",
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["list_directory"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileListTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileListTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "glob_search",
@@ -317,8 +342,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.http_request.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.http_request.allowed_domains.clone()
+            };
             Some(Box::new(HttpRequestTool::new(
-                ctx.config.http_request.allowed_domains.clone(),
+                allowed_domains,
                 WebToolSettings::from_config(
                     &ctx.config.proxy,
                     ctx.config.http_request.timeout_secs,
@@ -333,8 +363,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_fetch.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.web_fetch.allowed_domains.clone()
+            };
             Some(Box::new(WebFetchTool::new(
-                ctx.config.web_fetch.allowed_domains.clone(),
+                allowed_domains,
                 WebToolSettings::from_config(
                     &ctx.config.proxy,
                     ctx.config.web_fetch.timeout_secs,
@@ -416,12 +451,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 profile,
                 installed_profile,
             };
-            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable_and_personal_chrome(
+            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable_and_personal_chrome_access(
                 &ctx.config.browser.backend,
                 None,
                 session_opts.clone(),
                 ctx.config.browser.executable_path.clone(),
                 ctx.personal_chrome.cloned(),
+                ctx.config.permissions.is_full_access(),
             ) {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -435,7 +471,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 }
             };
             let policy = crate::tools::browser_runtime::BrowserRuntimePolicy {
-                allowed_domains: ctx.config.browser.allowed_domains.clone(),
+                allowed_domains: if ctx.config.permissions.is_full_access() {
+                    Vec::new()
+                } else {
+                    ctx.config.browser.allowed_domains.clone()
+                },
                 ..crate::tools::browser_runtime::BrowserRuntimePolicy::default()
             };
             let runtime = Arc::new(crate::tools::browser_runtime::BrowserRuntime::new(backend, policy));

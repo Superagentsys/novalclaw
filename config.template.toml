@@ -116,6 +116,13 @@
 # catalog_prompt_limit = 150
 # catalog_description_limit = 160
 
+# --- Global permission mode ---
+# Restricted preserves the granular autonomy/security/approval settings below.
+# Full access bypasses OmniNova approval prompts and policy allowlists, but only
+# within the OS permissions already granted to the OmniNova process.
+# [permissions]
+# mode = "restricted"           # restricted, full_access
+
 # --- Autonomy ---
 # [autonomy]
 # level = "supervised"          # supervised, semi, autonomous

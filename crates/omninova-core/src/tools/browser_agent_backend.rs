@@ -1324,13 +1324,36 @@ pub fn backend_from_config_with_executable_and_personal_chrome(
     executable_path: Option<PathBuf>,
     personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
 ) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_executable_and_personal_chrome_access(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        personal_chrome,
+        false,
+    )
+}
+
+/// Build a configured backend with the global authorization mode applied.
+/// Full access opens only OmniNova's Personal Chrome release/approval gate;
+/// transport availability, extension permissions, tab identity, ownership,
+/// and lifecycle checks remain enforced by the backend.
+pub fn backend_from_config_with_executable_and_personal_chrome_access(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+    full_access: bool,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
     backend_from_config_with_factory_gate(
         backend_name,
         search,
         defaults,
         executable_path,
         personal_chrome,
-        crate::tools::browser_personal_chrome::personal_chrome_production_enabled(),
+        full_access
+            || crate::tools::browser_personal_chrome::personal_chrome_production_enabled(),
     )
 }
 
@@ -2531,6 +2554,23 @@ mod tests {
         };
         assert_eq!(err.kind, BrowserErrorKind::Rejected);
         assert!(err.detail.contains("PersonalChromeNotAuthorized"));
+    }
+
+    #[test]
+    fn full_access_opens_omninova_release_gate_but_still_requires_transport_context() {
+        let err = match backend_from_config_with_executable_and_personal_chrome_access(
+            "personal-chrome",
+            None,
+            BrowserSessionOptions::default(),
+            None,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("personal-chrome still needs a connected bridge context"),
+            Err(err) => err,
+        };
+        assert!(err.detail.contains("PersonalChromeNotAuthorized"));
+        assert!(!err.detail.contains("release gate is closed"));
     }
 
     #[test]

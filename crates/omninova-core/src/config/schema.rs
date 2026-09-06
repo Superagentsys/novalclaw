@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub permissions: PermissionsConfig,
+    #[serde(default)]
     pub autonomy: AutonomyConfig,
     #[serde(default)]
     pub security: SecurityConfig,
@@ -200,6 +202,7 @@ impl Default for Config {
             provider: ProviderBehaviorConfig::default(),
             provider_runtime: ProviderRuntimeConfig::default(),
             agent: AgentConfig::default(),
+            permissions: PermissionsConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -752,6 +755,34 @@ where
         }
     };
     Ok(mapped)
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/// Global OmniNova authorization mode. Full access bypasses OmniNova policy
+/// prompts and allowlists, but does not bypass operating-system permissions or
+/// runtime correctness mechanisms such as E-Stop, browser ownership, session
+/// isolation, validation, and lifecycle locks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    Restricted,
+    FullAccess,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub mode: PermissionMode,
+}
+
+impl PermissionsConfig {
+    pub fn is_full_access(&self) -> bool {
+        self.mode == PermissionMode::FullAccess
+    }
 }
 
 // ---------------------------------------------------------------------------

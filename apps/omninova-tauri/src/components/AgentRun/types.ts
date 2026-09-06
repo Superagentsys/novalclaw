@@ -108,6 +108,7 @@ export interface PersonalChromeAuthorizationStatusDto {
   desktop_run_granted: boolean;
   authorization_generation: number | null;
   production_factory_enabled: boolean;
+  full_access: boolean;
   ready: boolean;
   error_code: string | null;
 }
