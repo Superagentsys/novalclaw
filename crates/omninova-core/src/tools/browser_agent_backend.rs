@@ -1323,6 +1323,13 @@ pub fn backend_from_config_with_executable(
             executable_path,
         )));
     }
+    if id == BrowserBackendId::personal_chrome() {
+        return Err(BrowserBackendError::new(
+            BrowserErrorKind::Rejected,
+            id,
+            "BrowserBackendUnsupported: personal-chrome production activation is blocked until B3.5-D authorization UX; extension install alone does not grant Agent control",
+        ));
+    }
     Err(BrowserBackendError::new(
         BrowserErrorKind::Rejected,
         id,

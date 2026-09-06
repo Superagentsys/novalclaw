@@ -105,3 +105,70 @@ async fn named_pipe_auth_hello_ping_reconnect_and_stale_generation() {
     );
     assert!(!rejected.contains(secret.as_str()));
 }
+
+#[tokio::test]
+async fn desktop_request_is_forwarded_and_correlated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bridge = PersonalChromeBridge::spawn(tmp.path().to_path_buf()).unwrap();
+    let endpoint = load_endpoint(tmp.path()).unwrap();
+    let secret = load_secret(tmp.path()).unwrap();
+    let mut client = connect_retry(&endpoint.path).await;
+    let auth = AuthRequest {
+        protocol_version: 1,
+        secret: secret.as_str().to_string(),
+        generation: endpoint.generation,
+        connection_nonce: endpoint.connection_nonce.clone(),
+        host_pid: std::process::id(),
+    };
+    write_frame(&mut client, &serde_json::to_string(&auth).unwrap())
+        .await
+        .unwrap();
+    let _ack = read_frame(&mut client).await.unwrap().unwrap();
+    write_frame(
+        &mut client,
+        &json!({
+            "protocol_version": 1,
+            "request_id": "h1",
+            "operation": "hello",
+            "payload": { "protocol_version": 1, "extension_version": "0.1.0" }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let hello = read_frame(&mut client).await.unwrap().unwrap();
+    assert!(hello.contains("hello_ack"));
+
+    let bridge2 = bridge.clone();
+    let responder = tokio::spawn(async move {
+        let req = read_frame(&mut client).await.unwrap().unwrap();
+        assert!(req.contains("tab_list_authorized"));
+        assert!(!req.contains(secret.as_str()));
+        let parsed: serde_json::Value = serde_json::from_str(&req).unwrap();
+        let id = parsed["request_id"].as_str().unwrap().to_string();
+        write_frame(
+            &mut client,
+            &json!({
+                "protocol_version": 1,
+                "request_id": id,
+                "ok": true,
+                "payload": { "tabs": [] }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        client
+    });
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        bridge2.request("tab_list_authorized", "", json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.ok);
+    assert_eq!(response.payload.unwrap()["tabs"], json!([]));
+    let _ = responder.await.unwrap();
+}

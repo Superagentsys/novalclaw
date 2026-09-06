@@ -3611,6 +3611,7 @@ dependencies = [
  "image 0.25.5",
  "indexmap 2.14.0",
  "num-conv",
+ "omninova-browser-host",
  "parking_lot",
  "pdf-extract",
  "pest",

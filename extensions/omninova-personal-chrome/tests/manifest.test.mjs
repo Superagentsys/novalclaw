@@ -6,12 +6,16 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-test("transport-only permissions and stable public key", () => {
+test("permissions stay transport-plus-authorized-tab and exclude debugger/cookies", () => {
   const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3);
-  assert.deepEqual(manifest.permissions.sort(), ["alarms", "nativeMessaging", "storage"].sort());
+  assert.deepEqual(
+    manifest.permissions.sort(),
+    ["alarms", "nativeMessaging", "storage", "tabs"].sort()
+  );
   assert.equal(manifest.host_permissions, undefined);
-  assert.equal(manifest.content_scripts, undefined);
+  assert.ok(Array.isArray(manifest.content_scripts));
+  assert.deepEqual(manifest.content_scripts[0].matches.sort(), ["http://*/*", "https://*/*"].sort());
   const forbidden = [
     "debugger",
     "cookies",

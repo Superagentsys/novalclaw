@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use uuid::Uuid;
 
 use crate::constants::{
@@ -17,7 +18,9 @@ use crate::install::{
     install_product_host, remove_product_host, resolve_host_executable, verify_product_host,
 };
 use crate::ipc::{verify_auth, AuthOk, AuthRequest};
-use crate::protocol::{dispatch, parse_request, TransportSession};
+use crate::protocol::{
+    dispatch, parse_request, TransportRequest, TransportResponse, TransportSession,
+};
 use crate::secret::{
     load_endpoint, load_or_create_secret, rotate_secret, write_endpoint, EndpointFile, Secret,
 };
@@ -31,11 +34,18 @@ struct LiveState {
     saw_connection: bool,
 }
 
+struct OutboundCall {
+    raw: String,
+    request_id: String,
+    reply: oneshot::Sender<Result<String, BridgeError>>,
+}
+
 struct Inner {
     dir: PathBuf,
     secret: Mutex<Secret>,
     live: Mutex<LiveState>,
     wake: Notify,
+    outbound: Mutex<Option<mpsc::Sender<OutboundCall>>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +81,7 @@ impl PersonalChromeBridge {
                 saw_connection: false,
             }),
             wake: Notify::new(),
+            outbound: Mutex::new(None),
         });
         let bridge = Self { inner };
         let worker = bridge.clone();
@@ -127,6 +138,51 @@ impl PersonalChromeBridge {
 
     pub async fn verify_bridge(&self) -> Result<TransportStatus, BridgeError> {
         Ok(self.status().await)
+    }
+
+    /// Send a backend operation to the connected extension. The Native Host
+    /// remains a thin forwarder; this is Desktop → extension over the live IPC.
+    pub async fn request(
+        &self,
+        operation: &str,
+        session_id: &str,
+        payload: Value,
+    ) -> Result<TransportResponse, BridgeError> {
+        let request_id = format!("dreq:{}", Uuid::new_v4());
+        let req = TransportRequest {
+            protocol_version: protocol_version(),
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            operation: operation.to_string(),
+            payload,
+        };
+        let encoded = serde_json::to_string(&req).map_err(BridgeError::from_json)?;
+        if encoded.len() > application_max_message_bytes() {
+            return Err(BridgeError::PayloadTooLarge {
+                len: encoded.len(),
+                max: application_max_message_bytes(),
+            });
+        }
+        let tx = self
+            .inner
+            .outbound
+            .lock()
+            .await
+            .clone()
+            .ok_or(BridgeError::Disconnected)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(OutboundCall {
+            raw: encoded,
+            request_id,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| BridgeError::Disconnected)?;
+        let raw = tokio::time::timeout(Duration::from_secs(20), reply_rx)
+            .await
+            .map_err(|_| BridgeError::Disconnected)?
+            .map_err(|_| BridgeError::Disconnected)??;
+        serde_json::from_str(&raw).map_err(BridgeError::from_json)
     }
 
     pub async fn remove_bridge(&self) -> Result<TransportStatus, BridgeError> {
@@ -252,48 +308,97 @@ impl PersonalChromeBridge {
             transport_session_id: None,
             hello_completed: false,
         };
+        let (out_tx, mut out_rx) = mpsc::channel::<OutboundCall>(32);
+        *self.inner.outbound.lock().await = Some(out_tx);
+        let mut pending: HashMap<String, oneshot::Sender<Result<String, BridgeError>>> =
+            HashMap::new();
+        let result = self
+            .session_mux(&mut stream, &mut session, &mut out_rx, &mut pending)
+            .await;
+        *self.inner.outbound.lock().await = None;
+        for (_, reply) in pending {
+            let _ = reply.send(Err(BridgeError::Disconnected));
+        }
+        result
+    }
+
+    async fn session_mux<S>(
+        &self,
+        stream: &mut S,
+        session: &mut TransportSession,
+        out_rx: &mut mpsc::Receiver<OutboundCall>,
+        pending: &mut HashMap<String, oneshot::Sender<Result<String, BridgeError>>>,
+    ) -> Result<(), BridgeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         loop {
-            let raw = match read_frame(&mut stream).await? {
-                Some(raw) => raw,
-                None => break,
-            };
-            let response = match parse_request(&raw) {
-                Ok(req) => {
-                    let response = dispatch(&mut session, &req);
-                    if !response.ok {
-                        if response
-                            .error
-                            .as_ref()
-                            .map(|e| e.code == "ProtocolMismatch")
-                            .unwrap_or(false)
-                        {
-                            let mut live = self.inner.live.lock().await;
-                            live.health = TransportHealth::ProtocolMismatch;
-                        }
-                    } else if req.operation == crate::protocol::OP_HELLO {
-                        let mut live = self.inner.live.lock().await;
-                        live.health = TransportHealth::Connected;
-                    }
-                    response
+            tokio::select! {
+                outbound = out_rx.recv() => {
+                    let Some(call) = outbound else {
+                        return Err(BridgeError::Disconnected);
+                    };
+                    pending.insert(call.request_id, call.reply);
+                    write_frame(stream, &call.raw).await?;
                 }
-                Err(err) => crate::protocol::TransportResponse::err("", &err),
-            };
-            let encoded = serde_json::to_string(&response).map_err(BridgeError::from_json)?;
-            write_frame(&mut stream, &encoded).await?;
-            if response
-                .error
-                .as_ref()
-                .map(|e| e.code == "ProtocolMismatch")
-                .unwrap_or(false)
-            {
-                return Err(BridgeError::ProtocolMismatch {
-                    requested: 0,
-                    expected: protocol_version(),
-                });
+                incoming = read_frame(stream) => {
+                    let raw = match incoming? {
+                        Some(raw) => raw,
+                        None => return Err(BridgeError::Disconnected),
+                    };
+                    if incoming_is_response(&raw) {
+                        if let Ok(resp) = serde_json::from_str::<TransportResponse>(&raw) {
+                            if let Some(reply) = pending.remove(&resp.request_id) {
+                                let _ = reply.send(Ok(raw));
+                            }
+                        }
+                        continue;
+                    }
+                    let response = match parse_request(&raw) {
+                        Ok(req) => {
+                            let response = dispatch(session, &req);
+                            if !response.ok {
+                                if response
+                                    .error
+                                    .as_ref()
+                                    .map(|e| e.code == "ProtocolMismatch")
+                                    .unwrap_or(false)
+                                {
+                                    let mut live = self.inner.live.lock().await;
+                                    live.health = TransportHealth::ProtocolMismatch;
+                                }
+                            } else if req.operation == crate::protocol::OP_HELLO {
+                                let mut live = self.inner.live.lock().await;
+                                live.health = TransportHealth::Connected;
+                            }
+                            response
+                        }
+                        Err(err) => TransportResponse::err("", &err),
+                    };
+                    let encoded = serde_json::to_string(&response).map_err(BridgeError::from_json)?;
+                    write_frame(stream, &encoded).await?;
+                    if response
+                        .error
+                        .as_ref()
+                        .map(|e| e.code == "ProtocolMismatch")
+                        .unwrap_or(false)
+                    {
+                        return Err(BridgeError::ProtocolMismatch {
+                            requested: 0,
+                            expected: protocol_version(),
+                        });
+                    }
+                }
             }
         }
-        Err(BridgeError::Disconnected)
     }
+}
+
+fn incoming_is_response(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    value.get("ok").is_some() && value.get("operation").is_none()
 }
 
 fn random_hex(nbytes: usize) -> Result<String, BridgeError> {

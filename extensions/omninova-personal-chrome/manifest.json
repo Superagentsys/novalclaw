@@ -2,9 +2,17 @@
   "manifest_version": 3,
   "name": "OmniNova Personal Chrome",
   "version": "0.1.0",
-  "description": "OmniNova Personal Chrome transport. Load unpacked for development. Chrome Web Store packaging is deferred.",
+  "description": "OmniNova Personal Chrome transport and authorized-tab content-script control. Load unpacked for development.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwy/QVjH3eYR8JigSeNUgKHI8e9OEtIAHJOvq0zNpyryxxkvU8G1h2ecxUSKuv22PYZMeIO/vp0qPf4AKGEvT5QT6d+9cAaWpAafN6CoWHdSAipX9K6+kbC3dFN7I7wD0RGcHAmLvIHXg4forFgL8QHo56eooCg3U0oNdUQQTAv1kgeLG3znbeR7wGQFJF1iYfjPy9RPmPYiAVBCE9T5nnfpjJR48yFo8gv5eLNjy4TsdC/DFPJ//lWgH41I/IjUjUcTKzQjPnmHLZfDGZMxzh9i69IP7TArz3nKX3+zZvcooi8LCPiToVuXFYG0QkFLZ4yk8gdMAedJu+S/N/WobAwIDAQAB",
-  "permissions": ["nativeMessaging", "storage", "alarms"],
+  "permissions": ["nativeMessaging", "storage", "alarms", "tabs"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
   "background": {
     "service_worker": "dist/background.js",
     "type": "module"

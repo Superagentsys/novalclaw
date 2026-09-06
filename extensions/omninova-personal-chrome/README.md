@@ -1,4 +1,4 @@
-# OmniNova Personal Chrome (B3.5-B transport)
+# OmniNova Personal Chrome (B3.5-C)
 
 Chrome cannot silently install unpacked extensions. Development load is one-time:
 
@@ -11,4 +11,19 @@ Chrome cannot silently install unpacked extensions. Development load is one-time
 
 Production Chrome Web Store packaging is deferred.
 
-This skeleton only establishes Native Messaging transport. It does not automate pages.
+## Manifest permissions (B3.5-C v1)
+
+| Permission | Why |
+|---|---|
+| `nativeMessaging` | B3.5-B transport to the Native Host |
+| `storage` | Transport status for the popup |
+| `alarms` | Reconnect + keepalive ping |
+| `tabs` | Read/update **only** an explicitly authorized tab (`tabs.get` / `tabs.update`) |
+
+Content scripts match `http://*/*` and `https://*/*` so the isolated-world DOM engine can run on normal web pages. This is **not** silent all-tab control: the service worker refuses every observe/act/navigate unless that exact tab is in the authorized-tab registry.
+
+Not requested: `debugger`, `cookies`, `history`, `downloads`, `webNavigation`, `<all_urls>`, `scripting`, `activeTab`.
+
+Screenshot (`captureVisibleTab`) is typed `OperationUnsupported` in v1 because it needs broader host access than this model allows.
+
+Eval / `page_eval` / CDP / `chrome.debugger` are typed unsupported. Production Agent activation remains fail-closed until B3.5-D authorization UX.

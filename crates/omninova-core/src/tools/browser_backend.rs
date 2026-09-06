@@ -16,7 +16,7 @@ use async_trait::async_trait;
 /// missing / empty → agent-browser
 /// legacy `"playwright"` → agent-browser
 /// `"agent-browser"` → agent-browser
-/// `"personal-chrome"` → personal-chrome (future)
+/// `"personal-chrome"` → personal-chrome (B3.5-C implemented; production factory fail-closed until B3.5-D)
 /// unknown → Rejected (`BrowserBackendUnsupported` at B3.1C)
 pub fn planned_backend_id_from_config(
     value: Option<&str>,

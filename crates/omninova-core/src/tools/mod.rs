@@ -7,6 +7,7 @@ pub mod browser_executable;
 pub mod browser_installed_profile;
 pub mod browser_lifecycle;
 pub mod browser_output;
+pub mod browser_personal_chrome;
 pub mod browser_profile;
 pub mod browser_profile_manager;
 pub mod browser_runtime;
