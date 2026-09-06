@@ -1359,6 +1359,43 @@ async fn cancel_browser_takeover(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn install_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .install_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn verify_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .verify_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn remove_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .remove_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn get_personal_chrome_bridge_status(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    Ok(bridge.status().await)
+}
+
 async fn workspace_dir_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> PathBuf {
     let runtime = {
         let app_state = state.lock().await;
@@ -2185,6 +2222,32 @@ mod browser_takeover_command_tests {
             !registered.contains(&runtime_ctor),
             "Tauri must not construct BrowserRuntime"
         );
+    }
+}
+
+#[cfg(test)]
+mod personal_chrome_bridge_command_tests {
+    #[test]
+    fn personal_chrome_bridge_commands_are_registered_and_do_not_expose_secrets() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "install_personal_chrome_bridge",
+            "verify_personal_chrome_bridge",
+            "remove_personal_chrome_bridge",
+            "get_personal_chrome_bridge_status",
+        ] {
+            assert!(registered.contains(command), "missing command {command}");
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let forbidden_backend = ["Personal", "Chrome", "Backend"].concat();
+        let secret_file = ["ipc", ".", "secret"].concat();
+        assert!(!registered.contains(&forbidden_backend));
+        assert!(!registered.contains(&secret_file));
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(!registered.contains(&runtime_ctor));
     }
 }
 
@@ -5410,6 +5473,10 @@ pub fn run() {
             request_browser_takeover,
             release_browser_takeover,
             cancel_browser_takeover,
+            install_personal_chrome_bridge,
+            verify_personal_chrome_bridge,
+            remove_personal_chrome_bridge,
+            get_personal_chrome_bridge_status,
             automation_list_jobs,
             automation_upsert_job,
             automation_delete_job,
@@ -5479,6 +5546,16 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".omninova"));
+            let bridge = omninova_browser_host::PersonalChromeBridge::spawn(
+                app_data_dir.join("personal-chrome-bridge"),
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("personal chrome transport: {}", error.code()),
+                )
+            })?;
+            app.manage(bridge);
             let webview_user_data_dir = resolve_webview_user_data_dir();
             std::fs::create_dir_all(&webview_user_data_dir).map_err(|error| {
                 std::io::Error::new(

@@ -2,6 +2,7 @@
 members = [
     "apps/omninova-tauri/src-tauri",
     "crates/omninova-core",
+    "crates/omninova-browser-host",
 ]
 resolver = "2"
 
@@ -24,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "=0.12.0", default-features = false, features = ["json", "rustls-tls", "http2"] }
 uuid = { version = "=1.11.0", features = ["v4", "std"] }
+native_messaging = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
 config = "=0.13.4"

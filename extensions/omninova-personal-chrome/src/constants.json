@@ -1,0 +1,9 @@
+{
+  "native_host_name": "com.omninova.browser_host",
+  "native_host_binary": "omninova-browser-host",
+  "protocol_version": 1,
+  "application_max_message_bytes": 1048576,
+  "dev_extension_id": "caooogobppgihkdpcjibhoinkfobenhe",
+  "app_data_folder": "com.omninova.claw",
+  "bridge_subdir": "personal-chrome-bridge"
+}
