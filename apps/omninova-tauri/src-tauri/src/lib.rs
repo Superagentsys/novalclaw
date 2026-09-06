@@ -5732,6 +5732,7 @@ pub fn run() {
         .expect("Failed to build async runtime");
     let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
     tauri::async_runtime::set(runtime.handle().clone());
+    let personal_chrome_runtime_handle = runtime.handle().clone();
 
     omninova_core::init().expect("Failed to initialize core");
 
@@ -5860,8 +5861,9 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".omninova"));
-            let bridge = omninova_browser_host::PersonalChromeBridge::spawn(
+            let bridge = omninova_browser_host::PersonalChromeBridge::spawn_on(
                 app_data_dir.join("personal-chrome-bridge"),
+                personal_chrome_runtime_handle.clone(),
             )
             .map_err(|error| {
                 std::io::Error::new(

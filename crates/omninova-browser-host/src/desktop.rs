@@ -55,6 +55,19 @@ pub struct PersonalChromeBridge {
 
 impl PersonalChromeBridge {
     pub fn spawn(dir: PathBuf) -> Result<Self, BridgeError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| BridgeError::RuntimeUnavailable)?;
+        Self::spawn_on(dir, runtime)
+    }
+
+    /// Starts the bridge listener on an explicit runtime.
+    ///
+    /// Desktop setup callbacks are synchronous and therefore may not have an
+    /// entered Tokio context even when the application already owns a runtime.
+    pub fn spawn_on(
+        dir: PathBuf,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, BridgeError> {
         std::fs::create_dir_all(&dir)?;
         let secret = load_or_create_secret(&dir)?;
         let previous_generation = load_endpoint(&dir).map(|e| e.generation).unwrap_or(0);
@@ -85,7 +98,7 @@ impl PersonalChromeBridge {
         });
         let bridge = Self { inner };
         let worker = bridge.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             if let Err(err) = worker.accept_loop().await {
                 tracing::warn!(code = err.code(), "personal chrome IPC listener stopped");
             }
@@ -492,6 +505,29 @@ pub fn handle_json_for_test(raw: &str, session: &mut TransportSession) -> Value 
 mod tests {
     use super::*;
     use crate::secret::Secret;
+
+    #[test]
+    fn spawn_without_runtime_returns_typed_error_instead_of_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = PersonalChromeBridge::spawn(tmp.path().join("bridge"));
+        assert!(matches!(result, Err(BridgeError::RuntimeUnavailable)));
+    }
+
+    #[test]
+    fn spawn_on_accepts_an_explicit_runtime_outside_entered_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = PersonalChromeBridge::spawn_on(
+            tmp.path().join("bridge"),
+            runtime.handle().clone(),
+        );
+
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn auth_failure_errors_do_not_include_secret() {

@@ -47,6 +47,9 @@ pub enum BridgeError {
     #[error("Disconnected: transport peer closed the connection")]
     Disconnected,
 
+    #[error("RuntimeUnavailable: Personal Chrome transport requires a Tokio runtime")]
+    RuntimeUnavailable,
+
     #[error("Io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -74,6 +77,7 @@ impl BridgeError {
             BridgeError::HostBinaryNotFound => "HostBinaryNotFound",
             BridgeError::NotInstalled => "NotInstalled",
             BridgeError::Disconnected => "Disconnected",
+            BridgeError::RuntimeUnavailable => "RuntimeUnavailable",
             BridgeError::Io(_) => "Io",
             BridgeError::Json(_) => "Json",
             BridgeError::Install(_) => "Install",
