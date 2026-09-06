@@ -945,6 +945,17 @@ struct ActiveAgentRun {
     cancel_token: AgentCancellationToken,
     browser_takeover: Option<BrowserTakeoverHandle>,
     events_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+    personal_chrome_grant: Option<PersonalChromeRunGrant>,
+}
+
+/// Exact extension grant approved for one active Agent run. This is runtime
+/// state only and is removed with the run; it is never persisted globally.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersonalChromeRunGrant {
+    pub run_id: String,
+    pub window_id: i32,
+    pub tab_id: i32,
+    pub authorization_generation: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1074,6 +1085,7 @@ impl AgentRunRegistry {
                 cancel_token: token.clone(),
                 browser_takeover,
                 events_tx,
+                personal_chrome_grant: None,
             },
         );
         Ok(token)
@@ -1129,6 +1141,50 @@ impl AgentRunRegistry {
         ) {
             let _ = sender.send(event);
         }
+    }
+
+    async fn grant_personal_chrome(
+        &self,
+        run_id: &str,
+        window_id: i32,
+        tab_id: i32,
+        authorization_generation: u64,
+    ) -> Result<PersonalChromeRunGrant, BrowserTakeoverRouteError> {
+        let mut runs = self.inner.write().await;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        let grant = PersonalChromeRunGrant {
+            run_id: run_id.to_string(),
+            window_id,
+            tab_id,
+            authorization_generation,
+        };
+        run.personal_chrome_grant = Some(grant.clone());
+        Ok(grant)
+    }
+
+    async fn personal_chrome_grant(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PersonalChromeRunGrant>, BrowserTakeoverRouteError> {
+        let runs = self.inner.read().await;
+        let run = runs
+            .get(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        Ok(run.personal_chrome_grant.clone())
+    }
+
+    async fn revoke_personal_chrome(
+        &self,
+        run_id: &str,
+    ) -> Result<(), BrowserTakeoverRouteError> {
+        let mut runs = self.inner.write().await;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        run.personal_chrome_grant = None;
+        Ok(())
     }
 }
 
@@ -1894,6 +1950,32 @@ impl GatewayRuntime {
         let dto = browser_takeover_dto(run_id, &handle, state);
         self.run_registry.notify_browser_takeover(&dto).await;
         Ok(dto)
+    }
+
+    pub async fn grant_personal_chrome_for_run(
+        &self,
+        run_id: &str,
+        window_id: i32,
+        tab_id: i32,
+        authorization_generation: u64,
+    ) -> Result<PersonalChromeRunGrant, BrowserTakeoverRouteError> {
+        self.run_registry
+            .grant_personal_chrome(run_id, window_id, tab_id, authorization_generation)
+            .await
+    }
+
+    pub async fn personal_chrome_grant_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PersonalChromeRunGrant>, BrowserTakeoverRouteError> {
+        self.run_registry.personal_chrome_grant(run_id).await
+    }
+
+    pub async fn revoke_personal_chrome_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<(), BrowserTakeoverRouteError> {
+        self.run_registry.revoke_personal_chrome(run_id).await
     }
 
     pub async fn refresh_memory_from_config(&self) -> anyhow::Result<()> {
@@ -14077,5 +14159,89 @@ mod browser_takeover_route_tests {
                 "dto keys={keys:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn personal_chrome_grants_are_exact_run_scoped_and_generation_bound() {
+        let gateway = GatewayRuntime::new(Config::default());
+        gateway
+            .run_registry
+            .start_run("run-a".into(), "session-a".into(), None, None)
+            .await
+            .unwrap();
+        gateway
+            .run_registry
+            .start_run("run-b".into(), "session-b".into(), None, None)
+            .await
+            .unwrap();
+
+        let granted = gateway
+            .grant_personal_chrome_for_run("run-a", 11, 22, 3)
+            .await
+            .unwrap();
+        assert_eq!(granted.run_id, "run-a");
+        assert_eq!(granted.window_id, 11);
+        assert_eq!(granted.tab_id, 22);
+        assert_eq!(granted.authorization_generation, 3);
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap(),
+            Some(granted)
+        );
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-b")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let replaced = gateway
+            .grant_personal_chrome_for_run("run-a", 11, 23, 4)
+            .await
+            .unwrap();
+        assert_eq!(replaced.tab_id, 23);
+        assert_eq!(replaced.authorization_generation, 4);
+    }
+
+    #[tokio::test]
+    async fn personal_chrome_grant_revoke_and_run_finish_fail_closed() {
+        let gateway = GatewayRuntime::new(Config::default());
+        gateway
+            .run_registry
+            .start_run("run-a".into(), "session-a".into(), None, None)
+            .await
+            .unwrap();
+        gateway
+            .grant_personal_chrome_for_run("run-a", 1, 2, 1)
+            .await
+            .unwrap();
+
+        gateway
+            .revoke_personal_chrome_for_run("run-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap(),
+            None
+        );
+
+        gateway
+            .grant_personal_chrome_for_run("run-a", 1, 2, 2)
+            .await
+            .unwrap();
+        gateway.run_registry.finish_run("run-a").await;
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap_err(),
+            BrowserTakeoverRouteError::RunNotFound
+        );
     }
 }

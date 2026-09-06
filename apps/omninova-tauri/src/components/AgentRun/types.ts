@@ -98,6 +98,20 @@ export interface BrowserTakeoverStateDto {
   headless: boolean;
 }
 
+export interface PersonalChromeAuthorizationStatusDto {
+  run_id: string;
+  configured: boolean;
+  state: string;
+  transport_connected: boolean;
+  protocol_version: number;
+  extension_tab_granted: boolean;
+  desktop_run_granted: boolean;
+  authorization_generation: number | null;
+  production_factory_enabled: boolean;
+  ready: boolean;
+  error_code: string | null;
+}
+
 export interface AgentRunEventBrowserTakeoverStateChanged {
   type: "browser_takeover_state_changed";
   run_id: string;

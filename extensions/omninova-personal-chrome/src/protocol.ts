@@ -28,9 +28,9 @@ export interface TransportResponse {
 }
 
 export const BACKEND_OPERATIONS = [
-  "authorize_tab_test_only",
   "tab_get",
   "tab_list_authorized",
+  "revoke_authorization",
   "attach_session",
   "detach_session",
   "session_health",
@@ -96,6 +96,16 @@ export function isRestrictedUrl(url: string): boolean {
     lower.startsWith("about:") ||
     lower.includes("chromewebstore.google.com")
   );
+}
+
+export function originPermissionPattern(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return `${parsed.protocol}//${parsed.host}/*`;
+  } catch {
+    return undefined;
+  }
 }
 
 export function redactInputValue(inputType: string, value: string): string | undefined {

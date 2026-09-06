@@ -1575,6 +1575,44 @@
   background: var(--ui-danger-soft) !important;
 }
 
+.agent-run-personal-chrome {
+  border-bottom-color: var(--ui-border) !important;
+}
+
+.agent-run-personal-chrome-copy strong {
+  color: var(--ui-text) !important;
+}
+
+.agent-run-personal-chrome-copy small {
+  color: var(--ui-text-muted) !important;
+}
+
+.agent-run-personal-chrome-actions button {
+  background: var(--ui-accent) !important;
+  color: #fff !important;
+}
+
+.agent-run-personal-chrome-secondary {
+  background: var(--ui-surface-2) !important;
+  color: var(--ui-text-secondary) !important;
+}
+
+.agent-run-personal-chrome--waiting {
+  background: var(--ui-accent-soft) !important;
+}
+
+.agent-run-personal-chrome--ready {
+  background: var(--ui-success-soft) !important;
+}
+
+.agent-run-personal-chrome--warn {
+  background: var(--ui-warning-soft) !important;
+}
+
+.agent-run-personal-chrome--error {
+  background: var(--ui-danger-soft) !important;
+}
+
 .agent-run-step--running .agent-run-step-title,
 .agent-run-output-toggle {
   color: var(--ui-accent-strong) !important;

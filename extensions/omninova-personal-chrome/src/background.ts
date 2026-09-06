@@ -1,9 +1,13 @@
 import {
   attachSession,
+  authorizationSnapshot,
   detachSession,
   getAuthorized,
-  grantTestAuthorization,
+  grantAuthorization,
   listAuthorized,
+  revokeAll,
+  revokeTab,
+  restoreAuthorizationGeneration,
 } from "./authorize.js";
 import {
   ConnectionStatus,
@@ -17,6 +21,7 @@ import {
   isProtocolMismatch,
   isRestrictedUrl,
   nativeHostName,
+  originPermissionPattern,
 } from "./protocol.js";
 
 const RECONNECT_ALARM = "omninova-personal-chrome-reconnect";
@@ -25,6 +30,12 @@ const PING_ALARM = "omninova-personal-chrome-ping";
 let port: chrome.runtime.Port | null = null;
 let status: ConnectionStatus = "disconnected";
 let reconnectAttempts = 0;
+
+async function initializeAuthorizationState(): Promise<void> {
+  const stored = await chrome.storage.local.get("authorizationGeneration");
+  restoreAuthorizationGeneration(Number(stored.authorizationGeneration ?? 0));
+  await revokeAuthorization();
+}
 
 async function setStatus(next: ConnectionStatus): Promise<void> {
   status = next;
@@ -101,28 +112,54 @@ async function sendToTab(tabId: number, message: Record<string, unknown>): Promi
   return await chrome.tabs.sendMessage(tabId, message);
 }
 
+async function injectAuthorizedContent(tabId: number, generation: number): Promise<void> {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    files: ["dist/dom.js", "dist/content.js"],
+  });
+  await sendToTab(tabId, {
+    kind: "authorization_sync",
+    authorization_generation: generation,
+  });
+}
+
+async function publishAuthorizationState(): Promise<void> {
+  const snapshot = authorizationSnapshot();
+  await chrome.storage.local.set({
+    authorizationEnabled: snapshot.authorized.length === 1,
+    authorizationGeneration: snapshot.generation,
+  });
+}
+
+async function revokeAuthorization(preserveOrigin?: string): Promise<void> {
+  const grants = listAuthorized();
+  revokeAll();
+  for (const grant of grants) {
+    try {
+      await sendToTab(grant.tabId, {
+        kind: "authorization_revoke",
+        authorization_generation: grant.authorizationGeneration,
+      });
+    } catch {
+      // A closed or navigated tab is already effectively revoked.
+    }
+    if (grant.originPermission && grant.originPermission !== preserveOrigin) {
+      try {
+        await chrome.permissions.remove({ origins: [grant.originPermission] });
+      } catch {
+        // Authorization is already invalid even if Chrome retains permission.
+      }
+    }
+  }
+  await publishAuthorizationState();
+}
+
 async function handleDesktopRequest(request: TransportRequest): Promise<void> {
   if (request.protocol_version !== PROTOCOL_VERSION) {
     fail(request, "ProtocolMismatch", "incompatible protocol");
     return;
   }
   switch (request.operation) {
-    case "authorize_tab_test_only": {
-      const tabId = Number(request.payload.tab_id);
-      const windowId = Number(request.payload.window_id || 0);
-      const tab = await tabInfo(tabId);
-      if (!tab) {
-        fail(request, "TabUnavailable", "tab does not exist");
-        return;
-      }
-      const grant = grantTestAuthorization(windowId || tab.windowId || 0, tabId);
-      respond(request, true, {
-        window_id: grant.windowId,
-        tab_id: grant.tabId,
-        authorization_generation: grant.authorizationGeneration,
-      });
-      return;
-    }
     case "tab_list_authorized": {
       const grants = listAuthorized();
       const tabs = [];
@@ -135,11 +172,14 @@ async function handleDesktopRequest(request: TransportRequest): Promise<void> {
           window_id: grant.windowId,
           tab_id: grant.tabId,
           authorization_generation: grant.authorizationGeneration,
-          url: tab.url ?? "",
-          title: tab.title ?? "",
         });
       }
       respond(request, true, { tabs });
+      return;
+    }
+    case "revoke_authorization": {
+      await revokeAuthorization();
+      respond(request, true, { revoked: true });
       return;
     }
     case "tab_get": {
@@ -186,6 +226,7 @@ async function handleDesktopRequest(request: TransportRequest): Promise<void> {
       try {
         const page = await sendToTab(bound.tabId, {
           kind: "observe",
+          authorization_generation: bound.authorizationGeneration,
           ref: request.payload.ref,
           selector: request.payload.selector,
           interactive_only: request.payload.interactive_only,
@@ -213,6 +254,7 @@ async function handleDesktopRequest(request: TransportRequest): Promise<void> {
       try {
         const page = await sendToTab(bound.tabId, {
           kind: "act",
+          authorization_generation: bound.authorizationGeneration,
           ...request.payload,
         });
         const pageError = page.error as { code?: string; message?: string } | undefined;
@@ -238,7 +280,11 @@ async function handleDesktopRequest(request: TransportRequest): Promise<void> {
       }
       const updated = await chrome.tabs.update(bound.tabId, { url });
       try {
-        await sendToTab(bound.tabId, { kind: "navigate" });
+        await injectAuthorizedContent(bound.tabId, bound.authorizationGeneration);
+        await sendToTab(bound.tabId, {
+          kind: "navigate",
+          authorization_generation: bound.authorizationGeneration,
+        });
       } catch {
         // Content script will reload with the new document.
       }
@@ -262,6 +308,100 @@ async function handleDesktopRequest(request: TransportRequest): Promise<void> {
       fail(request, "OperationUnsupported", `unknown operation ${request.operation}`);
   }
 }
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (!message || typeof message !== "object") return false;
+  const kind = (message as { kind?: string }).kind;
+  if (kind === "popup_authorization_status") {
+    void authorizationReady.then(() => {
+      const snapshot = authorizationSnapshot();
+      sendResponse({
+        transportStatus: status,
+        authorizationGeneration: snapshot.generation,
+        authorizedTabId: snapshot.authorized[0]?.tabId ?? null,
+        authorizedWindowId: snapshot.authorized[0]?.windowId ?? null,
+      });
+    });
+    return true;
+  }
+  if (kind === "popup_authorize_current_tab") {
+    void (async () => {
+      await authorizationReady;
+      const requestedTabId = Number((message as { tabId?: number }).tabId);
+      const requestedWindowId = Number((message as { windowId?: number }).windowId);
+      const requestedOrigin = String((message as { origin?: string }).origin ?? "");
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (
+        !tab?.id ||
+        tab.windowId === undefined ||
+        !tab.url ||
+        isRestrictedUrl(tab.url) ||
+        tab.id !== requestedTabId ||
+        tab.windowId !== requestedWindowId
+      ) {
+        sendResponse({ ok: false, code: "RestrictedOrUnavailableTab" });
+        return;
+      }
+      const origin = originPermissionPattern(tab.url);
+      if (!origin || origin !== requestedOrigin) {
+        sendResponse({ ok: false, code: "RestrictedOrUnavailableTab" });
+        return;
+      }
+      const permitted = await chrome.permissions.contains({ origins: [origin] });
+      if (!permitted) {
+        sendResponse({ ok: false, code: "HostPermissionDenied" });
+        return;
+      }
+      await revokeAuthorization(origin);
+      const grant = grantAuthorization(tab.windowId, tab.id, origin);
+      try {
+        await injectAuthorizedContent(tab.id, grant.authorizationGeneration);
+      } catch {
+        revokeTab(tab.id);
+        if (grant.originPermission) {
+          await chrome.permissions.remove({ origins: [grant.originPermission] });
+        }
+        await publishAuthorizationState();
+        sendResponse({ ok: false, code: "ContentScriptInjectionFailed" });
+        return;
+      }
+      await publishAuthorizationState();
+      sendResponse({ ok: true, authorizationGeneration: grant.authorizationGeneration });
+    })();
+    return true;
+  }
+  if (kind === "popup_revoke_authorization") {
+    void authorizationReady
+      .then(() => revokeAuthorization())
+      .then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  return false;
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const grant = getAuthorized(tabId);
+  if (!grant) return;
+  revokeTab(tabId);
+  if (grant.originPermission) {
+    void chrome.permissions.remove({ origins: [grant.originPermission] });
+  }
+  void publishAuthorizationState();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  const grant = getAuthorized(tabId);
+  if (!grant) return;
+  if (!tab.url || isRestrictedUrl(tab.url)) return;
+  void injectAuthorizedContent(tabId, grant.authorizationGeneration).catch(async () => {
+    revokeTab(tabId);
+    if (grant.originPermission) {
+      await chrome.permissions.remove({ origins: [grant.originPermission] });
+    }
+    await publishAuthorizationState();
+  });
+});
 
 function connect(): void {
   if (port) {
@@ -316,13 +456,17 @@ function schedulePing(): void {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  connect();
-  schedulePing();
+  void authorizationReady.then(() => {
+    connect();
+    schedulePing();
+  });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  connect();
-  schedulePing();
+  void authorizationReady.then(() => {
+    connect();
+    schedulePing();
+  });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -334,5 +478,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-connect();
-schedulePing();
+const authorizationReady = initializeAuthorizationState();
+void authorizationReady.then(() => {
+  connect();
+  schedulePing();
+});

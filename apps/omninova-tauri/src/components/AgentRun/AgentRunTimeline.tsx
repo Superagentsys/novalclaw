@@ -6,6 +6,7 @@ import { AgentRunEventCard } from "./AgentRunEventCard";
 import { AgentDiffPanel } from "../AgentDiff/AgentDiffPanel";
 import { buildAgentDiffState } from "../AgentDiff/diffStore";
 import { TakeoverStatusCard } from "./TakeoverStatusCard";
+import { PersonalChromeAuthorizationCard } from "./PersonalChromeAuthorizationCard";
 
 interface CachedLiveRun {
   events: RawEvent[];
@@ -277,6 +278,7 @@ export const AgentRunTimeline: React.FC<AgentRunTimelineProps> = memo(
     return (
       <section className={`agent-run-panel agent-run-panel--${status.type}`} aria-label="Agent 执行过程">
         {liveSessionId ? <TakeoverStatusCard runId={liveSessionId} /> : null}
+        {liveSessionId ? <PersonalChromeAuthorizationCard runId={liveSessionId} /> : null}
         <button type="button" className="agent-run-summary" onClick={toggleCollapsed}>
           <span className={`agent-run-summary-dot agent-run-summary-dot--${status.type}`} aria-hidden />
           <span className="agent-run-summary-text">{statusText}</span>

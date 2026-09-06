@@ -1,10 +1,8 @@
-import {
-  MAX_ELEMENT_TEXT,
-  MAX_OBSERVE_ELEMENTS,
-  redactInputValue,
-} from "./protocol.js";
+(() => {
+const MAX_ELEMENT_TEXT = 400;
+const MAX_OBSERVE_ELEMENTS = 80;
 
-export interface SnapshotElement {
+interface SnapshotElement {
   id: string;
   role: string;
   name: string;
@@ -12,7 +10,7 @@ export interface SnapshotElement {
   input_type?: string;
 }
 
-export interface SnapshotResult {
+interface SnapshotResult {
   snapshot_generation: number;
   text: string;
   elements: SnapshotElement[];
@@ -27,17 +25,17 @@ function randomGeneration(): number {
   return (bytes[0] % 0x3fffffff) * 100000 + (bytes[1] % 100000) + 1;
 }
 
-export function bumpSnapshotGeneration(): number {
+function bumpSnapshotGeneration(): number {
   snapshotGeneration += 1;
   refs.clear();
   return snapshotGeneration;
 }
 
-export function currentSnapshotGeneration(): number {
+function currentSnapshotGeneration(): number {
   return snapshotGeneration;
 }
 
-export function lookupRef(ref: string): Element | undefined {
+function lookupRef(ref: string): Element | undefined {
   const prefix = `pc:${snapshotGeneration}:`;
   if (!ref.startsWith(prefix)) {
     return undefined;
@@ -76,7 +74,7 @@ function visible(el: Element): boolean {
   return rect.width > 0 && rect.height > 0;
 }
 
-export function takeSnapshot(root: ParentNode, interactiveOnly = false): SnapshotResult {
+function takeSnapshot(root: ParentNode, interactiveOnly = false): SnapshotResult {
   snapshotGeneration = randomGeneration();
   refs.clear();
   const nodes = [...root.querySelectorAll("a, button, input, select, textarea, [role]")];
@@ -130,40 +128,56 @@ export function takeSnapshot(root: ParentNode, interactiveOnly = false): Snapsho
   };
 }
 
-export function readValue(el: Element): string {
+function readValue(el: Element): string {
   const input = el as HTMLInputElement;
   const inputType = input.type || "";
   const raw = input.value ?? "";
-  return redactInputValue(inputType, raw) ?? "";
+  return inputType.toLowerCase() === "password" ? "" : raw;
 }
 
-export function click(el: Element): void {
+function click(el: Element): void {
   (el as HTMLElement).click();
 }
 
-export function fill(el: Element, value: string): void {
+function fill(el: Element, value: string): void {
   const input = el as HTMLInputElement;
   input.value = value;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-export function hover(el: Element): void {
+function hover(el: Element): void {
   el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
 }
 
-export function press(key: string): void {
+function press(key: string): void {
   document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
 }
 
-export function scroll(direction: string, pixels = 400): void {
+function scroll(direction: string, pixels = 400): void {
   const dy = direction === "up" ? -pixels : direction === "down" ? pixels : 0;
   const dx = direction === "left" ? -pixels : direction === "right" ? pixels : 0;
   window.scrollBy(dx, dy);
 }
 
-export function selectValue(el: Element, value: string): void {
+function selectValue(el: Element, value: string): void {
   const select = el as HTMLSelectElement;
   select.value = value;
   select.dispatchEvent(new Event("change", { bubbles: true }));
 }
+
+(globalThis as typeof globalThis & { __omninovaPersonalChromeDom?: unknown })
+  .__omninovaPersonalChromeDom = {
+    bumpSnapshotGeneration,
+    click,
+    currentSnapshotGeneration,
+    fill,
+    hover,
+    lookupRef,
+    press,
+    readValue,
+    scroll,
+    selectValue,
+    takeSnapshot,
+  };
+})();

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   BACKEND_OPERATIONS,
   isRestrictedUrl,
+  originPermissionPattern,
   redactInputValue,
 } from "../dist/protocol.js";
 
@@ -24,5 +25,11 @@ test("backend operations exclude cookies eval debugger and storage dumps", () =>
   assert.equal(BACKEND_OPERATIONS.includes("debugger"), false);
   assert.equal(BACKEND_OPERATIONS.includes("storage_get"), false);
   assert.ok(BACKEND_OPERATIONS.includes("observe"));
-  assert.ok(BACKEND_OPERATIONS.includes("authorize_tab_test_only"));
+  assert.ok(BACKEND_OPERATIONS.includes("revoke_authorization"));
+  assert.equal(BACKEND_OPERATIONS.includes("authorize_tab_test_only"), false);
+});
+
+test("dynamic injection requests only the current HTTP(S) origin", () => {
+  assert.equal(originPermissionPattern("https://example.test/a"), "https://example.test/*");
+  assert.equal(originPermissionPattern("chrome://settings"), undefined);
 });
