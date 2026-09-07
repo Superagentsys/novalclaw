@@ -218,6 +218,7 @@ impl GatewayRuntime {
         let assembly_request = AgentAssemblyRequest {
             route: &route,
             channel,
+            run_id: None,
             session_id: Some(session_id),
             workspace: &workspace,
             spawn_depth: 0,
@@ -227,7 +228,8 @@ impl GatewayRuntime {
         let mut steps: Vec<ExecutionStep> = Vec::new();
         let mut agent = self
             .assemble_agent(cfg, &assembly_request, &mut steps)
-            .await?;
+            .await?
+            .agent;
 
         let loaded = load_session_history(cfg, channel, session_id).await?;
         let history_len_before = loaded.messages.len();

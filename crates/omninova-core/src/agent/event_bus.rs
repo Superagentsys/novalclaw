@@ -490,6 +490,7 @@ impl EventBus {
         let type_name = event_type_name(&event);
         let content_preview = match &event {
             AgentRunEvent::run_started { agent_name, .. } => agent_name.clone(),
+            AgentRunEvent::browser_takeover_state_changed { phase, .. } => phase.clone(),
             AgentRunEvent::step_started { title, .. } => title.clone(),
             AgentRunEvent::model_started { title, .. } => title.clone(),
             AgentRunEvent::model_delta { content, .. } => content.clone(),
@@ -540,6 +541,9 @@ impl EventBus {
 fn event_type_name(event: &AgentRunEvent) -> &'static str {
     match event {
         AgentRunEvent::run_started { .. } => "run_started",
+        AgentRunEvent::browser_takeover_state_changed { .. } => {
+            "browser_takeover_state_changed"
+        }
         AgentRunEvent::step_started { .. } => "step_started",
         AgentRunEvent::model_started { .. } => "model_started",
         AgentRunEvent::model_delta { .. } => "model_delta",
@@ -594,6 +598,9 @@ impl EventBusDrainHandle {
             while let Some(evt) = r.recv().await {
                 let type_name: &'static str = match &evt {
                     AgentRunEvent::run_started { .. } => "run_started",
+                    AgentRunEvent::browser_takeover_state_changed { .. } => {
+                        "browser_takeover_state_changed"
+                    }
                     AgentRunEvent::step_started { .. } => "step_started",
                     AgentRunEvent::model_started { .. } => "model_started",
                     AgentRunEvent::model_delta { .. } => "model_delta",

@@ -76,6 +76,9 @@ export function eventKey(event: RawEvent): string {
   if (type === "run_started") {
     return `run_started:${runId}`;
   }
+  if (type === "browser_takeover_state_changed") {
+    return `browser_takeover_state_changed:${runId}:${stringField(event, "phase")}:${numberField(event, "generation")}`;
+  }
   if (type === "run_completed" || type === "run_failed" || type === "run_cancelled" || type === "error") {
     return `${type}:${runId}`;
   }
@@ -243,7 +246,7 @@ export function aggregateSteps(events: RawEvent[], options: AggregateStepsOption
       runTerminated = true;
     }
 
-    if (isContextUsageEvent(type)) {
+    if (isContextUsageEvent(type) || type === "browser_takeover_state_changed") {
       return;
     }
 

@@ -22,7 +22,7 @@ pub use crate::tools::browser_agent_backend::{
 pub use crate::tools::browser_runtime::{browser_host_allowed, parse_browser_open_url};
 
 pub struct BrowserTool {
-    runtime: BrowserRuntime,
+    runtime: Arc<BrowserRuntime>,
     session_key: Option<BrowserSessionKey>,
     session_opts: BrowserSessionOptions,
 }
@@ -39,12 +39,21 @@ impl BrowserTool {
             attach_only,
             cdp_url,
             profile: None,
+            installed_profile: None,
         };
         Self::assemble(allowed_domains, session_opts, None, None)
     }
 
     pub fn from_runtime(
         runtime: BrowserRuntime,
+        session_opts: BrowserSessionOptions,
+        session_key: Option<BrowserSessionKey>,
+    ) -> Self {
+        Self::from_shared_runtime(Arc::new(runtime), session_opts, session_key)
+    }
+
+    pub fn from_shared_runtime(
+        runtime: Arc<BrowserRuntime>,
         session_opts: BrowserSessionOptions,
         session_key: Option<BrowserSessionKey>,
     ) -> Self {
@@ -67,7 +76,7 @@ impl BrowserTool {
             ..BrowserRuntimePolicy::default()
         };
         Self {
-            runtime: BrowserRuntime::new(backend, policy),
+            runtime: Arc::new(BrowserRuntime::new(backend, policy)),
             session_key,
             session_opts,
         }
@@ -926,6 +935,12 @@ mod tests {
         assert!(!props.contains_key("elements"));
         assert!(!props.contains_key("extract"));
         assert!(!props.contains_key("extract_json"));
+        assert!(!props.contains_key("profile"));
+        assert!(!props.contains_key("installed_profile"));
+        assert!(!props.contains_key("executable_path"));
+        assert!(!props.contains_key("list_profiles"));
+        assert!(!props.contains_key("create_profile"));
+        assert!(!props.contains_key("delete_profile"));
         let description = tool.description();
         assert!(description.contains("prefer read with outline/filter"));
         assert!(!description.contains("BrowserRuntime"));

@@ -34,6 +34,9 @@ pub fn resolve_shell_allowlist(config: &Config) -> Vec<String> {
 }
 
 pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return true;
+    }
     let direct = config
         .autonomy
         .auto_approve
@@ -81,6 +84,9 @@ pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
 }
 
 pub fn is_tool_denied(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return false;
+    }
     if config
         .security
         .tool_policy
@@ -102,6 +108,9 @@ pub fn is_tool_denied(config: &Config, tool_name: &str) -> bool {
 }
 
 pub fn is_tool_globally_allowed(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return true;
+    }
     if is_tool_denied(config, tool_name) {
         return false;
     }
@@ -126,6 +135,9 @@ pub fn evaluate_tool_call(
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> ToolPolicyDecision {
+    if config.permissions.is_full_access() {
+        return ToolPolicyDecision::Allow;
+    }
     if !config.security.tool_policy.enabled {
         return ToolPolicyDecision::Allow;
     }
@@ -426,5 +438,41 @@ mod tests {
             &serde_json::json!({"value": 1}),
         );
         assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
+    fn full_access_bypasses_denies_approvals_and_shell_allowlist() {
+        let mut config = Config::default();
+        config.permissions.mode = crate::config::PermissionMode::FullAccess;
+        config.security.tool_policy.enabled = true;
+        config.security.tool_policy.denied_tools = vec!["shell".into()];
+        config.commands.forbidden = vec!["shell".into()];
+        config.autonomy.allowed_commands.clear();
+        config.autonomy.forbidden_paths = vec!["/".into()];
+        config.autonomy.block_high_risk_commands = true;
+        config.approvals.enabled = true;
+        config.approvals.require_approval = vec!["shell".into()];
+
+        assert!(is_tool_globally_allowed(&config, "shell"));
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                "shell",
+                &serde_json::json!({"command": "arbitrary-program --flag"}),
+            ),
+            ToolPolicyDecision::Allow
+        );
+
+        config.security.tool_policy.denied_tools = vec!["git_operations".into()];
+        config.approvals.require_approval = vec!["git_operations".into()];
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                "git_operations",
+                &serde_json::json!({"operation": "commit"}),
+            ),
+            ToolPolicyDecision::Allow,
+            "full access must centrally authorize git operations without a prompt"
+        );
     }
 }

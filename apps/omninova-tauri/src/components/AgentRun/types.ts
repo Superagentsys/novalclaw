@@ -46,6 +46,7 @@ export interface AgentRunStep {
 
 export type AgentRunEvent =
   | AgentRunEventRunStarted
+  | AgentRunEventBrowserTakeoverStateChanged
   | AgentRunEventModelStarted
   | AgentRunEventModelDelta
   | AgentRunEventModelCompleted
@@ -75,6 +76,50 @@ export interface AgentRunEventRunStarted {
   run_id: string;
   agent_name: string;
   session_id: string | null;
+}
+
+export type BrowserTakeoverPhase =
+  | "agent_controlled"
+  | "takeover_requested"
+  | "human_controlled"
+  | "timed_out"
+  | "resynchronizing"
+  | "browser_lost";
+
+export interface BrowserTakeoverStateDto {
+  run_id: string;
+  session_id: string;
+  phase: BrowserTakeoverPhase | string;
+  owner: string;
+  generation: number;
+  reason?: string | null;
+  since_ms: number;
+  eligible: boolean;
+  headless: boolean;
+}
+
+export interface PersonalChromeAuthorizationStatusDto {
+  run_id: string;
+  configured: boolean;
+  state: string;
+  transport_connected: boolean;
+  protocol_version: number;
+  extension_tab_granted: boolean;
+  desktop_run_granted: boolean;
+  authorization_generation: number | null;
+  production_factory_enabled: boolean;
+  full_access: boolean;
+  ready: boolean;
+  error_code: string | null;
+}
+
+export interface AgentRunEventBrowserTakeoverStateChanged {
+  type: "browser_takeover_state_changed";
+  run_id: string;
+  session_id: string;
+  phase: string;
+  generation: number;
+  reason?: string;
 }
 
 export interface AgentRunEventModelStarted {

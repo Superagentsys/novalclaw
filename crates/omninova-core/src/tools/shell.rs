@@ -43,6 +43,7 @@ pub struct ShellTool {
     allowed_commands: Vec<String>,
     timeout_secs: u64,
     config: Config,
+    full_access: bool,
 }
 
 impl ShellTool {
@@ -52,15 +53,33 @@ impl ShellTool {
         timeout_secs: Option<u64>,
         config: Config,
     ) -> Self {
+        let full_access = config.permissions.is_full_access();
         Self {
             workspace_dir: workspace_dir.into(),
             allowed_commands,
             timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1),
             config,
+            full_access,
         }
     }
 
     async fn resolve_working_directory(&self, relative: Option<&str>) -> anyhow::Result<PathBuf> {
+        if self.full_access {
+            let raw = relative.map(str::trim).filter(|path| !path.is_empty());
+            let path = raw.map(PathBuf::from).unwrap_or_else(|| self.workspace_dir.clone());
+            if path.as_os_str().to_string_lossy().contains('\0') {
+                anyhow::bail!("null bytes in working_directory are not allowed");
+            }
+            let candidate = if path.is_absolute() {
+                path
+            } else {
+                self.workspace_dir.join(path)
+            };
+            return tokio::fs::canonicalize(&candidate)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to resolve working directory: {e}"));
+        }
+
         let wd = match relative {
             Some(p) if !p.trim().is_empty() => {
                 let normalized = normalize_workspace_path(&self.workspace_dir, p).await?;
@@ -97,6 +116,9 @@ impl ShellTool {
     }
 
     fn check_command_allowed(&self, command: &str) -> anyhow::Result<()> {
+        if self.full_access {
+            return Ok(());
+        }
         let first = command
             .split_whitespace()
             .next()
@@ -235,7 +257,7 @@ impl Tool for ShellTool {
                 });
             }
         };
-        if self.command_targets_workspace_root(command, &cwd, &workspace) {
+        if !self.full_access && self.command_targets_workspace_root(command, &cwd, &workspace) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -378,7 +400,7 @@ impl ShellTool {
         let working_directory: Option<&str> = None;
         let timeout_secs = self.timeout_secs;
 
-        if !bypass_allowlist {
+        if !bypass_allowlist && !self.full_access {
             if let Err(e) = self.check_command_allowed(&command) {
                 let content = e.to_string();
                 debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
@@ -407,7 +429,7 @@ impl ShellTool {
             }
         };
 
-        if self.command_targets_workspace_root(&command, &cwd, &workspace) {
+        if !self.full_access && self.command_targets_workspace_root(&command, &cwd, &workspace) {
             let content = "error: refused to delete workspace root".to_string();
             debug!(target: "e2e", "[e2e-shell-send] timestamp={} is_stderr=true content=\"{}\"", now_ts(), preview(&content, 80));
             let _ = output_tx.send((content, true));
@@ -578,7 +600,10 @@ fn preview(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod encoding_tests {
-    use super::windows_powershell_script;
+    use super::{windows_powershell_script, ShellTool};
+    use crate::config::{Config, PermissionMode};
+    use crate::tools::traits::Tool;
+    use serde_json::json;
 
     #[test]
     fn powershell_child_is_forced_to_utf8() {
@@ -586,5 +611,50 @@ mod encoding_tests {
         assert!(script.contains("UTF8Encoding"));
         assert!(script.contains("PYTHONIOENCODING"));
         assert!(script.ends_with("Write-Output '中文'"));
+    }
+
+    #[test]
+    fn full_access_accepts_arbitrary_commands_without_changing_restricted_mode() {
+        let restricted = ShellTool::new(".", Vec::new(), None, Config::default());
+        assert!(restricted.check_command_allowed("unlisted-command --flag").is_err());
+
+        let mut config = Config::default();
+        config.permissions.mode = PermissionMode::FullAccess;
+        let full_access = ShellTool::new(".", Vec::new(), None, config);
+        assert!(full_access
+            .check_command_allowed("unlisted-command --flag")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_access_shell_can_write_and_delete_outside_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "omninova-shell-access-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = Config::default();
+        config.permissions.mode = PermissionMode::FullAccess;
+        let shell = ShellTool::new(&workspace, Vec::new(), Some(30), config);
+        let command = if cfg!(windows) {
+            format!(
+                "Set-Content -LiteralPath '{}' -Value 'ok'; Remove-Item -LiteralPath '{}'",
+                outside.display(),
+                outside.display()
+            )
+        } else {
+            format!(
+                "printf ok > '{}'; rm '{}'",
+                outside.display(),
+                outside.display()
+            )
+        };
+        let result = shell.execute(json!({"command": command})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(!outside.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

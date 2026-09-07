@@ -343,6 +343,43 @@ http_proxy = "http://proxy:3128"
         assert!(cfg.workspace_dir.as_os_str().is_empty());
     }
 
+    #[test]
+    fn full_access_permission_mode_persists_across_reload() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
+        let dir = tempdir();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[permissions]\nmode = \"full_access\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&config_path).unwrap();
+        assert!(cfg.permissions.is_full_access());
+        cfg.save().unwrap();
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("[permissions]"));
+        assert!(saved.contains("mode = \"full_access\""));
+        assert!(Config::load_from(&config_path)
+            .unwrap()
+            .permissions
+            .is_full_access());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_permission_mode_remains_restricted() {
+        let _guard = test_env_lock().lock().unwrap();
+        clear_common_env_overrides();
+        let cfg = Config::load_from_str("api_key = \"test\"").unwrap();
+        assert_eq!(
+            cfg.permissions.mode,
+            crate::config::PermissionMode::Restricted
+        );
+    }
+
     fn tempdir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "omninova-cfg-test-{}-{}",

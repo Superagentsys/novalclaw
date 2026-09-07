@@ -1,5 +1,5 @@
 use crate::agent::AgentCancellationToken;
-use crate::security::sandbox::{normalize_workspace_path, resolve_workspace_relative};
+use crate::security::sandbox::{normalize_workspace_path, resolve_tool_path};
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -45,13 +45,20 @@ struct PatchOutput {
 
 pub struct FilePatchTool {
     workspace_dir: PathBuf,
+    full_access: bool,
 }
 
 impl FilePatchTool {
     pub fn new(workspace_dir: impl Into<PathBuf>) -> Self {
         Self {
             workspace_dir: workspace_dir.into(),
+            full_access: false,
         }
+    }
+
+    pub fn with_full_access(mut self, full_access: bool) -> Self {
+        self.full_access = full_access;
+        self
     }
 }
 
@@ -230,14 +237,18 @@ impl Tool for FilePatchTool {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
-        let normalized_path = match normalize_workspace_path(&self.workspace_dir, path).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
+        let normalized_path = if self.full_access {
+            path.trim().to_string()
+        } else {
+            match normalize_workspace_path(&self.workspace_dir, path).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
             }
         };
         if normalized_path == "." {
@@ -247,7 +258,13 @@ impl Tool for FilePatchTool {
                 error: Some("file_patch requires a file path, not the workspace root".to_string()),
             });
         }
-        let resolved = match resolve_workspace_relative(&self.workspace_dir, &normalized_path).await {
+        let resolved = match resolve_tool_path(
+            &self.workspace_dir,
+            &normalized_path,
+            self.full_access,
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {

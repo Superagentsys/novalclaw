@@ -24,13 +24,22 @@ use crate::tools::browser_output::{
 use crate::tools::browser_profile::{
     paths_refer_to_same_location, BrowserProfileError, BrowserProfileResolver,
 };
+use crate::tools::browser_profile_manager::{
+    BrowserProfileManager, ManagedBrowserProfileState,
+};
+use crate::tools::browser_installed_profile::{
+    cleanup_owned_snapshots, installed_named_profile_argv, locate_latest_snapshot_dir,
+    omninova_snapshot_root, remove_snapshot_dir, validate_installed_snapshot,
+    write_snapshot_marker, BrowserInstalledProfileResolver, InstalledProfileResolveError,
+};
 use crate::tools::browser_types::{
     BackendAvailability, BackendCapabilities, BackendSessionHandle, BrowserAction,
     BrowserActionResult, BrowserBackendError, BrowserBackendId, BrowserElement, BrowserElementRef,
     BrowserErrorKind, BrowserEvalMode, BrowserHealth, BrowserObservation, BrowserObserveKind,
     BrowserPageId, BrowserProfileRef, BrowserSessionKey, BrowserSessionOpenRequest,
-    BrowserSessionOptions, BrowserSnapshot, BrowserTab, BrowserTarget, NavigateRequest,
-    ObserveRequest, ScreenshotRequest, ScreenshotResult, BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL,
+    BrowserSessionOptions, BrowserSnapshot, BrowserTab, BrowserTarget, InstalledBrowserProfileRef,
+    NavigateRequest, ObserveRequest, ScreenshotRequest, ScreenshotResult,
+    BROWSER_EXTRACT_SOURCE_TOO_LARGE_DETAIL, BROWSER_INSTALLED_SNAPSHOT_INCOMPLETE_DETAIL,
     BROWSER_PROFILE_BUSY_DETAIL, BROWSER_SESSION_PROFILE_MISMATCH_DETAIL,
     BROWSER_STALE_REFERENCE_DETAIL,
 };
@@ -117,7 +126,9 @@ pub struct AgentBrowserBackend {
     defaults: BrowserSessionOptions,
     last_stdout_len: Mutex<Option<usize>>,
     profile_resolver: BrowserProfileResolver,
+    profile_manager: BrowserProfileManager,
     executable_resolver: BrowserExecutableResolver,
+    installed_profiles: BrowserInstalledProfileResolver,
     launch_by_session: Mutex<HashMap<String, BoundSessionLaunch>>,
     #[cfg(test)]
     cli_invocations: Mutex<Vec<CliInvocationRecord>>,
@@ -126,11 +137,22 @@ pub struct AgentBrowserBackend {
 /// Per-session launch identity. Bound at `open_session` and reused by every
 /// later CLI spawn so open/eval cannot diverge. Profile path is argv-only
 /// and must not be logged or returned to the model.
+///
+/// Installed snapshots bind a named Chrome directory (`Default`, `Profile 1`)
+/// once. Recovery that relaunches must take a new snapshot rather than reuse
+/// a partial copy. Copied login state may be unusable under Chrome App-Bound
+/// Encryption when the selected executable does not match the source
+/// installation; OmniNova does not decrypt or bypass that protection.
 #[derive(Clone)]
 struct BoundSessionLaunch {
     profile: Option<BrowserProfileRef>,
+    installed_profile: Option<InstalledBrowserProfileRef>,
+    installed_directory: Option<String>,
     profile_path: Option<PathBuf>,
     cli_profile_arg: Option<OsString>,
+    snapshot_dir: Option<PathBuf>,
+    snapshot_ready: bool,
+    snapshot_started: Option<std::time::SystemTime>,
     headless: bool,
     attach_only: bool,
     cdp_url: Option<String>,
@@ -194,8 +216,10 @@ impl AgentBrowserBackend {
             search,
             defaults,
             last_stdout_len: Mutex::new(None),
-            profile_resolver,
+            profile_resolver: profile_resolver.clone(),
+            profile_manager: BrowserProfileManager::new(profile_resolver),
             executable_resolver,
+            installed_profiles: BrowserInstalledProfileResolver::discover(),
             launch_by_session: Mutex::new(HashMap::new()),
             #[cfg(test)]
             cli_invocations: Mutex::new(Vec::new()),
@@ -204,6 +228,13 @@ impl AgentBrowserBackend {
 
     pub fn last_stdout_len(&self) -> Option<usize> {
         self.last_stdout_len.lock().ok().and_then(|guard| *guard)
+    }
+
+    #[cfg(test)]
+    fn with_installed_user_data(mut self, user_data_dir: PathBuf) -> Self {
+        self.installed_profiles =
+            BrowserInstalledProfileResolver::with_user_data_dir(user_data_dir);
+        self
     }
 
     fn id_value(&self) -> BrowserBackendId {
@@ -246,12 +277,21 @@ impl AgentBrowserBackend {
         options: &BrowserSessionOptions,
         profile_path: Option<PathBuf>,
     ) -> Result<(), BrowserBackendError> {
+        if options.profile.is_some() && options.installed_profile.is_some() {
+            return Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                "BrowserSessionConfigMismatch: managed persistent profile and installed snapshot cannot be combined",
+            ));
+        }
         let mut map = self
             .launch_by_session
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         if let Some(existing) = map.get(token) {
-            if existing.profile != options.profile {
+            if existing.profile != options.profile
+                || existing.installed_profile != options.installed_profile
+            {
                 let mut err = BrowserBackendError::new(
                     BrowserErrorKind::Rejected,
                     self.id_value(),
@@ -293,19 +333,138 @@ impl AgentBrowserBackend {
                 return Err(profile_busy_error(self.id_value()));
             }
         }
-        let cli_profile_arg = profile_path.as_ref().map(|path| profile_path_for_cli(path));
+        let (cli_profile_arg, installed_directory) =
+            if let Some(installed) = options.installed_profile.as_ref() {
+                let directory = self.resolve_installed_directory(installed)?;
+                (Some(OsString::from(&directory)), Some(directory))
+            } else {
+                (
+                    profile_path.as_ref().map(|path| profile_path_for_cli(path)),
+                    None,
+                )
+            };
         map.insert(
             token.to_string(),
             BoundSessionLaunch {
                 profile: options.profile.clone(),
+                installed_profile: options.installed_profile.clone(),
+                installed_directory,
                 profile_path,
                 cli_profile_arg,
+                snapshot_dir: None,
+                snapshot_ready: false,
+                snapshot_started: options
+                    .installed_profile
+                    .as_ref()
+                    .map(|_| std::time::SystemTime::now()),
                 headless: options.headless,
                 attach_only: options.attach_only,
                 cdp_url: options.cdp_url.clone(),
                 executable: None,
             },
         );
+        Ok(())
+    }
+
+    fn resolve_installed_directory(
+        &self,
+        installed: &InstalledBrowserProfileRef,
+    ) -> Result<String, BrowserBackendError> {
+        match self.installed_profiles.resolve(installed) {
+            Ok(directory) => Ok(directory),
+            Err(InstalledProfileResolveError::Ambiguous) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                "BrowserInstalledProfileAmbiguous: installed Chrome profile identity matches more than one profile; use the directory name",
+            )),
+            Err(InstalledProfileResolveError::Unavailable) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                "BrowserInstalledProfileUnavailable: no installed Chrome profiles were found",
+            )),
+            Err(InstalledProfileResolveError::NotFound) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                "BrowserInstalledProfileNotFound: installed Chrome profile was not found",
+            )),
+        }
+    }
+
+    fn clear_installed_snapshot_state(&self, token: &str) {
+        let mut map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(bound) = map.get_mut(token) {
+            bound.snapshot_dir = None;
+            bound.snapshot_ready = false;
+            bound.snapshot_started = Some(std::time::SystemTime::now());
+        }
+    }
+
+    fn record_ready_snapshot(&self, token: &str, snapshot_dir: PathBuf) {
+        let mut map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(bound) = map.get_mut(token) {
+            bound.snapshot_dir = Some(snapshot_dir);
+            bound.snapshot_ready = true;
+        }
+    }
+
+    fn cleanup_session_snapshot(&self, token: &str) {
+        let snapshot_dir = self
+            .session_launch(token)
+            .and_then(|bound| bound.snapshot_dir);
+        if let Some(path) = snapshot_dir {
+            let _ = remove_snapshot_dir(&path);
+        }
+        self.cleanup_stale_snapshots();
+    }
+
+    fn cleanup_stale_snapshots(&self) {
+        let root = omninova_snapshot_root();
+        let active: Vec<PathBuf> = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .filter_map(|bound| bound.snapshot_dir.clone())
+            .collect();
+        let _ = cleanup_owned_snapshots(&root, &active, |session| {
+            probe_owned_session_pid(session) == Some(true)
+        });
+    }
+
+    fn ensure_installed_snapshot(
+        &self,
+        token: &str,
+    ) -> Result<(), BrowserBackendError> {
+        let Some(bound) = self.session_launch(token) else {
+            return Ok(());
+        };
+        let Some(directory) = bound.installed_directory.clone() else {
+            return Ok(());
+        };
+        if bound.snapshot_ready {
+            return Ok(());
+        }
+        let root = omninova_snapshot_root();
+        let started = bound
+            .snapshot_started
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let Some(snapshot_dir) = locate_latest_snapshot_dir(&root, &directory, started) else {
+            return Err(installed_snapshot_incomplete_error(self.id_value()));
+        };
+        let _ = write_snapshot_marker(&snapshot_dir, token, &directory);
+        let source = self.installed_profiles.source_cookies_status(&directory);
+        if let Err(err) = validate_installed_snapshot(&snapshot_dir, &directory, source) {
+            let _ = remove_snapshot_dir(&snapshot_dir);
+            let _ = err;
+            return Err(installed_snapshot_incomplete_error(self.id_value()));
+        }
+        self.record_ready_snapshot(token, snapshot_dir);
         Ok(())
     }
 
@@ -380,7 +539,10 @@ impl AgentBrowserBackend {
         profile: &BrowserProfileRef,
     ) -> Result<PathBuf, BrowserBackendError> {
         match self.profile_resolver.resolve(profile) {
-            Ok(resolved) => Ok(resolved.path),
+            Ok(resolved) => {
+                let _ = self.profile_manager.claim_if_unmarked(&resolved);
+                Ok(resolved.path)
+            }
             Err(BrowserProfileError::Invalid { detail }) => Err(BrowserBackendError::new(
                 BrowserErrorKind::Rejected,
                 self.id_value(),
@@ -391,6 +553,11 @@ impl AgentBrowserBackend {
                 self.id_value(),
                 BrowserProfileError::EscapedRoot.to_string(),
             )),
+            Err(BrowserProfileError::Missing) => Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                self.id_value(),
+                BrowserProfileError::Missing.to_string(),
+            )),
             Err(BrowserProfileError::Io { detail }) => Err(BrowserBackendError::new(
                 BrowserErrorKind::LaunchFailed,
                 self.id_value(),
@@ -398,6 +565,31 @@ impl AgentBrowserBackend {
                     "BrowserLaunchFailed: failed to prepare managed browser profile directory ({detail})"
                 ),
             )),
+        }
+    }
+
+    fn managed_profile_occupancy(&self, profile: &BrowserProfileRef) -> ManagedBrowserProfileState {
+        let map = self
+            .launch_by_session
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut bound = false;
+        let mut live = false;
+        for (token, launch) in map.iter() {
+            if launch.profile.as_ref() != Some(profile) {
+                continue;
+            }
+            bound = true;
+            if probe_owned_session_pid(token) == Some(true) {
+                live = true;
+            }
+        }
+        if live {
+            ManagedBrowserProfileState::Active
+        } else if bound {
+            ManagedBrowserProfileState::Busy
+        } else {
+            ManagedBrowserProfileState::Available
         }
     }
 
@@ -504,8 +696,15 @@ impl AgentBrowserBackend {
                     let outcome = parse_action_outcome(v1_action, &stdout, &stderr, exit_success);
                     if outcome.success {
                         if v1_action == "close" {
+                            self.cleanup_session_snapshot(cli_session);
                             forget_owned_browser_session(cli_session);
                             self.unbind_session_launch(cli_session);
+                        } else if let Err(err) = self.ensure_installed_snapshot(cli_session) {
+                            self.cleanup_session_snapshot(cli_session);
+                            recover_owned_session(cli_session);
+                            forget_owned_browser_session(cli_session);
+                            self.unbind_session_launch(cli_session);
+                            return Err(err);
                         }
                         return Ok(NamedSuccess {
                             output: outcome.output,
@@ -549,6 +748,7 @@ impl AgentBrowserBackend {
                     ) {
                         if !recovered {
                             recover_owned_session(cli_session);
+                            self.clear_installed_snapshot_state(cli_session);
                             recovered = true;
                         } else {
                             concurrent_followup = true;
@@ -562,6 +762,7 @@ impl AgentBrowserBackend {
                                 | BrowserFailureKind::SessionUnavailable
                         )
                     {
+                        self.cleanup_session_snapshot(cli_session);
                         recover_owned_session(cli_session);
                         forget_owned_browser_session(cli_session);
                         self.unbind_session_launch(cli_session);
@@ -590,6 +791,7 @@ impl AgentBrowserBackend {
                     let msg = err.detail.clone();
                     if retryable_action && !recovered && msg.starts_with("BrowserCommandTimeout:") {
                         if recover_owned_session(cli_session) {
+                            self.clear_installed_snapshot_state(cli_session);
                             recovered = true;
                             continue;
                         }
@@ -616,6 +818,7 @@ impl AgentBrowserBackend {
             .or(opts.cdp_url.as_deref());
         let cli_profile_arg = bound.and_then(|cfg| cfg.cli_profile_arg.clone());
         let executable = bound.and_then(|cfg| cfg.executable.as_ref());
+        let installed_directory = bound.and_then(|cfg| cfg.installed_directory.clone());
         let daemon_alive = probe_owned_session_pid(cli_session) == Some(true);
         let emit_launch_config = should_forward_local_launch_config(daemon_alive);
         let emit_profile = cli_profile_arg.is_some() && emit_launch_config;
@@ -629,7 +832,13 @@ impl AgentBrowserBackend {
         cmd.arg("--session").arg(cli_session);
         cmd.arg("--namespace").arg(AGENT_BROWSER_NAMESPACE);
         if emit_profile {
-            if let Some(profile_arg) = cli_profile_arg.as_ref() {
+            if let Some(directory) = installed_directory.as_deref() {
+                apply_installed_named_profile_cli_arg(&mut cmd, directory, self.id_value())?;
+                let root = omninova_snapshot_root();
+                let _ = std::fs::create_dir_all(&root);
+                cmd.env("TMP", &root);
+                cmd.env("TEMP", &root);
+            } else if let Some(profile_arg) = cli_profile_arg.as_ref() {
                 apply_managed_profile_cli_arg(&mut cmd, profile_arg, self.id_value())?;
             }
         }
@@ -753,6 +962,16 @@ fn profile_busy_error(backend: BrowserBackendId) -> BrowserBackendError {
     err
 }
 
+fn installed_snapshot_incomplete_error(backend: BrowserBackendId) -> BrowserBackendError {
+    let mut err = BrowserBackendError::new(
+        BrowserErrorKind::InstalledProfileSnapshotIncomplete,
+        backend,
+        BROWSER_INSTALLED_SNAPSHOT_INCOMPLETE_DETAIL,
+    );
+    err.retryable = false;
+    err
+}
+
 /// Conservative 0.36.0 Chrome singleton signature. Not "any exit 21".
 fn looks_like_managed_profile_busy(diagnostic: &str) -> bool {
     let lower = diagnostic.to_ascii_lowercase();
@@ -776,6 +995,24 @@ fn apply_managed_profile_cli_arg(
     }
     cmd.arg("--profile");
     cmd.arg(profile_arg);
+    Ok(())
+}
+
+fn apply_installed_named_profile_cli_arg(
+    cmd: &mut Command,
+    directory: &str,
+    backend: BrowserBackendId,
+) -> Result<(), BrowserBackendError> {
+    if InstalledBrowserProfileRef::new(directory).is_err() {
+        return Err(BrowserBackendError::new(
+            BrowserErrorKind::Rejected,
+            backend,
+            "BrowserProfileRejected: installed snapshot profile must be a directory name, not a path",
+        ));
+    }
+    for arg in installed_named_profile_argv(directory) {
+        cmd.arg(arg);
+    }
     Ok(())
 }
 
@@ -1071,6 +1308,63 @@ pub fn backend_from_config_with_executable(
     defaults: BrowserSessionOptions,
     executable_path: Option<PathBuf>,
 ) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_executable_and_personal_chrome(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        None,
+    )
+}
+
+pub fn backend_from_config_with_executable_and_personal_chrome(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_executable_and_personal_chrome_access(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        personal_chrome,
+        false,
+    )
+}
+
+/// Build a configured backend with the global authorization mode applied.
+/// Full access opens only OmniNova's Personal Chrome release/approval gate;
+/// transport availability, extension permissions, tab identity, ownership,
+/// and lifecycle checks remain enforced by the backend.
+pub fn backend_from_config_with_executable_and_personal_chrome_access(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+    full_access: bool,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
+    backend_from_config_with_factory_gate(
+        backend_name,
+        search,
+        defaults,
+        executable_path,
+        personal_chrome,
+        full_access
+            || crate::tools::browser_personal_chrome::personal_chrome_production_enabled(),
+    )
+}
+
+fn backend_from_config_with_factory_gate(
+    backend_name: &str,
+    search: Option<BrowserBinarySearch>,
+    defaults: BrowserSessionOptions,
+    executable_path: Option<PathBuf>,
+    personal_chrome: Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
+    personal_chrome_release_enabled: bool,
+) -> Result<Arc<dyn BrowserBackend>, BrowserBackendError> {
     let trimmed = backend_name.trim();
     let id = planned_backend_id_from_config(Some(trimmed))?;
     if id == BrowserBackendId::agent_browser() {
@@ -1085,6 +1379,27 @@ pub fn backend_from_config_with_executable(
             defaults,
             executable_path,
         )));
+    }
+    if id == BrowserBackendId::personal_chrome() {
+        if !personal_chrome_release_enabled {
+            return Err(BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                id,
+                "BrowserBackendUnsupported: personal-chrome authorization release gate is closed",
+            ));
+        }
+        let context = personal_chrome.ok_or_else(|| {
+            BrowserBackendError::new(
+                BrowserErrorKind::Rejected,
+                id.clone(),
+                "PersonalChromeNotAuthorized: no exact active-run authorization provider",
+            )
+        })?;
+        return Ok(Arc::new(
+            crate::tools::browser_personal_chrome::PersonalChromeBackend::from_authorized_factory(
+                context,
+            ),
+        ));
     }
     Err(BrowserBackendError::new(
         BrowserErrorKind::Rejected,
@@ -1104,6 +1419,7 @@ pub fn browser_backend_enabled(configured_enabled: bool, backend_name: &str) -> 
                 crate::tools::browser_bin::agent_browser_runtime_available(),
             )
         }
+        Ok(id) if id == BrowserBackendId::personal_chrome() => true,
         _ => false,
     }
 }
@@ -1147,6 +1463,8 @@ impl BrowserBackend for AgentBrowserBackend {
             None => None,
         };
         self.bind_session_launch(handle.token(), &req.options, profile_path)?;
+        self.cleanup_stale_snapshots();
+        let _ = self.profile_manager.cleanup_profile_trash();
         Ok(handle)
     }
 
@@ -1609,7 +1927,9 @@ mod tests {
     };
     use crate::tools::browser_output::agent_browser_0_36_snapshot_stdout;
     use crate::tools::browser_output::BROWSER_EXTRACT_SOURCE_CHAR_LIMIT;
-    use crate::tools::browser_profile::BrowserProfileResolver;
+    use crate::tools::browser_profile_manager::{
+        ManagedBrowserProfileState, PROFILE_MARKER_NAME,
+    };
     use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy};
     use crate::tools::browser_types::{
         BrowserElement, BrowserElementRef, BrowserErrorKind, BrowserExtractRequest,
@@ -2220,6 +2540,40 @@ mod tests {
     }
 
     #[test]
+    fn personal_chrome_factory_requires_exact_run_authorization_context() {
+        let err = match backend_from_config_with_factory_gate(
+            "personal-chrome",
+            None,
+            BrowserSessionOptions::default(),
+            None,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("personal-chrome must not construct without run authorization"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        assert!(err.detail.contains("PersonalChromeNotAuthorized"));
+    }
+
+    #[test]
+    fn full_access_opens_omninova_release_gate_but_still_requires_transport_context() {
+        let err = match backend_from_config_with_executable_and_personal_chrome_access(
+            "personal-chrome",
+            None,
+            BrowserSessionOptions::default(),
+            None,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("personal-chrome still needs a connected bridge context"),
+            Err(err) => err,
+        };
+        assert!(err.detail.contains("PersonalChromeNotAuthorized"));
+        assert!(!err.detail.contains("release gate is closed"));
+    }
+
+    #[test]
     fn parse_tabs_reads_vendor_json() {
         let stdout = r#"{"success":true,"data":{"tabs":[{"id":"1","url":"https://example.com/","title":"Example","active":true}]}}"#;
         let tabs = parse_tabs_output(stdout, "URL: https://example.com/");
@@ -2465,6 +2819,36 @@ mod tests {
     }
 
     #[test]
+    fn open_session_claims_legacy_unmarked_managed_profile() {
+        let (backend, root) = scratch_profile_backend(None);
+        let id = BrowserProfileRef::new("legacy-open").unwrap();
+        let resolved = backend.profile_resolver.resolve(&id).unwrap();
+        assert!(!resolved.path.join(PROFILE_MARKER_NAME).exists());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            BrowserSessionKey::new("b33e-claim").unwrap(),
+            profile_opts("legacy-open"),
+        )))
+        .unwrap();
+        assert!(resolved.path.join(PROFILE_MARKER_NAME).exists());
+        assert_eq!(
+            backend.managed_profile_occupancy(&id),
+            ManagedBrowserProfileState::Busy
+        );
+        assert_eq!(
+            backend
+                .profile_manager
+                .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile))
+                .unwrap_err(),
+            crate::tools::browser_profile_manager::BrowserProfileManagerError::Busy
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn ephemeral_session_does_not_emit_profile_argv() {
         assert!(managed_profile_argv(None).is_empty());
         let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default());
@@ -2500,6 +2884,177 @@ mod tests {
         );
         assert_ne!(args[1], "work");
         assert_ne!(args[1], "default");
+    }
+
+    fn fake_chrome_user_data() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "omninova-b33d-chrome-user-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("Default").join("Network")).unwrap();
+        let cache = serde_json::json!({
+            "profile": {
+                "info_cache": {
+                    "Default": { "name": "Person 1" },
+                    "Profile 1": { "name": "Work" }
+                }
+            }
+        });
+        std::fs::write(root.join("Local State"), cache.to_string()).unwrap();
+        std::fs::write(
+            root.join("Default").join("Network").join("Cookies"),
+            vec![0u8; 20_000],
+        )
+        .unwrap();
+        root
+    }
+
+    fn installed_opts(id: &str) -> BrowserSessionOptions {
+        BrowserSessionOptions {
+            installed_profile: Some(InstalledBrowserProfileRef::new(id).unwrap()),
+            ..BrowserSessionOptions::default()
+        }
+    }
+
+    #[test]
+    fn installed_snapshot_binds_named_profile_not_source_path() {
+        let user_data = fake_chrome_user_data();
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default())
+            .with_installed_user_data(user_data.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33d-named").unwrap(),
+                installed_opts("Default"),
+            )))
+            .unwrap();
+        let bound = backend.session_launch(handle.token()).unwrap();
+        assert!(bound.profile.is_none());
+        assert_eq!(
+            bound.installed_directory.as_deref(),
+            Some("Default")
+        );
+        assert_eq!(
+            bound.cli_profile_arg.as_ref().map(|arg| arg.to_string_lossy().into_owned()),
+            Some("Default".into())
+        );
+        assert!(bound.profile_path.is_none());
+        let arg = bound.cli_profile_arg.unwrap();
+        let text = arg.to_string_lossy();
+        assert!(!text.contains('\\'));
+        assert!(!text.contains("User Data"));
+        let _ = std::fs::remove_dir_all(&user_data);
+    }
+
+    #[test]
+    fn managed_and_installed_modes_cannot_combine() {
+        let user_data = fake_chrome_user_data();
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default())
+            .with_installed_user_data(user_data.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut opts = profile_opts("account-a");
+        opts.installed_profile = Some(InstalledBrowserProfileRef::new("Default").unwrap());
+        let err = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33d-combo").unwrap(),
+                opts,
+            )))
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        let _ = std::fs::remove_dir_all(&user_data);
+    }
+
+    #[test]
+    fn installed_snapshot_mode_is_distinct_from_managed_persistent() {
+        let managed = profile_opts("work");
+        let installed = installed_opts("Default");
+        assert!(managed.profile.is_some());
+        assert!(managed.installed_profile.is_none());
+        assert!(installed.profile.is_none());
+        assert!(installed.installed_profile.is_some());
+        assert_ne!(
+            format!("{:?}", managed.profile_mode().unwrap()),
+            format!("{:?}", installed.profile_mode().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_is_bound_for_installed_snapshot_sessions() {
+        let user_data = fake_chrome_user_data();
+        let (backend, root, probe) = scratch_executable_backend();
+        let backend = backend.with_installed_user_data(user_data.clone());
+        let session = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33d-exe").unwrap(),
+                installed_opts("Default"),
+            ))
+            .await
+            .unwrap();
+        let bound = backend
+            .ensure_session_executable(session.token(), "open")
+            .await
+            .unwrap();
+        assert!(bound.profile_path.is_none());
+        assert_eq!(bound.installed_directory.as_deref(), Some("Default"));
+        assert_eq!(
+            bound.executable.as_ref().map(|value| value.source),
+            Some(BrowserExecutableSource::SystemChrome)
+        );
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(user_data);
+    }
+
+    #[test]
+    fn same_session_installed_profile_mismatch_is_rejected() {
+        let user_data = fake_chrome_user_data();
+        let backend = AgentBrowserBackend::new(None, BrowserSessionOptions::default())
+            .with_installed_user_data(user_data.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = BrowserSessionKey::new("b33d-mismatch").unwrap();
+        rt.block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+            key.clone(),
+            installed_opts("Default"),
+        )))
+        .unwrap();
+        let err = rt
+            .block_on(backend.open_session(&BrowserSessionOpenRequest::new(
+                key,
+                installed_opts("Profile 1"),
+            )))
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::Rejected);
+        assert!(!err.retryable);
+        let _ = std::fs::remove_dir_all(&user_data);
+    }
+
+    #[tokio::test]
+    async fn cdp_attach_does_not_bind_installed_snapshot() {
+        let options = BrowserSessionOptions {
+            attach_only: true,
+            cdp_url: Some("http://127.0.0.1:9222".into()),
+            ..BrowserSessionOptions::default()
+        };
+        let backend = AgentBrowserBackend::new(None, options.clone());
+        let session = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new("b33d-cdp").unwrap(),
+                options,
+            ))
+            .await
+            .unwrap();
+        let bound = backend.session_launch(session.token()).unwrap();
+        assert!(bound.installed_profile.is_none());
+        assert!(bound.cli_profile_arg.is_none());
     }
 
     #[test]
@@ -3633,5 +4188,430 @@ document.title = "persist-boot";
         } else {
             eprintln!("CRASH_COOKIE=missing_in_crash_window cookie={cookie}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_installed_profile_snapshot_is_complete_or_typed_failure() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let Some(_) = crate::tools::browser_installed_profile::find_chrome_user_data_dir() else {
+            eprintln!("skip runtime-dependent test: no installed Chrome user data");
+            return;
+        };
+        let backend = Arc::new(AgentBrowserBackend::new(
+            Some(search),
+            BrowserSessionOptions::default(),
+        ));
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let html = "<html><head><title>b33d-target</title></head><body>ok</body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html".to_string()],
+            );
+        });
+        let opts = installed_opts("Default");
+        let key = BrowserSessionKey::new(format!("b33d-live-{}", uuid::Uuid::new_v4())).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/target");
+        let opened = runtime
+            .open(&key, &opts, &NavigateRequest { url: url.clone() })
+            .await;
+        match opened {
+            Ok(_) => {
+                let href = runtime
+                    .observe(
+                        &key,
+                        &opts,
+                        &ObserveRequest {
+                            kind: BrowserObserveKind::Url,
+                            interactive_only: false,
+                            compact: false,
+                        },
+                    )
+                    .await
+                    .expect("observe after complete snapshot");
+                let text = href
+                    .text
+                    .as_deref()
+                    .or(href.url.as_deref())
+                    .unwrap_or("");
+                assert!(
+                    text.contains(&url),
+                    "installed snapshot session should keep the opened page"
+                );
+                let token = browser_session_id(Some(key.as_str())).unwrap();
+                let snapshot_dir = backend
+                    .session_launch(&token)
+                    .and_then(|bound| bound.snapshot_dir);
+                runtime.close_session(&key, &opts).await.ok();
+                if let Some(path) = snapshot_dir {
+                    assert!(
+                        !path.exists(),
+                        "normal close must remove the OmniNova-owned snapshot"
+                    );
+                }
+                eprintln!("INSTALLED_SNAPSHOT=SAFE_COMPLETE");
+            }
+            Err(err) => {
+                assert_eq!(
+                    err.kind,
+                    BrowserErrorKind::InstalledProfileSnapshotIncomplete
+                );
+                assert!(!err.retryable);
+                assert!(err.detail.contains("BrowserInstalledProfileSnapshotIncomplete"));
+                assert!(!err.detail.to_ascii_lowercase().contains("cookie="));
+                eprintln!("INSTALLED_SNAPSHOT=SAFE_TYPED_FAILURE");
+            }
+        }
+        eprintln!(
+            "APP_BOUND_ENCRYPTION=login reuse is not guaranteed across Chrome/CfT executables; OmniNova does not decrypt cookies"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn real_managed_profile_lifecycle_delete_and_gc() {
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = persist_fixture_html("b33e");
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                &html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let (backend, root) = scratch_profile_backend(Some(search));
+        let backend = Arc::new(backend);
+        let created = backend
+            .profile_manager
+            .ensure_managed_profile(&BrowserProfileRef::new("b33e-test").unwrap())
+            .unwrap();
+        assert_eq!(created.id.as_str(), "b33e-test");
+        let listed = backend.profile_manager.list_managed_profiles(|_| {
+            ManagedBrowserProfileState::Available
+        });
+        assert!(listed.iter().any(|profile| profile.id.as_str() == "b33e-test"));
+        let runtime = BrowserRuntime::new(
+            backend.clone(),
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let opts = profile_opts("b33e-test");
+        let key = BrowserSessionKey::new(format!("b33e-live-{}", uuid::Uuid::new_v4())).unwrap();
+        let url = format!("http://127.0.0.1:{page_port}/persist");
+        runtime
+            .open(&key, &opts, &NavigateRequest { url: url.clone() })
+            .await
+            .expect("open managed profile");
+        wait_persist_ready(&runtime, &key, &opts).await;
+        let id = BrowserProfileRef::new("b33e-test").unwrap();
+        let active = backend
+            .profile_manager
+            .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile));
+        assert!(
+            matches!(
+                active,
+                Err(crate::tools::browser_profile_manager::BrowserProfileManagerError::Active)
+                    | Err(crate::tools::browser_profile_manager::BrowserProfileManagerError::Busy)
+            ),
+            "active/busy managed profile must not be deleted"
+        );
+        runtime.close_session(&key, &opts).await.ok();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let live = backend.profile_resolver.locate(&id).unwrap().path;
+        let trash = backend
+            .profile_manager
+            .delete_managed_profile(&id, |profile| backend.managed_profile_occupancy(profile))
+            .expect("closed managed profile should move to trash");
+        assert!(!live.exists());
+        assert!(trash.exists());
+        let removed = backend
+            .profile_manager
+            .cleanup_profile_trash_after(std::time::Duration::from_secs(0));
+        assert!(removed >= 1);
+        assert!(!trash.exists());
+        let _ = crate::tools::browser_installed_profile::find_chrome_user_data_dir();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn headed_live_opts() -> BrowserSessionOptions {
+        BrowserSessionOptions {
+            headless: false,
+            ..BrowserSessionOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_observe_first_resume() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-takeover</title></head><body><h1>Takeover fixture</h1><p>synthetic</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-a-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open headed synthetic fixture");
+        let granted = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .expect("headed takeover");
+        assert_eq!(granted.phase, BrowserTakeoverPhase::HumanControlled);
+        let blocked = runtime
+            .act(&key, &opts, &BrowserAction::eval_raw("1+1"))
+            .await
+            .expect_err("agent work blocked during human control");
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+        let released = runtime.release_human_takeover(&key).unwrap();
+        assert_eq!(released.phase, BrowserTakeoverPhase::Resynchronizing);
+        let stale = runtime
+            .act(&key, &opts, &BrowserAction::Reload)
+            .await
+            .expect_err("mutation before observe");
+        assert_eq!(stale.kind, BrowserErrorKind::StaleAssumptions);
+        runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect("resync observe");
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        runtime
+            .act(&key, &opts, &BrowserAction::Reload)
+            .await
+            .expect("mutation after observe");
+        runtime.close_session(&key, &opts).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_in_flight_safe_point() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-inflight</title></head><body><p>wait</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = Arc::new(BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        ));
+        let key = BrowserSessionKey::new(format!("b34b-b-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open");
+        let task_rt = Arc::clone(&runtime);
+        let task_key = key.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .act(
+                    &task_key,
+                    &task_opts,
+                    &BrowserAction::Wait {
+                        timeout_ms: Some(4_000),
+                        text: Some("__omninova_never_match__".into()),
+                        target: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let pending = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ManualCorrection)
+            .unwrap();
+        assert!(
+            pending.phase == BrowserTakeoverPhase::TakeoverRequested
+                || pending.phase == BrowserTakeoverPhase::HumanControlled
+        );
+        let blocked = runtime
+            .observe(&key, &opts, &ObserveRequest::snapshot())
+            .await
+            .expect_err("new ops blocked after request");
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+        let _ = inflight.await.unwrap();
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+        runtime.close_session(&key, &opts).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live headed agent-browser + Chromium runtime"]
+    async fn live_human_takeover_multiple_cycles_and_close() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let html = "<html><head><title>b34b-cycles</title></head><body><p>cycle</p></body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        let opts = headed_live_opts();
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-c-{}", uuid::Uuid::new_v4())).unwrap();
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open");
+        for expected in 1..=2 {
+            runtime
+                .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+                .unwrap();
+            let released = runtime.release_human_takeover(&key).unwrap();
+            assert_eq!(released.generation, expected);
+            runtime
+                .observe(&key, &opts, &ObserveRequest::snapshot())
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.get_takeover_state(&key).phase,
+                BrowserTakeoverPhase::AgentControlled
+            );
+        }
+        runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .unwrap();
+        runtime.close_session(&key, &opts).await.expect("close during HumanControlled");
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live agent-browser + Chromium runtime"]
+    async fn live_human_takeover_headless_typed_failure() {
+        use crate::tools::browser_control::{BrowserTakeoverPhase, TakeoverReason};
+
+        let Some(search) = native_cli_search() else {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        };
+        let opts = BrowserSessionOptions::default();
+        assert!(opts.headless);
+        let backend = Arc::new(AgentBrowserBackend::new(Some(search), opts.clone()));
+        let runtime = BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy {
+                allowed_domains: vec!["127.0.0.1".into()],
+                ..BrowserRuntimePolicy::default()
+            },
+        );
+        let key = BrowserSessionKey::new(format!("b34b-d-{}", uuid::Uuid::new_v4())).unwrap();
+        let html = "<html><body>headless</body></html>";
+        let page_port = crate::tools::web_client::tests::spawn_test_server(move |_, stream| {
+            crate::tools::web_client::tests::write_response(
+                stream,
+                "HTTP/1.1 200 OK",
+                html,
+                &["content-type: text/html; charset=utf-8".to_string()],
+            );
+        });
+        runtime
+            .open(
+                &key,
+                &opts,
+                &NavigateRequest {
+                    url: format!("http://127.0.0.1:{page_port}/fixture"),
+                },
+            )
+            .await
+            .expect("open headless");
+        let err = runtime
+            .request_human_takeover(&key, &opts, TakeoverReason::ExplicitUserRequest)
+            .expect_err("headless takeover must fail");
+        assert_eq!(err.kind, BrowserErrorKind::TakeoverUnsupportedHeadless);
+        assert_eq!(
+            runtime.get_takeover_state(&key).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        runtime.close_session(&key, &opts).await.ok();
     }
 }

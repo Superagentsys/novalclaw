@@ -1239,6 +1239,7 @@ pub async fn process_feishu_job(
             .is_some();
     
     let text_len = job.inbound.text.len();
+    let full_access = runtime.get_config().await.permissions.is_full_access();
     
     println!(
         "[{}-worker] job_started job_id={} event_id_present={} message_id_present={} chat_id_present={} mode={}",
@@ -1272,7 +1273,7 @@ pub async fn process_feishu_job(
     }
     
     // Check for tool intent in chat_only mode
-    if job.is_chat_only {
+    if job.is_chat_only && !full_access {
         if let Some(intent) = detect_tool_intent(&job.inbound.text) {
             println!(
                 "[{}-worker] short_circuit job_id={} intent={} text_len={}",

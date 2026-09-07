@@ -6,8 +6,8 @@ use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
     resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
-    GatewayPublicMode, ModelProviderConfig, ProviderConfig, ProviderTransportConfig, RobotConfig,
-    DEFAULT_OPEN_SKILLS_ENABLED,
+    GatewayPublicMode, ModelProviderConfig, PermissionMode, ProviderConfig,
+    ProviderTransportConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -466,6 +466,7 @@ struct SetupWorkspaceStatus {
 
 const APPROVAL_PROFILE_REQUEST: &str = "request_approval";
 const APPROVAL_PROFILE_RISK_BASED: &str = "risk_based";
+const APPROVAL_PROFILE_FULL_ACCESS: &str = "full_access";
 
 /// Tools whose normal use can mutate the workspace or contact an external
 /// service. Both legacy `[autonomy]` and the newer `[approvals]` table must
@@ -499,7 +500,13 @@ struct ApprovalProfilePayload {
 }
 
 fn approval_profile_payload(profile: &str) -> ApprovalProfilePayload {
-    if profile == APPROVAL_PROFILE_RISK_BASED {
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        ApprovalProfilePayload {
+            profile: APPROVAL_PROFILE_FULL_ACCESS.to_string(),
+            label: "Full Access".to_string(),
+            description: "无需确认即可访问文件、运行命令、控制浏览器和使用网络。".to_string(),
+        }
+    } else if profile == APPROVAL_PROFILE_RISK_BASED {
         ApprovalProfilePayload {
             profile: APPROVAL_PROFILE_RISK_BASED.to_string(),
             label: "帮我批准".to_string(),
@@ -540,6 +547,13 @@ fn ensure_tool_entries(list: &mut Vec<String>, tools: &[&str]) {
 /// was contradictory. Treat that legacy shape as the risk-based profile so an
 /// upgrade does not unexpectedly block edits meant to run automatically.
 fn configured_approval_profile(config: &Config) -> &'static str {
+    if config.permissions.is_full_access() {
+        return APPROVAL_PROFILE_FULL_ACCESS;
+    }
+    configured_restricted_approval_profile(config)
+}
+
+fn configured_restricted_approval_profile(config: &Config) -> &'static str {
     if config.approvals.mode.as_deref() == Some(APPROVAL_PROFILE_RISK_BASED) {
         return APPROVAL_PROFILE_RISK_BASED;
     }
@@ -560,11 +574,28 @@ fn configured_approval_profile(config: &Config) -> &'static str {
 }
 
 fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, String> {
-    if profile != APPROVAL_PROFILE_REQUEST && profile != APPROVAL_PROFILE_RISK_BASED {
+    if profile != APPROVAL_PROFILE_REQUEST
+        && profile != APPROVAL_PROFILE_RISK_BASED
+        && profile != APPROVAL_PROFILE_FULL_ACCESS
+    {
         return Err("未知的权限策略。".to_string());
     }
 
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        let changed = !config.permissions.is_full_access();
+        config.permissions.mode = PermissionMode::FullAccess;
+        return Ok(changed);
+    }
+
+    if config.permissions.is_full_access()
+        && configured_restricted_approval_profile(config) == profile
+    {
+        config.permissions.mode = PermissionMode::Restricted;
+        return Ok(true);
+    }
+
     let before = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -574,6 +605,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
         config.approvals.require_approval.clone(),
     );
 
+    config.permissions.mode = PermissionMode::Restricted;
     config.autonomy.level = "supervised".to_string();
     // Shell commands still pass through the explicit allowlist and dangerous
     // command deny list. Keep medium-risk commands available so the approval
@@ -605,6 +637,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
     }
 
     let after = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -1297,6 +1330,317 @@ async fn reject_tool_request(
         .reject_request(&approval_id, reason)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_browser_takeover_state(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .get_browser_takeover_state(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn request_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .request_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn release_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .release_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .cancel_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn install_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .install_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn verify_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .verify_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn remove_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .remove_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn get_personal_chrome_bridge_status(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    Ok(bridge.status().await)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersonalChromeAuthorizationStatusDto {
+    run_id: String,
+    configured: bool,
+    state: String,
+    transport_connected: bool,
+    protocol_version: u32,
+    extension_tab_granted: bool,
+    desktop_run_granted: bool,
+    authorization_generation: Option<u64>,
+    production_factory_enabled: bool,
+    full_access: bool,
+    ready: bool,
+    error_code: Option<String>,
+}
+
+async fn read_extension_tab_grant(
+    bridge: &omninova_browser_host::PersonalChromeBridge,
+) -> Result<Option<(i32, i32, u64)>, String> {
+    let response = bridge
+        .request("tab_list_authorized", "", serde_json::json!({}))
+        .await
+        .map_err(|error| error.code().to_string())?;
+    if !response.ok {
+        return Err(response
+            .error
+            .map(|error| error.code)
+            .unwrap_or_else(|| "PersonalChromeAuthorizationFailed".to_string()));
+    }
+    let tabs = response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("tabs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tabs.is_empty() {
+        return Ok(None);
+    }
+    if tabs.len() != 1 {
+        return Err("PersonalChromeAuthorizationAmbiguous".to_string());
+    }
+    let tab = &tabs[0];
+    let window_id = tab
+        .get("window_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())? as i32;
+    let tab_id = tab
+        .get("tab_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())? as i32;
+    let generation = tab
+        .get("authorization_generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())?;
+    Ok(Some((window_id, tab_id, generation)))
+}
+
+async fn personal_chrome_authorization_status(
+    run_id: &str,
+    runtime: &GatewayRuntime,
+    bridge: &omninova_browser_host::PersonalChromeBridge,
+) -> PersonalChromeAuthorizationStatusDto {
+    let transport = bridge.status().await;
+    let config = runtime.get_config().await;
+    let full_access = config.permissions.is_full_access();
+    let configured = config.browser.enabled
+        && config.browser.backend.trim().eq_ignore_ascii_case("personal-chrome");
+    let extension = if transport.connected {
+        read_extension_tab_grant(bridge).await
+    } else {
+        Ok(None)
+    };
+    let desktop = runtime.personal_chrome_grant_for_run(run_id).await;
+    let extension_tab_granted = matches!(extension, Ok(Some(_)));
+    let desktop_run_granted = full_access || matches!(desktop, Ok(Some(_)));
+    let authorization_generation = if full_access {
+        extension
+            .as_ref()
+            .ok()
+            .and_then(|grant| grant.as_ref().map(|(_, _, generation)| *generation))
+    } else {
+        personal_chrome_grant_matches(&extension, &desktop)
+    };
+    let production_factory_enabled =
+        full_access
+            || omninova_core::tools::browser_personal_chrome::personal_chrome_production_enabled();
+    let ready = transport.connected
+        && extension_tab_granted
+        && desktop_run_granted
+        && authorization_generation.is_some()
+        && production_factory_enabled;
+    let error_code = extension
+        .as_ref()
+        .err()
+        .cloned()
+        .or_else(|| {
+            (!full_access)
+                .then(|| desktop.as_ref().err().map(ToString::to_string))
+                .flatten()
+        });
+    let state = if !transport.connected {
+        transport.state.clone()
+    } else if error_code.is_some() {
+        "authorization_error".to_string()
+    } else if !extension_tab_granted {
+        "no_tab_authorized".to_string()
+    } else if !desktop_run_granted {
+        "awaiting_desktop_approval".to_string()
+    } else if authorization_generation.is_none() {
+        "authorization_stale".to_string()
+    } else if !production_factory_enabled {
+        "authorized_release_gate_closed".to_string()
+    } else {
+        "ready".to_string()
+    };
+    PersonalChromeAuthorizationStatusDto {
+        run_id: run_id.to_string(),
+        configured,
+        state,
+        transport_connected: transport.connected,
+        protocol_version: transport.protocol_version,
+        extension_tab_granted,
+        desktop_run_granted,
+        authorization_generation,
+        production_factory_enabled,
+        full_access,
+        ready,
+        error_code,
+    }
+}
+
+fn personal_chrome_grant_matches(
+    extension: &Result<Option<(i32, i32, u64)>, String>,
+    desktop: &Result<
+        Option<omninova_core::gateway::PersonalChromeRunGrant>,
+        omninova_core::gateway::BrowserTakeoverRouteError,
+    >,
+) -> Option<u64> {
+    match (extension, desktop) {
+        (Ok(Some((window_id, tab_id, generation))), Ok(Some(grant)))
+            if *window_id == grant.window_id
+                && *tab_id == grant.tab_id
+                && *generation == grant.authorization_generation =>
+        {
+            Some(*generation)
+        }
+        _ => None,
+    }
+}
+
+#[tauri::command]
+async fn get_personal_chrome_authorization_status(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
+}
+
+#[tauri::command]
+async fn approve_personal_chrome_for_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    if !config.browser.enabled
+        || !config
+            .browser
+            .backend
+            .trim()
+            .eq_ignore_ascii_case("personal-chrome")
+    {
+        return Err("PersonalChromeNotConfigured".to_string());
+    }
+    let (window_id, tab_id, generation) = read_extension_tab_grant(&bridge)
+        .await?
+        .ok_or_else(|| "PersonalChromeNotAuthorized".to_string())?;
+    runtime
+        .grant_personal_chrome_for_run(&run_id, window_id, tab_id, generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
+}
+
+#[tauri::command]
+async fn revoke_personal_chrome_for_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let _ = bridge
+        .request("revoke_authorization", "", serde_json::json!({}))
+        .await;
+    runtime
+        .revoke_personal_chrome_for_run(&run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
 }
 
 async fn workspace_dir_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> PathBuf {
@@ -2063,6 +2407,155 @@ mod browser_dep_tests {
             chromium_status_from_doctor(unrelated)
                 .unwrap_err()
                 .contains("did not report Chromium")
+        );
+    }
+}
+
+#[cfg(test)]
+mod browser_takeover_command_tests {
+    use omninova_core::gateway::{BrowserTakeoverRouteError, BrowserTakeoverStateDto};
+
+    #[test]
+    fn takeover_dto_and_errors_serialize_without_runtime_construction() {
+        let dto = BrowserTakeoverStateDto {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            phase: "human_controlled".into(),
+            owner: "human".into(),
+            generation: 2,
+            reason: Some("explicit_user_request".into()),
+            since_ms: 1,
+            eligible: true,
+            headless: false,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["run_id"], "run-1");
+        assert_eq!(value["phase"], "human_controlled");
+        assert!(value.get("pid").is_none());
+        assert!(value.get("hwnd").is_none());
+        assert!(value.get("cdp_url").is_none());
+        let missing = BrowserTakeoverRouteError::RunNotFound.to_string();
+        assert!(missing.starts_with("BrowserTakeoverRunNotFound"));
+        let unavailable = BrowserTakeoverRouteError::Unavailable.to_string();
+        assert!(unavailable.starts_with("BrowserTakeoverUnavailable"));
+        let headless = BrowserTakeoverRouteError::Runtime {
+            code: "BrowserTakeoverUnsupportedHeadless".into(),
+            message: "headed required".into(),
+        }
+        .to_string();
+        assert!(headless.contains("BrowserTakeoverUnsupportedHeadless"));
+    }
+
+    #[test]
+    fn takeover_commands_are_registered_by_name() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "get_browser_takeover_state",
+            "request_browser_takeover",
+            "release_browser_takeover",
+            "cancel_browser_takeover",
+        ] {
+            assert!(
+                registered.contains(command),
+                "missing command {command}"
+            );
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(
+            !registered.contains(&runtime_ctor),
+            "Tauri must not construct BrowserRuntime"
+        );
+    }
+}
+
+#[cfg(test)]
+mod personal_chrome_bridge_command_tests {
+    use super::{personal_chrome_grant_matches, PersonalChromeAuthorizationStatusDto};
+    use omninova_core::gateway::PersonalChromeRunGrant;
+
+    #[test]
+    fn personal_chrome_bridge_commands_are_registered_and_do_not_expose_secrets() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "install_personal_chrome_bridge",
+            "verify_personal_chrome_bridge",
+            "remove_personal_chrome_bridge",
+            "get_personal_chrome_bridge_status",
+            "get_personal_chrome_authorization_status",
+            "approve_personal_chrome_for_run",
+            "revoke_personal_chrome_for_run",
+        ] {
+            assert!(registered.contains(command), "missing command {command}");
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let forbidden_backend = ["Personal", "Chrome", "Backend"].concat();
+        let secret_file = ["ipc", ".", "secret"].concat();
+        assert!(!registered.contains(&forbidden_backend));
+        assert!(!registered.contains(&secret_file));
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(!registered.contains(&runtime_ctor));
+    }
+
+    #[test]
+    fn personal_chrome_authorization_status_is_metadata_only() {
+        let dto = PersonalChromeAuthorizationStatusDto {
+            run_id: "run-a".to_string(),
+            configured: true,
+            state: "awaiting_desktop_approval".to_string(),
+            transport_connected: true,
+            protocol_version: 1,
+            extension_tab_granted: true,
+            desktop_run_granted: false,
+            authorization_generation: None,
+            production_factory_enabled: false,
+            full_access: false,
+            ready: false,
+            error_code: None,
+        };
+        let value = serde_json::to_value(dto).unwrap();
+        let object = value.as_object().unwrap();
+        for forbidden in [
+            "url",
+            "title",
+            "cookie",
+            "token",
+            "secret",
+            "window_id",
+            "tab_id",
+        ] {
+            assert!(
+                !object.keys().any(|key| key.contains(forbidden)),
+                "authorization status leaked forbidden key {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_grant_requires_exact_window_tab_and_generation_match() {
+        let desktop = Ok(Some(PersonalChromeRunGrant {
+            run_id: "run-a".to_string(),
+            window_id: 1,
+            tab_id: 2,
+            authorization_generation: 3,
+        }));
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 2, 3))), &desktop),
+            Some(3)
+        );
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 9, 3))), &desktop),
+            None
+        );
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 2, 4))), &desktop),
+            None
         );
     }
 }
@@ -5239,6 +5732,7 @@ pub fn run() {
         .expect("Failed to build async runtime");
     let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
     tauri::async_runtime::set(runtime.handle().clone());
+    let personal_chrome_runtime_handle = runtime.handle().clone();
 
     omninova_core::init().expect("Failed to initialize core");
 
@@ -5253,8 +5747,10 @@ pub fn run() {
         }
     }
 
+    let gateway_runtime = GatewayRuntime::new(config);
+    let personal_chrome_runtime = gateway_runtime.clone();
     let state = Arc::new(Mutex::new(AppState {
-        runtime: GatewayRuntime::new(config),
+        runtime: gateway_runtime,
         gateway_task: None,
         last_gateway_started_at: None,
         last_gateway_error: None,
@@ -5285,6 +5781,17 @@ pub fn run() {
             cancel_agent_run,
             approve_tool_request,
             reject_tool_request,
+            get_browser_takeover_state,
+            request_browser_takeover,
+            release_browser_takeover,
+            cancel_browser_takeover,
+            install_personal_chrome_bridge,
+            verify_personal_chrome_bridge,
+            remove_personal_chrome_bridge,
+            get_personal_chrome_bridge_status,
+            get_personal_chrome_authorization_status,
+            approve_personal_chrome_for_run,
+            revoke_personal_chrome_for_run,
             automation_list_jobs,
             automation_upsert_job,
             automation_delete_job,
@@ -5347,13 +5854,32 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             configure_embedded_agent_browser_env(app.handle());
 
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".omninova"));
+            let bridge = omninova_browser_host::PersonalChromeBridge::spawn_on(
+                app_data_dir.join("personal-chrome-bridge"),
+                personal_chrome_runtime_handle.clone(),
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("personal chrome transport: {}", error.code()),
+                )
+            })?;
+            personal_chrome_runtime
+                .install_personal_chrome_bridge(bridge.clone())
+                .map_err(|code| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("personal chrome runtime bridge: {code}"),
+                    )
+                })?;
+            app.manage(bridge);
             let webview_user_data_dir = resolve_webview_user_data_dir();
             std::fs::create_dir_all(&webview_user_data_dir).map_err(|error| {
                 std::io::Error::new(
@@ -5649,6 +6175,43 @@ mod approval_profile_tests {
         let mut config = Config::default();
         assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
         assert!(!apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
+    }
+
+    #[test]
+    fn full_access_is_additive_and_preserves_granular_permissions() {
+        let mut config = Config::default();
+        config.autonomy.allowed_commands = vec!["custom-command".into()];
+        config.security.tool_policy.denied_tools = vec!["custom-tool".into()];
+        config.approvals.require_approval = vec!["custom-approval".into()];
+        let granular = (
+            config.autonomy.allowed_commands.clone(),
+            config.security.tool_policy.denied_tools.clone(),
+            config.approvals.require_approval.clone(),
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_FULL_ACCESS).unwrap());
+        assert!(config.permissions.is_full_access());
+        assert_eq!(configured_approval_profile(&config), APPROVAL_PROFILE_FULL_ACCESS);
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            )
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_REQUEST).unwrap());
+        assert!(!config.permissions.is_full_access());
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            ),
+            "leaving full access for the pre-existing restricted profile must not rewrite granular settings"
+        );
     }
 }
 

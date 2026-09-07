@@ -136,6 +136,14 @@ pub struct ToolBuildContext<'a> {
     /// the `/api/tools` endpoint. Memory-backed tools are skipped then.
     pub memory: Option<&'a Arc<dyn Memory>>,
     pub session_id: Option<&'a str>,
+    /// Optional assembly-owned slot for the exact BrowserRuntime handle used
+    /// by this toolset. Enumeration callers leave it unset.
+    pub browser_takeover_slot:
+        Option<&'a Arc<std::sync::Mutex<Option<crate::tools::browser_runtime::BrowserTakeoverHandle>>>>,
+    /// Exact active-run Personal Chrome authorization. Enumeration and
+    /// non-run callers leave this unset, keeping Personal Chrome fail-closed.
+    pub personal_chrome:
+        Option<&'a crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
 }
 
 /// One row of the registry.
@@ -161,14 +169,24 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["read_file"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileReadTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileReadTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_write",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileWriteTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileWriteTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "office_create",
@@ -182,21 +200,36 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileEditTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileEditTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_patch",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &["apply_patch"],
         enabled: always,
-        build: |ctx| Some(Box::new(FilePatchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FilePatchTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_list",
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["list_directory"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileListTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileListTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "glob_search",
@@ -309,8 +342,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.http_request.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.http_request.allowed_domains.clone()
+            };
             Some(Box::new(HttpRequestTool::new(
-                ctx.config.http_request.allowed_domains.clone(),
+                allowed_domains,
                 WebToolSettings::from_config(
                     &ctx.config.proxy,
                     ctx.config.http_request.timeout_secs,
@@ -325,8 +363,13 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_fetch.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.web_fetch.allowed_domains.clone()
+            };
             Some(Box::new(WebFetchTool::new(
-                ctx.config.web_fetch.allowed_domains.clone(),
+                allowed_domains,
                 WebToolSettings::from_config(
                     &ctx.config.proxy,
                     ctx.config.web_fetch.timeout_secs,
@@ -374,17 +417,47 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             )
         },
         build: |ctx| {
+            let (profile, installed_profile) = match crate::tools::browser_profile_manager::parse_browser_session_profile_config(
+                ctx.config.browser.profile.as_deref(),
+                ctx.config.browser.installed_profile.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidManaged) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid browser.profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidInstalled) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid installed_profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::ConflictingModes) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "browser.profile and browser.installed_profile cannot be combined; browser tool not registered"
+                    );
+                    return None;
+                }
+            };
             let session_opts = crate::tools::browser_types::BrowserSessionOptions {
                 headless: ctx.config.browser.native_headless,
                 attach_only: ctx.config.browser.attach_only,
                 cdp_url: ctx.config.browser.cdp_url.clone(),
-                profile: None,
+                profile,
+                installed_profile,
             };
-            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable(
+            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable_and_personal_chrome_access(
                 &ctx.config.browser.backend,
                 None,
                 session_opts.clone(),
                 ctx.config.browser.executable_path.clone(),
+                ctx.personal_chrome.cloned(),
+                ctx.config.permissions.is_full_access(),
             ) {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -398,16 +471,29 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
                 }
             };
             let policy = crate::tools::browser_runtime::BrowserRuntimePolicy {
-                allowed_domains: ctx.config.browser.allowed_domains.clone(),
+                allowed_domains: if ctx.config.permissions.is_full_access() {
+                    Vec::new()
+                } else {
+                    ctx.config.browser.allowed_domains.clone()
+                },
                 ..crate::tools::browser_runtime::BrowserRuntimePolicy::default()
             };
-            let runtime = crate::tools::browser_runtime::BrowserRuntime::new(backend, policy);
+            let runtime = Arc::new(crate::tools::browser_runtime::BrowserRuntime::new(backend, policy));
             let session_key = ctx
                 .session_id
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .and_then(|s| crate::tools::browser_types::BrowserSessionKey::new(s).ok());
-            Some(Box::new(BrowserTool::from_runtime(
+            if let (Some(slot), Some(key)) = (ctx.browser_takeover_slot, session_key.clone()) {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                    crate::tools::browser_runtime::BrowserTakeoverHandle::new(
+                        Arc::clone(&runtime),
+                        key,
+                        session_opts.clone(),
+                    ),
+                );
+            }
+            Some(Box::new(BrowserTool::from_shared_runtime(
                 runtime,
                 session_opts,
                 session_key,
@@ -514,6 +600,8 @@ mod tests {
             workspace: Path::new("/fake/workspace"),
             memory,
             session_id: None,
+            browser_takeover_slot: None,
+            personal_chrome: None,
         })
         .iter()
         .map(|tool| tool.name().to_string())
@@ -594,6 +682,8 @@ mod tests {
                 workspace: Path::new("/fake/workspace"),
                 memory: Some(&memory),
                 session_id: session,
+                browser_takeover_slot: None,
+                personal_chrome: None,
             });
             let browser = tools
                 .iter_mut()
@@ -668,6 +758,34 @@ mod tests {
             mapped_unicode,
             crate::tools::browser::browser_session_id(Some(&logical_unicode)).unwrap()
         );
+    }
+
+    #[test]
+    fn browser_takeover_slot_captures_exact_runtime_for_active_session() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        if !crate::tools::browser_bin::agent_browser_runtime_available() {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        }
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let _tools = build_tools(&ToolBuildContext {
+            config: &config,
+            workspace: Path::new("/fake/workspace"),
+            memory: Some(&memory),
+            session_id: Some("takeover-session"),
+            browser_takeover_slot: Some(&slot),
+            personal_chrome: None,
+        });
+        let handle = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active session must register a takeover handle");
+        assert_eq!(handle.session_id(), "takeover-session");
+        assert_eq!(handle.headless(), config.browser.native_headless);
+        assert_eq!(handle.state().generation, 0);
     }
 
     #[test]

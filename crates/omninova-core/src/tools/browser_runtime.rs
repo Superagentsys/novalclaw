@@ -3,6 +3,9 @@
 //! Production path: `BrowserTool` → `BrowserRuntime` → `BrowserBackend`.
 
 use crate::tools::browser_backend::BrowserBackend;
+use crate::tools::browser_control::{
+    AgentOpClass, BrowserControlError, BrowserControlRegistry, BrowserControlState, TakeoverReason,
+};
 use crate::tools::browser_output::{
     BROWSER_OP_CHAR_LIMIT, BROWSER_SNAPSHOT_CHAR_LIMIT, BROWSER_TEXT_CHAR_LIMIT,
 };
@@ -11,7 +14,10 @@ use crate::tools::browser_types::{
     BrowserBackendError, BrowserBackendId, BrowserElement, BrowserErrorKind, BrowserExtractRequest,
     BrowserExtractResult, BrowserHealth, BrowserObservation, BrowserObserveKind, BrowserSessionKey,
     BrowserSessionOpenRequest, BrowserSessionOptions, BrowserSnapshot, BrowserTab, NavigateRequest,
-    ObserveRequest, ScreenshotRequest, ScreenshotResult, BROWSER_STALE_REFERENCE_DETAIL,
+    ObserveRequest, ScreenshotRequest, ScreenshotResult, BROWSER_HUMAN_TAKEOVER_ACTIVE_DETAIL,
+    BROWSER_STALE_ASSUMPTIONS_DETAIL, BROWSER_STALE_REFERENCE_DETAIL,
+    BROWSER_TAKEOVER_LOST_DETAIL, BROWSER_TAKEOVER_REJECTED_DETAIL,
+    BROWSER_TAKEOVER_UNSUPPORTED_HEADLESS_DETAIL,
 };
 use crate::tools::text_bound::{bound_head, truncate_head_chars};
 use crate::tools::web_client::{host_matches_allowlist, redact_secrets_in_text};
@@ -87,11 +93,96 @@ enum RuntimeOp {
 pub struct BrowserRuntime {
     backend: Arc<dyn BrowserBackend>,
     policy: BrowserRuntimePolicy,
+    control: Arc<BrowserControlRegistry>,
+}
+
+/// Minimal, backend-neutral control surface retained by an active Agent run.
+///
+/// The handle intentionally exposes neither backend/session handles nor
+/// executable/profile details. It points at the exact runtime used by the
+/// model-visible BrowserTool, so BrowserControlRegistry remains authoritative.
+#[derive(Clone)]
+pub struct BrowserTakeoverHandle {
+    runtime: Arc<BrowserRuntime>,
+    session_key: BrowserSessionKey,
+    session_opts: BrowserSessionOptions,
+}
+
+impl std::fmt::Debug for BrowserTakeoverHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserTakeoverHandle")
+            .field("session_id_present", &true)
+            .field("headless", &self.session_opts.headless)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrowserTakeoverHandle {
+    pub fn new(
+        runtime: Arc<BrowserRuntime>,
+        session_key: BrowserSessionKey,
+        session_opts: BrowserSessionOptions,
+    ) -> Self {
+        Self {
+            runtime,
+            session_key,
+            session_opts,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session_key.as_str()
+    }
+
+    pub fn headless(&self) -> bool {
+        self.session_opts.headless
+    }
+
+    pub fn request(
+        &self,
+        reason: TakeoverReason,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime
+            .request_human_takeover(&self.session_key, &self.session_opts, reason)
+    }
+
+    pub fn state(&self) -> BrowserControlState {
+        self.runtime.get_takeover_state(&self.session_key)
+    }
+
+    pub fn release(&self) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.release_human_takeover(&self.session_key)
+    }
+
+    pub fn cancel(&self) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.cancel_human_takeover(&self.session_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_runtime_with(&self, runtime: &Arc<BrowserRuntime>) -> bool {
+        Arc::ptr_eq(&self.runtime, runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_browser_lost_for_test(&self) {
+        self.runtime.control.note_browser_lost(&self.session_key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_timeout_for_test(
+        &self,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.runtime.force_human_takeover_timeout(&self.session_key)
+    }
 }
 
 impl BrowserRuntime {
     pub fn new(backend: Arc<dyn BrowserBackend>, policy: BrowserRuntimePolicy) -> Self {
-        Self { backend, policy }
+        Self {
+            backend,
+            policy,
+            control: Arc::new(BrowserControlRegistry::new()),
+        }
     }
 
     pub fn backend_id(&self) -> BrowserBackendId {
@@ -111,13 +202,67 @@ impl BrowserRuntime {
         key: &BrowserSessionKey,
         opts: &BrowserSessionOptions,
     ) -> BrowserHealth {
-        match self.ensure_session(key, opts).await {
-            Ok(handle) => self.backend.session_health(&handle).await,
+        let health = match self.ensure_session(key, opts).await {
+            Ok(handle) => {
+                self.control.remember_headless(key, opts.headless);
+                self.backend.session_health(&handle).await
+            }
             Err(err) => BrowserHealth::Unhealthy {
                 kind: err.kind,
                 detail: err.detail,
             },
+        };
+        if self.control.blocks_crash_recovery(key) {
+            if let BrowserHealth::Unhealthy { kind, .. } = &health {
+                if is_browser_lost_kind(*kind) {
+                    self.control.note_browser_lost(key);
+                }
+            }
         }
+        health
+    }
+
+    pub fn request_human_takeover(
+        &self,
+        key: &BrowserSessionKey,
+        opts: &BrowserSessionOptions,
+        reason: TakeoverReason,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.control
+            .request_human_takeover(key, opts.headless, reason)
+            .map_err(|err| self.map_control_error(err))
+    }
+
+    pub fn get_takeover_state(&self, key: &BrowserSessionKey) -> BrowserControlState {
+        self.control.get(key)
+    }
+
+    pub fn release_human_takeover(
+        &self,
+        key: &BrowserSessionKey,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.control
+            .release_human_takeover(key)
+            .map_err(|err| self.map_control_error(err))
+    }
+
+    pub fn cancel_human_takeover(
+        &self,
+        key: &BrowserSessionKey,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.control
+            .cancel_human_takeover(key)
+            .map_err(|err| self.map_control_error(err))
+    }
+
+    #[cfg(test)]
+    pub fn force_human_takeover_timeout(
+        &self,
+        key: &BrowserSessionKey,
+    ) -> Result<BrowserControlState, BrowserBackendError> {
+        self.control
+            .force_timeout(key)
+            .map_err(|err| self.map_control_error(err))
     }
 
     pub async fn open(
@@ -275,7 +420,9 @@ impl BrowserRuntime {
             return Err(BrowserBackendError::new(kind, self.backend.id(), detail));
         }
         let req = BrowserSessionOpenRequest::new(key.clone(), opts.clone());
-        self.backend.open_session(&req).await
+        let handle = self.backend.open_session(&req).await?;
+        self.control.remember_headless(key, opts.headless);
+        Ok(handle)
     }
 
     fn reject_reserved_logical_session(
@@ -301,19 +448,63 @@ impl BrowserRuntime {
         F: FnMut(BackendSessionHandle) -> Fut,
         Fut: std::future::Future<Output = Result<T, BrowserBackendError>>,
     {
+        if matches!(op, RuntimeOp::CloseSession) {
+            let result = self.dispatch_with_recovery(&op, key, opts, &mut call).await;
+            self.control.remove(key);
+            return result;
+        }
+
+        let class = agent_op_class(&op);
+        let permit = self
+            .control
+            .begin_agent_operation(key, class)
+            .map_err(|err| self.map_control_error(err))?;
+
+        let result = self.dispatch_with_recovery(&op, key, opts, &mut call).await;
+        match &result {
+            Ok(_) if matches!(op, RuntimeOp::Observe(_)) => {
+                self.control.complete_resync(key);
+            }
+            Err(err)
+                if self.control.blocks_crash_recovery(key) && is_browser_lost_kind(err.kind) =>
+            {
+                self.control.note_browser_lost(key);
+            }
+            _ => {}
+        }
+        drop(permit);
+        result
+    }
+
+    async fn dispatch_with_recovery<T, F, Fut>(
+        &self,
+        op: &RuntimeOp,
+        key: &BrowserSessionKey,
+        opts: &BrowserSessionOptions,
+        call: &mut F,
+    ) -> Result<T, BrowserBackendError>
+    where
+        F: FnMut(BackendSessionHandle) -> Fut,
+        Fut: std::future::Future<Output = Result<T, BrowserBackendError>>,
+    {
         let mut recovered = 0u8;
         loop {
             let handle = match self.ensure_session(key, opts).await {
                 Ok(handle) => handle,
-                Err(err) if self.can_recover(&op, recovered, &err) => {
+                Err(err) if self.can_recover(op, key, recovered, &err) => {
                     recovered = recovered.saturating_add(1);
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if self.control.blocks_crash_recovery(key) && is_browser_lost_kind(err.kind) {
+                        self.control.note_browser_lost(key);
+                    }
+                    return Err(err);
+                }
             };
             match call(handle).await {
                 Ok(value) => return Ok(value),
-                Err(err) if self.can_recover(&op, recovered, &err) => {
+                Err(err) if self.can_recover(op, key, recovered, &err) => {
                     recovered = recovered.saturating_add(1);
                     continue;
                 }
@@ -322,11 +513,44 @@ impl BrowserRuntime {
         }
     }
 
-    fn can_recover(&self, op: &RuntimeOp, recovered: u8, err: &BrowserBackendError) -> bool {
-        err.retryable
+    fn can_recover(
+        &self,
+        op: &RuntimeOp,
+        key: &BrowserSessionKey,
+        recovered: u8,
+        err: &BrowserBackendError,
+    ) -> bool {
+        !self.control.blocks_crash_recovery(key)
+            && err.retryable
             && recovered < self.policy.max_recovery_attempts
             && operation_is_retryable(op)
             && runtime_should_recover(err.kind)
+    }
+
+    fn map_control_error(&self, err: BrowserControlError) -> BrowserBackendError {
+        let (kind, detail) = match err {
+            BrowserControlError::HumanTakeoverActive { .. } => (
+                BrowserErrorKind::HumanTakeoverActive,
+                BROWSER_HUMAN_TAKEOVER_ACTIVE_DETAIL.to_string(),
+            ),
+            BrowserControlError::UnsupportedHeadless => (
+                BrowserErrorKind::TakeoverUnsupportedHeadless,
+                BROWSER_TAKEOVER_UNSUPPORTED_HEADLESS_DETAIL.to_string(),
+            ),
+            BrowserControlError::StaleAssumptions => (
+                BrowserErrorKind::StaleAssumptions,
+                BROWSER_STALE_ASSUMPTIONS_DETAIL.to_string(),
+            ),
+            BrowserControlError::BrowserLost { .. } => (
+                BrowserErrorKind::TakeoverBrowserLost,
+                BROWSER_TAKEOVER_LOST_DETAIL.to_string(),
+            ),
+            BrowserControlError::Rejected { .. } => (
+                BrowserErrorKind::TakeoverRejected,
+                BROWSER_TAKEOVER_REJECTED_DETAIL.to_string(),
+            ),
+        };
+        BrowserBackendError::new(kind, self.backend.id(), detail)
     }
 
     fn validate_open_url(&self, raw: &str) -> Result<Url, BrowserBackendError> {
@@ -684,13 +908,44 @@ pub fn present_backend_error(err: &BrowserBackendError) -> String {
         BrowserErrorKind::InvalidStructuredOutput => "BrowserStructuredOutputInvalid",
         BrowserErrorKind::StaleReference => "BrowserCommandFailed",
         BrowserErrorKind::ProfileBusy => "BrowserProfileBusy",
+        BrowserErrorKind::InstalledProfileSnapshotIncomplete => {
+            "BrowserInstalledProfileSnapshotIncomplete"
+        }
+        BrowserErrorKind::HumanTakeoverActive => "BrowserHumanTakeoverActive",
+        BrowserErrorKind::TakeoverUnsupportedHeadless => "BrowserTakeoverUnsupportedHeadless",
+        BrowserErrorKind::StaleAssumptions => "BrowserStaleAssumptions",
+        BrowserErrorKind::TakeoverBrowserLost => "BrowserTakeoverLost",
+        BrowserErrorKind::TakeoverRejected => "BrowserTakeoverRejected",
     };
     format!("{prefix}: {}", err.detail)
+}
+
+fn agent_op_class(op: &RuntimeOp) -> AgentOpClass {
+    match op {
+        RuntimeOp::Observe(_) => AgentOpClass::Observe,
+        RuntimeOp::Open | RuntimeOp::Act(_) | RuntimeOp::Screenshot | RuntimeOp::Tabs => {
+            AgentOpClass::Mutate
+        }
+        RuntimeOp::CloseSession => AgentOpClass::Mutate,
+    }
+}
+
+fn is_browser_lost_kind(kind: BrowserErrorKind) -> bool {
+    matches!(
+        kind,
+        BrowserErrorKind::Crashed
+            | BrowserErrorKind::NotConnected
+            | BrowserErrorKind::SessionNotFound
+            | BrowserErrorKind::TakeoverBrowserLost
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser_control::{
+        BrowserControlOwner, BrowserTakeoverPhase, TakeoverReason,
+    };
     use crate::tools::browser_lifecycle::is_retryable_action;
     use crate::tools::browser_types::{
         BackendCapabilities, BrowserBackendId, BrowserElement, BrowserElementRef, BrowserPageId,
@@ -701,7 +956,10 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CallKind {
@@ -736,6 +994,12 @@ mod tests {
     struct FakeBackend {
         id: BrowserBackendId,
         state: Mutex<FakeState>,
+        observe_hold: AtomicBool,
+        observe_started: Notify,
+        observe_release: Notify,
+        act_hold: AtomicBool,
+        act_started: Notify,
+        act_release: Notify,
     }
 
     impl FakeBackend {
@@ -777,6 +1041,12 @@ mod tests {
                     tabs: Vec::new(),
                     last_handle_tokens: HashMap::new(),
                 }),
+                observe_hold: AtomicBool::new(false),
+                observe_started: Notify::new(),
+                observe_release: Notify::new(),
+                act_hold: AtomicBool::new(false),
+                act_started: Notify::new(),
+                act_release: Notify::new(),
             }
         }
 
@@ -831,6 +1101,31 @@ mod tests {
 
         fn set_structured_output(&self, value: Option<Value>) {
             self.state.lock().expect("state").structured_output = value;
+        }
+
+        fn enable_observe_hold(&self) {
+            self.observe_hold.store(true, Ordering::SeqCst);
+        }
+
+        fn release_observe_hold(&self) {
+            self.observe_hold.store(false, Ordering::SeqCst);
+            self.observe_release.notify_waiters();
+        }
+
+        fn enable_act_hold(&self) {
+            self.act_hold.store(true, Ordering::SeqCst);
+        }
+
+        fn release_act_hold(&self) {
+            self.act_hold.store(false, Ordering::SeqCst);
+            self.act_release.notify_waiters();
+        }
+
+        async fn wait_if_held(&self, hold: &AtomicBool, started: &Notify, release: &Notify) {
+            if hold.load(Ordering::SeqCst) {
+                started.notify_waiters();
+                release.notified().await;
+            }
         }
 
         fn maybe_fail(&self, kind: CallKind) -> Result<(), BrowserBackendError> {
@@ -938,6 +1233,8 @@ mod tests {
             _session: &BackendSessionHandle,
             req: &ObserveRequest,
         ) -> Result<BrowserObservation, BrowserBackendError> {
+            self.wait_if_held(&self.observe_hold, &self.observe_started, &self.observe_release)
+                .await;
             self.maybe_fail(CallKind::Observe)?;
             let mut state = self.state.lock().expect("state");
             state.observe_kinds.push(req.kind.v1_action_name().into());
@@ -949,6 +1246,8 @@ mod tests {
             _session: &BackendSessionHandle,
             action: &BrowserAction,
         ) -> Result<BrowserActionResult, BrowserBackendError> {
+            self.wait_if_held(&self.act_hold, &self.act_started, &self.act_release)
+                .await;
             self.maybe_fail(CallKind::Act)?;
             self.state
                 .lock()
@@ -993,6 +1292,13 @@ mod tests {
 
     fn opts() -> BrowserSessionOptions {
         BrowserSessionOptions::default()
+    }
+
+    fn headed_opts() -> BrowserSessionOptions {
+        BrowserSessionOptions {
+            headless: false,
+            ..BrowserSessionOptions::default()
+        }
     }
 
     fn css() -> BrowserTarget {
@@ -1718,6 +2024,16 @@ mod tests {
         assert!(!runtime_should_recover(BrowserErrorKind::Timeout));
         assert!(!runtime_should_recover(BrowserErrorKind::StaleReference));
         assert!(!runtime_should_recover(BrowserErrorKind::ProfileBusy));
+        assert!(!runtime_should_recover(
+            BrowserErrorKind::InstalledProfileSnapshotIncomplete
+        ));
+        assert!(!runtime_should_recover(BrowserErrorKind::HumanTakeoverActive));
+        assert!(!runtime_should_recover(
+            BrowserErrorKind::TakeoverUnsupportedHeadless
+        ));
+        assert!(!runtime_should_recover(BrowserErrorKind::StaleAssumptions));
+        assert!(!runtime_should_recover(BrowserErrorKind::TakeoverBrowserLost));
+        assert!(!runtime_should_recover(BrowserErrorKind::TakeoverRejected));
         assert!(runtime_should_recover(BrowserErrorKind::NotConnected));
     }
 
@@ -1736,6 +2052,18 @@ mod tests {
             ),
             (BrowserErrorKind::StaleReference, "BrowserCommandFailed"),
             (BrowserErrorKind::ProfileBusy, "BrowserProfileBusy"),
+            (
+                BrowserErrorKind::InstalledProfileSnapshotIncomplete,
+                "BrowserInstalledProfileSnapshotIncomplete",
+            ),
+            (BrowserErrorKind::HumanTakeoverActive, "BrowserHumanTakeoverActive"),
+            (
+                BrowserErrorKind::TakeoverUnsupportedHeadless,
+                "BrowserTakeoverUnsupportedHeadless",
+            ),
+            (BrowserErrorKind::StaleAssumptions, "BrowserStaleAssumptions"),
+            (BrowserErrorKind::TakeoverBrowserLost, "BrowserTakeoverLost"),
+            (BrowserErrorKind::TakeoverRejected, "BrowserTakeoverRejected"),
         ];
         for (kind, prefix) in cases {
             let err = BrowserBackendError::new(kind, id.clone(), "detail");
@@ -2017,5 +2345,467 @@ mod tests {
         for action in V1_TOOL_ACTIONS {
             crate::tools::browser_types::route_v1_tool_action(action).expect(action);
         }
+    }
+
+    #[tokio::test]
+    async fn headed_takeover_blocks_all_agent_ops_until_observe_resume() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let k = key("takeover-a");
+        let opts = headed_opts();
+        rt.open(
+            &k,
+            &opts,
+            &NavigateRequest {
+                url: "https://example.com/".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let granted = rt
+            .request_human_takeover(&k, &opts, TakeoverReason::ExplicitUserRequest)
+            .unwrap();
+        assert_eq!(granted.phase, BrowserTakeoverPhase::HumanControlled);
+        assert_eq!(granted.owner, BrowserControlOwner::Human);
+
+        let open_err = rt
+            .open(
+                &k,
+                &opts,
+                &NavigateRequest {
+                    url: "https://example.com/next".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(open_err.kind, BrowserErrorKind::HumanTakeoverActive);
+        assert!(!open_err.retryable);
+
+        let observe_err = rt
+            .observe(&k, &opts, &ObserveRequest::snapshot())
+            .await
+            .unwrap_err();
+        assert_eq!(observe_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let read_err = rt
+            .observe(
+                &k,
+                &opts,
+                &ObserveRequest {
+                    kind: BrowserObserveKind::Read {
+                        outline: false,
+                        filter: None,
+                    },
+                    interactive_only: false,
+                    compact: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(read_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let shot_err = rt
+            .screenshot(&k, &opts, &ScreenshotRequest { locator: None })
+            .await
+            .unwrap_err();
+        assert_eq!(shot_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let tabs_err = rt.tabs(&k, &opts).await.unwrap_err();
+        assert_eq!(tabs_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let act_err = rt
+            .act(&k, &opts, &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert_eq!(act_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let eval_err = rt
+            .act(&k, &opts, &BrowserAction::eval_raw("1+1"))
+            .await
+            .unwrap_err();
+        assert_eq!(eval_err.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        let health = rt.session_health(&k, &opts).await;
+        assert_eq!(health, BrowserHealth::Healthy);
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+
+        let released = rt.release_human_takeover(&k).unwrap();
+        assert_eq!(released.phase, BrowserTakeoverPhase::Resynchronizing);
+        assert_eq!(released.generation, 1);
+
+        let mutate_err = rt
+            .act(&k, &opts, &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert_eq!(mutate_err.kind, BrowserErrorKind::StaleAssumptions);
+        assert!(mutate_err.detail.contains("Observe the current browser state"));
+
+        rt.observe(&k, &opts, &ObserveRequest::snapshot())
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        rt.act(&k, &opts, &BrowserAction::Click { target: css() })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn takeover_waits_for_in_flight_observe_then_blocks_new_ops() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = Arc::new(runtime(backend.clone()));
+        let k = key("takeover-inflight-read");
+        let opts = headed_opts();
+        backend.enable_observe_hold();
+        let started = backend.observe_started.notified();
+        let task_rt = Arc::clone(&rt);
+        let task_k = k.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .observe(&task_k, &task_opts, &ObserveRequest::snapshot())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .expect("in-flight observe should start");
+
+        let pending = rt
+            .request_human_takeover(&k, &opts, TakeoverReason::Captcha)
+            .unwrap();
+        assert_eq!(pending.phase, BrowserTakeoverPhase::TakeoverRequested);
+        assert_eq!(pending.in_flight, 1);
+
+        let blocked = rt
+            .observe(&k, &opts, &ObserveRequest::snapshot())
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+
+        backend.release_observe_hold();
+        inflight.await.unwrap().unwrap();
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+        assert_eq!(rt.get_takeover_state(&k).in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn takeover_waits_for_in_flight_mutation_and_error_decrements() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = Arc::new(runtime(backend.clone()));
+        let k = key("takeover-inflight-act");
+        let opts = headed_opts();
+        backend.enable_act_hold();
+        let started = backend.act_started.notified();
+        let task_rt = Arc::clone(&rt);
+        let task_k = k.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .act(
+                    &task_k,
+                    &task_opts,
+                    &BrowserAction::Click { target: css() },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .expect("in-flight act should start");
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Mfa)
+            .unwrap();
+        backend.release_act_hold();
+        inflight.await.unwrap().unwrap();
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+
+        let timeout_backend = Arc::new(FakeBackend::new());
+        let timeout_rt = Arc::new(runtime(timeout_backend.clone()));
+        let timeout_key = key("takeover-timeout-inflight");
+        timeout_backend.enable_observe_hold();
+        timeout_backend.fail_next(CallKind::Observe, BrowserErrorKind::Timeout, 1);
+        let timeout_started = timeout_backend.observe_started.notified();
+        let timeout_task_rt = Arc::clone(&timeout_rt);
+        let timeout_task_key = timeout_key.clone();
+        let timeout_opts = headed_opts();
+        let timeout_join = tokio::spawn(async move {
+            timeout_task_rt
+                .observe(
+                    &timeout_task_key,
+                    &timeout_opts,
+                    &ObserveRequest::snapshot(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), timeout_started)
+            .await
+            .unwrap();
+        timeout_rt
+            .request_human_takeover(&timeout_key, &headed_opts(), TakeoverReason::Unknown)
+            .unwrap();
+        timeout_backend.release_observe_hold();
+        let timeout_err = timeout_join.await.unwrap().unwrap_err();
+        assert_eq!(timeout_err.kind, BrowserErrorKind::Timeout);
+        assert_eq!(timeout_rt.get_takeover_state(&timeout_key).in_flight, 0);
+        assert_eq!(
+            timeout_rt.get_takeover_state(&timeout_key).phase,
+            BrowserTakeoverPhase::HumanControlled
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_during_takeover_requested_is_browser_lost_not_recovered() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = Arc::new(runtime(backend.clone()));
+        let k = key("takeover-lost");
+        let opts = headed_opts();
+        backend.enable_observe_hold();
+        backend.fail_next(CallKind::Observe, BrowserErrorKind::Crashed, 1);
+        let started = backend.observe_started.notified();
+        let task_rt = Arc::clone(&rt);
+        let task_k = k.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .observe(&task_k, &task_opts, &ObserveRequest::snapshot())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap();
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Unknown)
+            .unwrap();
+        backend.release_observe_hold();
+        let err = inflight.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::Crashed);
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::BrowserLost
+        );
+        assert_eq!(backend.call_count(CallKind::Observe), 1);
+
+        let lost = rt
+            .act(&k, &opts, &BrowserAction::Click { target: css() })
+            .await
+            .unwrap_err();
+        assert_eq!(lost.kind, BrowserErrorKind::TakeoverBrowserLost);
+        assert!(!lost.retryable);
+        let release_err = rt.release_human_takeover(&k).unwrap_err();
+        assert_eq!(release_err.kind, BrowserErrorKind::TakeoverBrowserLost);
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_during_human_control_can_surface_browser_lost() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let k = key("takeover-health-lost");
+        let opts = headed_opts();
+        rt.open(
+            &k,
+            &opts,
+            &NavigateRequest {
+                url: "https://example.com/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Unknown)
+            .unwrap();
+        backend.mark_unhealthy(k.as_str());
+        let health = rt.session_health(&k, &opts).await;
+        assert!(matches!(health, BrowserHealth::Unhealthy { .. }));
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::BrowserLost
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_takeover_is_typed_failure_without_relaunch() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let k = key("takeover-headless");
+        rt.open(
+            &k,
+            &opts(),
+            &NavigateRequest {
+                url: "https://example.com/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let opens = backend.call_count(CallKind::OpenSession);
+        let err = rt
+            .request_human_takeover(&k, &opts(), TakeoverReason::ExplicitUserRequest)
+            .unwrap_err();
+        assert_eq!(err.kind, BrowserErrorKind::TakeoverUnsupportedHeadless);
+        assert!(!err.retryable);
+        assert_eq!(backend.call_count(CallKind::OpenSession), opens);
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        rt.observe(&k, &opts(), &ObserveRequest::snapshot())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorded_headed_session_accepts_takeover_even_if_request_opts_are_headless() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend);
+        let k = key("takeover-recorded-headed");
+        rt.open(
+            &k,
+            &headed_opts(),
+            &NavigateRequest {
+                url: "https://example.com/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let state = rt
+            .request_human_takeover(&k, &opts(), TakeoverReason::ExplicitUserRequest)
+            .unwrap();
+        assert_eq!(state.phase, BrowserTakeoverPhase::HumanControlled);
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_return_agent_ownership() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend);
+        let k = key("takeover-timeout");
+        let opts = headed_opts();
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Mfa)
+            .unwrap();
+        let timed = rt.force_human_takeover_timeout(&k).unwrap();
+        assert_eq!(timed.phase, BrowserTakeoverPhase::TimedOut);
+        let blocked = rt
+            .observe(&k, &opts, &ObserveRequest::snapshot())
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.kind, BrowserErrorKind::HumanTakeoverActive);
+        let released = rt.release_human_takeover(&k).unwrap();
+        assert_eq!(released.phase, BrowserTakeoverPhase::Resynchronizing);
+        assert_eq!(released.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_semantics_depend_on_whether_human_was_granted() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = Arc::new(runtime(backend.clone()));
+        let k = key("takeover-cancel-pending");
+        let opts = headed_opts();
+        backend.enable_observe_hold();
+        let started = backend.observe_started.notified();
+        let task_rt = Arc::clone(&rt);
+        let task_k = k.clone();
+        let task_opts = opts.clone();
+        let inflight = tokio::spawn(async move {
+            task_rt
+                .observe(&task_k, &task_opts, &ObserveRequest::snapshot())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap();
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Unknown)
+            .unwrap();
+        let cancelled = rt.cancel_human_takeover(&k).unwrap();
+        assert_eq!(cancelled.phase, BrowserTakeoverPhase::AgentControlled);
+        assert_eq!(cancelled.generation, 0);
+        backend.release_observe_hold();
+        inflight.await.unwrap().unwrap();
+
+        let granted = rt
+            .request_human_takeover(&k, &opts, TakeoverReason::Unknown)
+            .unwrap();
+        assert_eq!(granted.phase, BrowserTakeoverPhase::HumanControlled);
+        let after_human = rt.cancel_human_takeover(&k).unwrap();
+        assert_eq!(after_human.phase, BrowserTakeoverPhase::Resynchronizing);
+        assert_eq!(after_human.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn close_during_human_controlled_clears_registry() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend.clone());
+        let k = key("takeover-close");
+        let opts = headed_opts();
+        rt.open(
+            &k,
+            &opts,
+            &NavigateRequest {
+                url: "https://example.com/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        rt.request_human_takeover(&k, &opts, TakeoverReason::Unknown)
+            .unwrap();
+        rt.close_session(&k, &opts).await.unwrap();
+        assert_eq!(
+            rt.get_takeover_state(&k).phase,
+            BrowserTakeoverPhase::AgentControlled
+        );
+        assert_eq!(rt.get_takeover_state(&k).generation, 0);
+        rt.close_session(&k, &opts).await.unwrap();
+        assert_eq!(backend.call_count(CallKind::Close), 2);
+    }
+
+    #[tokio::test]
+    async fn multiple_takeover_cycles_increment_generation_on_same_session() {
+        let backend = Arc::new(FakeBackend::new());
+        let rt = runtime(backend);
+        let k = key("takeover-cycles");
+        let opts = headed_opts();
+        for expected in 1..=3 {
+            rt.request_human_takeover(&k, &opts, TakeoverReason::ExplicitUserRequest)
+                .unwrap();
+            let released = rt.release_human_takeover(&k).unwrap();
+            assert_eq!(released.generation, expected);
+            rt.observe(&k, &opts, &ObserveRequest::snapshot())
+                .await
+                .unwrap();
+            assert_eq!(
+                rt.get_takeover_state(&k).phase,
+                BrowserTakeoverPhase::AgentControlled
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schema_does_not_gain_takeover_actions() {
+        let tool = BrowserTool::new(Vec::new(), true, false, None);
+        let actions = tool.parameters_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 25);
+        assert!(!actions.iter().any(|a| a.contains("takeover")));
+        assert!(!actions.iter().any(|a| a.contains("human")));
+        assert_eq!(
+            actions,
+            V1_TOOL_ACTIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
+        );
     }
 }

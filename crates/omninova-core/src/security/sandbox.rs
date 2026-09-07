@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// Minimal environment for sandboxed shell execution.
 pub fn sandbox_env(config: &Config) -> HashMap<String, String> {
     let sandbox = &config.security.sandbox;
-    if !sandbox.enabled {
+    if config.permissions.is_full_access() || !sandbox.enabled {
         return HashMap::new();
     }
 
@@ -32,11 +32,11 @@ pub fn sandbox_home_dir(config: &Config) -> PathBuf {
 }
 
 pub fn sandbox_enabled(config: &Config) -> bool {
-    config.security.sandbox.enabled
+    config.security.sandbox.enabled && !config.permissions.is_full_access()
 }
 
 pub async fn ensure_sandbox_home(config: &Config) -> anyhow::Result<()> {
-    if !config.security.sandbox.enabled {
+    if config.permissions.is_full_access() || !config.security.sandbox.enabled {
         return Ok(());
     }
     tokio::fs::create_dir_all(sandbox_home_dir(config)).await?;
@@ -50,6 +50,9 @@ pub async fn ensure_sandbox_home(config: &Config) -> anyhow::Result<()> {
 /// `/home`, `/root`, etc. The actual per-tool canonicalization (e.g.
 /// `resolve_workspace_relative`) is what guarantees the path cannot escape.
 pub fn path_hits_forbidden(config: &Config, path: &str) -> Option<String> {
+    if config.permissions.is_full_access() {
+        return None;
+    }
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return None;
@@ -206,6 +209,63 @@ pub async fn resolve_workspace_relative(
         anyhow::bail!("path escapes workspace");
     }
     Ok(resolved)
+}
+
+/// Resolve a tool path according to the global authorization mode. Restricted
+/// mode preserves the workspace jail. Full access accepts absolute paths and
+/// paths outside the workspace while still validating the input and relying on
+/// ordinary OS ACLs for the final access decision.
+pub async fn resolve_tool_path(
+    workspace_dir: &Path,
+    input: &str,
+    full_access: bool,
+) -> anyhow::Result<PathBuf> {
+    if !full_access {
+        return resolve_workspace_relative(workspace_dir, input).await;
+    }
+
+    let trimmed = input.trim();
+    if trimmed.contains('\0') {
+        anyhow::bail!("null bytes in path are not allowed");
+    }
+    if trimmed.is_empty() || trimmed == "." {
+        return tokio::fs::canonicalize(workspace_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to resolve workspace dir: {e}"));
+    }
+
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        home::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(trimmed))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace_dir.join(expanded)
+    };
+
+    if candidate.exists() {
+        return tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to resolve path: {e}"));
+    }
+
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent directory"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| anyhow::anyhow!("parent dir does not exist: {e}"))?;
+    let parent = tokio::fs::canonicalize(parent)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve parent: {e}"))?;
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path has no file name"))?;
+    Ok(parent.join(file_name))
 }
 
 /// Normalize a model-provided path into a workspace-relative path.

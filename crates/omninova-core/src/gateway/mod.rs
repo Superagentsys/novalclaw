@@ -88,6 +88,11 @@ use crate::tools::{
     AgentInvoker, DelegateRequest, DelegateTool, SkillActivationGate, Tool, ToolBuildContext,
     UseSkillTool,
 };
+use crate::tools::browser_control::{
+    BrowserControlOwner, BrowserTakeoverPhase, TakeoverReason,
+};
+use crate::tools::browser_runtime::BrowserTakeoverHandle;
+use crate::tools::browser_types::{BrowserBackendError, BrowserErrorKind};
 use crate::util::auth::verify_webhook_signature_with_policy_options;
 use crate::Agent;
 use axum::extract::{Path, Query, State};
@@ -479,6 +484,10 @@ pub struct GatewayRuntime {
     active_children_by_parent: Arc<RwLock<HashMap<String, usize>>>,
     session_tree: Arc<RwLock<HashMap<String, SessionLineageMeta>>>,
     run_registry: AgentRunRegistry,
+    /// Desktop-owned Personal Chrome transport. It is installed explicitly by
+    /// the Tauri host and is never created by the browser backend itself.
+    personal_chrome_bridge:
+        Arc<OnceLock<omninova_browser_host::PersonalChromeBridge>>,
     /// Feishu async job queue sender (for background worker processing)
     feishu_job_sender: Arc<RwLock<Option<FeishuJobSender>>>,
     /// Feishu worker queue length tracker
@@ -932,12 +941,208 @@ pub struct AgentRunRegistry {
     inner: Arc<RwLock<HashMap<String, ActiveAgentRun>>>,
 }
 
+#[derive(Clone)]
+struct RunScopedPersonalChromeAuthorization {
+    run_id: String,
+    registry: AgentRunRegistry,
+    bridge: omninova_browser_host::PersonalChromeBridge,
+    full_access: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::browser_personal_chrome::PersonalChromeAuthorizationProvider
+    for RunScopedPersonalChromeAuthorization
+{
+    async fn current_grant(
+        &self,
+    ) -> Result<
+        crate::tools::browser_personal_chrome::AuthorizedTab,
+        crate::tools::browser_personal_chrome::PersonalChromeAuthorizationError,
+    > {
+        use crate::tools::browser_personal_chrome::{
+            AuthorizedTab, PersonalChromeAuthorizationError,
+        };
+
+        let response = self
+            .bridge
+            .request("tab_list_authorized", "", serde_json::json!({}))
+            .await
+            .map_err(|error| match error {
+                omninova_browser_host::BridgeError::ProtocolMismatch { .. }
+                | omninova_browser_host::BridgeError::StaleGeneration { .. } => {
+                    PersonalChromeAuthorizationError::ProtocolMismatch
+                }
+                _ => PersonalChromeAuthorizationError::TransportUnavailable,
+            })?;
+        if !response.ok {
+            let code = response
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str())
+                .unwrap_or_default();
+            return Err(if code == "ProtocolMismatch" || code == "StaleGeneration" {
+                PersonalChromeAuthorizationError::ProtocolMismatch
+            } else {
+                PersonalChromeAuthorizationError::NotAuthorized
+            });
+        }
+        let tabs = response
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("tabs"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?;
+        if tabs.len() != 1 {
+            return Err(PersonalChromeAuthorizationError::NotAuthorized);
+        }
+        let extension = AuthorizedTab {
+            window_id: tabs[0]
+                .get("window_id")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?
+                as i32,
+            tab_id: tabs[0]
+                .get("tab_id")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?
+                as i32,
+            authorization_generation: tabs[0]
+                .get("authorization_generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?,
+        };
+        if self.full_access {
+            return Ok(extension);
+        }
+        let desktop = self
+            .registry
+            .personal_chrome_grant(&self.run_id)
+            .await
+            .map_err(|_| PersonalChromeAuthorizationError::NotAuthorized)?
+            .ok_or(PersonalChromeAuthorizationError::NotAuthorized)?;
+        if desktop.window_id != extension.window_id
+            || desktop.tab_id != extension.tab_id
+            || desktop.authorization_generation != extension.authorization_generation
+        {
+            return Err(PersonalChromeAuthorizationError::NotAuthorized);
+        }
+        Ok(extension)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ActiveAgentRun {
     run_id: String,
     session_id: String,
     started_at: SystemTime,
     cancel_token: AgentCancellationToken,
+    browser_takeover: Option<BrowserTakeoverHandle>,
+    events_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+    personal_chrome_grant: Option<PersonalChromeRunGrant>,
+}
+
+/// Exact extension grant approved for one active Agent run. This is runtime
+/// state only and is removed with the run; it is never persisted globally.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersonalChromeRunGrant {
+    pub run_id: String,
+    pub window_id: i32,
+    pub tab_id: i32,
+    pub authorization_generation: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrowserTakeoverStateDto {
+    pub run_id: String,
+    pub session_id: String,
+    pub phase: String,
+    pub owner: String,
+    pub generation: u64,
+    pub reason: Option<String>,
+    pub since_ms: u64,
+    pub eligible: bool,
+    pub headless: bool,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BrowserTakeoverRouteError {
+    #[error("BrowserTakeoverRunNotFound: active Agent run was not found")]
+    RunNotFound,
+    #[error("BrowserTakeoverUnavailable: active Agent run has no browser control handle")]
+    Unavailable,
+    #[error("{code}: {message}")]
+    Runtime { code: String, message: String },
+}
+
+fn browser_takeover_phase_name(phase: BrowserTakeoverPhase) -> &'static str {
+    match phase {
+        BrowserTakeoverPhase::AgentControlled => "agent_controlled",
+        BrowserTakeoverPhase::TakeoverRequested => "takeover_requested",
+        BrowserTakeoverPhase::HumanControlled => "human_controlled",
+        BrowserTakeoverPhase::TimedOut => "timed_out",
+        BrowserTakeoverPhase::Resynchronizing => "resynchronizing",
+        BrowserTakeoverPhase::BrowserLost => "browser_lost",
+    }
+}
+
+fn browser_control_owner_name(owner: BrowserControlOwner) -> &'static str {
+    match owner {
+        BrowserControlOwner::Agent => "agent",
+        BrowserControlOwner::Human => "human",
+    }
+}
+
+fn browser_takeover_reason_name(reason: TakeoverReason) -> &'static str {
+    match reason {
+        TakeoverReason::Captcha => "captcha",
+        TakeoverReason::Mfa => "mfa",
+        TakeoverReason::QrLogin => "qr_login",
+        TakeoverReason::SmsVerification => "sms_verification",
+        TakeoverReason::Sso => "sso",
+        TakeoverReason::ManualCorrection => "manual_correction",
+        TakeoverReason::UnexpectedModal => "unexpected_modal",
+        TakeoverReason::ExplicitUserRequest => "explicit_user_request",
+        TakeoverReason::Unknown => "unknown",
+    }
+}
+
+fn takeover_route_error(error: BrowserBackendError) -> BrowserTakeoverRouteError {
+    let code = match error.kind {
+        BrowserErrorKind::TakeoverUnsupportedHeadless => "BrowserTakeoverUnsupportedHeadless",
+        BrowserErrorKind::TakeoverBrowserLost => "BrowserTakeoverLost",
+        BrowserErrorKind::TakeoverRejected => "BrowserTakeoverRejected",
+        BrowserErrorKind::HumanTakeoverActive => "BrowserHumanTakeoverActive",
+        BrowserErrorKind::StaleAssumptions => "BrowserStaleAssumptions",
+        _ => "BrowserTakeoverFailed",
+    };
+    BrowserTakeoverRouteError::Runtime {
+        code: code.to_string(),
+        message: error.detail,
+    }
+}
+
+fn browser_takeover_dto(
+    run_id: &str,
+    handle: &BrowserTakeoverHandle,
+    state: crate::tools::browser_control::BrowserControlState,
+) -> BrowserTakeoverStateDto {
+    let since_ms = state
+        .since
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    BrowserTakeoverStateDto {
+        run_id: run_id.to_string(),
+        session_id: handle.session_id().to_string(),
+        phase: browser_takeover_phase_name(state.phase).to_string(),
+        owner: browser_control_owner_name(state.owner).to_string(),
+        generation: state.generation,
+        reason: state.reason.map(browser_takeover_reason_name).map(str::to_string),
+        since_ms,
+        eligible: !handle.headless() && state.phase != BrowserTakeoverPhase::BrowserLost,
+        headless: handle.headless(),
+    }
 }
 
 impl AgentRunRegistry {
@@ -951,6 +1156,8 @@ impl AgentRunRegistry {
         &self,
         run_id: String,
         session_id: String,
+        browser_takeover: Option<BrowserTakeoverHandle>,
+        events_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
     ) -> anyhow::Result<AgentCancellationToken> {
         let mut runs = self.inner.write().await;
         if runs
@@ -969,6 +1176,9 @@ impl AgentRunRegistry {
                 session_id,
                 started_at: SystemTime::now(),
                 cancel_token: token.clone(),
+                browser_takeover,
+                events_tx,
+                personal_chrome_grant: None,
             },
         );
         Ok(token)
@@ -990,6 +1200,84 @@ impl AgentRunRegistry {
             }
             None => Err(anyhow::anyhow!("未找到正在运行的 Agent Run")),
         }
+    }
+
+    async fn browser_takeover_handle(
+        &self,
+        run_id: &str,
+    ) -> Result<BrowserTakeoverHandle, BrowserTakeoverRouteError> {
+        let runs = self.inner.read().await;
+        let run = runs
+            .get(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        run.browser_takeover
+            .clone()
+            .ok_or(BrowserTakeoverRouteError::Unavailable)
+    }
+
+    async fn notify_browser_takeover(&self, state: &BrowserTakeoverStateDto) {
+        let sender = {
+            let runs = self.inner.read().await;
+            runs.get(&state.run_id).and_then(|run| run.events_tx.clone())
+        };
+        let Some(sender) = sender else {
+            return;
+        };
+        if let Ok(event) = serde_json::to_value(
+            crate::agent::AgentRunEvent::browser_takeover_state_changed {
+                run_id: state.run_id.clone(),
+                session_id: state.session_id.clone(),
+                phase: state.phase.clone(),
+                generation: state.generation,
+                reason: state.reason.clone(),
+            },
+        ) {
+            let _ = sender.send(event);
+        }
+    }
+
+    async fn grant_personal_chrome(
+        &self,
+        run_id: &str,
+        window_id: i32,
+        tab_id: i32,
+        authorization_generation: u64,
+    ) -> Result<PersonalChromeRunGrant, BrowserTakeoverRouteError> {
+        let mut runs = self.inner.write().await;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        let grant = PersonalChromeRunGrant {
+            run_id: run_id.to_string(),
+            window_id,
+            tab_id,
+            authorization_generation,
+        };
+        run.personal_chrome_grant = Some(grant.clone());
+        Ok(grant)
+    }
+
+    async fn personal_chrome_grant(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PersonalChromeRunGrant>, BrowserTakeoverRouteError> {
+        let runs = self.inner.read().await;
+        let run = runs
+            .get(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        Ok(run.personal_chrome_grant.clone())
+    }
+
+    async fn revoke_personal_chrome(
+        &self,
+        run_id: &str,
+    ) -> Result<(), BrowserTakeoverRouteError> {
+        let mut runs = self.inner.write().await;
+        let run = runs
+            .get_mut(run_id)
+            .ok_or(BrowserTakeoverRouteError::RunNotFound)?;
+        run.personal_chrome_grant = None;
+        Ok(())
     }
 }
 
@@ -1040,6 +1328,7 @@ impl GatewayRuntime {
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
             run_registry: AgentRunRegistry::new(),
+            personal_chrome_bridge: Arc::new(OnceLock::new()),
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
@@ -1070,6 +1359,7 @@ impl GatewayRuntime {
             active_children_by_parent: Arc::new(RwLock::new(HashMap::new())),
             session_tree: Arc::new(RwLock::new(HashMap::new())),
             run_registry: AgentRunRegistry::new(),
+            personal_chrome_bridge: Arc::new(OnceLock::new()),
             feishu_job_sender: Arc::new(RwLock::new(None)),
             feishu_queue_len: Arc::new(RwLock::new(0)),
             feishu_store: None,
@@ -1091,6 +1381,38 @@ impl GatewayRuntime {
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<serde_json::Value> {
         self.event_bus.subscribe()
+    }
+
+    pub fn install_personal_chrome_bridge(
+        &self,
+        bridge: omninova_browser_host::PersonalChromeBridge,
+    ) -> Result<(), &'static str> {
+        self.personal_chrome_bridge
+            .set(bridge)
+            .map_err(|_| "PersonalChromeBridgeAlreadyInstalled")
+    }
+
+    pub(super) fn personal_chrome_factory_context(
+        &self,
+        run_id: Option<&str>,
+        full_access: bool,
+    ) -> Option<crate::tools::browser_personal_chrome::PersonalChromeFactoryContext> {
+        let run_id = run_id?.trim();
+        if run_id.is_empty() {
+            return None;
+        }
+        let bridge = self.personal_chrome_bridge.get()?.clone();
+        Some(
+            crate::tools::browser_personal_chrome::PersonalChromeFactoryContext {
+                bridge: bridge.clone(),
+                authorization: Arc::new(RunScopedPersonalChromeAuthorization {
+                    run_id: run_id.to_string(),
+                    registry: self.run_registry.clone(),
+                    bridge,
+                    full_access,
+                }),
+            },
+        )
     }
 
     pub fn publish_event(&self, event: serde_json::Value) {
@@ -1714,6 +2036,75 @@ impl GatewayRuntime {
         Ok(())
     }
 
+    pub async fn get_browser_takeover_state(
+        &self,
+        run_id: &str,
+    ) -> Result<BrowserTakeoverStateDto, BrowserTakeoverRouteError> {
+        let handle = self.run_registry.browser_takeover_handle(run_id).await?;
+        Ok(browser_takeover_dto(run_id, &handle, handle.state()))
+    }
+
+    pub async fn request_browser_takeover(
+        &self,
+        run_id: &str,
+    ) -> Result<BrowserTakeoverStateDto, BrowserTakeoverRouteError> {
+        let handle = self.run_registry.browser_takeover_handle(run_id).await?;
+        let state = handle
+            .request(TakeoverReason::ExplicitUserRequest)
+            .map_err(takeover_route_error)?;
+        let dto = browser_takeover_dto(run_id, &handle, state);
+        self.run_registry.notify_browser_takeover(&dto).await;
+        Ok(dto)
+    }
+
+    pub async fn release_browser_takeover(
+        &self,
+        run_id: &str,
+    ) -> Result<BrowserTakeoverStateDto, BrowserTakeoverRouteError> {
+        let handle = self.run_registry.browser_takeover_handle(run_id).await?;
+        let state = handle.release().map_err(takeover_route_error)?;
+        let dto = browser_takeover_dto(run_id, &handle, state);
+        self.run_registry.notify_browser_takeover(&dto).await;
+        Ok(dto)
+    }
+
+    pub async fn cancel_browser_takeover(
+        &self,
+        run_id: &str,
+    ) -> Result<BrowserTakeoverStateDto, BrowserTakeoverRouteError> {
+        let handle = self.run_registry.browser_takeover_handle(run_id).await?;
+        let state = handle.cancel().map_err(takeover_route_error)?;
+        let dto = browser_takeover_dto(run_id, &handle, state);
+        self.run_registry.notify_browser_takeover(&dto).await;
+        Ok(dto)
+    }
+
+    pub async fn grant_personal_chrome_for_run(
+        &self,
+        run_id: &str,
+        window_id: i32,
+        tab_id: i32,
+        authorization_generation: u64,
+    ) -> Result<PersonalChromeRunGrant, BrowserTakeoverRouteError> {
+        self.run_registry
+            .grant_personal_chrome(run_id, window_id, tab_id, authorization_generation)
+            .await
+    }
+
+    pub async fn personal_chrome_grant_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PersonalChromeRunGrant>, BrowserTakeoverRouteError> {
+        self.run_registry.personal_chrome_grant(run_id).await
+    }
+
+    pub async fn revoke_personal_chrome_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<(), BrowserTakeoverRouteError> {
+        self.run_registry.revoke_personal_chrome(run_id).await
+    }
+
     pub async fn refresh_memory_from_config(&self) -> anyhow::Result<()> {
         let cfg = self.config.read().await.clone();
         let memory = build_memory_from_config(&cfg).await?;
@@ -1746,13 +2137,17 @@ impl GatewayRuntime {
         let request = AgentAssemblyRequest {
             route: &route,
             channel: &ChannelKind::Web,
+            run_id: None,
             session_id: None,
             workspace: &effective_workspace,
             spawn_depth: 0,
             skill_invocations: &[],
             security: &security,
         };
-        self.assemble_agent(&cfg, &request, &mut Vec::new()).await
+        Ok(self
+            .assemble_agent(&cfg, &request, &mut Vec::new())
+            .await?
+            .agent)
     }
 
     pub async fn route(&self, inbound: &InboundMessage) -> RouteDecision {
@@ -1883,6 +2278,7 @@ impl GatewayRuntime {
         let assembly_request = AgentAssemblyRequest {
             route: &route,
             channel: &inbound.channel,
+            run_id: None,
             session_id: inbound.session_id.as_deref(),
             workspace: &effective_workspace,
             spawn_depth: lineage.spawn_depth,
@@ -1891,7 +2287,8 @@ impl GatewayRuntime {
         };
         let mut agent = self
             .assemble_agent(&cfg, &assembly_request, &mut steps)
-            .await?;
+            .await?
+            .agent;
         // Check for stateless mode - skip session history loading
         let is_stateless = inbound.metadata.get("stateless")
             .and_then(|v| v.as_bool())
@@ -2110,19 +2507,26 @@ impl GatewayRuntime {
             .validate_and_resolve_session_lineage(&cfg, inbound, &route.agent_name)
             .await?;
 
+        // The browser factory must receive the exact run identity. Generate it
+        // before tool assembly rather than after the backend has been created.
+        let run_id = metadata_str(inbound, &["run_id"])
+            .map(String::from)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let skill_invocations = invocations_from_inbound_metadata(&inbound.metadata);
         let assembly_request = AgentAssemblyRequest {
             route: &route,
             channel: &inbound.channel,
+            run_id: Some(&run_id),
             session_id: inbound.session_id.as_deref(),
             workspace: &effective_workspace,
             spawn_depth: lineage.spawn_depth,
             skill_invocations: &skill_invocations,
             security: &security,
         };
-        let mut agent = self
+        let assembled = self
             .assemble_agent(&cfg, &assembly_request, &mut steps)
             .await?;
+        let mut agent = assembled.agent;
 
         // Check for stateless mode - skip session history loading
         let is_stateless = inbound.metadata.get("stateless")
@@ -2166,17 +2570,18 @@ impl GatewayRuntime {
         };
         agent.set_pending_user_images(vision_images);
 
-        // Use the frontend-provided run_id if available, otherwise generate a new one.
-        let run_id = metadata_str(inbound, &["run_id"])
-            .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let session_key = inbound
             .session_id
             .clone()
             .unwrap_or_else(|| format!("{:?}:default", inbound.channel));
         let cancel_token = match self
             .run_registry
-            .start_run(run_id.clone(), session_key)
+            .start_run(
+                run_id.clone(),
+                session_key,
+                assembled.browser_takeover,
+                Some(events_tx.clone()),
+            )
             .await
         {
             Ok(token) => token,
@@ -9752,6 +10157,8 @@ pub fn create_default_tools(config: &Config) -> Vec<Box<dyn Tool>> {
         workspace: &config.workspace_dir,
         memory: None,
         session_id: None,
+        browser_takeover_slot: None,
+        personal_chrome: None,
     })
 }
 
@@ -9941,6 +10348,8 @@ fn create_tools_for_route(
         workspace: effective_workspace,
         memory: Some(&memory),
         session_id,
+        browser_takeover_slot: None,
+        personal_chrome: None,
     });
     assembly::apply_agent_tool_allowlist(config, route_agent_name, &mut tools);
     tools
@@ -13657,5 +14066,315 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(response.ok);
         assert_eq!(response.action.as_deref(), Some("help"));
+    }
+}
+
+#[cfg(test)]
+mod browser_takeover_route_tests {
+    use super::{
+        browser_takeover_dto, BrowserTakeoverRouteError, GatewayRuntime,
+    };
+    use crate::config::Config;
+    use crate::tools::browser_agent_backend::AgentBrowserBackend;
+    use crate::tools::browser_control::{BrowserControlOwner, BrowserTakeoverPhase, TakeoverReason};
+    use crate::tools::browser_runtime::{BrowserRuntime, BrowserRuntimePolicy, BrowserTakeoverHandle};
+    use crate::tools::browser_types::{BrowserSessionKey, BrowserSessionOptions};
+    use std::sync::Arc;
+
+    fn runtime_and_handle(
+        session: &str,
+        headless: bool,
+    ) -> (Arc<BrowserRuntime>, BrowserTakeoverHandle) {
+        let opts = BrowserSessionOptions {
+            headless,
+            ..BrowserSessionOptions::default()
+        };
+        let backend = Arc::new(AgentBrowserBackend::new(None, opts.clone()));
+        let runtime = Arc::new(BrowserRuntime::new(
+            backend,
+            BrowserRuntimePolicy::default(),
+        ));
+        let key = BrowserSessionKey::new(session).unwrap();
+        let handle = BrowserTakeoverHandle::new(Arc::clone(&runtime), key, opts);
+        (runtime, handle)
+    }
+
+    #[tokio::test]
+    async fn routes_to_exact_runtime_and_isolates_runs() {
+        let gateway = GatewayRuntime::new(Config::default());
+        let (runtime_a, handle_a) = runtime_and_handle("session-a", false);
+        let (_runtime_b, handle_b) = runtime_and_handle("session-b", false);
+        gateway
+            .run_registry
+            .start_run(
+                "run-a".into(),
+                "session-a".into(),
+                Some(handle_a),
+                None,
+            )
+            .await
+            .unwrap();
+        gateway
+            .run_registry
+            .start_run(
+                "run-b".into(),
+                "session-b".into(),
+                Some(handle_b),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let routed = gateway
+            .run_registry
+            .browser_takeover_handle("run-a")
+            .await
+            .unwrap();
+        assert!(routed.shares_runtime_with(&runtime_a));
+
+        let requested = gateway.request_browser_takeover("run-a").await.unwrap();
+        assert_eq!(requested.run_id, "run-a");
+        assert_eq!(requested.session_id, "session-a");
+        assert_eq!(requested.phase, "human_controlled");
+        assert_eq!(requested.owner, "human");
+        assert_eq!(requested.reason.as_deref(), Some("explicit_user_request"));
+        assert!(!requested.headless);
+        assert!(requested.eligible);
+        let encoded = serde_json::to_string(&requested).unwrap();
+        assert!(!encoded.to_ascii_lowercase().contains("cookie"));
+        assert!(!encoded.contains("cdp"));
+        assert!(!encoded.contains("Local State"));
+        assert!(!encoded.contains("pid"));
+        assert!(!encoded.contains("hwnd"));
+        assert!(!encoded.contains("executable"));
+        assert!(!encoded.contains("\\\\"));
+
+        let other = gateway.get_browser_takeover_state("run-b").await.unwrap();
+        assert_eq!(other.phase, "agent_controlled");
+        assert_eq!(other.owner, "agent");
+        assert_eq!(other.generation, 0);
+
+        let released = gateway.release_browser_takeover("run-a").await.unwrap();
+        assert_eq!(released.phase, "resynchronizing");
+        assert_eq!(released.generation, 1);
+        assert_eq!(
+            gateway.get_browser_takeover_state("run-b").await.unwrap().phase,
+            "agent_controlled"
+        );
+
+        gateway.run_registry.finish_run("run-a").await;
+        let missing = gateway.get_browser_takeover_state("run-a").await.unwrap_err();
+        assert_eq!(missing, BrowserTakeoverRouteError::RunNotFound);
+        assert!(gateway.get_browser_takeover_state("run-b").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wrong_run_and_missing_handle_fail_typed() {
+        let gateway = GatewayRuntime::new(Config::default());
+        let err = gateway
+            .request_browser_takeover("missing")
+            .await
+            .unwrap_err();
+        assert_eq!(err, BrowserTakeoverRouteError::RunNotFound);
+        gateway
+            .run_registry
+            .start_run("run-empty".into(), "session-empty".into(), None, None)
+            .await
+            .unwrap();
+        let unavailable = gateway
+            .get_browser_takeover_state("run-empty")
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable, BrowserTakeoverRouteError::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn headless_timed_out_and_lost_survive_adapter() {
+        let gateway = GatewayRuntime::new(Config::default());
+        let (_runtime, headed) = runtime_and_handle("session-headed", false);
+        let (_headless_runtime, headless) = runtime_and_handle("session-headless", true);
+        gateway
+            .run_registry
+            .start_run("run-headed".into(), "session-headed".into(), Some(headed.clone()), None)
+            .await
+            .unwrap();
+        gateway
+            .run_registry
+            .start_run(
+                "run-headless".into(),
+                "session-headless".into(),
+                Some(headless),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let headless_err = gateway
+            .request_browser_takeover("run-headless")
+            .await
+            .unwrap_err();
+        match headless_err {
+            BrowserTakeoverRouteError::Runtime { code, message } => {
+                assert_eq!(code, "BrowserTakeoverUnsupportedHeadless");
+                assert!(message.contains("headed"));
+                assert!(!message.contains("cookie"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            gateway
+                .get_browser_takeover_state("run-headless")
+                .await
+                .unwrap()
+                .phase,
+            "agent_controlled"
+        );
+
+        headed.request(TakeoverReason::Mfa).unwrap();
+        headed.force_timeout_for_test().unwrap();
+        let timed = gateway.get_browser_takeover_state("run-headed").await.unwrap();
+        assert_eq!(timed.phase, "timed_out");
+        assert_eq!(timed.owner, "human");
+        assert_ne!(timed.phase, "agent_controlled");
+
+        let cancelled = gateway.cancel_browser_takeover("run-headed").await.unwrap();
+        assert_eq!(cancelled.phase, "resynchronizing");
+
+        let (_runtime2, headed2) = runtime_and_handle("session-lost", false);
+        gateway
+            .run_registry
+            .start_run("run-lost".into(), "session-lost".into(), Some(headed2.clone()), None)
+            .await
+            .unwrap();
+        gateway.request_browser_takeover("run-lost").await.unwrap();
+        headed2.note_browser_lost_for_test();
+        let lost = gateway.get_browser_takeover_state("run-lost").await.unwrap();
+        assert_eq!(lost.phase, "browser_lost");
+        assert!(!lost.eligible);
+        let release_lost = gateway.release_browser_takeover("run-lost").await.unwrap_err();
+        match release_lost {
+            BrowserTakeoverRouteError::Runtime { code, .. } => {
+                assert_eq!(code, "BrowserTakeoverLost");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dto_mirrors_runtime_phases_without_secrets() {
+        let (_runtime, handle) = runtime_and_handle("session-dto", false);
+        let state = handle.state();
+        assert_eq!(state.phase, BrowserTakeoverPhase::AgentControlled);
+        assert_eq!(state.owner, BrowserControlOwner::Agent);
+        let dto = browser_takeover_dto("run-dto", &handle, state);
+        assert_eq!(dto.phase, "agent_controlled");
+        assert_eq!(dto.owner, "agent");
+        assert_eq!(dto.run_id, "run-dto");
+        assert!(!dto.headless);
+        let keys: Vec<String> = serde_json::to_value(&dto)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for forbidden in [
+            "token",
+            "cookie",
+            "path",
+            "executable",
+            "cdp_url",
+            "pid",
+            "hwnd",
+        ] {
+            assert!(
+                !keys.iter().any(|key| key.contains(forbidden)),
+                "dto keys={keys:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn personal_chrome_grants_are_exact_run_scoped_and_generation_bound() {
+        let gateway = GatewayRuntime::new(Config::default());
+        gateway
+            .run_registry
+            .start_run("run-a".into(), "session-a".into(), None, None)
+            .await
+            .unwrap();
+        gateway
+            .run_registry
+            .start_run("run-b".into(), "session-b".into(), None, None)
+            .await
+            .unwrap();
+
+        let granted = gateway
+            .grant_personal_chrome_for_run("run-a", 11, 22, 3)
+            .await
+            .unwrap();
+        assert_eq!(granted.run_id, "run-a");
+        assert_eq!(granted.window_id, 11);
+        assert_eq!(granted.tab_id, 22);
+        assert_eq!(granted.authorization_generation, 3);
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap(),
+            Some(granted)
+        );
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-b")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let replaced = gateway
+            .grant_personal_chrome_for_run("run-a", 11, 23, 4)
+            .await
+            .unwrap();
+        assert_eq!(replaced.tab_id, 23);
+        assert_eq!(replaced.authorization_generation, 4);
+    }
+
+    #[tokio::test]
+    async fn personal_chrome_grant_revoke_and_run_finish_fail_closed() {
+        let gateway = GatewayRuntime::new(Config::default());
+        gateway
+            .run_registry
+            .start_run("run-a".into(), "session-a".into(), None, None)
+            .await
+            .unwrap();
+        gateway
+            .grant_personal_chrome_for_run("run-a", 1, 2, 1)
+            .await
+            .unwrap();
+
+        gateway
+            .revoke_personal_chrome_for_run("run-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap(),
+            None
+        );
+
+        gateway
+            .grant_personal_chrome_for_run("run-a", 1, 2, 2)
+            .await
+            .unwrap();
+        gateway.run_registry.finish_run("run-a").await;
+        assert_eq!(
+            gateway
+                .personal_chrome_grant_for_run("run-a")
+                .await
+                .unwrap_err(),
+            BrowserTakeoverRouteError::RunNotFound
+        );
     }
 }

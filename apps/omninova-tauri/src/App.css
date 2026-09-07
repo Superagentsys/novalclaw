@@ -3409,6 +3409,148 @@
   box-shadow: 0 10px 28px rgba(28, 31, 48, 0.05);
 }
 
+.agent-run-takeover {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(78, 86, 120, 0.12);
+}
+
+.agent-run-takeover-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.agent-run-takeover-copy strong {
+  color: #2f3348;
+  font-size: 12px;
+}
+
+.agent-run-takeover-copy small {
+  color: #6b7088;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.agent-run-takeover-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.agent-run-takeover-actions button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: #3b82f6;
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.agent-run-takeover-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agent-run-takeover-secondary {
+  background: transparent !important;
+  color: #4a4f68 !important;
+  box-shadow: inset 0 0 0 1px rgba(78, 86, 120, 0.22);
+}
+
+.agent-run-takeover--waiting {
+  background: rgba(59, 130, 246, 0.06);
+}
+
+.agent-run-takeover--human {
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.agent-run-takeover--warn {
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.agent-run-takeover--error {
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.agent-run-personal-chrome {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(78, 86, 120, 0.12);
+}
+
+.agent-run-personal-chrome-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.agent-run-personal-chrome-copy strong {
+  color: #2f3348;
+  font-size: 12px;
+}
+
+.agent-run-personal-chrome-copy small {
+  color: #6b7088;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.agent-run-personal-chrome-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.agent-run-personal-chrome-actions button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: #3b82f6;
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.agent-run-personal-chrome-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agent-run-personal-chrome-secondary {
+  background: transparent !important;
+  color: #4a4f68 !important;
+  box-shadow: inset 0 0 0 1px rgba(78, 86, 120, 0.22);
+}
+
+.agent-run-personal-chrome--waiting {
+  background: rgba(59, 130, 246, 0.06);
+}
+
+.agent-run-personal-chrome--ready {
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.agent-run-personal-chrome--warn {
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.agent-run-personal-chrome--error {
+  background: rgba(239, 68, 68, 0.08);
+}
+
 .agent-run-summary {
   width: 100%;
   min-height: 34px;

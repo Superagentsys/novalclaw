@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub permissions: PermissionsConfig,
+    #[serde(default)]
     pub autonomy: AutonomyConfig,
     #[serde(default)]
     pub security: SecurityConfig,
@@ -200,6 +202,7 @@ impl Default for Config {
             provider: ProviderBehaviorConfig::default(),
             provider_runtime: ProviderRuntimeConfig::default(),
             agent: AgentConfig::default(),
+            permissions: PermissionsConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -752,6 +755,34 @@ where
         }
     };
     Ok(mapped)
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/// Global OmniNova authorization mode. Full access bypasses OmniNova policy
+/// prompts and allowlists, but does not bypass operating-system permissions or
+/// runtime correctness mechanisms such as E-Stop, browser ownership, session
+/// isolation, validation, and lifecycle locks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    Restricted,
+    FullAccess,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub mode: PermissionMode,
+}
+
+impl PermissionsConfig {
+    pub fn is_full_access(&self) -> bool {
+        self.mode == PermissionMode::FullAccess
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,6 +1551,14 @@ pub struct BrowserConfig {
     /// Managed Browser. This is runtime configuration, never a tool argument.
     #[serde(default)]
     pub executable_path: Option<PathBuf>,
+    /// Trusted installed Chrome profile directory identity (`Default`,
+    /// `Profile 1`). Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub installed_profile: Option<String>,
+    /// Trusted OmniNova managed persistent profile id (`work`, `b33e-test`).
+    /// Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -1536,6 +1575,8 @@ impl Default for BrowserConfig {
             attach_only: false,
             cdp_url: None,
             executable_path: None,
+            installed_profile: None,
+            profile: None,
         }
     }
 }
@@ -2814,6 +2855,23 @@ pub struct SubagentsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_native_headless_defaults_to_false() {
+        assert!(
+            !BrowserConfig::default().native_headless,
+            "BrowserConfig::default native_headless must be headed (false)"
+        );
+        let parsed: BrowserConfig = toml::from_str("enabled = true\nbackend = \"agent-browser\"\n")
+            .expect("partial browser config must deserialize");
+        assert!(
+            !parsed.native_headless,
+            "#[serde(default)] bool for native_headless is false, not a custom true default"
+        );
+        let from_table: Config = toml::from_str("[browser]\nenabled = true\n")
+            .expect("config with [browser] table must load");
+        assert!(!from_table.browser.native_headless);
+    }
 
     #[test]
     fn provider_runtime_defaults_apply_when_fields_absent() {
