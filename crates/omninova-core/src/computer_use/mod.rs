@@ -1289,7 +1289,28 @@ mod tests {
         }
     }
 
-    fn session(app: &str, allowed: &[&str]) -> (ComputerUseSession, Arc<AtomicUsize>, PathBuf) {
+    /// The E-Stop flag and the hourly budget are process-global, so a test that
+    /// pauses input denies the clicks of every test running beside it. Handing
+    /// this guard out with the session makes the reset above hold for the whole
+    /// test rather than just until the next one starts.
+    type DesktopStateGuard = std::sync::MutexGuard<'static, ()>;
+
+    fn desktop_state_guard() -> DesktopStateGuard {
+        static GUARD: Mutex<()> = Mutex::new(());
+        // A panicking test poisons the lock, and every acquirer resets the
+        // state it cares about, so the poison carries no stale expectations.
+        GUARD.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn session(
+        app: &str,
+        allowed: &[&str],
+    ) -> (
+        ComputerUseSession,
+        Arc<AtomicUsize>,
+        PathBuf,
+        DesktopStateGuard,
+    ) {
         session_with(app, allowed, |driver| driver)
     }
 
@@ -1297,7 +1318,13 @@ mod tests {
         app: &str,
         allowed: &[&str],
         tweak: impl FnOnce(FakeDriver) -> FakeDriver,
-    ) -> (ComputerUseSession, Arc<AtomicUsize>, PathBuf) {
+    ) -> (
+        ComputerUseSession,
+        Arc<AtomicUsize>,
+        PathBuf,
+        DesktopStateGuard,
+    ) {
+        let guard = desktop_state_guard();
         reset_hourly_budget_for_tests();
         set_desktop_input_paused(false);
         let dir = std::env::temp_dir().join(format!(
@@ -1327,6 +1354,7 @@ mod tests {
             ComputerUseSession::with_driver(dir.clone(), config, Box::new(driver)),
             clicks,
             dir,
+            guard,
         )
     }
 
@@ -1391,7 +1419,7 @@ mod tests {
 
     #[test]
     fn empty_allowlist_blocks_click() {
-        let (session, clicks, dir) = session("钉钉", &[]);
+        let (session, clicks, dir, _guard) = session("钉钉", &[]);
         let shot = session.execute(&serde_json::json!({"action": "screenshot"}));
         assert!(shot.ok, "{}", shot.message);
         let clicked = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
@@ -1402,7 +1430,7 @@ mod tests {
 
     #[test]
     fn star_allowlist_allows_any_foreground_app() {
-        let (session, clicks, dir) = session("Finder", &["*"]);
+        let (session, clicks, dir, _guard) = session("Finder", &["*"]);
         let shot = session.execute(&serde_json::json!({"action": "screenshot"}));
         assert!(shot.ok, "{}", shot.message);
         let clicked = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
@@ -1413,7 +1441,7 @@ mod tests {
 
     #[test]
     fn click_uses_image_space_and_captures_after() {
-        let (session, clicks, dir) = session("钉钉", &["钉钉"]);
+        let (session, clicks, dir, _guard) = session("钉钉", &["钉钉"]);
         let shot = session.execute(&serde_json::json!({"action": "screenshot"}));
         assert!(shot.ok, "{}", shot.message);
         let clicked = session.execute(&serde_json::json!({
@@ -1432,7 +1460,7 @@ mod tests {
 
     #[test]
     fn turn_budget_stops_extra_clicks() {
-        let (mut session, clicks, dir) = session("Excel", &["Excel"]);
+        let (mut session, clicks, dir, _guard) = session("Excel", &["Excel"]);
         session.config.max_actions_per_turn = 3;
         session.execute(&serde_json::json!({"action": "screenshot"}));
         for _ in 0..3 {
@@ -1448,7 +1476,7 @@ mod tests {
 
     #[test]
     fn unlimited_budgets_keep_driving_the_desktop() {
-        let (mut session, clicks, dir) = session("Excel", &["*"]);
+        let (mut session, clicks, dir, _guard) = session("Excel", &["*"]);
         session.config.max_actions_per_turn = 0;
         session.config.max_actions_per_hour = 0;
         session.execute(&serde_json::json!({"action": "screenshot"}));
@@ -1463,7 +1491,7 @@ mod tests {
 
     #[test]
     fn denied_action_is_not_charged_to_the_run_budget() {
-        let (mut session, clicks, dir) = session("Excel", &["Excel"]);
+        let (mut session, clicks, dir, _guard) = session("Excel", &["Excel"]);
         session.config.max_actions_per_turn = 2;
         session.config.max_actions_per_hour = 0;
         session.execute(&serde_json::json!({"action": "screenshot"}));
@@ -1495,7 +1523,7 @@ mod tests {
 
     #[test]
     fn estop_blocks_mutating_actions() {
-        let (session, clicks, dir) = session("钉钉", &["钉钉"]);
+        let (session, clicks, dir, _guard) = session("钉钉", &["钉钉"]);
         session.execute(&serde_json::json!({"action": "screenshot"}));
         set_desktop_input_paused(true);
         let clicked = session.execute(&serde_json::json!({"action": "click", "x": 10, "y": 10}));
@@ -1534,7 +1562,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_observe_and_click_by_name_uses_node_center() {
-        let (session, clicks, dir) = session_with("钉钉", &["钉钉"], |mut driver| {
+        let (session, clicks, dir, _guard) = session_with("钉钉", &["钉钉"], |mut driver| {
             driver.nodes = vec![A11yNode {
                 id: String::new(),
                 role: "button".into(),
@@ -1574,7 +1602,7 @@ mod tests {
 
     #[test]
     fn thrash_soft_then_hard_stops_repeated_failed_clicks() {
-        let (session, clicks, dir) = session_with("钉钉", &["钉钉"], |mut driver| {
+        let (session, clicks, dir, _guard) = session_with("钉钉", &["钉钉"], |mut driver| {
             driver.fail_click = true;
             driver
         });
