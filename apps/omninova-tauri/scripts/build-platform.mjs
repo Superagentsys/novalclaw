@@ -8,6 +8,16 @@ const normalizedEnv = {
   CI: process.env.CI === "1" ? "true" : process.env.CI,
 };
 
+/**
+ * Hand the resolved target to hook scripts. prepare-browser-runtime.mjs must
+ * stage the agent-browser build for the *target*, and falling back to the host
+ * arch is how an arm64 browser ended up inside the macos-intel bundle. This is
+ * the authoritative source: it comes from the same table that builds the
+ * `--target` flag, so it cannot disagree with what Cargo is compiling.
+ */
+const withBuildTarget = (env, target) =>
+  target ? { ...env, OMNINOVA_BUILD_TARGET: target } : env;
+
 const listCommands = () => {
   console.log("Available OmniNova Tauri build commands:\n");
 
@@ -46,7 +56,7 @@ console.log(`> npm ${tauriArgs.join(" ")}`);
 const result = spawnSync("npm", tauriArgs, {
   stdio: "inherit",
   shell: process.platform === "win32",
-  env: normalizedEnv,
+  env: withBuildTarget(normalizedEnv, command.target),
 });
 
 if (result.error) {
