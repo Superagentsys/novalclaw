@@ -200,7 +200,9 @@ fn xml_visible_text(xml: &str) -> String {
     decode_xml_entities(result.trim())
 }
 
-fn extract_office_text(path: &Path, extension: &str) -> Result<String, String> {
+/// Extract user-visible text from an Office Open XML document without exposing
+/// the package's internal XML files.
+pub(crate) fn extract_office_text(path: &Path, extension: &str) -> Result<String, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("Office 文档结构无效：{error}"))?;
@@ -314,7 +316,7 @@ async fn prepare_path_attachment(
         "image"
     } else if is_text_extension(&ext) {
         "text"
-    } else if matches!(ext.as_str(), "pptx" | "docx" | "xlsx") {
+    } else if matches!(ext.as_str(), "pptx" | "docx" | "xlsx" | "doc" | "ppt" | "xls" | "pdf" | "rtf" | "odt") {
         "office"
     } else {
         "file"
@@ -343,25 +345,22 @@ async fn prepare_path_attachment(
             .map_err(|error| error.to_string())?;
         content.push_str(&format!("\n\n内容：\n{}", decode_text_bytes(&bytes)));
         note = format!("已挂载 · {} KB · 内容已读取", size.div_ceil(1024));
-    } else if matches!(ext.as_str(), "pptx" | "docx" | "xlsx") {
-        let source_for_extract = source.clone();
-        let ext_for_extract = ext.clone();
-        match tokio::task::spawn_blocking(move || {
-            extract_office_text(&source_for_extract, &ext_for_extract)
-        })
-        .await
-        {
-            Ok(Ok(text)) => {
-                content.push_str(&format!("\n\n文档提取文字：\n{text}"));
+    } else if matches!(ext.as_str(), "pptx" | "docx" | "xlsx" | "doc" | "ppt" | "xls" | "pdf" | "rtf" | "odt") {
+        match omninova_core::document_text::read(&source).await {
+            Ok(text) => {
+                let preview: String = text.chars().take(12_000).collect();
+                content.push_str(&format!("\n\n文档提取文字：\n{preview}"));
+                if text.chars().count() > 12_000 {
+                    content.push_str("\n[附件预览已截断；使用 file_read 的 offset/limit 分段读取剩余正文。]");
+                }
                 note = format!("已挂载 · {} KB · 文字已提取", size.div_ceil(1024));
             }
-            Ok(Err(reason)) => {
+            Err(reason) => {
                 content.push_str(&format!(
                     "\n\n文字提取提示：{reason}；仍可通过 Workspace 路径使用工具读取原文件。"
                 ));
                 note = format!("已挂载 · {} KB · 可由工具读取", size.div_ceil(1024));
             }
-            Err(error) => return Err(format!("文档文字提取任务失败：{error}")),
         }
     } else {
         content.push_str("\n\n内容未内嵌，请使用工作区文件工具读取上面的已挂载路径。");

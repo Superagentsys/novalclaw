@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { invokeTauri } from "../../utils/tauri";
 import { writeClipboardText } from "../../utils/clipboard";
@@ -12,18 +13,40 @@ import {
 import {
   areStoredMessagesEqual,
   fetchSessionHistory,
+  fetchSessionHistoryWithProjection,
   fetchWebSessionsFromGateway,
   formatTime,
   loadChatStorage,
   mergeAvatarSessions,
   mergeLocalMessageMetadata,
+  projectSessionContext,
   saveChatStorage,
   type StoredAvatarSession,
   type StoredChatMessage,
 } from "../../utils/chatStorage";
-import type {
-  AgentRunEvent,
+import {
+  toolCompletedSucceeded,
+  type AgentRunEvent,
+  type AgentRunEventContextLifecycle,
+  type AgentRunEventContextUsage,
+  type ContextUsageSnapshot,
 } from "../AgentRun/types";
+import {
+  applyLifecycleToActivity,
+  finalizeOpenContextOperations,
+} from "../AgentRun/contextLifecycle";
+import {
+  applyContextUsageLifecycle,
+  applyContextUsageSnapshot,
+  applySessionOpenCandidate,
+  emptyContextUsageState,
+  failContextUsageProjection,
+  finishContextUsageRun,
+  identityKey,
+  restorePersistedContextProjection,
+  switchContextUsageIdentity,
+  type ContextUsageIdentity,
+} from "../AgentRun/contextUsageState";
 import {
   addTask,
   formatDuration,
@@ -69,6 +92,8 @@ import {
 import { CommandPalette as CommandPaletteMenu } from "./CommandPalette";
 import { ContractReviewPanel, ContractReviewReport } from "./ContractReviewPanel";
 import { MessageActions } from "./MessageActions";
+import { ContextUsageBadge } from "./ContextUsageBadge";
+import "./ContextUsageBadge.css";
 import type {
   ContractReviewStage,
   ContractReviewEngineCard,
@@ -120,6 +145,11 @@ const MESSAGE_EDIT_MAX_HEIGHT = 240;
 const COMPOSER_HELP_TEXT =
   "可用命令：\n/help — 显示帮助\n/skills — 打开技能设置\n输入 / 打开命令面板，选择已安装技能后再发送任务。";
 
+function isVisibleTaskArtifactPath(path: string): boolean {
+  const filename = path.split(/[\\/]/).pop() ?? path;
+  return !filename.toLowerCase().endsWith(".xml");
+}
+
 function resizeMessageEditor(textarea: HTMLTextAreaElement) {
   textarea.style.height = "0px";
   const nextHeight = Math.min(textarea.scrollHeight, MESSAGE_EDIT_MAX_HEIGHT);
@@ -127,7 +157,7 @@ function resizeMessageEditor(textarea: HTMLTextAreaElement) {
   textarea.style.overflowY = textarea.scrollHeight > MESSAGE_EDIT_MAX_HEIGHT ? "auto" : "hidden";
 }
 
-type ApprovalProfile = "request_approval" | "risk_based";
+type ApprovalProfile = "request_approval" | "risk_based" | "full_access";
 
 interface ApprovalProfilePayload {
   profile: ApprovalProfile;
@@ -180,6 +210,7 @@ function friendlyToolApprovalError(message: string): string {
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   shell: "运行命令",
   file_write: "新建或写入文件",
+  office_create: "生成 Office 文件",
   file_edit: "编辑文件",
   file_patch: "修改文件",
   git_operations: "执行 Git 操作",
@@ -505,6 +536,26 @@ interface ModifyDocxResult {
   failed: string[];
 }
 
+function placeComposerMenu(
+  trigger: HTMLElement | null,
+  width: number
+): CSSProperties | undefined {
+  if (!trigger) return undefined;
+  const rect = trigger.getBoundingClientRect();
+  const nextWidth = Math.min(width, window.innerWidth - 24);
+  const left = Math.min(
+    Math.max(12, rect.left),
+    Math.max(12, window.innerWidth - nextWidth - 12)
+  );
+  return {
+    position: "fixed",
+    left,
+    bottom: Math.max(12, window.innerHeight - rect.top + 8),
+    width: nextWidth,
+    zIndex: 80,
+  };
+}
+
 export function Chat({
   initialSidebarTab = "avatars",
   isActive = true,
@@ -617,6 +668,12 @@ export function Chat({
     Record<string, PendingToolApproval>
   >({});
   const approvalMenuRef = useRef<HTMLDivElement>(null);
+  const approvalTriggerRef = useRef<HTMLButtonElement>(null);
+  const approvalPanelRef = useRef<HTMLDivElement>(null);
+  const [approvalMenuStyle, setApprovalMenuStyle] = useState<CSSProperties>();
+  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspacePanelRef = useRef<HTMLDivElement>(null);
+  const [workspaceMenuStyle, setWorkspaceMenuStyle] = useState<CSSProperties>();
   /**
    * Session-level temporary workspace. Set by the chat-page Workspace button
    * without modifying the agent's default workspace. This takes the highest
@@ -703,7 +760,128 @@ export function Chat({
   const elapsedSec = activeRun?.elapsedSec ?? 0;
   const activeSteps = useMemo(() => activeRun?.steps ?? [], [activeRun?.steps]);
   const activeRunId = activeRun?.runId ?? null;
-  const activeToolApproval = activeRunId ? pendingToolApprovals[activeRunId] : undefined;
+  const contextUsageIdentity = useMemo<ContextUsageIdentity>(() => {
+    const selected = parseModelSelection(selectedModel);
+    return {
+      sessionId,
+      provider: selectedModel === "auto" ? defaultProviderId : selected.providerId ?? "",
+      model: selectedModel === "auto" ? defaultModelId : selected.model ?? "",
+      liveRunId: activeRunId,
+    };
+  }, [activeRunId, defaultModelId, defaultProviderId, selectedModel, sessionId]);
+  const [contextUsageState, setContextUsageState] = useState(() =>
+    emptyContextUsageState(contextUsageIdentity)
+  );
+  const contextUsageCacheRef = useRef<Map<string, ContextUsageSnapshot>>(new Map());
+  useEffect(() => {
+    setContextUsageState((previous) => {
+      const next = switchContextUsageIdentity(previous, contextUsageIdentity);
+      if (next.current) return next;
+      const cached = contextUsageCacheRef.current.get(identityKey(contextUsageIdentity));
+      if (!cached) return next;
+      return applyContextUsageSnapshot(next, cached);
+    });
+  }, [contextUsageIdentity]);
+  // Invalidate stale data in the same render as a session/model switch. The
+  // effect above then commits this identity for subsequent event reduction.
+  const visibleContextUsageState = useMemo(
+    () => switchContextUsageIdentity(contextUsageState, contextUsageIdentity),
+    [contextUsageIdentity, contextUsageState]
+  );
+  const contextProjectedKeyRef = useRef("");
+  useEffect(() => {
+    if (gatewayStatus !== "connected") return;
+    if (!sessionId || !contextUsageIdentity.provider || !contextUsageIdentity.model) return;
+    if (activeRunId) return;
+    const key = identityKey({
+      sessionId: contextUsageIdentity.sessionId,
+      provider: contextUsageIdentity.provider,
+      model: contextUsageIdentity.model,
+    });
+    if (contextProjectedKeyRef.current === key) return;
+    contextProjectedKeyRef.current = key;
+    const identity = {
+      sessionId: contextUsageIdentity.sessionId,
+      provider: contextUsageIdentity.provider,
+      model: contextUsageIdentity.model,
+      liveRunId: contextUsageIdentity.liveRunId,
+    };
+    let cancelled = false;
+    void (async () => {
+      try {
+        const history = await fetchSessionHistoryWithProjection(sessionId);
+        if (cancelled) return;
+        setContextUsageState((previous) =>
+          restorePersistedContextProjection(
+            switchContextUsageIdentity(previous, identity),
+            history.contextProjection
+          )
+        );
+        const projected = await projectSessionContext({
+          sessionId,
+          provider: identity.provider,
+          model: identity.model,
+        });
+        if (cancelled) return;
+        setContextUsageState((previous) => {
+          let next = switchContextUsageIdentity(previous, identity);
+          if (projected.unavailable && !projected.current) {
+            return failContextUsageProjection(next);
+          }
+          if (projected.current) {
+            next = applySessionOpenCandidate(next, projected.current);
+            if (next.current) {
+              contextUsageCacheRef.current.set(
+                identityKey({
+                  sessionId: identity.sessionId,
+                  provider: identity.provider,
+                  model: identity.model,
+                }),
+                next.current
+              );
+            }
+          }
+          const actual = projected.last_actual ?? projected.lastActual;
+          if (actual && actual.input_tokens > 0) {
+            next = {
+              ...next,
+              lastActual: {
+                inputTokens: actual.input_tokens,
+                revision: actual.request_revision,
+                runId: actual.run_id ?? null,
+                provider: actual.provider,
+                model: actual.model,
+              },
+            };
+          }
+          if (!next.current) {
+            return failContextUsageProjection(next);
+          }
+          return next;
+        });
+      } catch {
+        if (cancelled) return;
+        setContextUsageState((previous) =>
+          failContextUsageProjection(switchContextUsageIdentity(previous, identity))
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeRunId,
+    contextUsageIdentity.liveRunId,
+    contextUsageIdentity.model,
+    contextUsageIdentity.provider,
+    contextUsageIdentity.sessionId,
+    gatewayStatus,
+    sessionId,
+  ]);
+  const activeToolApproval =
+    approvalProfile.profile === "full_access" || !activeRunId
+      ? undefined
+      : pendingToolApprovals[activeRunId];
   const input = inputs[activeAvatarId] ?? "";
   const attachments = attachmentsBySession[activeAvatarId] ?? [];
   const selectedSkill = selectedSkills[activeAvatarId];
@@ -723,7 +901,12 @@ export function Chat({
     const selected = selectedTaskRunId
       ? taskHistory.find((task) => task.runId === selectedTaskRunId)
       : null;
-    return selected ?? taskHistory.find((task) => task.avatarId === activeAvatarId) ?? null;
+    // A task selected in one Agent must not leak into another Agent's
+    // inspector. Keeping the selection scoped to its owner also prevents the
+    // live process view from being rebound and restarted during Agent switches.
+    return (selected?.avatarId === activeAvatarId ? selected : null)
+      ?? taskHistory.find((task) => task.avatarId === activeAvatarId)
+      ?? null;
   }, [activeAvatarId, selectedTaskRunId, taskHistory]);
 
   // Grow the composer with its content up to the CSS max-height, then scroll.
@@ -1156,9 +1339,11 @@ export function Chat({
         if (!latest) return prev;
         const byPath = new Map<string, TaskChangedFile>();
         for (const file of latest.changedFiles ?? []) {
+          if (!isVisibleTaskArtifactPath(file.path)) continue;
           byPath.set(file.path.replace(/\\/g, "/"), file);
         }
         for (const artifact of detected) {
+          if (!isVisibleTaskArtifactPath(artifact.path)) continue;
           const key = artifact.path.replace(/\\/g, "/");
           const existing = byPath.get(key);
           byPath.set(key, {
@@ -1371,6 +1556,7 @@ export function Chat({
               : status === "failed"
                 ? "打开任务检查器查看最后步骤，修正配置后重新执行。"
                 : undefined,
+          activity: finalizeOpenContextOperations(target.activity ?? []),
         });
       });
     },
@@ -1561,12 +1747,32 @@ export function Chat({
     void loadSessionHistory(activeAvatarId, sessionId, true);
   }, [activeAvatarId, sessionId, gatewayStatus, loadSessionHistory]);
 
+  useLayoutEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const place = () => {
+      setWorkspaceMenuStyle(placeComposerMenu(workspaceTriggerRef.current, 240));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [workspaceMenuOpen]);
+
   useEffect(() => {
     if (!workspaceMenuOpen) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
-      if (target && workspaceMenuRef.current?.contains(target)) return;
+      if (
+        target &&
+        (workspaceMenuRef.current?.contains(target) ||
+          workspacePanelRef.current?.contains(target))
+      ) {
+        return;
+      }
       setWorkspaceMenuOpen(false);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1581,12 +1787,32 @@ export function Chat({
     };
   }, [workspaceMenuOpen]);
 
+  useLayoutEffect(() => {
+    if (!approvalMenuOpen) return;
+    const place = () => {
+      setApprovalMenuStyle(placeComposerMenu(approvalTriggerRef.current, 370));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [approvalMenuOpen]);
+
   useEffect(() => {
     if (!approvalMenuOpen) return;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
-      if (target && approvalMenuRef.current?.contains(target)) return;
+      if (
+        target &&
+        (approvalMenuRef.current?.contains(target) ||
+          approvalPanelRef.current?.contains(target))
+      ) {
+        return;
+      }
       setApprovalMenuOpen(false);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1684,6 +1910,9 @@ export function Chat({
           profile,
         });
         setApprovalProfile(saved);
+        if (saved.profile === "full_access") {
+          setPendingToolApprovals({});
+        }
         setApprovalMenuOpen(false);
         setCopyNotice(`权限模式已切换为“${saved.label}”，新任务立即生效。`);
         window.setTimeout(() => setCopyNotice(null), 2400);
@@ -2041,7 +2270,7 @@ export function Chat({
         });
       } else if (eventType === "file_changed" || eventType === "fileChanged") {
         const path = typeof rawPayload.path === "string" ? rawPayload.path : "";
-        if (path) {
+        if (path && isVisibleTaskArtifactPath(path)) {
           setTaskHistory((prev) => {
             const target = prev.find((task) => task.runId === runId);
             if (!target) return prev;
@@ -2086,7 +2315,10 @@ export function Chat({
         });
       } else if (eventType === "tool_completed" || eventType === "toolCompleted") {
         const toolName = stringValue("tool_name", "toolName") || "工具";
-        const success = rawPayload.success === true;
+        const success = toolCompletedSucceeded({
+          success: typeof rawPayload.success === "boolean" ? rawPayload.success : undefined,
+          status: typeof rawPayload.status === "string" ? rawPayload.status : undefined,
+        });
         const summary = stringValue("result_summary", "resultSummary", "summary");
         appendTaskActivity(runId, `${toolName}${success ? "已完成" : "执行失败"}`, success ? "success" : "error", {
           kind: "tool",
@@ -2181,12 +2413,58 @@ export function Chat({
           kind: "lifecycle",
           status: "running",
         });
+      } else if (eventType === "context_usage") {
+        const snapshot = rawPayload.snapshot;
+        if (snapshot && typeof snapshot === "object") {
+          const usagePayload = payload as AgentRunEventContextUsage;
+          const authoritativeSnapshot = {
+            ...usagePayload.snapshot,
+            run_id: usagePayload.snapshot.run_id ?? runId,
+          };
+          setContextUsageState((previous) => {
+            const next = applyContextUsageSnapshot(previous, authoritativeSnapshot);
+            if (next.current) {
+              contextUsageCacheRef.current.set(
+                identityKey({
+                  sessionId: next.identity.sessionId,
+                  provider: next.identity.provider,
+                  model: next.identity.model,
+                }),
+                next.current
+              );
+            }
+            return next;
+          });
+        }
+      } else if (eventType === "context_lifecycle") {
+        const lifecycle = rawPayload.event;
+        if (lifecycle && typeof lifecycle === "object") {
+          const contextPayload = {
+            type: "context_lifecycle",
+            run_id: runId,
+            event: lifecycle,
+          } as AgentRunEventContextLifecycle;
+          setContextUsageState((previous) =>
+            applyContextUsageLifecycle(previous, contextPayload)
+          );
+          setTaskHistory((prev) => {
+            const target = prev.find((task) => task.runId === runId);
+            if (!target) return prev;
+            const activity = applyLifecycleToActivity(target.activity ?? [], contextPayload, {
+              runId,
+              sessionId: target.sessionId,
+            }).slice(-120);
+            return patchTask(prev, runId, { activity });
+          });
+        }
       }
       if (
         !isTerminalEvent
       ) {
         return;
       }
+
+      setContextUsageState((previous) => finishContextUsageRun(previous, runId));
 
       const avatarId = findAvatarIdByRunId(runId);
       if (!avatarId) {
@@ -3612,7 +3890,9 @@ export function Chat({
                           <div className="chat-task-signals">
                             <span>
                               <UiIcon name="file" size={11} />
-                              {task.changedFiles?.length ?? 0} 个文件
+                              {(task.changedFiles ?? []).filter((file) =>
+                                isVisibleTaskArtifactPath(file.path)
+                              ).length} 个文件
                             </span>
                             {taskNeedsAttention(task.status) ? (
                               <span className="chat-task-attention">
@@ -4281,6 +4561,7 @@ export function Chat({
                 </div>
 
                 <div className="chat-composer-tools-center">
+                  <ContextUsageBadge state={visibleContextUsageState} />
                   <div className="chat-composer-model-shell">
                     <ModelPicker
                       value={selectedModel}
@@ -4307,6 +4588,7 @@ export function Chat({
                   <div ref={approvalMenuRef} className="chat-approval-actions">
                     <button
                       type="button"
+                      ref={approvalTriggerRef}
                       className={`chat-composer-permission${approvalMenuOpen ? " is-open" : ""}`}
                       title={approvalProfile.description}
                       aria-haspopup="menu"
@@ -4318,41 +4600,72 @@ export function Chat({
                       <span>{approvalSaving ? "保存中…" : approvalProfile.label}</span>
                       <span className="chat-permission-chevron" aria-hidden />
                     </button>
-                    {approvalMenuOpen ? (
-                      <div className="chat-permission-menu" role="menu" aria-label="工具权限模式">
-                        <button
-                          type="button"
-                          role="menuitemradio"
-                          aria-checked={approvalProfile.profile === "request_approval"}
-                          className={approvalProfile.profile === "request_approval" ? "is-selected" : ""}
-                          onClick={() => void handleApprovalProfileChange("request_approval")}
-                          disabled={approvalSaving}
-                        >
-                          <span className="chat-permission-option-icon"><UiIcon name="safety" size={16} /></span>
-                          <span className="chat-permission-option-copy">
-                            <strong>请求批准</strong>
-                            <small>编辑文件、运行命令和使用互联网时始终询问</small>
-                          </span>
-                          {approvalProfile.profile === "request_approval" ? <UiIcon name="check" size={14} /> : null}
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitemradio"
-                          aria-checked={approvalProfile.profile === "risk_based"}
-                          className={approvalProfile.profile === "risk_based" ? "is-selected" : ""}
-                          onClick={() => void handleApprovalProfileChange("risk_based")}
-                          disabled={approvalSaving}
-                        >
-                          <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
-                          <span className="chat-permission-option-copy">
-                            <strong>帮我批准</strong>
-                            <small>自动执行常规操作，仅对检测到的风险操作进行限制</small>
-                          </span>
-                          {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
-                        </button>
-                        <p>危险命令和禁止路径仍会被安全策略拦截。</p>
-                      </div>
-                    ) : null}
+                    {approvalMenuOpen
+                      ? createPortal(
+                          <div
+                            ref={approvalPanelRef}
+                            className="chat-permission-menu"
+                            role="menu"
+                            aria-label="工具权限模式"
+                            style={{
+                              ...approvalMenuStyle,
+                              visibility: approvalMenuStyle ? "visible" : "hidden",
+                            }}
+                          >
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "request_approval"}
+                              className={approvalProfile.profile === "request_approval" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("request_approval")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="safety" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>请求批准</strong>
+                                <small>编辑文件、运行命令和使用互联网时始终询问</small>
+                              </span>
+                              {approvalProfile.profile === "request_approval" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "risk_based"}
+                              className={approvalProfile.profile === "risk_based" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("risk_based")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>帮我批准</strong>
+                                <small>自动执行常规操作，仅对检测到的风险操作进行限制</small>
+                              </span>
+                              {approvalProfile.profile === "risk_based" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={approvalProfile.profile === "full_access"}
+                              className={approvalProfile.profile === "full_access" ? "is-selected" : ""}
+                              onClick={() => void handleApprovalProfileChange("full_access")}
+                              disabled={approvalSaving}
+                            >
+                              <span className="chat-permission-option-icon"><UiIcon name="agent" size={16} /></span>
+                              <span className="chat-permission-option-copy">
+                                <strong>Full Access（完全访问）</strong>
+                                <small>无需确认即可访问文件、运行命令、控制浏览器和使用网络</small>
+                              </span>
+                              {approvalProfile.profile === "full_access" ? <UiIcon name="check" size={14} /> : null}
+                            </button>
+                            <p>
+                              {approvalProfile.profile === "full_access"
+                                ? "仅使用 OmniNova 进程已有的系统权限；接管状态与运行时锁仍然有效。"
+                                : "危险命令和禁止路径仍会被安全策略拦截。"}
+                            </p>
+                          </div>,
+                          document.body
+                        )
+                      : null}
                   </div>
                   <div
                     ref={workspaceMenuRef}
@@ -4360,6 +4673,7 @@ export function Chat({
                   >
                     <button
                       type="button"
+                      ref={workspaceTriggerRef}
                       className="chat-workspace-pill"
                       title={
                         activeWorkspaceDir
@@ -4378,26 +4692,37 @@ export function Chat({
                       {activeWorkspaceDir ? <span className="chat-workspace-pill-scope">{workspaceLabel}</span> : null}
                       <span className="chat-workspace-pill-path">{workspaceSummary}</span>
                     </button>
-                    {workspaceMenuOpen ? (
-                      <div className="chat-workspace-menu" role="menu">
-                        <button type="button" role="menuitem" onClick={(e) => void handleChooseWorkspace(e)}>
-                          重新选择 Workspace
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => void handleOpenWorkspace()}
-                          disabled={!activeWorkspaceDir}
-                        >
-                          打开当前 Workspace 文件夹
-                        </button>
-                        {sessionWorkspaceDir ? (
-                          <button type="button" role="menuitem" onClick={handleClearSessionWorkspace}>
-                            清除当前会话临时 Workspace
-                          </button>
-                        ) : null}
-                      </div>
-                    ) : null}
+                    {workspaceMenuOpen
+                      ? createPortal(
+                          <div
+                            ref={workspacePanelRef}
+                            className="chat-workspace-menu"
+                            role="menu"
+                            style={{
+                              ...workspaceMenuStyle,
+                              visibility: workspaceMenuStyle ? "visible" : "hidden",
+                            }}
+                          >
+                            <button type="button" role="menuitem" onClick={(e) => void handleChooseWorkspace(e)}>
+                              重新选择 Workspace
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => void handleOpenWorkspace()}
+                              disabled={!activeWorkspaceDir}
+                            >
+                              打开当前 Workspace 文件夹
+                            </button>
+                            {sessionWorkspaceDir ? (
+                              <button type="button" role="menuitem" onClick={handleClearSessionWorkspace}>
+                                清除当前会话临时 Workspace
+                              </button>
+                            ) : null}
+                          </div>,
+                          document.body
+                        )
+                      : null}
                   </div>
                 </div>
 

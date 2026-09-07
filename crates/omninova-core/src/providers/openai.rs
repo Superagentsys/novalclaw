@@ -1,12 +1,27 @@
+use crate::agent::context::force_context_recovery;
 use crate::config::TransportMode;
+use crate::observability::{
+    build_snapshot, current_context, emit_lifecycle, emit_snapshot, new_operation_id,
+    ContextLifecycleEventKind, ContextRequestIdentity, ContextTelemetryMode, MeasurementKind,
+};
+use crate::providers::context_budget::{
+    context_window_exceeded_info, native_request_output_limit_from_json, ContextBudget,
+    ProviderOverflowInfo, TokenEstimator, CONTEXT_BUDGET_EXCEEDED_MARKER,
+};
+use crate::providers::generation_limit::{GenerationLimitSource, ResolvedGenerationLimit};
+use crate::providers::anthropic_count::{count_anthropic_tokens, AnthropicCountConfig};
+use crate::providers::native_request::{
+    convert_messages as convert_native_messages, convert_tools as convert_native_tools,
+    NativeChatRequest, NativeToolCall,
+};
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ProviderHttpError, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -434,10 +449,15 @@ pub struct OpenAiProvider {
     model: String,
     temperature: f64,
     max_tokens: Option<u32>,
+    generation_limit_source: GenerationLimitSource,
     timeouts: ProviderTimeouts,
     retry_backoff: Duration,
     transport_mode: TransportMode,
     client: Client,
+    context_budget: Option<ContextBudget>,
+    exact_tokenizer: Option<String>,
+    anthropic_native_count: Option<AnthropicCountConfig>,
+    anthropic_count_trusted: bool,
 }
 
 struct ConsumeOutcome {
@@ -688,21 +708,6 @@ where
     }
 }
 
-#[derive(Debug, Serialize)]
-struct NativeChatRequest {
-    model: String,
-    messages: Vec<NativeMessage>,
-    temperature: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-}
-
 // --- Streaming (SSE) chunk shapes ---
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
@@ -793,48 +798,6 @@ fn completion_state(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct NativeMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<NativeToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolSpec {
-    #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeToolCall {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    function: NativeFunctionCall,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NativeFunctionCall {
-    name: String,
-    arguments: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
@@ -897,13 +860,45 @@ fn semantic_provider_error_code(body: &str) -> Option<&'static str> {
         .copied()
 }
 
+fn safe_provider_error_metadata(body: &str) -> (Option<String>, String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (
+            None,
+            format!("provider returned a non-JSON error body (body_len={})", body.len()),
+        );
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .map(|value| sanitize_network_error_fragment(&value));
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_network_error_fragment)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "provider rejected the request".to_string());
+    (code, message)
+}
+
 async fn api_error(provider_name: &str, response: Response) -> AttemptError {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     let retry_reason = transient_http_reason(status.as_u16())
         .filter(|_| semantic_provider_error_code(&text).is_none());
+    let (code, message) = safe_provider_error_metadata(&text);
     AttemptError::permanent(
-        anyhow::anyhow!("{provider_name} API error ({status}): {text}"),
+        anyhow::Error::new(ProviderHttpError {
+            provider: provider_name.to_string(),
+            status: status.as_u16(),
+            code,
+            message,
+        }),
         "request",
         "http_error",
     )
@@ -932,11 +927,54 @@ impl OpenAiProvider {
             model: model.into(),
             temperature,
             max_tokens: max_tokens.filter(|v| *v > 0),
+            generation_limit_source: if max_tokens.filter(|v| *v > 0).is_some() {
+                GenerationLimitSource::ProfileOverride
+            } else {
+                GenerationLimitSource::ModelMaximumFallback
+            },
             timeouts,
             retry_backoff: PROVIDER_RETRY_BACKOFF,
             transport_mode,
             client,
+            context_budget: None,
+            exact_tokenizer: None,
+            anthropic_native_count: None,
+            anthropic_count_trusted: false,
         }
+    }
+
+    /// Sets an optional authoritative context budget for final preflight.
+    pub fn with_context_budget(mut self, budget: Option<ContextBudget>) -> Self {
+        self.context_budget = budget;
+        self
+    }
+
+    pub fn with_generation_limit_source(mut self, source: GenerationLimitSource) -> Self {
+        self.generation_limit_source = source;
+        self
+    }
+
+    /// Sets an optional trusted display tokenizer name. Unknown names are ignored.
+    pub fn with_exact_tokenizer(mut self, name: Option<String>) -> Self {
+        self.exact_tokenizer = name.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Enables observation-only Anthropic `/v1/messages/count_tokens` calls
+    /// for this OpenAI-compatible transport when the model is trusted.
+    pub fn with_anthropic_native_count(mut self, base_url: Option<&str>, credential: Option<&str>) -> Self {
+        self.anthropic_native_count = base_url.map(|base_url| AnthropicCountConfig {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            credential: credential.map(str::to_string),
+        });
+        self
+    }
+
+    /// Records that the resolved provider/profile/model mapping is trusted by
+    /// ModelCapabilityRegistry for Anthropic-native count conversion.
+    pub fn with_anthropic_count_trusted(mut self, trusted: bool) -> Self {
+        self.anthropic_count_trusted = trusted;
+        self
     }
 
     /// Sets the per-provider HTTP transport mode. Default is `Auto`; the
@@ -945,6 +983,268 @@ impl OpenAiProvider {
         self.transport_mode = mode;
         self.client = Self::build_client(self.timeouts.connect, mode);
         self
+    }
+
+    /// C1 hard preflight: conservative TokenEstimator only. Display metering
+    /// (exact tokenizer / ProviderActual) must not be used here.
+    fn preflight_context(&self, request_body: &str) -> anyhow::Result<()> {
+        self.preflight_context_with_source(request_body, self.generation_limit_source)
+    }
+
+    fn preflight_context_with_source(
+        &self,
+        request_body: &str,
+        source: GenerationLimitSource,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = self.budget_for_request_body_with_source(request_body, source) else {
+            return Ok(());
+        };
+        budget.ensure_usable()?;
+        let estimator = TokenEstimator::new();
+        let estimated_input_tokens = estimator.estimate_request(request_body);
+        if estimated_input_tokens <= budget.max_input_tokens {
+            tracing::info!(
+                target: "omninova_core::providers::context",
+                model = %self.model,
+                budget_source = %budget.source.as_str(),
+                context_window_tokens = %budget.context_window_tokens,
+                estimated_input_tokens = %estimated_input_tokens,
+                max_input_tokens = %budget.max_input_tokens,
+                output_reserve_tokens = %budget.output_reserve_tokens,
+                request_output_reserve_tokens = %budget.request_output_reserve_tokens,
+                model_max_output_tokens = ?budget.model_max_output_tokens,
+                safety_reserve_tokens = %budget.safety_reserve_tokens,
+                result = "allow",
+                "context_preflight"
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "omninova_core::providers::context",
+            model = %self.model,
+            budget_source = %budget.source.as_str(),
+            context_window_tokens = %budget.context_window_tokens,
+            estimated_input_tokens = %estimated_input_tokens,
+            max_input_tokens = %budget.max_input_tokens,
+            output_reserve_tokens = %budget.output_reserve_tokens,
+            request_output_reserve_tokens = %budget.request_output_reserve_tokens,
+            model_max_output_tokens = ?budget.model_max_output_tokens,
+            safety_reserve_tokens = %budget.safety_reserve_tokens,
+            result = "blocked",
+            "context_preflight"
+        );
+        Err(anyhow::anyhow!(
+            "{}: estimated_input_tokens={estimated_input_tokens}, context_window_tokens={}, max_input_tokens={}, output_reserve_tokens={}, safety_reserve_tokens={}, model={}",
+            CONTEXT_BUDGET_EXCEEDED_MARKER,
+            budget.context_window_tokens,
+            budget.max_input_tokens,
+            budget.output_reserve_tokens,
+            budget.safety_reserve_tokens,
+            self.model
+        ))
+    }
+
+    fn budget_for_request_body(&self, request_body: &str) -> Option<ContextBudget> {
+        self.budget_for_request_body_with_source(request_body, self.generation_limit_source)
+    }
+
+    fn budget_for_request_body_with_source(
+        &self,
+        request_body: &str,
+        source: GenerationLimitSource,
+    ) -> Option<ContextBudget> {
+        let base = self.context_budget?;
+        match native_request_output_limit_from_json(request_body) {
+            Some(cap) => Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+                effective_tokens: Some(cap),
+                source,
+            })),
+            None => Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+                effective_tokens: None,
+                source: GenerationLimitSource::ModelMaximumFallback,
+            })),
+        }
+    }
+
+    fn resolved_generation_limit_for_request(
+        &self,
+        request_override: Option<u32>,
+    ) -> ResolvedGenerationLimit {
+        let model_max = self
+            .context_budget
+            .and_then(|budget| budget.model_max_output_tokens);
+        let request = request_override.map(u64::from).filter(|value| *value > 0);
+        if request.is_some() {
+            return crate::providers::generation_limit::resolve_effective_request_generation_limit(
+                request,
+                None,
+                None,
+                model_max,
+            );
+        }
+        let raw = self.max_tokens.map(u64::from).filter(|value| *value > 0);
+        let effective = match (raw, model_max.filter(|value| *value > 0)) {
+            (Some(value), Some(max)) => Some(value.min(max)).filter(|value| *value > 0),
+            (Some(value), None) => Some(value),
+            (None, _) => None,
+        };
+        ResolvedGenerationLimit {
+            effective_tokens: effective,
+            source: self.generation_limit_source,
+        }
+    }
+
+    fn finalized_max_tokens(&self) -> Option<u32> {
+        self.resolved_generation_limit_for_request(None)
+            .native_max_tokens()
+    }
+
+    fn finalized_max_tokens_for(&self, request_override: Option<u32>) -> Option<u32> {
+        self.resolved_generation_limit_for_request(request_override)
+            .native_max_tokens()
+    }
+
+    fn runtime_request_budget(&self) -> Option<ContextBudget> {
+        let base = self.context_budget?;
+        Some(base.with_resolved_generation_limit(ResolvedGenerationLimit {
+            effective_tokens: self.max_tokens.map(u64::from).filter(|v| *v > 0),
+            source: self.generation_limit_source,
+        }))
+    }
+
+    fn observe_preflight(
+        &self,
+        request_body: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        source: GenerationLimitSource,
+    ) -> Option<ContextRequestIdentity> {
+        let ctx = current_context()?;
+        if !ctx.snapshots_enabled() {
+            return None;
+        }
+        let mut identity = ctx.allocate_request_identity();
+        if identity.provider.is_empty() {
+            identity.provider = self.name().to_string();
+        }
+        if identity.model.is_empty() {
+            identity.model = self.model.clone();
+        }
+        let snapshot = build_snapshot(
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.request_revision,
+            identity.provider.clone(),
+            identity.model.clone(),
+            MeasurementKind::FinalRequestEstimate,
+            messages,
+            tools,
+            self.budget_for_request_body_with_source(request_body, source)
+                .as_ref(),
+            Some(request_body),
+        );
+        emit_snapshot(snapshot);
+        Some(identity)
+    }
+
+    fn observe_provider_actual(
+        &self,
+        identity: Option<&ContextRequestIdentity>,
+        request_body: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        usage: Option<&TokenUsage>,
+        source: GenerationLimitSource,
+    ) {
+        let Some(actual) = usage.and_then(|u| u.input_tokens) else {
+            return;
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let snapshot = build_snapshot(
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.request_revision,
+            identity.provider.clone(),
+            identity.model.clone(),
+            MeasurementKind::ProviderActual,
+            messages,
+            tools,
+            self.budget_for_request_body_with_source(request_body, source)
+                .as_ref(),
+            Some(request_body),
+        )
+        .with_provider_actual(actual);
+        emit_snapshot(snapshot);
+    }
+
+    fn begin_overflow_recovery(
+        &self,
+        info: ProviderOverflowInfo,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> String {
+        let estimated_before =
+            TokenEstimator::new().estimate_messages_with_tools(messages, tools);
+        let operation_id = new_operation_id();
+        emit_lifecycle(
+            operation_id.clone(),
+            ContextTelemetryMode::ForcedOverflowRecovery,
+            ContextLifecycleEventKind::ContextOverflowRecoveryStarted {
+                mode: ContextTelemetryMode::ForcedOverflowRecovery,
+                provider_reported_window: info.provider_reported_window,
+                estimated_before,
+            },
+        );
+        operation_id
+    }
+
+    fn finish_overflow_recovery(
+        &self,
+        operation_id: String,
+        result: &anyhow::Result<ProviderChatResponse>,
+        recovered_estimate: u64,
+        did_retry: bool,
+    ) {
+        let mode = ContextTelemetryMode::ForcedOverflowRecovery;
+        if !did_retry {
+            emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "non_shrinking".to_string(),
+                },
+            );
+            return;
+        }
+        match result {
+            Ok(_) => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryCompleted {
+                    mode,
+                    estimated_after: recovered_estimate,
+                },
+            ),
+            Err(error) if context_window_exceeded_info(error).is_some() => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "context_window_exceeded".to_string(),
+                },
+            ),
+            Err(_) => emit_lifecycle(
+                operation_id,
+                mode,
+                ContextLifecycleEventKind::ContextOverflowRecoveryFailed {
+                    mode,
+                    reason: "retry_error".to_string(),
+                },
+            ),
+        }
     }
 
     fn build_client(connect_timeout: Duration, mode: TransportMode) -> Client {
@@ -1089,129 +1389,6 @@ impl OpenAiProvider {
         .retryable(transient_transport_reason(&diagnostics))
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools
-            .filter(|items| !items.is_empty())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|tool| NativeToolSpec {
-                        kind: "function".to_string(),
-                        function: NativeToolFunctionSpec {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.parameters.clone(),
-                        },
-                    })
-                    .collect()
-            })
-    }
-
-    fn user_content_value(message: &ChatMessage) -> serde_json::Value {
-        let images = message.images.as_deref().unwrap_or_default();
-        if images.is_empty() {
-            return serde_json::Value::String(message.content.clone());
-        }
-
-        let mut parts = vec![serde_json::json!({
-            "type": "text",
-            "text": message.content,
-        })];
-        for url in images {
-            parts.push(serde_json::json!({
-                "type": "image_url",
-                "image_url": { "url": url },
-            }));
-        }
-        serde_json::Value::Array(parts)
-    }
-
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
-        messages
-            .iter()
-            .filter_map(|m| {
-                if m.role == "assistant" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
-                            {
-                                if !parsed_calls.is_empty() {
-                                    let tool_calls = parsed_calls
-                                        .into_iter()
-                                        .map(|tc| NativeToolCall {
-                                            id: Some(tc.id),
-                                            kind: Some("function".to_string()),
-                                            function: NativeFunctionCall {
-                                                name: tc.name,
-                                                arguments: tc.arguments,
-                                            },
-                                        })
-                                        .collect::<Vec<_>>();
-                                    let content = value
-                                        .get("content")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(ToString::to_string);
-                                    let reasoning_content = value
-                                        .get("reasoning_content")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(ToString::to_string);
-                                    return Some(NativeMessage {
-                                        role: "assistant".to_string(),
-                                        content: content.map(serde_json::Value::String),
-                                        tool_call_id: None,
-                                        tool_calls: Some(tool_calls),
-                                        reasoning_content,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if m.role == "tool" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        let tool_call_id = value
-                            .get("tool_call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .map(ToString::to_string);
-                        let content = value
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-                        if tool_call_id.is_some() {
-                            return Some(NativeMessage {
-                                role: "tool".to_string(),
-                                content: content.map(serde_json::Value::String),
-                                tool_call_id,
-                                tool_calls: None,
-                                reasoning_content: None,
-                            });
-                        }
-                    }
-                    return None;
-                }
-
-                let content = if m.role == "user" {
-                    Some(Self::user_content_value(m))
-                } else {
-                    Some(serde_json::Value::String(m.content.clone()))
-                };
-
-                Some(NativeMessage {
-                    role: m.role.clone(),
-                    content,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                })
-            })
-            .collect()
-    }
-
     fn parse_native_response(
         message: NativeResponseMessage,
         finish_reason: Option<String>,
@@ -1276,16 +1453,12 @@ impl Provider for OpenAiProvider {
         "openai"
     }
 
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn chat(&self, request: ProviderChatRequest<'_>) -> anyhow::Result<ProviderChatResponse> {
-        let started = Instant::now();
-        let attempts = AtomicU32::new(0);
-        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
-            self.chat_inner(request, client, attempt)
-        });
-        match tokio::time::timeout(self.timeouts.request, driver).await {
-            Ok(result) => result,
-            Err(_) => Err(self.request_timeout_error(started, &attempts)),
-        }
+        self.run_chat_with_overflow_recovery(request).await
     }
 
     async fn chat_stream(
@@ -1306,21 +1479,74 @@ impl Provider for OpenAiProvider {
                 attempt,
             )
         });
-        match tokio::time::timeout(self.timeouts.request, driver).await {
-            Ok(result) => {
-                if let Ok(response) = &result {
-                    log_provider_stream_ok(
-                        &self.model,
-                        first_delta_ms.load(Ordering::Relaxed),
-                        started.elapsed().as_millis() as u64,
-                        "complete",
-                        response.finish_reason.as_deref(),
-                    );
-                }
-                result
-            }
+        let mut result = match tokio::time::timeout(self.timeouts.request, driver).await {
+            Ok(result) => result,
             Err(_) => Err(self.request_timeout_error(started, &attempts)),
+        };
+        if let Err(error) = &result {
+                if let Some(info) = context_window_exceeded_info(error) {
+                tracing::warn!(
+                    target: "omninova_core::providers::context",
+                    context_overflow_detected = true,
+                    provider_reported_window = ?info.provider_reported_window,
+                    context_overflow_retry_attempt = 1,
+                    "context_overflow_recovery_started"
+                );
+                let tools = request.tools.unwrap_or(&[]);
+                let recovery_op = self.begin_overflow_recovery(info, request.messages, tools);
+                let recovered = force_context_recovery(
+                    self,
+                    request.messages.to_vec(),
+                    tools,
+                    usize::MAX,
+                    request.request_max_output_tokens,
+                )
+                .await;
+                let estimator = TokenEstimator::new();
+                let recovered_estimate = estimator.estimate_messages_with_tools(&recovered, tools);
+                let original_estimate = estimator.estimate_messages_with_tools(request.messages, tools);
+                if recovered_estimate < original_estimate {
+                    let recovered_request = ProviderChatRequest {
+                        messages: &recovered,
+                        tools: Some(tools),
+                        request_max_output_tokens: request.request_max_output_tokens,
+                    };
+                    let attempts2 = AtomicU32::new(0);
+                    let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
+                        self.chat_stream_inner(
+                            recovered_request,
+                            token_tx.clone(),
+                            &first_delta_ms,
+                            started,
+                            client,
+                            attempt,
+                        )
+                    });
+                    result = match tokio::time::timeout(self.timeouts.request, driver2).await {
+                        Ok(result) => result,
+                        Err(_) => Err(self.request_timeout_error(started, &attempts2)),
+                    };
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, true);
+                } else {
+                    tracing::warn!(
+                        target: "omninova_core::providers::context",
+                        context_overflow_recovery_result = "non_shrinking",
+                        "context_overflow_recovery_blocked"
+                    );
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, false);
+                }
+            }
         }
+        if let Ok(response) = &result {
+            log_provider_stream_ok(
+                &self.model,
+                first_delta_ms.load(Ordering::Relaxed),
+                started.elapsed().as_millis() as u64,
+                "complete",
+                response.finish_reason.as_deref(),
+            );
+        }
+        result
     }
 
     async fn health_check(&self) -> bool {
@@ -1331,6 +1557,69 @@ impl Provider for OpenAiProvider {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    fn context_budget(&self) -> Option<ContextBudget> {
+        self.runtime_request_budget()
+    }
+
+    fn exact_tokenizer(&self) -> Option<&str> {
+        self.exact_tokenizer.as_deref()
+    }
+
+    async fn measure_provider_count_tokens(
+        &self,
+        identity: Option<ContextRequestIdentity>,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        request_body: &str,
+    ) {
+        if !self.anthropic_count_trusted || !self.can_use_provider_count_api(model) {
+            return;
+        }
+        let Some(identity) = identity else {
+            return;
+        };
+        let Some(config) = self.anthropic_native_count.clone() else {
+            return;
+        };
+        let Some(ctx) = current_context() else {
+            return;
+        };
+        let model = model.to_string();
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
+        let request_body = request_body.to_string();
+        let budget = self.budget_for_request_body(&request_body);
+        let timeout = self.timeouts.connect.min(Duration::from_millis(750));
+        crate::observability::spawn_context_usage_task(ctx, async move {
+            let Some(measurement) = count_anthropic_tokens(
+                &config,
+                &model,
+                &messages,
+                &tools,
+                timeout,
+            )
+            .await
+            else {
+                return;
+            };
+            let snapshot = build_snapshot(
+                identity.session_id.clone(),
+                identity.run_id.clone(),
+                identity.request_revision,
+                identity.provider.clone(),
+                identity.model.clone(),
+                MeasurementKind::FinalRequestEstimate,
+                &messages,
+                &tools,
+                budget.as_ref(),
+                Some(&request_body),
+            )
+            .with_provider_count_api(measurement.tokens, measurement.exact);
+            emit_snapshot(snapshot);
+        });
     }
 }
 
@@ -1406,6 +1695,69 @@ impl OpenAiProvider {
         }
     }
 
+    async fn run_chat_with_overflow_recovery(
+        &self,
+        mut request: ProviderChatRequest<'_>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let started = Instant::now();
+        let attempts = AtomicU32::new(0);
+        let driver = self.run_with_transient_retry(started, &attempts, |client, attempt| {
+            self.chat_inner(request, client, attempt)
+        });
+        let mut result = match tokio::time::timeout(self.timeouts.request, driver).await {
+            Ok(result) => result,
+            Err(_) => Err(self.request_timeout_error(started, &attempts)),
+        };
+        if let Err(error) = &result {
+            if let Some(info) = context_window_exceeded_info(error) {
+                tracing::warn!(
+                    target: "omninova_core::providers::context",
+                    context_overflow_detected = true,
+                    provider_reported_window = ?info.provider_reported_window,
+                    context_overflow_retry_attempt = 1,
+                    "context_overflow_recovery_started"
+                );
+                let tools = request.tools.unwrap_or(&[]);
+                let recovery_op = self.begin_overflow_recovery(info, request.messages, tools);
+                let recovered = force_context_recovery(
+                    self,
+                    request.messages.to_vec(),
+                    tools,
+                    usize::MAX,
+                    request.request_max_output_tokens,
+                )
+                .await;
+                let estimator = TokenEstimator::new();
+                let recovered_estimate = estimator.estimate_messages_with_tools(&recovered, tools);
+                let original_estimate = estimator.estimate_messages_with_tools(request.messages, tools);
+                if recovered_estimate < original_estimate {
+                    request = ProviderChatRequest {
+                        messages: &recovered,
+                        tools: Some(tools),
+                        request_max_output_tokens: request.request_max_output_tokens,
+                    };
+                    let attempts2 = AtomicU32::new(0);
+                    let driver2 = self.run_with_transient_retry(started, &attempts2, |client, attempt| {
+                        self.chat_inner(request, client, attempt)
+                    });
+                    result = match tokio::time::timeout(self.timeouts.request, driver2).await {
+                        Ok(result) => result,
+                        Err(_) => Err(self.request_timeout_error(started, &attempts2)),
+                    };
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, true);
+                } else {
+                    tracing::warn!(
+                        target: "omninova_core::providers::context",
+                        context_overflow_recovery_result = "non_shrinking",
+                        "context_overflow_recovery_blocked"
+                    );
+                    self.finish_overflow_recovery(recovery_op, &result, recovered_estimate, false);
+                }
+            }
+        }
+        result
+    }
+
     fn request_timeout_error(&self, started: Instant, attempts: &AtomicU32) -> anyhow::Error {
         log_provider_error(
             &self.model,
@@ -1428,16 +1780,43 @@ impl OpenAiProvider {
         client: Client,
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = convert_native_tools(request.tools);
+        let resolved = self.resolved_generation_limit_for_request(request.request_max_output_tokens);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
-            messages: Self::convert_messages(request.messages),
+            messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.max_tokens,
+            max_tokens: resolved.native_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: None,
         };
+
+        let request_body = serde_json::to_string(&native_request)
+            .map_err(|error| {
+                AttemptError::permanent(
+                    anyhow::anyhow!("序列化请求失败: {error}"),
+                    "request",
+                    "serialize_error",
+                )
+            })?;
+        let tool_specs = request.tools.unwrap_or(&[]);
+        let request_identity = self.observe_preflight(
+            &request_body,
+            request.messages,
+            tool_specs,
+            resolved.source,
+        );
+        self.preflight_context_with_source(&request_body, resolved.source)
+            .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
+        self.measure_provider_count_tokens(
+            request_identity.clone(),
+            &self.model,
+            request.messages,
+            tool_specs,
+            &request_body,
+        )
+        .await;
 
         let response = self
             .authorized_post(&client, "/chat/completions")
@@ -1475,6 +1854,14 @@ impl OpenAiProvider {
         })?;
         let mut result = Self::parse_native_response(choice.message, choice.finish_reason);
         result.usage = usage;
+        self.observe_provider_actual(
+            request_identity.as_ref(),
+            &request_body,
+            request.messages,
+            tool_specs,
+            result.usage.as_ref(),
+            resolved.source,
+        );
         Ok(result)
     }
 
@@ -1487,16 +1874,43 @@ impl OpenAiProvider {
         client: Client,
         attempt: u32,
     ) -> Result<ProviderChatResponse, AttemptError> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = convert_native_tools(request.tools);
+        let resolved = self.resolved_generation_limit_for_request(request.request_max_output_tokens);
         let native_request = NativeChatRequest {
             model: self.model.clone(),
-            messages: Self::convert_messages(request.messages),
+            messages: convert_native_messages(request.messages),
             temperature: self.temperature,
-            max_tokens: self.max_tokens,
+            max_tokens: resolved.native_max_tokens(),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             stream: Some(true),
         };
+
+        let request_body = serde_json::to_string(&native_request)
+            .map_err(|error| {
+                AttemptError::permanent(
+                    anyhow::anyhow!("序列化流式请求失败: {error}"),
+                    "request",
+                    "serialize_error",
+                )
+            })?;
+        let tool_specs = request.tools.unwrap_or(&[]);
+        let request_identity = self.observe_preflight(
+            &request_body,
+            request.messages,
+            tool_specs,
+            resolved.source,
+        );
+        self.preflight_context_with_source(&request_body, resolved.source)
+            .map_err(|error| AttemptError::permanent(error, "context", "context_budget_exceeded"))?;
+        self.measure_provider_count_tokens(
+            request_identity.clone(),
+            &self.model,
+            request.messages,
+            tool_specs,
+            &request_body,
+        )
+        .await;
 
         let response = self
             .authorized_post(&client, "/chat/completions")
@@ -1602,6 +2016,14 @@ impl OpenAiProvider {
             Some(text)
         };
 
+        self.observe_provider_actual(
+            request_identity.as_ref(),
+            &request_body,
+            request.messages,
+            tool_specs,
+            usage.as_ref(),
+            resolved.source,
+        );
         Ok(ProviderChatResponse {
             text: final_text,
             tool_calls,
@@ -1916,6 +2338,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let response = provider
@@ -1972,6 +2395,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let result = provider.chat_stream(request, token_tx).await;
@@ -2421,6 +2845,7 @@ mod tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            request_max_output_tokens: None,
         };
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let result = provider.chat_stream(request, token_tx).await;
@@ -2493,6 +2918,7 @@ mod tests {
             .chat(ProviderChatRequest {
                 messages: &messages,
                 tools: None,
+                request_max_output_tokens: None,
             })
             .await
             .expect("the replay must succeed");
@@ -2543,6 +2969,39 @@ mod tests {
             assert!(result.is_err(), "HTTP {status} must fail");
             assert_eq!(attempts, 1, "HTTP {status} must not be replayed");
         }
+    }
+
+    #[tokio::test]
+    async fn http_403_surfaces_typed_access_error_without_retry() {
+        let (result, _deltas, attempts) = stream_against_script(
+            vec![Scripted::Status(
+                403,
+                "{\"error\":{\"code\":\"permission_denied\",\"message\":\"model access denied\"}}",
+            )],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        let error = result.expect_err("403 must fail");
+        let failure = error
+            .downcast_ref::<ProviderHttpError>()
+            .expect("HTTP failures remain structurally inspectable");
+        assert_eq!(failure.status, 403);
+        assert_eq!(failure.code.as_deref(), Some("permission_denied"));
+        assert!(failure.is_access_failure());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn provider_error_metadata_redacts_sensitive_or_non_json_bodies() {
+        let (code, message) = safe_provider_error_metadata(
+            "{\"error\":{\"code\":\"auth_error\",\"message\":\"Authorization: Bearer secret-value\"}}",
+        );
+        assert_eq!(code.as_deref(), Some("auth_error"));
+        assert_eq!(message, "<redacted-sensitive-error-source>");
+
+        let (_, message) = safe_provider_error_metadata("<html>denied secret page</html>");
+        assert!(message.contains("non-JSON"));
+        assert!(!message.contains("secret page"));
     }
 
     #[tokio::test]
@@ -2666,6 +3125,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    request_max_output_tokens: None,
                 },
                 token_tx,
             )
@@ -2958,6 +3418,615 @@ mod tests {
         assert_eq!(
             attempts, 1,
             "semantic provider error must override HTTP retry"
+        );
+    }
+#[test]
+    fn preflight_blocks_oversized_request_before_send() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "oversized-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_048_576,
+            Some(16_384),
+            crate::providers::context_budget::ContextBudgetSource::ExplicitConfig,
+        )));
+
+        let huge = "x".repeat(1_680_613);
+        let error = provider
+            .preflight_context(&huge)
+            .expect_err("oversized request must be blocked locally");
+        assert!(error.to_string().contains("ContextBudgetExceeded"));
+    }
+
+    #[test]
+    fn preflight_allows_under_budget_request() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "small-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_048_576,
+            Some(16_384),
+            crate::providers::context_budget::ContextBudgetSource::ExplicitConfig,
+        )));
+
+        provider
+            .preflight_context("hello")
+            .expect("small request must pass");
+    }
+
+    #[test]
+    fn r2_e_request_cap_is_preserved_through_native_construction() {
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: Some(32_000),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        assert_eq!(native.output_limit_tokens(), Some(32_000));
+        let body = serde_json::to_string(&native).unwrap();
+        assert_eq!(
+            native_request_output_limit_from_json(&body),
+            Some(32_000)
+        );
+        assert!(body.contains("\"max_tokens\":32000"));
+    }
+
+    #[test]
+    fn r2_f_c1_preflight_uses_final_request_output_cap() {
+        let base = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        );
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(base));
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: Some(32_000),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        provider
+            .preflight_context(&body)
+            .expect("32K reserve should leave a large input budget");
+        let resolved = base.with_request_output_cap(Some(32_000));
+        assert_eq!(resolved.max_input_tokens, 1_000_000 - 32_000 - 32_768);
+        assert_eq!(
+            native_request_output_limit_from_json(&body),
+            Some(32_000)
+        );
+        assert_eq!(provider.context_budget().unwrap().output_reserve_tokens, 32_000);
+    }
+
+    #[test]
+    fn r2_c1_clamps_outgoing_max_tokens_to_model_max() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(500_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )));
+        assert_eq!(provider.finalized_max_tokens(), Some(384_000));
+        assert_eq!(provider.context_budget().unwrap().output_reserve_tokens, 384_000);
+    }
+
+    #[test]
+    fn r21_j_c1_native_reserve_matches_factory_resolved_cap() {
+        let profile = crate::config::ModelProviderConfig {
+            request_max_output_tokens: Some(32_000),
+            ..crate::config::ModelProviderConfig::default()
+        };
+        let cap = crate::providers::factory::resolve_request_generation_limit(
+            Some(&profile),
+            Some(384_000),
+        );
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            cap,
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )));
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: provider.finalized_max_tokens(),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        provider
+            .preflight_context(&body)
+            .expect("configured 32K reserve must pass C1");
+        assert_eq!(native_request_output_limit_from_json(&body), Some(32_000));
+        assert_eq!(
+            provider.context_budget().unwrap().request_output_reserve_tokens,
+            32_000
+        );
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
+    }
+
+    #[test]
+    fn r241_f_g_h_l_request_override_native_budget_and_retry_copy() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts::default(),
+        )
+        .with_context_budget(Some(ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )))
+        .with_generation_limit_source(
+            crate::providers::generation_limit::GenerationLimitSource::ProductDefault,
+        );
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
+        let resolved = provider.resolved_generation_limit_for_request(Some(64_000));
+        assert_eq!(resolved.effective_tokens, Some(64_000));
+        assert_eq!(
+            resolved.source,
+            crate::providers::generation_limit::GenerationLimitSource::RequestOverride
+        );
+        assert_eq!(provider.finalized_max_tokens_for(Some(64_000)), Some(64_000));
+        assert_eq!(provider.finalized_max_tokens(), Some(32_000));
+
+        let native = NativeChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: provider.finalized_max_tokens_for(Some(64_000)),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let body = serde_json::to_string(&native).unwrap();
+        assert_eq!(native_request_output_limit_from_json(&body), Some(64_000));
+        let c1 = provider
+            .budget_for_request_body_with_source(&body, resolved.source)
+            .unwrap();
+        assert_eq!(c1.request_output_reserve_tokens, 64_000);
+        assert_eq!(c1.output_reserve_tokens, 64_000);
+        assert_eq!(c1.max_input_tokens, 1_000_000 - 64_000 - 32_768);
+        assert_eq!(
+            c1.request_generation_limit_source,
+            crate::providers::generation_limit::GenerationLimitSource::RequestOverride
+        );
+
+        let request = ProviderChatRequest {
+            messages: &[],
+            tools: None,
+            request_max_output_tokens: Some(64_000),
+        };
+        let recovered = ProviderChatRequest {
+            messages: &[],
+            tools: Some(&[]),
+            request_max_output_tokens: request.request_max_output_tokens,
+        };
+        assert_eq!(recovered.request_max_output_tokens, Some(64_000));
+        assert_eq!(
+            provider
+                .resolved_generation_limit_for_request(recovered.request_max_output_tokens)
+                .effective_tokens,
+            Some(64_000)
+        );
+    }
+
+    #[test]
+    fn unknown_budget_does_not_block() {
+        let provider = OpenAiProvider::new(
+            Some("https://example.invalid/v1"),
+            None,
+            "unknown-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        );
+        provider
+            .preflight_context(&"x".repeat(2_000_000))
+            .expect("unknown budget must not fabricate a hard limit");
+    }
+
+    fn overflow_history() -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::system("bootstrap")];
+        for i in 0..24 {
+            messages.push(ChatMessage::user(format!("u{i} {}", "x".repeat(80))));
+            messages.push(ChatMessage::assistant(format!("a{i} {}", "y".repeat(80))));
+        }
+        messages
+    }
+
+    fn overflow_error_body() -> &'static str {
+        r#"{"error":{"code":"context_length_exceeded","message":"maximum context length is 128000 tokens"}}"#
+    }
+
+    const OK_SUMMARY: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+    const OK_FINAL: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+    fn overflow_kind_names(sink: &crate::observability::VecContextTelemetry) -> Vec<&'static str> {
+        sink.events()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. } => {
+                    Some("overflow_started")
+                }
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. } => {
+                    Some("overflow_completed")
+                }
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. } => {
+                    Some("overflow_failed")
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn chat_with_telemetry(
+        provider: OpenAiProvider,
+        messages: Vec<ChatMessage>,
+    ) -> (
+        Arc<crate::observability::VecContextTelemetry>,
+        anyhow::Result<ProviderChatResponse>,
+    ) {
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        let result = crate::observability::with_context_telemetry(
+            Some("session-o1".to_string()),
+            Some("run-o1".to_string()),
+            "openai",
+            "overflow-model",
+            sink.clone(),
+            async {
+                provider
+                    .chat(ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        request_max_output_tokens: None,
+                    })
+                    .await
+            },
+        )
+        .await;
+        (sink, result)
+    }
+
+    #[tokio::test]
+    async fn generic_http_400_does_not_start_overflow_recovery() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(
+            400,
+            "{\"error\":{\"message\":\"bad request\"}}",
+        )])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert!(overflow_kind_names(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_http_403_does_not_start_overflow_recovery() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(
+            403,
+            "{\"error\":{\"message\":\"forbidden\"}}",
+        )])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert!(overflow_kind_names(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_overflow_starts_recovery() {
+        let (base_url, _requests) = serve_scripted(vec![Scripted::Status(400, overflow_error_body())])
+            .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, _result) =
+            chat_with_telemetry(provider, vec![ChatMessage::user("hi")]).await;
+        let names = overflow_kind_names(&sink);
+        assert_eq!(names.first().copied(), Some("overflow_started"));
+        assert!(!names.contains(&"overflow_completed"));
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_completed_only_after_successful_retry() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(200, OK_FINAL),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert_eq!(result.expect("retry succeeds").text.as_deref(), Some("Hello"));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. }
+                )
+            })
+            .expect("started");
+        let completed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. }
+                )
+            })
+            .expect("completed");
+        assert_eq!(started.operation_id, completed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. }
+            )
+        }));
+        let actuals: Vec<_> = sink
+            .snapshots()
+            .into_iter()
+            .filter(|s| s.measurement_kind == crate::observability::MeasurementKind::ProviderActual)
+            .collect();
+        assert!(actuals.iter().any(|s| s.provider_actual_input_tokens == Some(42)));
+        assert!(actuals.iter().all(|s| s.session_id.as_deref() == Some("session-o1")));
+        assert!(actuals.iter().all(|s| s.model == "overflow-model"));
+    }
+
+    #[tokio::test]
+    async fn second_overflow_emits_failed_not_completed() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(400, overflow_error_body()),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        let events = sink.events();
+        let started = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryStarted { .. }
+                )
+            })
+            .expect("started");
+        let failed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryFailed { .. }
+                )
+            })
+            .expect("failed");
+        assert_eq!(started.operation_id, failed.operation_id);
+        assert!(!events.iter().any(|e| {
+            matches!(
+                e.kind,
+                crate::observability::ContextLifecycleEventKind::ContextOverflowRecoveryCompleted { .. }
+            )
+        }));
+    }
+
+    const OK_SHOULD_NOT_REPLAY: &str = r#"{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"SHOULD_NOT_REPLAY"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+    #[tokio::test]
+    async fn r3_h_c1_blocks_oversized_flash_before_http() {
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(200, OK_FINAL)]).await;
+        let budget = ContextBudget::new(
+            1_000_000,
+            Some(384_000),
+            crate::providers::context_budget::ContextBudgetSource::BuiltIn,
+        )
+        .with_resolved_generation_limit(
+            crate::providers::generation_limit::resolve_generation_limit(None, Some(384_000)),
+        );
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts {
+                connect: Duration::from_millis(250),
+                stream_idle: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        )
+        .with_context_budget(Some(budget))
+        .with_generation_limit_source(GenerationLimitSource::ProductDefault);
+
+        let small = vec![ChatMessage::user("hi")];
+        let ok = provider
+            .chat(ProviderChatRequest {
+                messages: &small,
+                tools: None,
+                request_max_output_tokens: None,
+            })
+            .await
+            .expect("under-budget Flash request must reach the Provider");
+        assert_eq!(ok.text.as_deref(), Some("Hello"));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        let (base_url, requests) = serve_scripted(vec![Scripted::Status(200, OK_FINAL)]).await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "deepseek-v4-flash",
+            0.0,
+            Some(32_000),
+            ProviderTimeouts {
+                connect: Duration::from_millis(250),
+                stream_idle: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        )
+        .with_context_budget(Some(budget))
+        .with_generation_limit_source(GenerationLimitSource::ProductDefault);
+        let huge = vec![ChatMessage::user("x".repeat(800_000))];
+        let err = provider
+            .chat(ProviderChatRequest {
+                messages: &huge,
+                tools: None,
+                request_max_output_tokens: None,
+            })
+            .await
+            .expect_err("oversized request must die at C1");
+        assert!(
+            err.to_string().contains(CONTEXT_BUDGET_EXCEEDED_MARKER),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            0,
+            "C1 must not send an oversized HTTP body"
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_i_c3_retries_exactly_once_even_if_a_third_would_succeed() {
+        let (base_url, requests) = serve_scripted(vec![
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SUMMARY),
+            Scripted::Status(400, overflow_error_body()),
+            Scripted::Status(200, OK_SHOULD_NOT_REPLAY),
+        ])
+        .await;
+        let provider = OpenAiProvider::new(
+            Some(&base_url),
+            None,
+            "overflow-model",
+            0.0,
+            None,
+            ProviderTimeouts::default(),
+        )
+        .with_retry_backoff(Duration::from_millis(1));
+        let (sink, result) = chat_with_telemetry(provider, overflow_history()).await;
+        let err = result.expect_err("second overflow must fail after one recovery");
+        assert!(
+            !err.to_string().contains("SHOULD_NOT_REPLAY"),
+            "must not take a third logical attempt: {err}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            3,
+            "overflow + summary + one retry, not a third logical send"
+        );
+        let names = overflow_kind_names(&sink);
+        assert_eq!(names.first().copied(), Some("overflow_started"));
+        assert!(names.contains(&"overflow_failed"));
+        assert!(!names.contains(&"overflow_completed"));
+    }
+
+    #[tokio::test]
+    async fn r3_j_partial_output_does_not_replay_logical_request() {
+        let (result, deltas, attempts) = stream_against_script(
+            vec![
+                Scripted::SseTruncated(vec![delta_chunk("部分"), tool_call_chunk()]),
+                Scripted::Sse(vec![delta_chunk("REPLAYED"), sse_line("[DONE]")]),
+            ],
+            ProviderTimeouts::default(),
+        )
+        .await;
+        assert_eq!(attempts, 1, "partial output must veto a replay");
+        assert_eq!(deltas, vec!["部分"]);
+        let message = result
+            .expect_err("a truncated stream must fail")
+            .to_string();
+        assert!(
+            !message.contains("REPLAYED"),
+            "unexpected message: {message}"
         );
     }
 }

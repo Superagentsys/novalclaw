@@ -24,6 +24,9 @@ pub enum SessionEventKind {
         content: String,
         #[serde(default)]
         interrupted: bool,
+        /// Full original tool output when the model-visible content was pruned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_content: Option<String>,
     },
     Compact {
         summary: String,

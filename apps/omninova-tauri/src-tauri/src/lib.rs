@@ -6,8 +6,8 @@ use base64::Engine;
 use omninova_core::channels::{ChannelKind, InboundMessage};
 use omninova_core::config::{
     resolve_configured_skills_dir, ChannelEntry, ChannelsConfig, Config, GatewayPublicConfig,
-    GatewayPublicMode, ModelProviderConfig, ProviderConfig, ProviderTransportConfig, RobotConfig,
-    DEFAULT_OPEN_SKILLS_ENABLED,
+    GatewayPublicMode, ModelProviderConfig, PermissionMode, ProviderConfig,
+    ProviderTransportConfig, RobotConfig, DEFAULT_OPEN_SKILLS_ENABLED,
 };
 use omninova_core::cron::{
     now_timestamp, CronJob, CronRun, CronRunStore, CronScheduler, CronStore, Schedule,
@@ -19,11 +19,15 @@ use omninova_core::gateway::{
     check_dingtalk_public_route, check_gateway_public_health,
     dingtalk_diagnostic_config_state, feishu_diagnostic_config_state,
     feishu_public_callback_urls, normalize_gateway_public_config,
-    normalize_public_webhook_base_url, AgentJobExecutor, GatewayHealth, GatewayInboundResponse,
+    normalize_public_webhook_base_url, AgentJobExecutor, GatewayHealth,     GatewayInboundResponse, GatewayContextProjectionResponse,
     DingtalkPublicRouteProbe, GatewayPublicHealthStatus, GatewayRuntime, GatewayRuntimeStatus,
     GatewaySessionHistoryResponse, GatewaySessionTreeQuery, GatewaySessionTreeResponse,
 };
 use omninova_core::providers::{ProviderSelection, build_provider_with_selection};
+use omninova_core::tools::{
+    agent_browser_runtime_available, cleanup_owned_browser_sessions, resolve_agent_browser_binary,
+    set_agent_browser_search_roots, sync_browser_enabled_with_runtime, AGENT_BROWSER_BIN_ENV,
+};
 use omninova_core::routing::RouteDecision;
 use omninova_core::skills::{
     import_skills_from_dir, load_skills_from_dir, skill_runtime_snapshot, skillhub_categories,
@@ -153,7 +157,6 @@ struct AppState {
     last_public_health: Option<GatewayPublicHealthStatus>,
 }
 
-const EMBEDDED_AGENT_BROWSER_BIN_ENV: &str = "OMNINOVA_AGENT_BROWSER_BIN";
 const WEBVIEW2_DATA_DIR_ENV: &str = "OMNINOVA_WEBVIEW2_DATA_DIR";
 const OPEN_DEVTOOLS_ENV: &str = "OMNINOVA_OPEN_DEVTOOLS";
 const WEBVIEW2_LOCK_SCAN_MAX_DEPTH: usize = 4;
@@ -348,119 +351,32 @@ fn log_webview_startup_diagnostics(diagnostics: &WebviewStartupDiagnostics) {
     );
 }
 
-fn resolve_embedded_agent_browser_relative_path() -> Option<&'static str> {
-    match std::env::consts::OS {
-        "macos" => Some("agent-browser/macos/agent-browser"),
-        "linux" => Some("agent-browser/linux/agent-browser"),
-        "windows" => Some("agent-browser/windows/agent-browser.exe"),
-        _ => None,
-    }
-}
-
 fn configure_embedded_agent_browser_env(app_handle: &tauri::AppHandle) {
-    let Some(relative_path) = resolve_embedded_agent_browser_relative_path() else {
-        return;
-    };
-
-    let Ok(resource_dir) = app_handle.path().resource_dir() else {
-        eprintln!("[browser] failed to resolve resource_dir");
-        return;
-    };
-
-    let candidates = [
-        resource_dir.join(relative_path),
-        resource_dir.join("resources").join(relative_path),
-    ];
-
-    if let Some(found) = candidates.iter().find(|path| is_working_agent_browser_binary(path)) {
-        std::env::set_var(
-            EMBEDDED_AGENT_BROWSER_BIN_ENV,
-            found.to_string_lossy().into_owned(),
-        );
-        eprintln!(
-            "[browser] using embedded binary from {}",
-            found.to_string_lossy()
-        );
-        return;
-    }
-
-    if let Some(found) = detect_agent_browser_binary() {
-        std::env::set_var(
-            EMBEDDED_AGENT_BROWSER_BIN_ENV,
-            found.to_string_lossy().into_owned(),
-        );
-        eprintln!(
-            "[browser] using system binary from {}",
-            found.to_string_lossy()
-        );
-    } else {
-        eprintln!(
-            "[browser] embedded binary not found. looked for: {}",
-            candidates
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
-fn is_working_agent_browser_binary(path: &std::path::Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    let mut command = StdCommand::new(path);
-    hide_std_command_window(&mut command);
-    let Ok(output) = command
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
-fn detect_agent_browser_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(EMBEDDED_AGENT_BROWSER_BIN_ENV) {
-        let candidate = PathBuf::from(path);
-        if is_working_agent_browser_binary(&candidate) {
-            return Some(candidate);
+    let mut roots = Vec::new();
+    match app_handle.path().resource_dir() {
+        Ok(dir) => {
+            eprintln!("[browser] resource_dir={}", dir.display());
+            roots.push(dir);
+        }
+        Err(error) => {
+            eprintln!("[browser] failed to resolve resource_dir: {error}");
         }
     }
+    set_agent_browser_search_roots(roots);
 
-    let static_candidates = [
-        "/opt/homebrew/bin/agent-browser",
-        "/usr/local/bin/agent-browser",
-        "/usr/bin/agent-browser",
-    ];
-    for candidate in static_candidates {
-        let path = PathBuf::from(candidate);
-        if is_working_agent_browser_binary(&path) {
-            return Some(path);
+    match resolve_agent_browser_binary() {
+        Ok(resolved) => {
+            std::env::set_var(AGENT_BROWSER_BIN_ENV, resolved.path.as_os_str());
+            eprintln!(
+                "[browser] resolved binary source={} path={}",
+                resolved.source.as_str(),
+                resolved.path.display()
+            );
+        }
+        Err(missing) => {
+            eprintln!("[browser] {missing}");
         }
     }
-
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let mut dynamic_candidates = vec![
-            home.join(".npm-global/bin/agent-browser"),
-            home.join(".local/bin/agent-browser"),
-        ];
-        let nvm_versions = home.join(".nvm/versions/node");
-        if let Ok(entries) = std::fs::read_dir(nvm_versions) {
-            for entry in entries.flatten() {
-                dynamic_candidates.push(entry.path().join("bin/agent-browser"));
-            }
-        }
-        for candidate in dynamic_candidates {
-            if is_working_agent_browser_binary(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +393,12 @@ struct SetupProviderConfig {
     enabled: bool,
     #[serde(default)]
     transport: ProviderTransportConfig,
+    #[serde(default)]
+    context_window_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    request_max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -489,6 +411,34 @@ struct SetupMultimodalConfig {
 
 fn default_desktop_vision_max_dimension_px() -> u32 {
     1280
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetupComputerUseConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_computer_use_allowed_apps")]
+    allowed_apps: Vec<String>,
+    #[serde(default = "default_true_computer_use_screenshot")]
+    require_screenshot_before_click: bool,
+}
+
+impl Default for SetupComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_apps: default_computer_use_allowed_apps(),
+            require_screenshot_before_click: true,
+        }
+    }
+}
+
+fn default_computer_use_allowed_apps() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn default_true_computer_use_screenshot() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -516,6 +466,7 @@ struct SetupWorkspaceStatus {
 
 const APPROVAL_PROFILE_REQUEST: &str = "request_approval";
 const APPROVAL_PROFILE_RISK_BASED: &str = "risk_based";
+const APPROVAL_PROFILE_FULL_ACCESS: &str = "full_access";
 
 /// Tools whose normal use can mutate the workspace or contact an external
 /// service. Both legacy `[autonomy]` and the newer `[approvals]` table must
@@ -528,6 +479,7 @@ const APPROVAL_CONTROLLED_TOOLS: &[&str] = &[
     "apply_patch",
     "git_operations",
     "browser",
+    "computer_use",
     "http_request",
 ];
 
@@ -548,7 +500,13 @@ struct ApprovalProfilePayload {
 }
 
 fn approval_profile_payload(profile: &str) -> ApprovalProfilePayload {
-    if profile == APPROVAL_PROFILE_RISK_BASED {
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        ApprovalProfilePayload {
+            profile: APPROVAL_PROFILE_FULL_ACCESS.to_string(),
+            label: "Full Access".to_string(),
+            description: "无需确认即可访问文件、运行命令、控制浏览器和使用网络。".to_string(),
+        }
+    } else if profile == APPROVAL_PROFILE_RISK_BASED {
         ApprovalProfilePayload {
             profile: APPROVAL_PROFILE_RISK_BASED.to_string(),
             label: "帮我批准".to_string(),
@@ -589,6 +547,13 @@ fn ensure_tool_entries(list: &mut Vec<String>, tools: &[&str]) {
 /// was contradictory. Treat that legacy shape as the risk-based profile so an
 /// upgrade does not unexpectedly block edits meant to run automatically.
 fn configured_approval_profile(config: &Config) -> &'static str {
+    if config.permissions.is_full_access() {
+        return APPROVAL_PROFILE_FULL_ACCESS;
+    }
+    configured_restricted_approval_profile(config)
+}
+
+fn configured_restricted_approval_profile(config: &Config) -> &'static str {
     if config.approvals.mode.as_deref() == Some(APPROVAL_PROFILE_RISK_BASED) {
         return APPROVAL_PROFILE_RISK_BASED;
     }
@@ -609,11 +574,28 @@ fn configured_approval_profile(config: &Config) -> &'static str {
 }
 
 fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, String> {
-    if profile != APPROVAL_PROFILE_REQUEST && profile != APPROVAL_PROFILE_RISK_BASED {
+    if profile != APPROVAL_PROFILE_REQUEST
+        && profile != APPROVAL_PROFILE_RISK_BASED
+        && profile != APPROVAL_PROFILE_FULL_ACCESS
+    {
         return Err("未知的权限策略。".to_string());
     }
 
+    if profile == APPROVAL_PROFILE_FULL_ACCESS {
+        let changed = !config.permissions.is_full_access();
+        config.permissions.mode = PermissionMode::FullAccess;
+        return Ok(changed);
+    }
+
+    if config.permissions.is_full_access()
+        && configured_restricted_approval_profile(config) == profile
+    {
+        config.permissions.mode = PermissionMode::Restricted;
+        return Ok(true);
+    }
+
     let before = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -623,6 +605,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
         config.approvals.require_approval.clone(),
     );
 
+    config.permissions.mode = PermissionMode::Restricted;
     config.autonomy.level = "supervised".to_string();
     // Shell commands still pass through the explicit allowlist and dangerous
     // command deny list. Keep medium-risk commands available so the approval
@@ -654,6 +637,7 @@ fn apply_approval_profile(config: &mut Config, profile: &str) -> Result<bool, St
     }
 
     let after = (
+        config.permissions.mode,
         config.autonomy.level.clone(),
         config.autonomy.require_approval_for_medium_risk,
         config.autonomy.auto_approve.clone(),
@@ -686,6 +670,8 @@ struct SetupAppConfig {
     channels: Option<SetupChannelsConfig>,
     #[serde(default)]
     multimodal: SetupMultimodalConfig,
+    #[serde(default)]
+    computer_use: SetupComputerUseConfig,
     #[serde(default)]
     observability: SetupObservabilityConfig,
     #[serde(default)]
@@ -1346,6 +1332,317 @@ async fn reject_tool_request(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_browser_takeover_state(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .get_browser_takeover_state(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn request_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .request_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn release_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .release_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_browser_takeover(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<omninova_core::gateway::BrowserTakeoverStateDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    runtime
+        .cancel_browser_takeover(&run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn install_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .install_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn verify_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .verify_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn remove_personal_chrome_bridge(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    bridge
+        .remove_bridge()
+        .await
+        .map_err(|err| err.code().to_string())
+}
+
+#[tauri::command]
+async fn get_personal_chrome_bridge_status(
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<omninova_browser_host::TransportStatus, String> {
+    Ok(bridge.status().await)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersonalChromeAuthorizationStatusDto {
+    run_id: String,
+    configured: bool,
+    state: String,
+    transport_connected: bool,
+    protocol_version: u32,
+    extension_tab_granted: bool,
+    desktop_run_granted: bool,
+    authorization_generation: Option<u64>,
+    production_factory_enabled: bool,
+    full_access: bool,
+    ready: bool,
+    error_code: Option<String>,
+}
+
+async fn read_extension_tab_grant(
+    bridge: &omninova_browser_host::PersonalChromeBridge,
+) -> Result<Option<(i32, i32, u64)>, String> {
+    let response = bridge
+        .request("tab_list_authorized", "", serde_json::json!({}))
+        .await
+        .map_err(|error| error.code().to_string())?;
+    if !response.ok {
+        return Err(response
+            .error
+            .map(|error| error.code)
+            .unwrap_or_else(|| "PersonalChromeAuthorizationFailed".to_string()));
+    }
+    let tabs = response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("tabs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tabs.is_empty() {
+        return Ok(None);
+    }
+    if tabs.len() != 1 {
+        return Err("PersonalChromeAuthorizationAmbiguous".to_string());
+    }
+    let tab = &tabs[0];
+    let window_id = tab
+        .get("window_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())? as i32;
+    let tab_id = tab
+        .get("tab_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())? as i32;
+    let generation = tab
+        .get("authorization_generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "PersonalChromeAuthorizationInvalid".to_string())?;
+    Ok(Some((window_id, tab_id, generation)))
+}
+
+async fn personal_chrome_authorization_status(
+    run_id: &str,
+    runtime: &GatewayRuntime,
+    bridge: &omninova_browser_host::PersonalChromeBridge,
+) -> PersonalChromeAuthorizationStatusDto {
+    let transport = bridge.status().await;
+    let config = runtime.get_config().await;
+    let full_access = config.permissions.is_full_access();
+    let configured = config.browser.enabled
+        && config.browser.backend.trim().eq_ignore_ascii_case("personal-chrome");
+    let extension = if transport.connected {
+        read_extension_tab_grant(bridge).await
+    } else {
+        Ok(None)
+    };
+    let desktop = runtime.personal_chrome_grant_for_run(run_id).await;
+    let extension_tab_granted = matches!(extension, Ok(Some(_)));
+    let desktop_run_granted = full_access || matches!(desktop, Ok(Some(_)));
+    let authorization_generation = if full_access {
+        extension
+            .as_ref()
+            .ok()
+            .and_then(|grant| grant.as_ref().map(|(_, _, generation)| *generation))
+    } else {
+        personal_chrome_grant_matches(&extension, &desktop)
+    };
+    let production_factory_enabled =
+        full_access
+            || omninova_core::tools::browser_personal_chrome::personal_chrome_production_enabled();
+    let ready = transport.connected
+        && extension_tab_granted
+        && desktop_run_granted
+        && authorization_generation.is_some()
+        && production_factory_enabled;
+    let error_code = extension
+        .as_ref()
+        .err()
+        .cloned()
+        .or_else(|| {
+            (!full_access)
+                .then(|| desktop.as_ref().err().map(ToString::to_string))
+                .flatten()
+        });
+    let state = if !transport.connected {
+        transport.state.clone()
+    } else if error_code.is_some() {
+        "authorization_error".to_string()
+    } else if !extension_tab_granted {
+        "no_tab_authorized".to_string()
+    } else if !desktop_run_granted {
+        "awaiting_desktop_approval".to_string()
+    } else if authorization_generation.is_none() {
+        "authorization_stale".to_string()
+    } else if !production_factory_enabled {
+        "authorized_release_gate_closed".to_string()
+    } else {
+        "ready".to_string()
+    };
+    PersonalChromeAuthorizationStatusDto {
+        run_id: run_id.to_string(),
+        configured,
+        state,
+        transport_connected: transport.connected,
+        protocol_version: transport.protocol_version,
+        extension_tab_granted,
+        desktop_run_granted,
+        authorization_generation,
+        production_factory_enabled,
+        full_access,
+        ready,
+        error_code,
+    }
+}
+
+fn personal_chrome_grant_matches(
+    extension: &Result<Option<(i32, i32, u64)>, String>,
+    desktop: &Result<
+        Option<omninova_core::gateway::PersonalChromeRunGrant>,
+        omninova_core::gateway::BrowserTakeoverRouteError,
+    >,
+) -> Option<u64> {
+    match (extension, desktop) {
+        (Ok(Some((window_id, tab_id, generation))), Ok(Some(grant)))
+            if *window_id == grant.window_id
+                && *tab_id == grant.tab_id
+                && *generation == grant.authorization_generation =>
+        {
+            Some(*generation)
+        }
+        _ => None,
+    }
+}
+
+#[tauri::command]
+async fn get_personal_chrome_authorization_status(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
+}
+
+#[tauri::command]
+async fn approve_personal_chrome_for_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let config = runtime.get_config().await;
+    if !config.browser.enabled
+        || !config
+            .browser
+            .backend
+            .trim()
+            .eq_ignore_ascii_case("personal-chrome")
+    {
+        return Err("PersonalChromeNotConfigured".to_string());
+    }
+    let (window_id, tab_id, generation) = read_extension_tab_grant(&bridge)
+        .await?
+        .ok_or_else(|| "PersonalChromeNotAuthorized".to_string())?;
+    runtime
+        .grant_personal_chrome_for_run(&run_id, window_id, tab_id, generation)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
+}
+
+#[tauri::command]
+async fn revoke_personal_chrome_for_run(
+    run_id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    bridge: tauri::State<'_, omninova_browser_host::PersonalChromeBridge>,
+) -> Result<PersonalChromeAuthorizationStatusDto, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let _ = bridge
+        .request("revoke_authorization", "", serde_json::json!({}))
+        .await;
+    runtime
+        .revoke_personal_chrome_for_run(&run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(personal_chrome_authorization_status(&run_id, &runtime, &bridge).await)
+}
+
 async fn workspace_dir_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> PathBuf {
     let runtime = {
         let app_state = state.lock().await;
@@ -1380,7 +1677,12 @@ async fn open_knowledge_store(
 }
 
 async fn spawn_desktop_automation_scheduler(runtime: GatewayRuntime) {
-    let workspace = runtime.get_config().await.workspace_dir;
+    let cfg = runtime.get_config().await;
+    if !cfg.scheduler.enabled && !cfg.computer_use.enabled {
+        eprintln!("[automation] scheduler skipped (scheduler.enabled=false)");
+        return;
+    }
+    let workspace = cfg.workspace_dir;
     let store = match CronStore::open(workspace.join("cron.json")).await {
         Ok(store) => store,
         Err(error) => {
@@ -1429,6 +1731,8 @@ struct AutomationJobInput {
     #[serde(default)]
     description: String,
     template_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     tz_offset_minutes: Option<i32>,
     enabled: Option<bool>,
 }
@@ -1459,6 +1763,14 @@ fn build_cron_job(input: AutomationJobInput, existing: Option<CronJob>) -> Resul
         command: String::new(),
         description: input.description.trim().to_string(),
         template_id: input.template_id.filter(|value| !value.is_empty()),
+        provider: input
+            .provider
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| existing.as_ref().and_then(|job| job.provider.clone())),
+        model: input
+            .model
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| existing.as_ref().and_then(|job| job.model.clone())),
         tz_offset_minutes,
         enabled: input.enabled.unwrap_or(existing.as_ref().map(|job| job.enabled).unwrap_or(true)),
         last_run: existing.as_ref().and_then(|job| job.last_run.clone()),
@@ -1515,9 +1827,17 @@ async fn automation_delete_job(
 async fn automation_set_enabled(
     id: String,
     enabled: bool,
+    provider: Option<String>,
+    model: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<CronJob>, String> {
     let store = open_cron_store(&state).await?;
+    if enabled && (provider.is_some() || model.is_some()) {
+        store
+            .set_route(&id, provider, model)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let found = store
         .set_enabled(&id, enabled)
         .await
@@ -1540,6 +1860,8 @@ async fn automation_set_enabled(
 #[tauri::command]
 async fn automation_run_now(
     id: String,
+    provider: Option<String>,
+    model: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<CronRun, String> {
     let runtime = {
@@ -1550,6 +1872,12 @@ async fn automation_run_now(
     let store = CronStore::open(workspace.join("cron.json"))
         .await
         .map_err(|error| error.to_string())?;
+    if provider.is_some() || model.is_some() {
+        store
+            .set_route(&id, provider, model)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let runs = CronRunStore::open(workspace.join("cron_runs.json"))
         .await
         .map_err(|error| error.to_string())?;
@@ -1595,7 +1923,9 @@ struct KnowledgeUpsertInput {
 #[serde(rename_all = "camelCase")]
 struct KnowledgeImportFile {
     name: String,
+    #[serde(default)]
     content: String,
+    content_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1620,6 +1950,18 @@ async fn knowledge_collections(
 ) -> Result<Vec<String>, String> {
     let store = open_knowledge_store(&state).await?;
     Ok(store.collections().await)
+}
+
+#[tauri::command]
+async fn knowledge_collection_update(
+    name: String,
+    replacement: Option<String>,
+    delete: Option<bool>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    open_knowledge_store(&state).await?.update_collection(
+        &name, replacement.as_deref(), delete.unwrap_or(false),
+    ).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1676,9 +2018,14 @@ async fn knowledge_import(
         );
     }
     for file in files.unwrap_or_default() {
+        let bytes = match file.content_base64 {
+            Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)
+                .map_err(|e| format!("{}: invalid base64: {e}", file.name))?,
+            None => file.content.into_bytes(),
+        };
         imported.push(
             store
-                .import_bytes(&file.name, file.content.as_bytes(), collection.as_deref(), tags.clone())
+                .import_bytes(&file.name, &bytes, collection.as_deref(), tags.clone())
                 .await
                 .map_err(|error| format!("{}: {error}", file.name))?,
         );
@@ -1789,6 +2136,38 @@ async fn get_chat_session_history(
         .await)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiContextProjectionQuery {
+    session_id: String,
+    #[serde(default)]
+    channel: Option<ChannelKind>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[tauri::command]
+async fn project_session_context(
+    query: UiContextProjectionQuery,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GatewayContextProjectionResponse, String> {
+    let runtime = {
+        let app_state = state.lock().await;
+        app_state.runtime.clone()
+    };
+    let channel = query.channel.unwrap_or(ChannelKind::Web);
+    Ok(runtime
+        .project_session_context(
+            &channel,
+            &query.session_id,
+            query.provider,
+            query.model,
+        )
+        .await)
+}
+
 #[tauri::command]
 async fn delete_chat_session(
     query: UiSessionHistoryQuery,
@@ -1829,12 +2208,40 @@ struct DepStatusPayload {
     detail: String,
 }
 
+fn chromium_status_from_doctor(stdout: &[u8]) -> Result<String, String> {
+    let payload: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("browser doctor returned invalid JSON: {error}"))?;
+    let check = payload
+        .get("checks")
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check.get("id").and_then(Value::as_str) == Some("chrome.installed"))
+        })
+        .ok_or_else(|| "browser doctor did not report Chromium status".to_string())?;
+    let message = check
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Chromium status unavailable")
+        .to_string();
+    if check.get("status").and_then(Value::as_str) == Some("pass") {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillSummaryItem {
     name: String,
     description: String,
     subdomain: Option<String>,
+    slug: Option<String>,
+    icon: Option<String>,
+    #[serde(rename = "iconUrl")]
+    icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1862,39 +2269,64 @@ struct SkillHubInstallResult {
 
 #[tauri::command]
 async fn check_browser_dep() -> Result<DepStatusPayload, String> {
-    if let Some(path) = detect_agent_browser_binary() {
-        let version = check_command_installed(path.to_string_lossy().as_ref(), "--version").await;
-        if version.installed {
-            return Ok(DepStatusPayload {
-                name: "agent-browser".to_string(),
-                installed: true,
+    match resolve_agent_browser_binary() {
+        Ok(resolved) => {
+            let path = resolved.path.to_string_lossy().into_owned();
+            let version = check_command_installed(&path, "--version").await;
+            if !version.installed {
+                return Ok(DepStatusPayload {
+                    name: "browser-runtime".to_string(),
+                    installed: false,
+                    version: None,
+                    detail: format!(
+                        "agent-browser CLI cannot run (source={})",
+                        resolved.source.as_str()
+                    ),
+                });
+            }
+
+            let mut doctor = tokio::process::Command::new(&resolved.path);
+            hide_tokio_command_window(&mut doctor);
+            let output = doctor
+                .args(["doctor", "--offline", "--quick", "--json"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await;
+            let chromium = output
+                .map_err(|error| format!("browser doctor could not start: {error}"))
+                .and_then(|output| chromium_status_from_doctor(&output.stdout));
+            let (installed, chromium_detail) = match chromium {
+                Ok(detail) => (true, detail),
+                Err(detail) => (false, detail),
+            };
+            Ok(DepStatusPayload {
+                name: "browser-runtime".to_string(),
+                installed,
                 version: version.version,
-                detail: format!("{} ({})", version.detail, path.to_string_lossy()),
-            });
+                detail: format!(
+                    "{chromium_detail} (agent-browser source={})",
+                    resolved.source.as_str()
+                ),
+            })
         }
+        Err(missing) => Ok(DepStatusPayload {
+            name: "browser-runtime".to_string(),
+            installed: false,
+            version: None,
+            detail: missing.to_string(),
+        }),
     }
-    let status = check_command_installed("agent-browser", "--version").await;
-    Ok(status)
 }
 
 #[tauri::command]
 async fn install_browser_dep() -> Result<DepStatusPayload, String> {
-    let mut npm_command = tokio::process::Command::new("npm");
-    hide_tokio_command_window(&mut npm_command);
-    let npm_out = npm_command
-        .args(["install", "-g", "agent-browser"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("npm install failed: {e}"))?;
-    if !npm_out.status.success() {
-        let stderr = String::from_utf8_lossy(&npm_out.stderr);
-        return Err(format!("npm install -g agent-browser failed: {stderr}"));
-    }
-
-    let agent_browser_cmd = detect_agent_browser_binary()
-        .unwrap_or_else(|| PathBuf::from("agent-browser"));
+    let agent_browser_cmd = match resolve_agent_browser_binary() {
+        Ok(resolved) => resolved.path,
+        Err(missing) => {
+            return Err(missing.to_string());
+        }
+    };
     let mut chromium_command = tokio::process::Command::new(&agent_browser_cmd);
     hide_tokio_command_window(&mut chromium_command);
     let chromium_out = chromium_command
@@ -1910,7 +2342,14 @@ async fn install_browser_dep() -> Result<DepStatusPayload, String> {
     }
 
     let status = check_browser_dep().await?;
-    Ok(status)
+    if status.installed {
+        Ok(status)
+    } else {
+        Err(format!(
+            "agent-browser install completed, but Chromium is still unavailable: {}",
+            status.detail
+        ))
+    }
 }
 
 async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayload {
@@ -1942,6 +2381,182 @@ async fn check_command_installed(bin: &str, version_flag: &str) -> DepStatusPayl
             version: None,
             detail: "not installed".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod browser_dep_tests {
+    use super::chromium_status_from_doctor;
+
+    #[test]
+    fn doctor_reports_chromium_ready_only_for_a_passing_install_check() {
+        let ready = br#"{"checks":[{"id":"chrome.installed","status":"pass","message":"Chrome ready"}]}"#;
+        assert_eq!(chromium_status_from_doctor(ready).unwrap(), "Chrome ready");
+
+        let missing = br#"{"checks":[{"id":"chrome.installed","status":"fail","message":"Chrome missing"}]}"#;
+        assert_eq!(
+            chromium_status_from_doctor(missing).unwrap_err(),
+            "Chrome missing"
+        );
+    }
+
+    #[test]
+    fn doctor_without_a_chromium_check_is_not_reported_as_ready() {
+        let unrelated = br#"{"checks":[{"id":"env.version","status":"pass"}]}"#;
+        assert!(
+            chromium_status_from_doctor(unrelated)
+                .unwrap_err()
+                .contains("did not report Chromium")
+        );
+    }
+}
+
+#[cfg(test)]
+mod browser_takeover_command_tests {
+    use omninova_core::gateway::{BrowserTakeoverRouteError, BrowserTakeoverStateDto};
+
+    #[test]
+    fn takeover_dto_and_errors_serialize_without_runtime_construction() {
+        let dto = BrowserTakeoverStateDto {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            phase: "human_controlled".into(),
+            owner: "human".into(),
+            generation: 2,
+            reason: Some("explicit_user_request".into()),
+            since_ms: 1,
+            eligible: true,
+            headless: false,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["run_id"], "run-1");
+        assert_eq!(value["phase"], "human_controlled");
+        assert!(value.get("pid").is_none());
+        assert!(value.get("hwnd").is_none());
+        assert!(value.get("cdp_url").is_none());
+        let missing = BrowserTakeoverRouteError::RunNotFound.to_string();
+        assert!(missing.starts_with("BrowserTakeoverRunNotFound"));
+        let unavailable = BrowserTakeoverRouteError::Unavailable.to_string();
+        assert!(unavailable.starts_with("BrowserTakeoverUnavailable"));
+        let headless = BrowserTakeoverRouteError::Runtime {
+            code: "BrowserTakeoverUnsupportedHeadless".into(),
+            message: "headed required".into(),
+        }
+        .to_string();
+        assert!(headless.contains("BrowserTakeoverUnsupportedHeadless"));
+    }
+
+    #[test]
+    fn takeover_commands_are_registered_by_name() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "get_browser_takeover_state",
+            "request_browser_takeover",
+            "release_browser_takeover",
+            "cancel_browser_takeover",
+        ] {
+            assert!(
+                registered.contains(command),
+                "missing command {command}"
+            );
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(
+            !registered.contains(&runtime_ctor),
+            "Tauri must not construct BrowserRuntime"
+        );
+    }
+}
+
+#[cfg(test)]
+mod personal_chrome_bridge_command_tests {
+    use super::{personal_chrome_grant_matches, PersonalChromeAuthorizationStatusDto};
+    use omninova_core::gateway::PersonalChromeRunGrant;
+
+    #[test]
+    fn personal_chrome_bridge_commands_are_registered_and_do_not_expose_secrets() {
+        let registered = include_str!("lib.rs");
+        for command in [
+            "install_personal_chrome_bridge",
+            "verify_personal_chrome_bridge",
+            "remove_personal_chrome_bridge",
+            "get_personal_chrome_bridge_status",
+            "get_personal_chrome_authorization_status",
+            "approve_personal_chrome_for_run",
+            "revoke_personal_chrome_for_run",
+        ] {
+            assert!(registered.contains(command), "missing command {command}");
+            assert!(
+                registered.contains(&format!("{command},")),
+                "command {command} must be listed in generate_handler"
+            );
+        }
+        let forbidden_backend = ["Personal", "Chrome", "Backend"].concat();
+        let secret_file = ["ipc", ".", "secret"].concat();
+        assert!(!registered.contains(&forbidden_backend));
+        assert!(!registered.contains(&secret_file));
+        let runtime_ctor = ["Browser", "Runtime", "::new("].concat();
+        assert!(!registered.contains(&runtime_ctor));
+    }
+
+    #[test]
+    fn personal_chrome_authorization_status_is_metadata_only() {
+        let dto = PersonalChromeAuthorizationStatusDto {
+            run_id: "run-a".to_string(),
+            configured: true,
+            state: "awaiting_desktop_approval".to_string(),
+            transport_connected: true,
+            protocol_version: 1,
+            extension_tab_granted: true,
+            desktop_run_granted: false,
+            authorization_generation: None,
+            production_factory_enabled: false,
+            full_access: false,
+            ready: false,
+            error_code: None,
+        };
+        let value = serde_json::to_value(dto).unwrap();
+        let object = value.as_object().unwrap();
+        for forbidden in [
+            "url",
+            "title",
+            "cookie",
+            "token",
+            "secret",
+            "window_id",
+            "tab_id",
+        ] {
+            assert!(
+                !object.keys().any(|key| key.contains(forbidden)),
+                "authorization status leaked forbidden key {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_grant_requires_exact_window_tab_and_generation_match() {
+        let desktop = Ok(Some(PersonalChromeRunGrant {
+            run_id: "run-a".to_string(),
+            window_id: 1,
+            tab_id: 2,
+            authorization_generation: 3,
+        }));
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 2, 3))), &desktop),
+            Some(3)
+        );
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 9, 3))), &desktop),
+            None
+        );
+        assert_eq!(
+            personal_chrome_grant_matches(&Ok(Some((1, 2, 4))), &desktop),
+            None
+        );
     }
 }
 
@@ -2577,10 +3192,44 @@ async fn skills_package_summary(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+            let slug = skill
+                .path
+                .strip_prefix(&target)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .map(|component| component.as_os_str().to_string_lossy().to_string())
+                .filter(|value| !value.is_empty());
+            let icon = skill
+                .metadata
+                .metadata
+                .get("emoji")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    skill.metadata.metadata
+                        .get("openclaw")
+                        .and_then(|value| value.get("emoji"))
+                        .and_then(|value| value.as_str())
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let icon_url = ["iconUrl", "icon_url", "logoUrl", "logo_url", "icon", "logo"]
+                .iter()
+                .find_map(|key| {
+                    skill.metadata.metadata
+                        .get(*key)
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+                        .map(str::to_string)
+                });
             SkillSummaryItem {
                 name: skill.metadata.name.clone(),
                 description,
                 subdomain,
+                slug,
+                icon,
+                icon_url,
             }
         })
         .collect::<Vec<_>>();
@@ -3104,6 +3753,9 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 models: with_default_model(provider.models.clone(), provider.default_model.clone()),
                 enabled: provider.enabled,
                 transport: provider.transport,
+                context_window_tokens: provider.context_window_tokens,
+                max_output_tokens: provider.max_output_tokens,
+                request_max_output_tokens: provider.request_max_output_tokens,
             })
             .collect::<Vec<_>>()
     } else {
@@ -3119,6 +3771,9 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
                 models: provider.models.clone(),
                 enabled: provider.enabled,
                 transport: ProviderTransportConfig::default(),
+                context_window_tokens: None,
+                max_output_tokens: None,
+                request_max_output_tokens: None,
             })
             .collect::<Vec<_>>()
     };
@@ -3159,6 +3814,11 @@ fn setup_config_from_core(config: &Config) -> SetupAppConfig {
         multimodal: SetupMultimodalConfig {
             desktop_vision_enabled: config.multimodal.desktop_vision_enabled,
             desktop_vision_max_dimension_px: config.multimodal.desktop_vision_max_dimension_px,
+        },
+        computer_use: SetupComputerUseConfig {
+            enabled: config.computer_use.enabled,
+            allowed_apps: config.computer_use.allowed_apps.clone(),
+            require_screenshot_before_click: config.computer_use.require_screenshot_before_click,
         },
         observability: SetupObservabilityConfig {
             prometheus_enabled: config.observability.prometheus_enabled,
@@ -3340,6 +4000,8 @@ fn default_provider_base_url(id: &str, config: &Config) -> Option<String> {
         "xai" => Some("https://api.x.ai/v1".to_string()),
         "mistral" => Some("https://api.mistral.ai/v1".to_string()),
         "lmstudio" => Some("http://localhost:1234/v1".to_string()),
+        "omnirun" => Some("http://localhost:28090/v1".to_string()),
+        "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
         _ => None,
     }
 }
@@ -3423,6 +4085,36 @@ fn setup_config_to_core(
                     enabled: provider.enabled,
                     timeout_secs: None,
                     transport: provider.transport,
+                    context_window_tokens: provider.context_window_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.context_window_tokens)
+                    }),
+                    max_output_tokens: provider.max_output_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.max_output_tokens)
+                    }),
+                    request_max_output_tokens: provider.request_max_output_tokens.or_else(|| {
+                        current
+                            .model_providers
+                            .get(&provider.id)
+                            .and_then(|p| p.request_max_output_tokens)
+                    }),
+                    exact_tokenizer: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.exact_tokenizer.clone()),
+                    canonical_model: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.canonical_model.clone()),
+                    provider_family: current
+                        .model_providers
+                        .get(&provider.id)
+                        .and_then(|p| p.provider_family.clone()),
                 },
             )
         })
@@ -3475,6 +4167,24 @@ fn setup_config_to_core(
         .multimodal
         .desktop_vision_max_dimension_px
         .max(320);
+
+    current.computer_use.enabled = setup.computer_use.enabled;
+    current.computer_use.allowed_apps = setup
+        .computer_use
+        .allowed_apps
+        .into_iter()
+        .map(|app| app.trim().to_string())
+        .filter(|app| !app.is_empty())
+        .collect();
+    current.computer_use.require_screenshot_before_click =
+        setup.computer_use.require_screenshot_before_click;
+    // Approval handling for `computer_use` belongs to the approval profile
+    // applied by `ensure_desktop_automation_capabilities`. Force-adding it to
+    // `require_approval` here also contradicted the auto-approve list and made
+    // every click wait for a human, so a desktop task could never run through.
+    if current.computer_use.enabled {
+        current.scheduler.enabled = true;
+    }
 
     current.observability.prometheus_enabled = setup.observability.prometheus_enabled;
     current.observability.prometheus_port = setup.observability.prometheus_port;
@@ -3607,8 +4317,10 @@ fn protect_channel_extra_fields(config: &mut Config) {
 fn ensure_desktop_automation_capabilities(config: &mut Config) -> bool {
     let mut changed = false;
 
-    if !config.browser.enabled {
-        config.browser.enabled = true;
+    if sync_browser_enabled_with_runtime(
+        &mut config.browser.enabled,
+        agent_browser_runtime_available(),
+    ) {
         changed = true;
     }
 
@@ -4161,6 +4873,11 @@ fn collect_recent_workspace_files(
             Ok(value) => value.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
+        // Office build XML is an implementation detail, not a task
+        // deliverable. The finished document is collected separately.
+        if artifact_extension(&path) == "xml" {
+            continue;
+        }
         output.push(CollectedTaskArtifact {
             extension: artifact_extension(&path),
             path: relative,
@@ -4733,6 +5450,18 @@ fn task_artifact_preview(
             let bytes = std::fs::read(&resolved).map_err(|error| error.to_string())?;
             data_url = Some(safe_svg_preview_data_url(&bytes)?);
         }
+    } else if matches!(extension.as_str(), "docx" | "pptx" | "xlsx") {
+        kind = "text".to_string();
+        let mut value = composer_attachments::extract_office_text(&resolved, &extension)?;
+        if value.len() > MAX_TEXT_BYTES as usize {
+            let mut end = MAX_TEXT_BYTES as usize;
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value.truncate(end);
+            value.push_str("\n\n… 预览已截断，请使用“打开文件”查看完整内容。");
+        }
+        text_preview = Some(value);
     } else if matches!(
         extension.as_str(),
         "txt" | "md" | "markdown" | "json" | "jsonl" | "yaml" | "yml" | "toml" |
@@ -4784,11 +5513,23 @@ fn open_task_artifact(
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer does not accept Rust canonicalize's verbatim path prefix.
+        let raw = resolved.to_string_lossy();
+        let shell_path = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+        };
+        if shell_path.contains('"') || shell_path.contains(['\r', '\n']) {
+            return Err("文件路径包含无效字符".into());
+        }
         let mut command = StdCommand::new("explorer.exe");
         if resolved.is_dir() {
-            command.arg(&resolved);
+            command.arg(&shell_path);
         } else {
-            command.arg(format!("/select,{}", resolved.display()));
+            // Quote the path, NOT the /select, switch (Explorer's own grammar).
+            command.raw_arg(format!("/select,\"{shell_path}\""));
         }
         hide_std_command_window(&mut command);
         command.spawn().map_err(|error| format!("无法定位文件：{error}"))?;
@@ -4892,6 +5633,7 @@ fn display_provider_name(id: &str) -> String {
         "openrouter" => "OpenRouter".to_string(),
         "ollama" => "Ollama (Local)".to_string(),
         "lmstudio" => "LM Studio (Local)".to_string(),
+        "omnirun" => "OmniRun (Local)".to_string(),
         "xai" => "xAI".to_string(),
         "mistral" => "Mistral".to_string(),
         other => other.to_string(),
@@ -4990,6 +5732,7 @@ pub fn run() {
         .expect("Failed to build async runtime");
     let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
     tauri::async_runtime::set(runtime.handle().clone());
+    let personal_chrome_runtime_handle = runtime.handle().clone();
 
     omninova_core::init().expect("Failed to initialize core");
 
@@ -5004,8 +5747,10 @@ pub fn run() {
         }
     }
 
+    let gateway_runtime = GatewayRuntime::new(config);
+    let personal_chrome_runtime = gateway_runtime.clone();
     let state = Arc::new(Mutex::new(AppState {
-        runtime: GatewayRuntime::new(config),
+        runtime: gateway_runtime,
         gateway_task: None,
         last_gateway_started_at: None,
         last_gateway_error: None,
@@ -5036,6 +5781,17 @@ pub fn run() {
             cancel_agent_run,
             approve_tool_request,
             reject_tool_request,
+            get_browser_takeover_state,
+            request_browser_takeover,
+            release_browser_takeover,
+            cancel_browser_takeover,
+            install_personal_chrome_bridge,
+            verify_personal_chrome_bridge,
+            remove_personal_chrome_bridge,
+            get_personal_chrome_bridge_status,
+            get_personal_chrome_authorization_status,
+            approve_personal_chrome_for_run,
+            revoke_personal_chrome_for_run,
             automation_list_jobs,
             automation_upsert_job,
             automation_delete_job,
@@ -5045,6 +5801,7 @@ pub fn run() {
             automation_clear_runs,
             knowledge_list,
             knowledge_collections,
+            knowledge_collection_update,
             knowledge_get,
             knowledge_upsert,
             knowledge_import,
@@ -5053,6 +5810,7 @@ pub fn run() {
             knowledge_search,
             debug_shell_stream,
             get_chat_session_history,
+            project_session_context,
             delete_chat_session,
             session_tree_snapshot,
             check_browser_dep,
@@ -5096,13 +5854,32 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             configure_embedded_agent_browser_env(app.handle());
 
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".omninova"));
+            let bridge = omninova_browser_host::PersonalChromeBridge::spawn_on(
+                app_data_dir.join("personal-chrome-bridge"),
+                personal_chrome_runtime_handle.clone(),
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("personal chrome transport: {}", error.code()),
+                )
+            })?;
+            personal_chrome_runtime
+                .install_personal_chrome_bridge(bridge.clone())
+                .map_err(|code| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("personal chrome runtime bridge: {code}"),
+                    )
+                })?;
+            app.manage(bridge);
             let webview_user_data_dir = resolve_webview_user_data_dir();
             std::fs::create_dir_all(&webview_user_data_dir).map_err(|error| {
                 std::io::Error::new(
@@ -5224,6 +6001,10 @@ pub fn run() {
     };
 
     app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            // Window close only hides to tray. Cleanup runs on real process exit.
+            cleanup_owned_browser_sessions();
+        }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
             if let Some(w) = app_handle.get_webview_window("main") {
@@ -5394,6 +6175,43 @@ mod approval_profile_tests {
         let mut config = Config::default();
         assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
         assert!(!apply_approval_profile(&mut config, APPROVAL_PROFILE_RISK_BASED).unwrap());
+    }
+
+    #[test]
+    fn full_access_is_additive_and_preserves_granular_permissions() {
+        let mut config = Config::default();
+        config.autonomy.allowed_commands = vec!["custom-command".into()];
+        config.security.tool_policy.denied_tools = vec!["custom-tool".into()];
+        config.approvals.require_approval = vec!["custom-approval".into()];
+        let granular = (
+            config.autonomy.allowed_commands.clone(),
+            config.security.tool_policy.denied_tools.clone(),
+            config.approvals.require_approval.clone(),
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_FULL_ACCESS).unwrap());
+        assert!(config.permissions.is_full_access());
+        assert_eq!(configured_approval_profile(&config), APPROVAL_PROFILE_FULL_ACCESS);
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            )
+        );
+
+        assert!(apply_approval_profile(&mut config, APPROVAL_PROFILE_REQUEST).unwrap());
+        assert!(!config.permissions.is_full_access());
+        assert_eq!(
+            granular,
+            (
+                config.autonomy.allowed_commands.clone(),
+                config.security.tool_policy.denied_tools.clone(),
+                config.approvals.require_approval.clone(),
+            ),
+            "leaving full access for the pre-existing restricted profile must not rewrite granular settings"
+        );
     }
 }
 

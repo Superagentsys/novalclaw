@@ -42,6 +42,7 @@ pub fn events_from_messages(messages: &[ChatMessage]) -> Vec<SessionEvent> {
                         tool_call_id,
                         content,
                         interrupted: false,
+                        original_content: message.original_tool_content.clone(),
                     }
                 }
                 _ => SessionEventKind::System {
@@ -127,6 +128,7 @@ pub fn repair_unclosed_tools(events: &mut Vec<SessionEvent>) -> bool {
                 .to_string(),
                 tool_call_id,
                 interrupted: true,
+                original_content: None,
             },
         });
     }
@@ -149,13 +151,16 @@ fn event_to_message(event: &SessionEvent) -> Option<ChatMessage> {
             tool_call_id,
             content,
             interrupted,
+            original_content,
         } => {
             let payload = serde_json::json!({
                 "tool_call_id": tool_call_id,
                 "content": content,
                 "interrupted": interrupted,
             });
-            Some(ChatMessage::tool(payload.to_string()))
+            let mut message = ChatMessage::tool(payload.to_string());
+            message.original_tool_content = original_content.clone();
+            Some(message)
         }
         SessionEventKind::Compact { summary, .. } => Some(ChatMessage::system(format!(
             "{} {}",
@@ -259,5 +264,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_result_original_content_round_trips() {
+        let messages = vec![
+            ChatMessage::system("bootstrap"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"call-1","name":"x","arguments":"{}"}]}"#),
+            {
+                let mut tool = ChatMessage::tool(r#"{"tool_call_id":"call-1","content":"pruned"}"#.to_string());
+                tool.original_tool_content = Some("FULL_ORIGINAL_OUTPUT".to_string());
+                tool
+            },
+        ];
+        let events = events_from_messages(&messages);
+        let restored = derive_messages(&events);
+        let restored_tool = restored
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message restored");
+        assert_eq!(restored_tool.original_tool_content.as_deref(), Some("FULL_ORIGINAL_OUTPUT"));
     }
 }

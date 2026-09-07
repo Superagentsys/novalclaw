@@ -1,0 +1,502 @@
+.context-usage {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+
+.context-usage-trigger {
+  display: inline-flex;
+  width: max-content;
+  min-width: 0;
+  min-height: 28px;
+  max-width: min(280px, 42vw);
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ui-text-secondary);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.context-usage-trigger:hover,
+.context-usage.is-open .context-usage-trigger {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.context-usage-trigger:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 2px;
+}
+
+.context-progress-ring {
+  position: relative;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--ui-text-muted);
+}
+
+.context-progress-ring__svg {
+  display: block;
+  overflow: visible;
+}
+
+.context-progress-ring__track,
+.context-progress-ring__value {
+  fill: none;
+  stroke-width: 2.2;
+}
+
+.context-progress-ring__track {
+  stroke: color-mix(in srgb, currentColor 20%, var(--ui-surface-3));
+}
+
+.context-progress-ring__value {
+  stroke: currentColor;
+  stroke-linecap: round;
+  transition: stroke-dasharray 240ms cubic-bezier(0.22, 1, 0.36, 1), stroke 180ms ease;
+}
+
+.context-progress-ring__activity {
+  fill: currentColor;
+  opacity: 0;
+  transform-box: view-box;
+  transform-origin: 14px 14px;
+}
+
+.context-progress-ring.tone-normal {
+  color: var(--ui-accent);
+}
+
+.context-progress-ring.tone-warning {
+  color: var(--ui-warning);
+}
+
+.context-progress-ring.tone-critical,
+.context-progress-ring.tone-error {
+  color: var(--ui-danger);
+}
+
+.context-progress-ring.is-unknown .context-progress-ring__motion,
+.context-progress-ring.is-calculating .context-progress-ring__motion {
+  transform-box: view-box;
+  transform-origin: 14px 14px;
+  animation: context-ring-spin 1.4s linear infinite;
+}
+
+.context-progress-ring.is-refreshing .context-progress-ring__activity,
+.context-progress-ring.is-compaction .context-progress-ring__activity {
+  opacity: 1;
+  animation: context-ring-spin 1.1s linear infinite;
+}
+
+.context-progress-ring.is-compaction .context-progress-ring__value {
+  animation: context-ring-pulse 900ms ease-in-out infinite alternate;
+}
+
+.context-progress-ring.is-unavailable .context-progress-ring__value {
+  stroke-dasharray: 12 88;
+}
+
+@keyframes context-ring-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes context-ring-pulse {
+  from {
+    opacity: 0.48;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.context-usage-compact {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.context-usage-primary,
+.context-usage-summary {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.context-usage-percent,
+.context-usage-state-text,
+.context-usage-current {
+  color: var(--ui-text-secondary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.context-usage-summary {
+  overflow: hidden;
+  color: var(--ui-text-secondary);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-usage-compact.is-placeholder .context-usage-state-text {
+  color: var(--ui-text-muted);
+  font-weight: 500;
+}
+
+.context-usage-separator,
+.context-usage-denominator,
+.context-usage-unknown-label {
+  color: var(--ui-text-muted);
+  font-weight: 500;
+}
+
+.context-usage-transient {
+  flex-shrink: 0;
+  padding-left: 5px;
+  border-left: 1px solid var(--ui-border);
+  color: var(--ui-accent-strong);
+  font-weight: 650;
+}
+
+.context-usage-panel {
+  position: fixed;
+  z-index: 120;
+  left: 0;
+  top: 0;
+  display: grid;
+  width: min(360px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: min(70vh, 520px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 11px;
+  background: var(--ui-surface-1);
+  box-shadow: var(--shadow-lg);
+  color: var(--ui-text);
+  animation: context-usage-popover-in 150ms ease-out;
+}
+
+.context-usage-panel[data-placement="above"] {
+  transform-origin: bottom center;
+}
+
+.context-usage-panel[data-placement="below"] {
+  transform-origin: top center;
+}
+
+@keyframes context-usage-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.context-usage-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: start;
+  padding-bottom: 10px;
+}
+
+.context-usage-hint {
+  margin: 0 0 10px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.context-usage-heading {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.context-usage-title,
+.context-usage-total {
+  color: var(--ui-text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.context-usage-total {
+  min-width: 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.context-usage-kind {
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.context-usage-meter-wrap {
+  display: grid;
+  gap: 5px;
+  padding-bottom: 10px;
+}
+
+.context-usage-bar {
+  position: relative;
+  display: flex;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--ui-surface-3);
+}
+
+.context-usage-bar-fill,
+.context-usage-segments {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+.context-usage-bar-fill {
+  background: var(--ui-accent);
+}
+
+.context-usage-segment {
+  display: block;
+  min-width: 1px;
+  height: 100%;
+}
+
+.context-usage-segment + .context-usage-segment {
+  box-shadow: -1px 0 0 color-mix(in srgb, var(--ui-surface-1) 72%, transparent);
+}
+
+.context-usage-bar-threshold {
+  position: absolute;
+  top: -2px;
+  z-index: 2;
+  width: 1px;
+  height: 10px;
+  background: var(--ui-text);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ui-surface-1) 75%, transparent);
+  opacity: 0.72;
+}
+
+.context-usage-threshold-note {
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.context-usage-section {
+  display: grid;
+  gap: 7px;
+  padding: 9px 0;
+  border-top: 1px solid var(--ui-border);
+}
+
+.context-usage-section-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: center;
+  color: var(--ui-text-muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.025em;
+}
+
+.context-usage-section-heading > span:last-child:not(:first-child) {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.context-usage-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.context-usage-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+
+.context-usage-row dt {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.context-usage-row-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.context-usage-row dd {
+  margin: 0;
+  color: var(--ui-text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.context-usage-rows--secondary .context-usage-row dt,
+.context-usage-rows--secondary .context-usage-row dd {
+  color: var(--ui-text-muted);
+  font-weight: 500;
+}
+
+.context-usage-marker {
+  display: inline-block;
+  flex: 0 0 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--context-segment-color);
+}
+
+.context-usage-marker.is-system,
+.context-usage-segment.is-system {
+  --context-segment-color: var(--ui-accent);
+  background: var(--context-segment-color);
+}
+
+.context-usage-marker.is-conversation,
+.context-usage-segment.is-conversation {
+  --context-segment-color: var(--ui-success);
+  background: var(--context-segment-color);
+}
+
+.context-usage-marker.is-tool-schema,
+.context-usage-segment.is-tool-schema {
+  --context-segment-color: var(--ui-warning);
+  background: var(--context-segment-color);
+}
+
+.context-usage-marker.is-tool-result,
+.context-usage-segment.is-tool-result {
+  --context-segment-color: var(--ui-accent-strong);
+  background: var(--context-segment-color);
+}
+
+.context-usage-marker.is-overhead,
+.context-usage-segment.is-overhead {
+  --context-segment-color: var(--ui-text-muted);
+  background: var(--context-segment-color);
+}
+
+.context-usage-unknown {
+  margin: 0 0 9px;
+  padding: 8px 9px;
+  border: 1px solid var(--ui-border);
+  border-radius: 7px;
+  background: var(--ui-surface-2);
+  color: var(--ui-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.context-usage-live {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 9px;
+  border-top: 1px solid var(--ui-border);
+  color: var(--ui-accent-strong);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.context-usage-live-dot {
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+@media (max-width: 900px) {
+  .context-usage-trigger {
+    max-width: 190px;
+  }
+
+  .context-usage-denominator,
+  .context-usage-unknown-label,
+  .context-usage-transient {
+    display: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .context-usage-trigger {
+    max-width: 96px;
+  }
+
+  .context-usage-summary {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .context-usage-trigger {
+    max-width: 38px;
+    padding-inline: 4px;
+  }
+
+  .context-usage-compact {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-usage-trigger {
+    transition: none;
+  }
+
+  .context-usage-panel {
+    animation: none;
+  }
+
+  .context-progress-ring__value {
+    transition: none;
+  }
+
+  .context-progress-ring__motion,
+  .context-progress-ring__activity,
+  .context-progress-ring.is-compaction .context-progress-ring__value {
+    animation: none;
+  }
+}

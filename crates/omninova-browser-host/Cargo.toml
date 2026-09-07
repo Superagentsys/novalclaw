@@ -1,0 +1,36 @@
+[package]
+name = "omninova-browser-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Thin Chrome Native Messaging host and Personal Chrome transport IPC for OmniNova"
+
+[[bin]]
+name = "omninova-browser-host"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+native_messaging.workspace = true
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

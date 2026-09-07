@@ -64,6 +64,11 @@ function isImageArtifact(path: string): boolean {
   return IMAGE_EXTENSIONS.has(extensionOf(path));
 }
 
+/** XML files are normally Office package/build internals, not user deliverables. */
+function isVisibleTaskArtifact(file: TaskChangedFile): boolean {
+  return extensionOf(file.path) !== "xml";
+}
+
 function artifactKindLabel(path: string): string {
   const extension = extensionOf(path);
   if (IMAGE_EXTENSIONS.has(extension)) return `${extension.toUpperCase()} 图片`;
@@ -266,7 +271,7 @@ export function TaskDeliverable({
   onOpenInspector: (tab?: InspectorTab) => void;
 }) {
   if (!task) return null;
-  const files = task.changedFiles ?? [];
+  const files = (task.changedFiles ?? []).filter(isVisibleTaskArtifact);
   const isComplete = task.status === "completed";
 
   return (
@@ -440,7 +445,10 @@ export function TaskInspector({
     { id: "logs", label: "日志", icon: "history" },
     { id: "results", label: "成果", icon: "check" },
   ];
-  const files = useMemo(() => task?.changedFiles ?? [], [task?.changedFiles]);
+  const files = useMemo(
+    () => (task?.changedFiles ?? []).filter(isVisibleTaskArtifact),
+    [task?.changedFiles]
+  );
   const activity = useMemo(() => task?.activity ?? [], [task?.activity]);
   const processEntries = useMemo(
     () => activity.filter((item) => item.kind || item.label),
@@ -582,6 +590,7 @@ export function TaskInspector({
         ))}
       </div>
       <div className="task-inspector-body">
+        {/* Keep Process mounted while switching Files/Logs so timeline state does not reset. */}
         <div className="task-inspector-tabpane" hidden={tab !== "process"}>
           {approval ? (
             <ApprovalGateCard
@@ -591,17 +600,23 @@ export function TaskInspector({
             />
           ) : null}
           {liveSessionId ? (
-            <AgentRunTimeline events={[]} isRunning defaultCollapsed={false} liveSessionId={liveSessionId} />
+            <AgentRunTimeline
+              events={[]}
+              isRunning
+              defaultCollapsed={false}
+              liveSessionId={liveSessionId}
+              sessionId={task?.sessionId}
+            />
           ) : processEntries.length ? (
             <ol className="task-inspector-process-list">
               {processEntries.map((item, index) => (
                 <li
-                  key={`${item.at}-${index}`}
+                  key={item.operationId ?? `${item.at}-${index}`}
                   data-status={item.status || (item.tone === "error" ? "failed" : item.tone === "success" ? "completed" : "waiting")}
                 >
                   <span className="task-inspector-process-icon">
                     <UiIcon
-                      name={item.kind === "file" ? "file" : item.kind === "approval" ? "safety" : item.kind === "model" ? "agent" : item.kind === "tool" ? "tool" : "sync"}
+                      name={item.kind === "file" ? "file" : item.kind === "approval" ? "safety" : item.kind === "model" ? "agent" : item.kind === "tool" ? "tool" : item.kind === "context" ? "sync" : "sync"}
                       size={13}
                     />
                   </span>

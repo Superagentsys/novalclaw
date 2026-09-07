@@ -46,6 +46,7 @@ export interface AgentRunStep {
 
 export type AgentRunEvent =
   | AgentRunEventRunStarted
+  | AgentRunEventBrowserTakeoverStateChanged
   | AgentRunEventModelStarted
   | AgentRunEventModelDelta
   | AgentRunEventModelCompleted
@@ -66,13 +67,59 @@ export type AgentRunEvent =
   | AgentRunEventRunCompleted
   | AgentRunEventRunFailed
   | AgentRunEventRunCancelled
-  | AgentRunEventError;
+  | AgentRunEventError
+  | AgentRunEventContextUsage
+  | AgentRunEventContextLifecycle;
 
 export interface AgentRunEventRunStarted {
   type: "run_started";
   run_id: string;
   agent_name: string;
   session_id: string | null;
+}
+
+export type BrowserTakeoverPhase =
+  | "agent_controlled"
+  | "takeover_requested"
+  | "human_controlled"
+  | "timed_out"
+  | "resynchronizing"
+  | "browser_lost";
+
+export interface BrowserTakeoverStateDto {
+  run_id: string;
+  session_id: string;
+  phase: BrowserTakeoverPhase | string;
+  owner: string;
+  generation: number;
+  reason?: string | null;
+  since_ms: number;
+  eligible: boolean;
+  headless: boolean;
+}
+
+export interface PersonalChromeAuthorizationStatusDto {
+  run_id: string;
+  configured: boolean;
+  state: string;
+  transport_connected: boolean;
+  protocol_version: number;
+  extension_tab_granted: boolean;
+  desktop_run_granted: boolean;
+  authorization_generation: number | null;
+  production_factory_enabled: boolean;
+  full_access: boolean;
+  ready: boolean;
+  error_code: string | null;
+}
+
+export interface AgentRunEventBrowserTakeoverStateChanged {
+  type: "browser_takeover_state_changed";
+  run_id: string;
+  session_id: string;
+  phase: string;
+  generation: number;
+  reason?: string;
 }
 
 export interface AgentRunEventModelStarted {
@@ -118,10 +165,25 @@ export interface AgentRunEventToolCompleted {
   run_id: string;
   tool_call_id: string;
   tool_name: string;
-  success: boolean;
+  status?: "pending" | "running" | "success" | "error";
+  success?: boolean;
   duration_ms: number;
   result_summary: string;
   diff_stats: RunDiffStats | null;
+}
+
+/** Core emits `status`, some older streams still emit `success`. */
+export function toolCompletedSucceeded(event: {
+  success?: boolean;
+  status?: string;
+}): boolean {
+  if (typeof event.success === "boolean") {
+    return event.success;
+  }
+  if (typeof event.status === "string" && event.status.length > 0) {
+    return event.status === "success";
+  }
+  return true;
 }
 
 export interface AgentRunEventSkillActivated {
@@ -271,6 +333,162 @@ export interface AgentRunEventError {
   message: string;
 }
 
+export type ContextMeasurementKind =
+  | "candidate_estimate"
+  | "final_request_estimate"
+  | "provider_actual";
+
+export type ContextMeasurementProvenance =
+  | "safety_estimate"
+  | "exact_tokenizer"
+  | "provider_count_api"
+  | "provider_actual";
+
+export type ContextTelemetryMode =
+  | "proactive"
+  | "unknown_budget_oversize"
+  | "forced_overflow_recovery";
+
+export interface ContextUsageBreakdown {
+  system_tokens: number;
+  conversation_tokens: number;
+  tool_schema_tokens: number;
+  tool_result_tokens: number;
+  request_overhead_tokens: number;
+}
+
+export interface ContextUsageSnapshot {
+  session_id?: string | null;
+  run_id?: string | null;
+  request_revision: number;
+  provider: string;
+  model: string;
+  measurement_kind: ContextMeasurementKind;
+  measurement_provenance?: ContextMeasurementProvenance | null;
+  measurement_exact?: boolean | null;
+  estimated_input_tokens: number;
+  provider_actual_input_tokens?: number | null;
+  context_window_tokens?: number | null;
+  max_input_tokens?: number | null;
+  output_reserve_tokens?: number | null;
+  model_max_output_tokens?: number | null;
+  request_output_reserve_tokens?: number | null;
+  request_generation_limit_source?: string | null;
+  safety_reserve_tokens?: number | null;
+  pressure_threshold_tokens?: number | null;
+  budget_source?: string | null;
+  usage_ratio?: number | null;
+  breakdown: ContextUsageBreakdown;
+  measured_at: number;
+}
+
+export type ContextLifecycleEventKindType =
+  | "context_pressure_detected"
+  | "context_pruning_started"
+  | "context_pruning_completed"
+  | "context_compaction_started"
+  | "context_compaction_completed"
+  | "context_compaction_failed"
+  | "context_overflow_recovery_started"
+  | "context_overflow_recovery_completed"
+  | "context_overflow_recovery_failed";
+
+export interface ContextPressureDetectedKind {
+  type: "context_pressure_detected";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  context_window_tokens?: number | null;
+  pressure_threshold_tokens?: number | null;
+  budget_source?: string | null;
+}
+
+export interface ContextPruningStartedKind {
+  type: "context_pruning_started";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+}
+
+export interface ContextPruningCompletedKind {
+  type: "context_pruning_completed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  estimated_after: number;
+  pruned_tool_result_count?: number;
+}
+
+export interface ContextCompactionStartedKind {
+  type: "context_compaction_started";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+}
+
+export interface ContextCompactionCompletedKind {
+  type: "context_compaction_completed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  estimated_after: number;
+  checkpoint_created?: boolean;
+}
+
+export interface ContextCompactionFailedKind {
+  type: "context_compaction_failed";
+  mode: ContextTelemetryMode;
+  estimated_before: number;
+  reason?: string;
+}
+
+export interface ContextOverflowRecoveryStartedKind {
+  type: "context_overflow_recovery_started";
+  mode: ContextTelemetryMode;
+  provider_reported_window?: number | null;
+  estimated_before: number;
+}
+
+export interface ContextOverflowRecoveryCompletedKind {
+  type: "context_overflow_recovery_completed";
+  mode: ContextTelemetryMode;
+  estimated_after: number;
+}
+
+export interface ContextOverflowRecoveryFailedKind {
+  type: "context_overflow_recovery_failed";
+  mode: ContextTelemetryMode;
+  reason?: string;
+}
+
+export type ContextLifecycleEventKind =
+  | ContextPressureDetectedKind
+  | ContextPruningStartedKind
+  | ContextPruningCompletedKind
+  | ContextCompactionStartedKind
+  | ContextCompactionCompletedKind
+  | ContextCompactionFailedKind
+  | ContextOverflowRecoveryStartedKind
+  | ContextOverflowRecoveryCompletedKind
+  | ContextOverflowRecoveryFailedKind
+  | { type: string; [key: string]: unknown };
+
+export interface ContextLifecycleEvent {
+  operation_id: string;
+  run_id?: string | null;
+  session_id?: string | null;
+  mode: ContextTelemetryMode;
+  kind: ContextLifecycleEventKind;
+  timestamp: number;
+}
+
+export interface AgentRunEventContextUsage {
+  type: "context_usage";
+  run_id: string;
+  snapshot: ContextUsageSnapshot;
+}
+
+export interface AgentRunEventContextLifecycle {
+  type: "context_lifecycle";
+  run_id: string;
+  event: ContextLifecycleEvent;
+}
+
 export type RunEvent =
   | RunEventToolStarted
   | RunEventToolCompleted
@@ -310,7 +528,7 @@ export interface RunEventFileChanged {
 }
 
 export function getEventStatusLabel(
-  event: RunEvent | AgentRunEvent | { type?: string; success?: boolean }
+  event: RunEvent | AgentRunEvent | { type?: string; success?: boolean; status?: string }
 ): string {
   switch (event.type) {
     case "run_started":
@@ -345,7 +563,7 @@ export function getEventStatusLabel(
       return "error";
     case "tool_completed":
     case "toolCompleted":
-      return event.success ? "success" : "error";
+      return toolCompletedSucceeded(event) ? "success" : "error";
     default:
       return "unknown";
   }
@@ -358,6 +576,7 @@ export function getToolLabel(toolName: string): string {
     file_read: "读取文件",
     read_file: "读取文件",
     file_write: "写入文件",
+    office_create: "生成 Office 文件",
     write_file: "写入文件",
     file_edit: "修改文件",
     edit_file: "修改文件",
@@ -384,6 +603,7 @@ export function getToolLabel(toolName: string): string {
     memory_recall: "回忆记忆",
     knowledge_search: "检索知识库",
     browser: "浏览器",
+    computer_use: "桌面操作",
     pdf_read: "读取 PDF",
   };
   return labels[toolName] ?? toolName;

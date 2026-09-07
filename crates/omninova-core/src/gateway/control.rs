@@ -56,7 +56,8 @@ struct SessionQuery {
 
 pub fn router() -> Router<GatewayRuntime> {
     Router::new()
-        .route("/api/v1/invoke", post(http_invoke))
+        .route("/api/v1/invoke", post(http_invoke)
+            .layer(axum::extract::DefaultBodyLimit::max(72 * 1024 * 1024)))
         .route("/api/v1/events", get(http_events))
         .route("/api", get(http_api_index))
         .layer(
@@ -261,6 +262,16 @@ async fn dispatch(runtime: &GatewayRuntime, command: &str, args: Value) -> Resul
             let history = runtime.get_session_history(&channel, &session_id).await;
             serde_json::to_value(history).map_err(|e| e.to_string())
         }
+        "project_session_context" => {
+            let session_id = args_string(&args, &["sessionId", "session_id"])?;
+            let channel = parse_channel(args_opt_string(&args, &["channel"]).as_deref());
+            let provider = args_opt_string(&args, &["provider"]);
+            let model = args_opt_string(&args, &["model"]);
+            let projected = runtime
+                .project_session_context(&channel, &session_id, provider, model)
+                .await;
+            serde_json::to_value(projected).map_err(|e| e.to_string())
+        }
         "delete_chat_session" => {
             let session_id = args_string(&args, &["sessionId", "session_id"])?;
             let channel = parse_channel(args_opt_string(&args, &["channel"]).as_deref());
@@ -404,6 +415,14 @@ async fn dispatch(runtime: &GatewayRuntime, command: &str, args: Value) -> Resul
             let store = open_knowledge_store(runtime).await?;
             serde_json::to_value(store.collections().await).map_err(|e| e.to_string())
         }
+        "knowledge_collection_update" => {
+            let name = args_string(&args, &["name"])?;
+            let replacement = args_opt_string(&args, &["replacement"]);
+            let delete = args.get("delete").and_then(Value::as_bool).unwrap_or(false);
+            open_knowledge_store(runtime).await?.update_collection(&name, replacement.as_deref(), delete)
+                .await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
         "knowledge_get" => {
             let id = args_string(&args, &["id"])?;
             let store = open_knowledge_store(runtime).await?;
@@ -525,6 +544,16 @@ async fn upsert_job(runtime: &GatewayRuntime, input: Value) -> Result<Value, Str
             .or_else(|| input.get("template_id"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        provider: input
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().and_then(|job| job.provider.clone())),
+        model: input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().and_then(|job| job.model.clone())),
         tz_offset_minutes: tz,
         enabled: input
             .get("enabled")
@@ -741,9 +770,13 @@ async fn knowledge_import(runtime: &GatewayRuntime, args: &Value) -> Result<Valu
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("untitled.md");
-            let content = file.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = match file.get("contentBase64").and_then(Value::as_str) {
+                Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)
+                    .map_err(|e| format!("{name}: invalid base64: {e}"))?,
+                None => file.get("content").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec(),
+            };
             let doc = store
-                .import_bytes(name, content.as_bytes(), collection.as_deref(), tags.clone())
+                .import_bytes(name, &bytes, collection.as_deref(), tags.clone())
                 .await
                 .map_err(|e| format!("{name}: {e}"))?;
             imported.push(doc);

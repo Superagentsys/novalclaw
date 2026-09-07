@@ -34,6 +34,9 @@ pub fn resolve_shell_allowlist(config: &Config) -> Vec<String> {
 }
 
 pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return true;
+    }
     let direct = config
         .autonomy
         .auto_approve
@@ -47,7 +50,7 @@ pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
     if direct {
         return true;
     }
-    if matches!(tool_name, "file_patch" | "apply_patch") {
+    if matches!(tool_name, "file_patch" | "apply_patch" | "office_create") {
         return ["file_write", "file_edit"].iter().any(|alias| {
             config
                 .autonomy
@@ -81,6 +84,9 @@ pub fn is_tool_auto_approved(config: &Config, tool_name: &str) -> bool {
 }
 
 pub fn is_tool_denied(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return false;
+    }
     if config
         .security
         .tool_policy
@@ -102,6 +108,9 @@ pub fn is_tool_denied(config: &Config, tool_name: &str) -> bool {
 }
 
 pub fn is_tool_globally_allowed(config: &Config, tool_name: &str) -> bool {
+    if config.permissions.is_full_access() {
+        return true;
+    }
     if is_tool_denied(config, tool_name) {
         return false;
     }
@@ -126,6 +135,9 @@ pub fn evaluate_tool_call(
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> ToolPolicyDecision {
+    if config.permissions.is_full_access() {
+        return ToolPolicyDecision::Allow;
+    }
     if !config.security.tool_policy.enabled {
         return ToolPolicyDecision::Allow;
     }
@@ -172,19 +184,23 @@ pub fn evaluate_tool_call(
         return ToolPolicyDecision::Allow;
     }
 
+    if computer_use_action_is_observe(tool_name, arguments) {
+        return ToolPolicyDecision::Allow;
+    }
+
     if is_tool_auto_approved(config, tool_name) {
         return ToolPolicyDecision::Allow;
     }
 
     if config.approvals.enabled {
-        let is_patch_tool = matches!(tool_name, "file_patch" | "apply_patch");
-        let requires_direct = !is_patch_tool
+        let is_equivalent_write = matches!(tool_name, "file_patch" | "apply_patch" | "office_create");
+        let requires_direct = !is_equivalent_write
             && config
                 .approvals
                 .require_approval
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(tool_name));
-        let requires_equivalent_write = is_patch_tool
+        let requires_equivalent_write = is_equivalent_write
             && config.approvals.require_approval.iter().any(|t| {
                 t.eq_ignore_ascii_case("file_write") || t.eq_ignore_ascii_case("file_edit")
             });
@@ -228,6 +244,20 @@ fn is_high_risk_tool(tool_name: &str) -> bool {
 
 fn is_read_only_workspace_tool(tool_name: &str) -> bool {
     capabilities_or_unknown(tool_name).is_read_only_workspace()
+}
+
+fn computer_use_action_is_observe(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    if !tool_name.eq_ignore_ascii_case("computer_use")
+        && !tool_name.eq_ignore_ascii_case("computer")
+        && !tool_name.eq_ignore_ascii_case("desktop_use")
+        && !tool_name.eq_ignore_ascii_case("os_use")
+    {
+        return false;
+    }
+    arguments
+        .get("action")
+        .and_then(|value| value.as_str())
+        .is_some_and(crate::computer_use::is_observe_action)
 }
 
 fn git_operation_is_read_only(arguments: &serde_json::Value) -> bool {
@@ -336,6 +366,51 @@ mod tests {
     }
 
     #[test]
+    fn computer_use_screenshot_is_allowed_without_approval() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "screenshot"}),
+        );
+        assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[test]
+    fn computer_use_snapshot_is_allowed_without_approval() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "snapshot"}),
+        );
+        assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[test]
+    fn computer_use_click_requires_approval_under_supervised() {
+        let mut config = Config::default();
+        config.security.tool_policy.enabled = true;
+        config.autonomy.level = "supervised".into();
+        config.approvals.enabled = true;
+
+        let decision = evaluate_tool_call(
+            &config,
+            "computer_use",
+            &serde_json::json!({"action": "click", "x": 10, "y": 10}),
+        );
+        assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
     fn mutating_git_operations_require_approval_under_supervised() {
         let mut config = Config::default();
         config.security.tool_policy.enabled = true;
@@ -363,5 +438,41 @@ mod tests {
             &serde_json::json!({"value": 1}),
         );
         assert!(matches!(decision, ToolPolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
+    fn full_access_bypasses_denies_approvals_and_shell_allowlist() {
+        let mut config = Config::default();
+        config.permissions.mode = crate::config::PermissionMode::FullAccess;
+        config.security.tool_policy.enabled = true;
+        config.security.tool_policy.denied_tools = vec!["shell".into()];
+        config.commands.forbidden = vec!["shell".into()];
+        config.autonomy.allowed_commands.clear();
+        config.autonomy.forbidden_paths = vec!["/".into()];
+        config.autonomy.block_high_risk_commands = true;
+        config.approvals.enabled = true;
+        config.approvals.require_approval = vec!["shell".into()];
+
+        assert!(is_tool_globally_allowed(&config, "shell"));
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                "shell",
+                &serde_json::json!({"command": "arbitrary-program --flag"}),
+            ),
+            ToolPolicyDecision::Allow
+        );
+
+        config.security.tool_policy.denied_tools = vec!["git_operations".into()];
+        config.approvals.require_approval = vec!["git_operations".into()];
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                "git_operations",
+                &serde_json::json!({"operation": "commit"}),
+            ),
+            ToolPolicyDecision::Allow,
+            "full access must centrally authorize git operations without a prompt"
+        );
     }
 }

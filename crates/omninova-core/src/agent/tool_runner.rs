@@ -17,6 +17,7 @@ use crate::agent::AgentCancellationToken;
 use crate::agent::{FileDiffStats, ToolExecutionEvent};
 use crate::providers::ToolCall;
 use crate::security::{ApprovalStatus, SecurityContext, ToolExecutionGate};
+use crate::tools::text_bound::bound_tool_output_for_model;
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use std::sync::Arc;
@@ -198,7 +199,7 @@ impl<'a> ToolRunner<'a> {
         let is_shell = tool.name() == "shell";
         let is_file_write = matches!(
             tool_call.name.as_str(),
-            "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor"
+            "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor"
         );
         let is_file_patch = matches!(tool_call.name.as_str(), "file_patch" | "apply_patch");
 
@@ -718,8 +719,13 @@ impl<'a> ToolRunner<'a> {
                     }
                 }
 
+                // Model-visible hard bound (W2.5): the full result enters the
+                // next model turn, so cap it here independently of the UI's
+                // 2000-char display truncation.
+                let bounded = bound_tool_output_for_model(&output);
+
                 Ok((
-                    output,
+                    bounded,
                     Some(ToolExecutionEvent::Completed {
                         tool_call_id: tool_call.id.clone(),
                         tool_name: tool_call.name.clone(),
@@ -744,7 +750,7 @@ impl<'a> ToolRunner<'a> {
                     );
                 }
                 Ok((
-                    msg.clone(),
+                    bound_tool_output_for_model(&msg),
                     Some(ToolExecutionEvent::Completed {
                         tool_call_id: tool_call.id.clone(),
                         tool_name: tool_call.name.clone(),
@@ -799,13 +805,43 @@ mod tests {
         }
     }
 
+    struct FakeHugeTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        output: String,
+    }
+
+    #[async_trait]
+    impl Tool for FakeHugeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake tool returning oversized output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: self.output.clone(),
+                error: None,
+            })
+        }
+    }
+
     fn test_config(workspace: &Path) -> Config {
         let mut config = Config::default();
         config.workspace_dir = workspace.to_path_buf();
         config.security.tool_policy.enabled = true;
         config.autonomy.level = "supervised".into();
         config.approvals.enabled = true;
-        config.approvals.auto_approve = vec!["test_read".into()];
+        config.approvals.auto_approve = vec!["test_read".into(), "test_huge".into()];
         config.approvals.require_approval = vec!["test_write".into()];
         config
     }
@@ -837,6 +873,33 @@ mod tests {
         assert!(result.0.contains("ok"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(security.approvals().list(true).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The model-visible bound is enforced by the ToolRunner, independent of
+    /// the UI's 2000-char display truncation.
+    #[tokio::test]
+    async fn oversized_tool_output_is_bounded_for_model_context() {
+        let dir = std::env::temp_dir().join(format!("toolrunner-bound-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let security = SecurityContext::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let huge = "x".repeat(70_000);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeHugeTool {
+            name: "test_huge".to_string(),
+            calls: calls.clone(),
+            output: huge.clone(),
+        })];
+        let runner = ToolRunner::new(&tools, &security).with_run_id("run-a");
+        let (output, _) = runner
+            .run_tool(&tool_call("test_huge", "call-1"), &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(output.chars().count() < huge.chars().count());
+        assert!(output.contains("[Tool output truncated for model context"));
+        // UTF-8 safety: the bounded string round-trips losslessly.
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 

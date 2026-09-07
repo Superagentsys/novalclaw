@@ -1,6 +1,31 @@
+use crate::providers::context_budget::ContextBudget;
+use crate::providers::model_capabilities::{
+    resolve_model_capabilities, ProviderCountApiKind, TokenStrategy,
+};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// Structured HTTP failure returned by a model provider.
+///
+/// The response detail is deliberately sanitized before construction. Keeping
+/// the status as typed metadata lets background runtimes distinguish terminal
+/// credential/access failures from transient transport failures without
+/// parsing user-facing error strings.
+#[derive(Debug, thiserror::Error)]
+#[error("{provider} API error (HTTP {status}): {message}")]
+pub struct ProviderHttpError {
+    pub provider: String,
+    pub status: u16,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl ProviderHttpError {
+    pub fn is_access_failure(&self) -> bool {
+        matches!(self.status, 401 | 403)
+    }
+}
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,6 +35,11 @@ pub struct ChatMessage {
     /// OpenAI 兼容视觉输入：`data:image/...;base64,...` 或 https URL。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
+    /// When a tool result is pruned for the model-visible context, this holds
+    /// the full original tool output so durable session storage can preserve
+    /// it without sending it to the Provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tool_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -18,6 +48,7 @@ impl ChatMessage {
             role: "system".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -26,6 +57,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -39,6 +71,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             images,
+            original_tool_content: None,
         }
     }
 
@@ -47,6 +80,7 @@ impl ChatMessage {
             role: "assistant".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -55,6 +89,7 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
             images: None,
+            original_tool_content: None,
         }
     }
 
@@ -117,6 +152,24 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Ephemeral per-request generation cap. `None` or `0` means absent.
+    /// Lifetime is one logical request/run; it is not profile configuration.
+    pub request_max_output_tokens: Option<u32>,
+}
+
+impl<'a> ChatRequest<'a> {
+    pub fn new(messages: &'a [ChatMessage], tools: Option<&'a [ToolSpec]>) -> Self {
+        Self {
+            messages,
+            tools,
+            request_max_output_tokens: None,
+        }
+    }
+
+    pub fn with_request_max_output_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.request_max_output_tokens = tokens.filter(|value| *value > 0);
+        self
+    }
 }
 
 /// A tool result to feed back to the LLM.
@@ -150,6 +203,11 @@ pub trait Provider: Send + Sync {
     /// Provider name (e.g., "openai", "anthropic")
     fn name(&self) -> &str;
 
+    /// Optional model id this provider will send. Default is unknown.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Send a chat request to the LLM
     async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse>;
 
@@ -175,4 +233,38 @@ pub trait Provider: Send + Sync {
 
     /// Check if the provider is healthy
     async fn health_check(&self) -> bool;
+
+    /// Optional model-aware exact tokenizer for display metering only.
+    fn exact_tokenizer(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the authoritative context budget if one is known.
+    fn context_budget(&self) -> Option<ContextBudget> {
+        None
+    }
+
+    /// Starts a provider-native display token measurement from the finalized
+    /// model-visible request. This is display telemetry only: failures are
+    /// swallowed by the default implementation, and it must never block or
+    /// affect the normal model request.
+    async fn measure_provider_count_tokens(
+        &self,
+        _identity: Option<crate::observability::ContextRequestIdentity>,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+        _request_body: &str,
+    ) {
+    }
+
+    /// Whether this provider is trusted to use its native count API for the
+    /// given model. The default implementation consults the capability
+    /// registry; providers may narrow it further.
+    fn can_use_provider_count_api(&self, model: &str) -> bool {
+        matches!(
+            resolve_model_capabilities(model, None).token_strategy,
+            TokenStrategy::ProviderCountApi(ProviderCountApiKind::AnthropicNative)
+        )
+    }
 }

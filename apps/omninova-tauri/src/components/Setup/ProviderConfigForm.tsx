@@ -5,6 +5,12 @@ import {
   type ProviderConfig,
   type ProviderTransportMode,
 } from "../../types/config";
+import {
+  applyRequestLimitInput,
+  formatRequestLimitInput,
+  formatTokenCount,
+  requestLimitError,
+} from "./requestLimit";
 
 type Props = {
   value: ProviderConfig[];
@@ -12,6 +18,7 @@ type Props = {
   defaultProvider?: string;
   defaultModel?: string;
   onDefaultChange?: (providerId: string, model: string) => void;
+  onValidationChange?: (error: string | null) => void;
 };
 
 const parseStringList = (value: string) =>
@@ -29,9 +36,15 @@ const PROVIDER_TRANSPORT_OPTIONS: { value: ProviderTransportMode; label: string 
 function isLocalProvider(provider: ProviderConfig): boolean {
   const preset = PROVIDER_PRESETS.find((item) => item.id === provider.id);
   if (preset) return preset.category === "local";
-  return ["ollama", "lmstudio", "vllm", "sglang", "llamacpp", "local"].includes(
-    provider.type
-  );
+  return [
+    "ollama",
+    "lmstudio",
+    "omnirun",
+    "vllm",
+    "sglang",
+    "llamacpp",
+    "local",
+  ].includes(provider.type);
 }
 
 function slugifyProviderId(name: string, existing: string[]): string {
@@ -54,15 +67,36 @@ export function ProviderConfigForm({
   defaultProvider = "",
   defaultModel = "",
   onDefaultChange,
+  onValidationChange,
 }: Props) {
   const [advancedIds, setAdvancedIds] = useState<Set<string>>(new Set());
   const [customOpen, setCustomOpen] = useState(false);
+  const [rawRequestLimits, setRawRequestLimits] = useState<Record<string, string>>({});
   const [customDraft, setCustomDraft] = useState({
     name: "",
     baseUrl: "",
     apiKey: "",
     models: "",
   });
+
+  const requestLimitInputValue = (provider: ProviderConfig): string => {
+    const raw = rawRequestLimits[provider.id];
+    if (raw !== undefined) return raw;
+    return formatRequestLimitInput(provider.request_max_output_tokens);
+  };
+
+  const handleRequestLimitChange = (provider: ProviderConfig, raw: string) => {
+    setRawRequestLimits((prev) => ({ ...prev, [provider.id]: raw }));
+    const next = applyRequestLimitInput(
+      provider.request_max_output_tokens,
+      raw,
+      provider.max_output_tokens
+    );
+    const index = value.findIndex((item) => item.id === provider.id);
+    if (index >= 0) {
+      updateProvider(index, "request_max_output_tokens", next);
+    }
+  };
 
   const updateProvider = (
     index: number,
@@ -131,6 +165,19 @@ export function ProviderConfigForm({
     activeProvider && activeProvider.models.includes(defaultModel)
       ? defaultModel
       : activeProvider?.models[0] ?? "";
+
+  const validationError = value.reduce<string | null>((found, provider) => {
+    if (found) return found;
+    return requestLimitError(requestLimitInputValue(provider), provider.max_output_tokens);
+  }, null);
+  if (onValidationChange) {
+    // This is intentionally called during render; it is a cheap callback that
+    // lets the Setup save boundary reject invalid raw input before persistence.
+    // The parent stores a string and does not set React state synchronously from
+    // a child render in a way that loops because the value is derived from the
+    // same raw/valid state.
+    onValidationChange(validationError);
+  }
 
   return (
     <div className="setup-stack">
@@ -409,6 +456,36 @@ export function ProviderConfigForm({
                         ))}
                       </select>
                       <small>自动协商适合大多数服务；仅在第三方 API 出现连接兼容问题时尝试 HTTP/1.1 或 HTTP/2。</small>
+                    </label>
+                    <label className="provider-request-limit-field">
+                      单次请求最大输出
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={requestLimitInputValue(provider)}
+                        placeholder="使用 OmniNova 默认策略"
+                        onChange={(event) => handleRequestLimitChange(provider, event.target.value)}
+                      />
+                      {requestLimitError(
+                        requestLimitInputValue(provider),
+                        provider.max_output_tokens
+                      ) ? (
+                        <small className="provider-field-error">
+                          {requestLimitError(
+                            requestLimitInputValue(provider),
+                            provider.max_output_tokens
+                          )}
+                        </small>
+                      ) : null}
+                      {provider.max_output_tokens ? (
+                        <small>模型最大输出上限：{formatTokenCount(provider.max_output_tokens)}（只读能力）</small>
+                      ) : (
+                        <small>模型最大输出上限未知</small>
+                      )}
+                      <small>
+                        限制一次模型请求最多生成的 Token 数量。该值不会改变模型本身的最大输出能力。
+                        留空则使用 OmniNova 默认策略（32K，且不超过模型最大输出上限）。
+                      </small>
                     </label>
                   </div>
                 ) : null}

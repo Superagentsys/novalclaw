@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub permissions: PermissionsConfig,
+    #[serde(default)]
     pub autonomy: AutonomyConfig,
     #[serde(default)]
     pub security: SecurityConfig,
@@ -70,6 +72,8 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
+    #[serde(default, alias = "computerUse")]
+    pub computer_use: ComputerUseConfig,
     #[serde(default, alias = "httpRequest")]
     pub http_request: HttpRequestConfig,
     #[serde(default, alias = "webFetch")]
@@ -198,6 +202,7 @@ impl Default for Config {
             provider: ProviderBehaviorConfig::default(),
             provider_runtime: ProviderRuntimeConfig::default(),
             agent: AgentConfig::default(),
+            permissions: PermissionsConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -209,6 +214,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             tunnel: TunnelConfig::default(),
             browser: BrowserConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             http_request: HttpRequestConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -295,6 +301,31 @@ pub struct ModelProviderConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+    /// Optional authoritative model context-window override.
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    /// Optional model max-output-token capability override.
+    /// This is model metadata, not the per-request generation cap.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Optional per-request generation cap sent on outgoing Provider calls.
+    /// Distinct from `max_output_tokens` (model capability). `None` or `0`
+    /// means the OmniNova product default request policy applies, clamped to
+    /// the model maximum when known.
+    #[serde(default)]
+    pub request_max_output_tokens: Option<u64>,
+    /// Optional trusted display tokenizer implementation name. Unknown names
+    /// are ignored; this never infers a tokenizer from a model alias.
+    #[serde(default)]
+    pub exact_tokenizer: Option<String>,
+    /// Optional canonical model id used when this profile is an alias/proxy.
+    /// This is the only supported way to map an alias to trusted capabilities.
+    #[serde(default)]
+    pub canonical_model: Option<String>,
+    /// Optional explicit provider family, e.g. "anthropic" or "openai".
+    /// This never overrides capability resolution by itself; it is metadata.
+    #[serde(default)]
+    pub provider_family: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +758,34 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/// Global OmniNova authorization mode. Full access bypasses OmniNova policy
+/// prompts and allowlists, but does not bypass operating-system permissions or
+/// runtime correctness mechanisms such as E-Stop, browser ownership, session
+/// isolation, validation, and lifecycle locks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    Restricted,
+    FullAccess,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub mode: PermissionMode,
+}
+
+impl PermissionsConfig {
+    pub fn is_full_access(&self) -> bool {
+        self.mode == PermissionMode::FullAccess
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Autonomy
 // ---------------------------------------------------------------------------
 
@@ -782,6 +841,8 @@ fn default_auto_approve() -> Vec<String> {
         "memory_recall".into(),
         "memory_store".into(),
         "knowledge_search".into(),
+        "web_search".into(),
+        "web_fetch".into(),
     ]
 }
 
@@ -798,8 +859,8 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: default_auto_approve(),
             non_cli_excluded_tools: vec![
-                "shell".into(), "file_write".into(), "file_edit".into(),
-                "git_operations".into(), "browser".into(),
+                "shell".into(), "file_write".into(), "office_create".into(), "file_edit".into(),
+                "git_operations".into(), "browser".into(), "computer_use".into(),
             ],
         }
     }
@@ -1486,6 +1547,18 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub attach_only: bool,
     pub cdp_url: Option<String>,
+    /// Trusted local override for the Chrome-compatible executable used by
+    /// Managed Browser. This is runtime configuration, never a tool argument.
+    #[serde(default)]
+    pub executable_path: Option<PathBuf>,
+    /// Trusted installed Chrome profile directory identity (`Default`,
+    /// `Profile 1`). Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub installed_profile: Option<String>,
+    /// Trusted OmniNova managed persistent profile id (`work`, `b33e-test`).
+    /// Not a filesystem path and never a tool argument.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 fn default_browser_backend() -> String {
@@ -1501,6 +1574,100 @@ impl Default for BrowserConfig {
             native_headless: false,
             attach_only: false,
             cdp_url: None,
+            executable_path: None,
+            installed_profile: None,
+            profile: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Computer Use (OS desktop control)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputerUseConfig {
+    /// Off by default. Enabling still requires approval for click/type/press.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default `*` = operate any foreground app.
+    /// Empty = observe-only. Otherwise a name whitelist.
+    #[serde(default = "default_computer_use_allowed_apps")]
+    pub allowed_apps: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_screenshot_before_click: bool,
+    /// Mouse/keyboard actions one agent run may perform. `0` = unlimited, which
+    /// is what a long unattended desktop task needs.
+    #[serde(default = "default_computer_use_max_actions_per_turn")]
+    pub max_actions_per_turn: u32,
+    /// Process-wide hourly rate limit on mouse/keyboard actions. `0` = unlimited.
+    #[serde(default = "default_computer_use_max_actions_per_hour")]
+    pub max_actions_per_hour: u32,
+    /// Raise the ReAct iteration cap when this tool is in the session.
+    #[serde(default = "default_computer_use_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+    #[serde(default = "default_desktop_vision_max_dimension_px")]
+    pub max_dimension_px: u32,
+    #[serde(default = "default_computer_use_thrash_soft")]
+    pub thrash_soft_limit: u32,
+    #[serde(default = "default_computer_use_thrash_hard")]
+    pub thrash_hard_limit: u32,
+    #[serde(default = "default_computer_use_max_snapshot_nodes")]
+    pub max_snapshot_nodes: usize,
+}
+
+fn default_computer_use_allowed_apps() -> Vec<String> {
+    vec!["*".into()]
+}
+
+/// Unlimited by default: a desktop task runs until it is done, and the ReAct
+/// iteration cap plus E-Stop are what bound it. A small number here silently
+/// froze long runs halfway through.
+fn default_computer_use_max_actions_per_turn() -> u32 {
+    0
+}
+fn default_computer_use_max_actions_per_hour() -> u32 {
+    0
+}
+fn default_computer_use_max_tool_iterations() -> usize {
+    200
+}
+fn default_computer_use_thrash_soft() -> u32 {
+    3
+}
+fn default_computer_use_thrash_hard() -> u32 {
+    5
+}
+fn default_computer_use_max_snapshot_nodes() -> usize {
+    80
+}
+
+impl ComputerUseConfig {
+    pub fn allowlist_allows_all(allowed_apps: &[String]) -> bool {
+        allowed_apps.iter().any(|app| {
+            let trimmed = app.trim();
+            trimmed == "*" || trimmed.eq_ignore_ascii_case("all")
+        })
+    }
+
+    pub fn allows_all_apps(&self) -> bool {
+        Self::allowlist_allows_all(&self.allowed_apps)
+    }
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_apps: default_computer_use_allowed_apps(),
+            require_screenshot_before_click: true,
+            max_actions_per_turn: default_computer_use_max_actions_per_turn(),
+            max_actions_per_hour: default_computer_use_max_actions_per_hour(),
+            max_tool_iterations: default_computer_use_max_tool_iterations(),
+            max_dimension_px: default_desktop_vision_max_dimension_px(),
+            thrash_soft_limit: default_computer_use_thrash_soft(),
+            thrash_hard_limit: default_computer_use_thrash_hard(),
+            max_snapshot_nodes: default_computer_use_max_snapshot_nodes(),
         }
     }
 }
@@ -1545,7 +1712,7 @@ impl Default for HttpRequestConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebFetchConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -1558,7 +1725,7 @@ pub struct WebFetchConfig {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: Vec::new(),
             max_response_size: default_max_response_size(),
             timeout_secs: default_timeout_secs(),
@@ -1605,12 +1772,27 @@ fn default_open_skills_enabled() -> bool {
     DEFAULT_OPEN_SKILLS_ENABLED
 }
 
+fn default_catalog_prompt_limit() -> usize {
+    crate::skills::catalog::DEFAULT_CATALOG_PROMPT_LIMIT
+}
+
+fn default_catalog_description_limit() -> usize {
+    crate::skills::catalog::DEFAULT_CATALOG_DESCRIPTION_LIMIT
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsConfig {
     #[serde(default = "default_open_skills_enabled")]
     pub open_skills_enabled: bool,
     pub open_skills_dir: Option<String>,
     pub prompt_injection_mode: Option<String>,
+    /// Entries inlined into the system prompt; 0 = unlimited. Entries past the
+    /// cap remain reachable through `use_skill`'s `query` search.
+    #[serde(default = "default_catalog_prompt_limit")]
+    pub catalog_prompt_limit: usize,
+    /// Per-entry description characters in the system prompt; 0 = unlimited.
+    #[serde(default = "default_catalog_description_limit")]
+    pub catalog_description_limit: usize,
 }
 
 impl Default for SkillsConfig {
@@ -1619,6 +1801,8 @@ impl Default for SkillsConfig {
             open_skills_enabled: DEFAULT_OPEN_SKILLS_ENABLED,
             open_skills_dir: None,
             prompt_injection_mode: None,
+            catalog_prompt_limit: default_catalog_prompt_limit(),
+            catalog_description_limit: default_catalog_description_limit(),
         }
     }
 }
@@ -1807,10 +1991,16 @@ pub struct ResearchPhaseConfig {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2500,6 +2690,7 @@ fn default_require_approval_tools() -> Vec<String> {
         "file_edit".into(),
         "git_operations".into(),
         "browser".into(),
+        "computer_use".into(),
         "http_request".into(),
     ]
 }
@@ -2664,6 +2855,23 @@ pub struct SubagentsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_native_headless_defaults_to_false() {
+        assert!(
+            !BrowserConfig::default().native_headless,
+            "BrowserConfig::default native_headless must be headed (false)"
+        );
+        let parsed: BrowserConfig = toml::from_str("enabled = true\nbackend = \"agent-browser\"\n")
+            .expect("partial browser config must deserialize");
+        assert!(
+            !parsed.native_headless,
+            "#[serde(default)] bool for native_headless is false, not a custom true default"
+        );
+        let from_table: Config = toml::from_str("[browser]\nenabled = true\n")
+            .expect("config with [browser] table must load");
+        assert!(!from_table.browser.native_headless);
+    }
 
     #[test]
     fn provider_runtime_defaults_apply_when_fields_absent() {
@@ -2899,6 +3107,66 @@ mode = "http10"
 "#,
         );
         assert!(result.is_err(), "invalid transport mode must fail config loading");
+    }
+
+    #[test]
+    fn r21_h_request_max_output_tokens_parses_and_roundtrips() {
+        let cfg: Config = toml::from_str(
+            r#"
+[model_providers.deepseek]
+request_max_output_tokens = 32000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_providers["deepseek"].request_max_output_tokens,
+            Some(32_000)
+        );
+        assert_eq!(cfg.model_providers["deepseek"].max_output_tokens, None);
+        let restored: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.model_providers["deepseek"].request_max_output_tokens,
+            Some(32_000)
+        );
+    }
+
+    #[test]
+    fn r21_request_max_output_tokens_absent_stays_none() {
+        let cfg: Config = toml::from_str(
+            r#"
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_providers["deepseek"].request_max_output_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn computer_use_and_scheduler_phase2_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.computer_use.enabled);
+        assert!(cfg.computer_use.allows_all_apps());
+        // 0 = unlimited, so a desktop task is not cut off mid-way.
+        assert_eq!(cfg.computer_use.max_actions_per_turn, 0);
+        assert_eq!(cfg.computer_use.max_actions_per_hour, 0);
+        assert!(cfg.computer_use.max_tool_iterations >= 200);
+        assert_eq!(cfg.computer_use.thrash_soft_limit, 3);
+        assert_eq!(cfg.computer_use.thrash_hard_limit, 5);
+        assert_eq!(cfg.computer_use.max_snapshot_nodes, 80);
+        assert!(cfg.scheduler.enabled);
+
+        let loaded: Config = toml::from_str("[computer_use]\nenabled = false\n").unwrap();
+        assert!(loaded.scheduler.enabled);
+        assert!(loaded.computer_use.allows_all_apps());
+        assert_eq!(loaded.computer_use.thrash_hard_limit, 5);
+
+        let observe_only: Config =
+            toml::from_str("[computer_use]\nenabled = true\nallowed_apps = []\n").unwrap();
+        assert!(!observe_only.computer_use.allows_all_apps());
     }
 }
 

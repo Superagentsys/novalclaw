@@ -103,4 +103,10 @@ pub trait Tool: Send + Sync {
             parameters: self.parameters_schema(),
         }
     }
+
+    /// Test-only downcast used by registry tests to inspect concrete tool state.
+    #[cfg(test)]
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }

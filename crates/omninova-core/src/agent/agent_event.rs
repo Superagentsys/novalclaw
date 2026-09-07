@@ -4,6 +4,7 @@
 //! a consistent schema for real-time UI streaming and final run replay.
 
 use serde::{Deserialize, Serialize};
+use crate::observability::{ContextLifecycleEvent, ContextUsageSnapshot};
 
 /// Execution status of a step or tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,17 @@ pub enum AgentRunEvent {
         session_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_step_id: Option<String>,
+    },
+
+    /// Notification only. Desktop must re-query BrowserRuntime state before
+    /// updating controls because events can be missed or arrive out of order.
+    browser_takeover_state_changed {
+        run_id: String,
+        session_id: String,
+        phase: String,
+        generation: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// A named step (group of tools) has started.
@@ -271,6 +283,18 @@ pub enum AgentRunEvent {
         run_id: String,
         reason: String,
     },
+
+    /// Authoritative context usage snapshot for one Provider request.
+    context_usage {
+        run_id: String,
+        snapshot: ContextUsageSnapshot,
+    },
+
+    /// Context Runtime lifecycle event (pressure/pruning/compaction/overflow).
+    context_lifecycle {
+        run_id: String,
+        event: ContextLifecycleEvent,
+    },
 }
 
 /// Diff statistics for a file change.
@@ -285,6 +309,7 @@ impl AgentRunEvent {
     pub fn run_id(&self) -> &str {
         match self {
             Self::run_started { run_id, .. } => run_id,
+            Self::browser_takeover_state_changed { run_id, .. } => run_id,
             Self::step_started { run_id, .. } => run_id,
             Self::model_started { run_id, .. } => run_id,
             Self::model_delta { run_id, .. } => run_id,
@@ -306,6 +331,8 @@ impl AgentRunEvent {
             Self::run_completed { run_id, .. } => run_id,
             Self::run_failed { run_id, .. } => run_id,
             Self::run_cancelled { run_id, .. } => run_id,
+            Self::context_usage { run_id, .. } => run_id,
+            Self::context_lifecycle { run_id, .. } => run_id,
         }
     }
 
@@ -313,6 +340,7 @@ impl AgentRunEvent {
     pub fn step_id(&self) -> Option<&str> {
         match self {
             Self::run_started { .. } => None,
+            Self::browser_takeover_state_changed { .. } => None,
             Self::step_started { step_id, .. } => Some(step_id),
             Self::model_started { step_id, .. } => Some(step_id),
             Self::model_delta { step_id, .. } => Some(step_id),
@@ -334,6 +362,8 @@ impl AgentRunEvent {
             Self::run_completed { .. } => None,
             Self::run_failed { .. } => None,
             Self::run_cancelled { .. } => None,
+            Self::context_usage { .. } => None,
+            Self::context_lifecycle { .. } => None,
         }
     }
 }

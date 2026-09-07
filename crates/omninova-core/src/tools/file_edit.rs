@@ -1,4 +1,4 @@
-use crate::security::sandbox::resolve_workspace_relative;
+use crate::security::sandbox::resolve_tool_path;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -6,13 +6,20 @@ use std::path::PathBuf;
 
 pub struct FileEditTool {
     workspace_dir: PathBuf,
+    full_access: bool,
 }
 
 impl FileEditTool {
     pub fn new(workspace_dir: impl Into<PathBuf>) -> Self {
         Self {
             workspace_dir: workspace_dir.into(),
+            full_access: false,
         }
+    }
+
+    pub fn with_full_access(mut self, full_access: bool) -> Self {
+        self.full_access = full_access;
+        self
     }
 }
 
@@ -52,7 +59,7 @@ impl Tool for FileEditTool {
             .and_then(|v| v.as_str())
             .unwrap_or("overwrite");
 
-        let resolved = match resolve_workspace_relative(&self.workspace_dir, path).await {
+        let resolved = match resolve_tool_path(&self.workspace_dir, path, self.full_access).await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {

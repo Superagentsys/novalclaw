@@ -1,0 +1,13 @@
+# Pinned DeepSeek V4 Flash tokenizer assets for OmniNova Token Meter V1.2A.
+#
+# These files are tokenizer/encoding artifacts only. No model weights.
+
+canonical_model = "deepseek-v4-flash"
+tokenizer_family = "deepseek_v4"
+tokenizer_revision = "DeepSeek-V4-Flash-0731"
+huggingface_repo = "deepseek-ai/DeepSeek-V4-Flash-0731"
+tokenizer_json = "tokenizer.json"
+source_commit_note = "Pinned from Hugging Face main tree at V1.2A implementation time"
+encoding_spec = "Official DeepSeek V4 encoding_dsv4.py semantics, ported in crates/omninova-core/src/providers/deepseek_v4.rs"
+official_fixtures = "encoding/tests/ (official test_input/test_output 1-4)"
+production_parity_validated = false

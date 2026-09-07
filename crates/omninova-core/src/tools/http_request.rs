@@ -1,19 +1,57 @@
 use crate::tools::traits::{Tool, ToolResult};
+use crate::tools::web_client::{
+    build_web_client, check_destination, host_matches_allowlist, map_reqwest_error,
+    read_body_limited, redact_secrets_in_text, WebClientError, WebToolSettings,
+    MAX_REQUEST_BODY_BYTES,
+};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 use std::collections::HashMap;
-use std::time::Duration;
+use url::Url;
 
-const MAX_RESPONSE_BYTES: usize = 1_048_576;
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Hop-by-hop and structural headers that must not be user-supplied: they
+/// corrupt the connection framing or leak credentials to the wrong hop. The
+/// HTTP client controls all of them.
+const FORBIDDEN_REQUEST_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+    "proxy-authorization",
+    "keep-alive",
+    "expect",
+];
+
+const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+fn is_sensitive_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "set-cookie2"
+            | "www-authenticate"
+    )
+}
 
 pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
+    settings: WebToolSettings,
 }
 
 impl HttpRequestTool {
-    pub fn new(allowed_domains: Vec<String>) -> Self {
-        Self { allowed_domains }
+    pub fn new(allowed_domains: Vec<String>, settings: WebToolSettings) -> Self {
+        Self {
+            allowed_domains,
+            settings,
+        }
     }
 
     fn is_domain_allowed(&self, url: &str) -> bool {
@@ -23,27 +61,34 @@ impl HttpRequestTool {
         let Ok(parsed) = url::Url::parse(url) else {
             return false;
         };
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        self.allowed_domains
-            .iter()
-            .any(|domain| host == domain.as_str() || host.ends_with(&format!(".{domain}")))
+        parsed
+            .host_str()
+            .is_some_and(|host| host_matches_allowlist(host, &self.allowed_domains))
     }
 
-    fn is_private_url(url: &str) -> bool {
-        let Ok(parsed) = url::Url::parse(url) else {
-            return true;
-        };
-        let Some(host) = parsed.host_str() else {
-            return true;
-        };
-        host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host.starts_with("10.")
-            || host.starts_with("172.")
-            || host.starts_with("192.168.")
+    fn sanitize_headers(headers: &HashMap<String, String>) -> Result<HeaderMap, WebClientError> {
+        let mut sanitized = HeaderMap::with_capacity(headers.len());
+        for (key, value) in headers {
+            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+                WebClientError::HeaderRejected {
+                    detail: format!("header name '{key}' is not a valid HTTP header name"),
+                }
+            })?;
+            if FORBIDDEN_REQUEST_HEADERS.contains(&name.as_str()) {
+                return Err(WebClientError::HeaderRejected {
+                    detail: format!(
+                        "header '{key}' is controlled by the HTTP client and cannot be set"
+                    ),
+                });
+            }
+            let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
+                WebClientError::HeaderRejected {
+                    detail: format!("header '{key}' contains non-visible-ASCII characters"),
+                }
+            })?;
+            sanitized.append(name, value);
+        }
+        Ok(sanitized)
     }
 }
 
@@ -54,7 +99,11 @@ impl Tool for HttpRequestTool {
     }
 
     fn description(&self) -> &str {
-        "Make an HTTP request. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS."
+        "Make a raw HTTP request to a REST/API endpoint. Supports GET, POST, PUT, DELETE, PATCH, \
+         HEAD, OPTIONS with custom headers and a body. Returns a bounded raw body — no HTML \
+         extraction and no JavaScript. Do not use this to read web pages (use web_fetch or browser) \
+         or to search the web (use web_search). \
+         Permanent failures such as [PrivateNetworkBlocked] will not succeed on retry."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -80,7 +129,10 @@ impl Tool for HttpRequestTool {
             .and_then(|v| v.as_str())
             .unwrap_or("GET")
             .to_uppercase();
-        let body = args.get("body").and_then(|v| v.as_str()).map(str::to_string);
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let headers: HashMap<String, String> = args
             .get("headers")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -90,75 +142,122 @@ impl Tool for HttpRequestTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Domain not in allowed list for URL: {url}")),
+                error: Some(format!(
+                    "[InvalidUrl] Domain not in allowed list for URL: {}",
+                    redact_secrets_in_text(url)
+                )),
             });
         }
 
-        if Self::is_private_url(url) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Requests to private/local addresses are not allowed".to_string()),
-            });
+        if !ALLOWED_METHODS.contains(&method.as_str()) {
+            return Ok(ToolResult::failure(format!(
+                "[InvalidUrl] method '{method}' is not supported; allowed: {ALLOWED_METHODS:?}"
+            )));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?;
-
-        let mut req = match method.as_str() {
-            "POST" => client.post(url),
-            "PUT" => client.put(url),
-            "DELETE" => client.delete(url),
-            "PATCH" => client.patch(url),
-            "HEAD" => client.head(url),
-            _ => client.get(url),
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    WebClientError::InvalidUrl {
+                        detail: e.to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
         };
 
-        for (key, value) in &headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-        if let Some(body) = body {
-            req = req.body(body);
-        }
+        let via_proxy = self.settings.proxy.for_scheme(parsed.scheme()).is_some();
 
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let resp_headers = resp
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("(binary)")))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                let body_str = if body_bytes.len() > MAX_RESPONSE_BYTES {
-                    format!(
-                        "{}\n[truncated at {MAX_RESPONSE_BYTES} bytes, total {} bytes]",
-                        String::from_utf8_lossy(&body_bytes[..MAX_RESPONSE_BYTES]),
-                        body_bytes.len()
-                    )
-                } else {
-                    String::from_utf8_lossy(&body_bytes).to_string()
-                };
+        // Local input validation first so malformed requests fail without any
+        // network activity.
+        let sanitized_headers = match Self::sanitize_headers(&headers) {
+            Ok(headers) => headers,
+            Err(e) => return Ok(ToolResult::failure(e.to_string())),
+        };
 
-                Ok(ToolResult {
-                    success: (200..400).contains(&status),
-                    output: format!("HTTP {status}\n{resp_headers}\n\n{body_str}"),
-                    error: if status >= 400 {
-                        Some(format!("HTTP {status}"))
-                    } else {
-                        None
-                    },
-                })
+        if let Some(body) = body.as_deref() {
+            if body.len() > MAX_REQUEST_BODY_BYTES {
+                return Ok(ToolResult::failure(
+                    WebClientError::RequestTooLarge {
+                        detail: format!(
+                            "request body is {} bytes; limit is {MAX_REQUEST_BODY_BYTES} bytes",
+                            body.len()
+                        ),
+                    }
+                    .to_string(),
+                ));
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
         }
+
+        if let Err(e) = check_destination(&parsed, &self.allowed_domains, via_proxy).await {
+            return Ok(ToolResult::failure(e.to_string()));
+        }
+
+        let client = match build_web_client(
+            &self
+                .settings
+                .web_client_settings(self.allowed_domains.clone()),
+        ) {
+            Ok(client) => client,
+            Err(e) => return Ok(ToolResult::failure(e.to_string())),
+        };
+
+        let mut request = match method.as_str() {
+            "POST" => client.post(parsed.clone()),
+            "PUT" => client.put(parsed.clone()),
+            "DELETE" => client.delete(parsed.clone()),
+            "PATCH" => client.patch(parsed.clone()),
+            "HEAD" => client.head(parsed.clone()),
+            "OPTIONS" => client.request(reqwest::Method::OPTIONS, parsed.clone()),
+            _ => client.get(parsed.clone()),
+        };
+        request = request.headers(sanitized_headers);
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => return Ok(ToolResult::failure(map_reqwest_error(e).to_string())),
+        };
+
+        let status = response.status().as_u16();
+        let resp_headers = response
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                let name = k.as_str();
+                if is_sensitive_response_header(name) {
+                    format!("{name}: [redacted]")
+                } else {
+                    format!("{name}: {}", v.to_str().unwrap_or("(binary)"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let resp_body =
+            match read_body_limited(&mut response, self.settings.max_response_size).await {
+                Ok(body) => body,
+                Err(e) => return Ok(ToolResult::failure(e.to_string())),
+            };
+        let mut body_str = String::from_utf8_lossy(&resp_body.bytes).to_string();
+        if resp_body.truncated {
+            body_str.push_str(&format!(
+                "\n[truncated at {} bytes; received {} bytes or more]",
+                self.settings.max_response_size, resp_body.total_read
+            ));
+        }
+
+        Ok(ToolResult {
+            success: (200..400).contains(&status),
+            output: format!("HTTP {status}\n{resp_headers}\n\n{body_str}"),
+            error: if status >= 400 {
+                Some(WebClientError::HttpStatusError { status }.to_string())
+            } else {
+                None
+            },
+        })
     }
 }

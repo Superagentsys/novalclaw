@@ -186,6 +186,9 @@ impl SecurityContext {
 
     /// Check if chat-only mode is enabled for this inbound (e.g., Feishu without slash commands)
     pub fn is_chat_only(&self) -> bool {
+        if self.config.permissions.is_full_access() {
+            return false;
+        }
         self.inbound_metadata
             .get("chat_only")
             .and_then(|v| v.as_bool())
@@ -264,6 +267,8 @@ impl SecurityContext {
             "desktop_vision",
             "screenshot",
             "screen_capture",
+            "computer_use",
+            "desktop_use",
             "git",
             "git_clone",
             "git_commit",
@@ -319,6 +324,11 @@ impl SecurityContext {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<ToolPolicyDecision> {
+        if self.config.permissions.is_full_access() {
+            self.ensure_active().await?;
+            return Ok(ToolPolicyDecision::Allow);
+        }
+
         // ==== CHAT-ONLY MODE CHECK ====
         // Block dangerous tools in Feishu chat-only mode
         if self.is_chat_only() && self.is_tool_blocked_by_chat_only(tool_name) {
@@ -342,6 +352,13 @@ impl SecurityContext {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<ToolExecutionGate> {
+        if self.config.permissions.is_full_access() {
+            self.ensure_active().await?;
+            return Ok(ToolExecutionGate::Proceed {
+                note: Some("full access permission mode".to_string()),
+            });
+        }
+
         if let Some(grant) = self
             .approvals
             .consume_matching_grant(run_id, tool_call_id, tool_name, arguments)
@@ -457,5 +474,73 @@ impl ToolExecutionGate {
             )),
             Self::Proceed { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod full_access_tests {
+    use super::*;
+    use crate::config::PermissionMode;
+
+    fn temp_workspace(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "omninova-full-access-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn full_access_gate_proceeds_without_creating_approval() {
+        let workspace = temp_workspace("zero-prompt");
+        let mut config = Config::default();
+        config.workspace_dir = workspace.clone();
+        config.permissions.mode = PermissionMode::FullAccess;
+        config.security.estop.enabled = false;
+        config.security.tool_policy.enabled = true;
+        config.security.tool_policy.denied_tools = vec!["shell".into()];
+        config.approvals.require_approval = vec!["shell".into()];
+        let security = SecurityContext::from_config(&config);
+
+        let gate = security
+            .gate_tool_execution(
+                "run-full",
+                "call-full",
+                "shell",
+                &serde_json::json!({"command": "anything"}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(gate, ToolExecutionGate::Proceed { .. }));
+        assert!(security.approvals().list(true).await.unwrap().is_empty());
+        assert!(!workspace.join(".omninova-approvals.json").exists());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn full_access_does_not_bypass_emergency_stop() {
+        let workspace = temp_workspace("estop");
+        let state_file = workspace.join("estop.json");
+        std::fs::write(&state_file, r#"{"paused":true}"#).unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.clone();
+        config.permissions.mode = PermissionMode::FullAccess;
+        config.security.estop.enabled = true;
+        config.security.estop.state_file = Some(state_file.to_string_lossy().to_string());
+        let security = SecurityContext::from_config(&config);
+
+        let error = security
+            .gate_tool_execution(
+                "run-paused",
+                "call-paused",
+                "shell",
+                &serde_json::json!({"command": "anything"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("E-Stop"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

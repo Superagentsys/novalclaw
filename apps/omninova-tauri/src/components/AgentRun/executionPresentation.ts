@@ -11,6 +11,7 @@ const TOOL_RUNNING_LABELS: Record<string, string> = {
   file_read: "正在读取文件",
   read_file: "正在读取文件",
   file_write: "正在写入文件",
+  office_create: "正在生成 Office 文件",
   write_file: "正在写入文件",
   file_edit: "正在修改文件",
   edit_file: "正在修改文件",
@@ -37,6 +38,7 @@ const TOOL_RUNNING_LABELS: Record<string, string> = {
   memory_recall: "正在回忆记忆",
   knowledge_search: "正在检索知识库",
   browser: "正在操作浏览器",
+  computer_use: "正在操作桌面",
   pdf_read: "正在读取 PDF",
 };
 
@@ -46,6 +48,7 @@ const TOOL_COMPLETED_LABELS: Record<string, string> = {
   file_read: "读取文件",
   read_file: "读取文件",
   file_write: "写入文件",
+  office_create: "生成 Office 文件",
   write_file: "写入文件",
   file_edit: "修改文件",
   edit_file: "修改文件",
@@ -72,6 +75,7 @@ const TOOL_COMPLETED_LABELS: Record<string, string> = {
   memory_recall: "记忆回忆完成",
   knowledge_search: "知识库检索完成",
   browser: "浏览器操作完成",
+  computer_use: "桌面操作完成",
   pdf_read: "PDF 读取完成",
 };
 
@@ -96,6 +100,22 @@ export function getToolFailedLabel(toolName: string): string {
 export const MODEL_STARTED_LABEL = "等待模型响应";
 export const MODEL_STREAMING_LABEL = "正在接收模型输出";
 export const MODEL_COMPLETED_LABEL = "模型响应完成";
+
+/** Context Runtime Process labels. Runtime semantics stay in Core events. */
+export const CONTEXT_PRESSURE_LABEL = "检测到上下文压力";
+export const CONTEXT_MAINTENANCE_CONDITION_LABEL = "检测到上下文维护条件";
+export const CONTEXT_PRUNING_STARTED_LABEL = "正在裁剪大型工具结果";
+export const CONTEXT_PRUNING_COMPLETED_LABEL = "已裁剪大型工具结果";
+export const CONTEXT_COMPACTION_STARTED_LABEL = "正在压缩上下文";
+export const CONTEXT_COMPACTION_COMPLETED_LABEL = "上下文压缩完成";
+export const CONTEXT_COMPACTION_FAILED_LABEL = "上下文压缩失败";
+export const CONTEXT_COMPACTION_INCOMPLETE_LABEL = "上下文压缩未完成";
+export const CONTEXT_PRUNING_INCOMPLETE_LABEL = "工具结果裁剪未完成";
+export const CONTEXT_RECOVERY_STARTED_LABEL = "正在执行上下文恢复";
+export const CONTEXT_RECOVERY_COMPLETED_LABEL = "上下文恢复完成";
+export const CONTEXT_RECOVERY_FAILED_LABEL = "上下文恢复失败";
+export const CONTEXT_RECOVERY_INCOMPLETE_LABEL = "上下文恢复未完成";
+export const CONTEXT_SECOND_OVERFLOW_DETAIL = "自动维护后仍超过模型上下文容量";
 
 const SECRET_PATTERNS: RegExp[] = [
   /sk-[A-Za-z0-9_-]{8,}/gi,
@@ -148,7 +168,14 @@ export function getErrorPresentation(
     if (/(model_not_found|model.*not.*found|no.*model|模型不存在)/i.test(lower)) {
       return { title: "模型不存在或不可用", detail: detail };
     }
-    if (/(content_filter|content moderation|safety|内容被.*拦截)/i.test(lower)) {
+    // Context overflow is checked first, and the safety pattern below no longer
+    // matches a bare "safety": the preflight error reports safety_reserve_tokens,
+    // so an oversized request (a desktop screenshot, a long run) used to be
+    // reported to the user as a model content block.
+    if (/(contextbudgetexceeded|contextwindowexceeded|context_length_exceeded|context window|maximum context|上下文.*(超|溢出|过长))/i.test(lower)) {
+      return { title: "上下文超出模型窗口", detail: detail };
+    }
+    if (/(content_filter|content moderation|safety (filter|polic|system)|内容被.*拦截)/i.test(lower)) {
       return { title: "内容被模型安全策略拦截", detail: detail };
     }
     if (/(permission|denied|not allowed|forbidden|blocked|权限不足)/i.test(lower)) {

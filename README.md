@@ -268,7 +268,8 @@ We use GitHub Actions for automated cross-platform builds.
 - **Platform Support**:
   - macOS (Universal/Apple Silicon) `.dmg`
   - Windows (x64) `.msi`
-  - Linux (x64) `.AppImage` / `.deb`
+  - Linux (x64) `.AppImage` / `.deb` / `.rpm`
+  - Linux (ARM64) `.deb` / `.rpm`
 
 ## 📄 License
 

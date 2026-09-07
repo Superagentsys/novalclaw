@@ -211,6 +211,11 @@ const initialConfig: Config = {
     desktop_vision_enabled: false,
     desktop_vision_max_dimension_px: 1280,
   },
+  computer_use: {
+    enabled: false,
+    allowed_apps: ["*"],
+    require_screenshot_before_click: true,
+  },
   observability: {
     prometheus_enabled: false,
     prometheus_port: 9090,
@@ -220,6 +225,13 @@ const initialConfig: Config = {
     record_arguments: false,
   },
 };
+
+function computerUseAllowsAllApps(apps: string[] | undefined): boolean {
+  return (apps ?? []).some((app) => {
+    const trimmed = app.trim();
+    return trimmed === "*" || trimmed.toLowerCase() === "all";
+  });
+}
 
 export type SetupTab = "general" | "providers" | "channels" | "skills" | "persona";
 
@@ -232,6 +244,30 @@ interface CliInstallStatus {
   onPath: boolean;
   hint: string;
 }
+
+interface BrowserDepStatus {
+  name: string;
+  installed: boolean;
+  version: string | null;
+  detail: string;
+}
+
+type BrowserDepUiState =
+  | "checking"
+  | "ready"
+  | "missing"
+  | "installing"
+  | "installed"
+  | "failed";
+
+const BROWSER_DEP_STATE_LABELS: Record<BrowserDepUiState, string> = {
+  checking: "检测中",
+  ready: "可用",
+  missing: "缺少 Chromium",
+  installing: "安装中",
+  installed: "已安装",
+  failed: "安装或检测失败",
+};
 type SetupTabItem = {
   id: SetupTab;
   label: string;
@@ -359,6 +395,7 @@ export function Setup({
   >(null);
   const [actionMessage, setActionMessage] = useState("");
   const [channelValidationError, setChannelValidationError] = useState<string | undefined>();
+  const [providerValidationError, setProviderValidationError] = useState<string | null>(null);
   const [activeChannelId, setActiveChannelIdState] = useState("");
   const dirtyChannelIdsRef = useRef<Set<string>>(new Set());
   const [localHealthStatus, setLocalHealthStatus] = useState<HealthUiStatus>("not_ready");
@@ -384,6 +421,9 @@ export function Setup({
   const [dingtalkRouteLoading, setDingtalkRouteLoading] = useState(false);
   const [cliInstall, setCliInstall] = useState<CliInstallStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
+  const [browserDep, setBrowserDep] = useState<BrowserDepStatus | null>(null);
+  const [browserDepState, setBrowserDepState] =
+    useState<BrowserDepUiState>("checking");
   const jsonPreview = useMemo(() => {
     const redacted = redactSensitiveFields(config);
     return JSON.stringify(redacted, null, 2);
@@ -500,6 +540,25 @@ export function Setup({
     }
   }, []);
 
+  const refreshBrowserDep = useCallback(async () => {
+    setBrowserDepState("checking");
+    try {
+      const status = await invokeTauri<BrowserDepStatus>("check_browser_dep");
+      setBrowserDep(status);
+      setBrowserDepState(status.installed ? "ready" : "missing");
+      return status;
+    } catch (error) {
+      setBrowserDep({
+        name: "browser-runtime",
+        installed: false,
+        version: null,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      setBrowserDepState("failed");
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     void loadSetupState();
   }, []);
@@ -507,8 +566,9 @@ export function Setup({
   useEffect(() => {
     if (activeTab === "general") {
       void refreshCliInstall();
+      void refreshBrowserDep();
     }
-  }, [activeTab, refreshCliInstall]);
+  }, [activeTab, refreshBrowserDep, refreshCliInstall]);
 
   useEffect(() => {
     if (activeTab !== "channels") {
@@ -612,6 +672,29 @@ export function Setup({
     }
   };
 
+  const formatTokenCount = (value: number): string => {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+    if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+    return String(value);
+  };
+
+  const validateProviderRequestLimits = (providers: Config["providers"]): string | null => {
+    for (const provider of providers) {
+      const value = provider.request_max_output_tokens;
+      if (value == null) continue;
+      if (!Number.isSafeInteger(value) || value < 0) {
+        return `${provider.name} 的单次请求最大输出必须是有效的非负整数。`;
+      }
+      if (value === 0) {
+        return `${provider.name} 的单次请求最大输出不能为 0，请留空表示使用 OmniNova 默认策略。`;
+      }
+      if (provider.max_output_tokens && value > provider.max_output_tokens) {
+        return `${provider.name} 的单次请求最大输出不能超过该模型的最大输出上限 ${formatTokenCount(provider.max_output_tokens)}。`;
+      }
+    }
+    return null;
+  };
+
   const saveSetupConfig = async (
     validateAllChannels: boolean,
     configToSave = config,
@@ -636,6 +719,15 @@ export function Setup({
       setActionMessage(`配置验证失败：${channelValidationError}`);
       return;
     }
+    if (providerValidationError) {
+      setActionMessage(`配置验证失败：${providerValidationError}`);
+      return;
+    }
+    const providerLimitError = validateProviderRequestLimits(config.providers);
+    if (providerLimitError) {
+      setActionMessage(`配置验证失败：${providerLimitError}`);
+      return;
+    }
     setBusyAction("save");
     try {
       const restarted = await saveSetupConfig(false);
@@ -657,6 +749,15 @@ export function Setup({
   const handleSaveAndStartGateway = async () => {
     if (channelValidationError) {
       setActionMessage(`配置验证失败：${channelValidationError}`);
+      return;
+    }
+    if (providerValidationError) {
+      setActionMessage(`配置验证失败：${providerValidationError}`);
+      return;
+    }
+    const providerLimitError = validateProviderRequestLimits(config.providers);
+    if (providerLimitError) {
+      setActionMessage(`配置验证失败：${providerLimitError}`);
       return;
     }
     setBusyAction("start");
@@ -759,6 +860,23 @@ export function Setup({
       );
     } finally {
       setCliBusy(false);
+    }
+  };
+
+  const handleBrowserDepInstall = async () => {
+    setBrowserDepState("installing");
+    try {
+      const status = await invokeTauri<BrowserDepStatus>("install_browser_dep");
+      setBrowserDep(status);
+      setBrowserDepState(status.installed ? "installed" : "failed");
+    } catch (error) {
+      setBrowserDep((current) => ({
+        name: current?.name ?? "browser-runtime",
+        installed: false,
+        version: current?.version ?? null,
+        detail: error instanceof Error ? error.message : String(error),
+      }));
+      setBrowserDepState("failed");
     }
   };
 
@@ -1173,6 +1291,107 @@ export function Setup({
             </section>
 
             <section className="setup-section">
+              <h2>Computer Use（桌面操作）</h2>
+              <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
+                让助手操作本机原生窗口（钉钉、飞书客户端、Excel、用友等）。网页请继续用浏览器工具。
+                默认关闭；开启后截屏可自动执行，点击/输入仍需审批。勾选「允许操作系统内的所有软件」即可操作前台任意应用。
+                不勾选且白名单为空时，只能看屏、不能点。macOS 需同时授权「屏幕录制」和「辅助功能」。
+              </p>
+              <div className="setup-grid">
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={config.computer_use?.enabled ?? false}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: event.target.checked,
+                          allowed_apps:
+                            event.target.checked &&
+                            !(config.computer_use?.allowed_apps?.length)
+                              ? ["*"]
+                              : config.computer_use?.allowed_apps ?? ["*"],
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                        },
+                      })
+                    }
+                  />
+                  <span>启用桌面 Computer Use（总开关）</span>
+                </label>
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={
+                      config.computer_use?.require_screenshot_before_click ?? true
+                    }
+                    disabled={!config.computer_use?.enabled}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          allowed_apps: config.computer_use?.allowed_apps ?? ["*"],
+                          require_screenshot_before_click: event.target.checked,
+                        },
+                      })
+                    }
+                  />
+                  <span>点击前必须先截屏</span>
+                </label>
+                <label className="setup-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={computerUseAllowsAllApps(config.computer_use?.allowed_apps)}
+                    disabled={!config.computer_use?.enabled}
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                          allowed_apps: event.target.checked ? ["*"] : [],
+                        },
+                      })
+                    }
+                  />
+                  <span>允许操作系统内的所有软件</span>
+                </label>
+                <label>
+                  允许操作的应用（逗号分隔；勾选「所有软件」时为 *）
+                  <input
+                    value={(config.computer_use?.allowed_apps ?? ["*"]).join("，")}
+                    disabled={
+                      !config.computer_use?.enabled ||
+                      computerUseAllowsAllApps(config.computer_use?.allowed_apps)
+                    }
+                    placeholder="钉钉，飞书，Excel"
+                    onChange={(event) =>
+                      setConfig({
+                        ...config,
+                        computer_use: {
+                          ...config.computer_use,
+                          enabled: config.computer_use?.enabled ?? false,
+                          require_screenshot_before_click:
+                            config.computer_use?.require_screenshot_before_click ?? true,
+                          allowed_apps: event.target.value
+                            .split(/[,，]/)
+                            .map((item) => item.trim())
+                            .filter(Boolean),
+                        },
+                      })
+                    }
+                  />
+                </label>
+              </div>
+            </section>
+
+            <section className="setup-section">
               <h2>审计与可观测性</h2>
               <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
                 全链路审计写入工作区 <code>.omninova-audit.log</code>（JSONL）。
@@ -1259,6 +1478,50 @@ export function Setup({
             </section>
 
             <section className="setup-section">
+              <h2>浏览器运行环境</h2>
+              <p
+                className="setup-embed-sub"
+                style={{ marginTop: 0, marginBottom: "0.75rem" }}
+              >
+                网页交互使用随应用分发的 agent-browser CLI；首次使用只需安装
+                Chromium，无需安装 npm 或全局命令。
+              </p>
+              <div className="setup-grid">
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <p style={{ margin: "0 0 0.5rem", fontSize: "0.9rem" }}>
+                    状态：{BROWSER_DEP_STATE_LABELS[browserDepState]}
+                    {browserDep?.version ? ` · agent-browser ${browserDep.version}` : ""}
+                  </p>
+                  {browserDep?.detail ? (
+                    <p className="setup-action-hint" style={{ margin: "0 0 0.75rem" }}>
+                      {browserDep.detail}
+                    </p>
+                  ) : null}
+                  <div className="setup-embed-buttons">
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--secondary"
+                      disabled={browserDepState === "checking" || browserDepState === "installing"}
+                      onClick={() => void refreshBrowserDep()}
+                    >
+                      {browserDepState === "checking" ? "检测中…" : "重新检测"}
+                    </button>
+                    <button
+                      type="button"
+                      className="setup-btn setup-btn--primary"
+                      disabled={browserDepState === "checking" || browserDepState === "installing"}
+                      onClick={() => void handleBrowserDepInstall()}
+                    >
+                      {browserDepState === "installing"
+                        ? "正在安装 Chromium…"
+                        : "安装浏览器运行环境"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="setup-section">
               <h2>命令行 omninova（全平台）</h2>
               <p className="setup-embed-sub" style={{ marginTop: 0, marginBottom: "0.75rem" }}>
                 将随应用分发的 CLI 安装到用户目录并写入 PATH，无需管理员权限；效果类似 Ollama 安装后可在终端直接使用
@@ -1324,6 +1587,7 @@ export function Setup({
                 default_model: model,
               })
             }
+            onValidationChange={(error) => setProviderValidationError(error)}
           />
         );
       case "channels":

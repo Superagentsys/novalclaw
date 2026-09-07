@@ -1,0 +1,14 @@
+{
+  "name": "omninova-personal-chrome",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test tests/protocol.test.mjs tests/reconnect.test.mjs tests/manifest.test.mjs tests/authorize.test.mjs tests/dom.test.mjs tests/popup.test.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "typescript": "~5.9.3"
+  }
+}

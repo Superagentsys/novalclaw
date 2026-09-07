@@ -25,6 +25,7 @@ pub async fn generate_plan(
     task: &str,
     max_steps: usize,
     feedback: Option<&str>,
+    request_max_output_tokens: Option<u32>,
 ) -> Result<(Vec<String>, ChatResponse)> {
     let system = "You are the planning module of an AI agent. Decompose the task into a short \
                   ordered list of concrete, self-contained steps that an executor with tools \
@@ -42,10 +43,10 @@ pub async fn generate_plan(
 
     let messages = [ChatMessage::system(system), ChatMessage::user(user)];
     let response = provider
-        .chat(ChatRequest {
-            messages: &messages,
-            tools: None,
-        })
+        .chat(
+            ChatRequest::new(&messages, None)
+                .with_request_max_output_tokens(request_max_output_tokens),
+        )
         .await?;
     let steps = parse_plan(response.text.as_deref().unwrap_or(""), max_steps, task);
     Ok((steps, response))
@@ -58,6 +59,7 @@ pub async fn reflect(
     task: &str,
     transcript: &str,
     remaining_steps: usize,
+    request_max_output_tokens: Option<u32>,
 ) -> Result<(Reflection, ChatResponse)> {
     let system = "You are the reflector of an AI agent run. Judge strictly from the evidence \
                   whether the original task has been fully accomplished. Do not assume \
@@ -74,10 +76,10 @@ pub async fn reflect(
 
     let messages = [ChatMessage::system(system), ChatMessage::user(user)];
     let response = provider
-        .chat(ChatRequest {
-            messages: &messages,
-            tools: None,
-        })
+        .chat(
+            ChatRequest::new(&messages, None)
+                .with_request_max_output_tokens(request_max_output_tokens),
+        )
         .await?;
     let verdict = parse_reflection(response.text.as_deref().unwrap_or(""));
     Ok((verdict, response))

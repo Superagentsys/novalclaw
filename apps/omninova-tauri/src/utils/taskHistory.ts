@@ -28,8 +28,10 @@ export interface TaskActivityEntry {
   label: string;
   tone?: "info" | "success" | "warning" | "error";
   /** Compact process category. Raw model deltas and command output are never stored. */
-  kind?: "lifecycle" | "model" | "tool" | "file" | "approval";
+  kind?: "lifecycle" | "model" | "tool" | "file" | "approval" | "context";
   status?: "running" | "completed" | "failed" | "waiting";
+  /** Stable Context Runtime operation key, conceptually `context:<operation_id>`. */
+  operationId?: string;
   detail?: string;
   toolName?: string;
   path?: string;

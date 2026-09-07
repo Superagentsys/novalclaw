@@ -1,16 +1,14 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::dispatcher::AgentDispatcher;
 use crate::agent::event_bus::EventBus;
-use crate::agent::history::{
-    apply_compaction, plan_compaction, render_for_summary, truncate_history_preserving_system,
-    SUMMARY_MARKER,
-};
+use crate::agent::context::maintain_context;
 use crate::agent::planner::{self, Reflection};
-use crate::agent::prompt::bootstrap_system_messages;
+use crate::agent::prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
 use crate::agent::{AgentCancellationToken, AgentRunEvent, ToolExecutionEvent};
 use crate::config::AgentConfig;
 use crate::memory::{Memory, MemoryCategory};
-use crate::providers::{ChatMessage, ChatRequest, Provider};
+use crate::observability::{with_context_telemetry, SharedSink};
+use crate::providers::{ChatMessage, Provider};
 use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
@@ -46,6 +44,22 @@ const SUMMARIZER_PROMPT: &str = "你是对话摘要器。把下面较早的对�
 省略寒暄与重复内容，不要编造未出现的信息。用中文输出，不超过 1200 字。\
 不要改写或省略以 [任务] 或 [检查点] 开头的内容。";
 
+macro_rules! agent_dispatcher {
+    ($agent:expr, $budget:expr, $override:expr) => {
+        AgentDispatcher::new(
+            $agent.provider.as_ref(),
+            &$agent.tools,
+            &$agent.tool_specs,
+            $agent.config.max_tool_iterations,
+            &$agent.security,
+            $budget,
+            $agent.config.max_history_messages,
+            $agent.config.compact_context,
+        )
+        .with_request_max_output_tokens($override)
+    };
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -54,6 +68,10 @@ pub struct Agent {
     config: AgentConfig,
     security: SecurityContext,
     messages: Vec<ChatMessage>,
+    /// Consumed by the next logical `process_message*` run. Not persisted.
+    run_generation_limit_override: Option<u32>,
+    /// Desktop / checkpoint screenshots for the next user turn.
+    pending_user_images: Vec<String>,
 }
 
 impl Agent {
@@ -73,8 +91,44 @@ impl Agent {
             config,
             security,
             messages: Vec::new(),
+            run_generation_limit_override: None,
+            pending_user_images: Vec::new(),
         }
     }
+
+    /// Sets an ephemeral generation-limit override for the next logical run.
+    /// `None` or `0` means absent. Consumed when the run starts.
+    pub fn set_request_max_output_tokens(&mut self, tokens: Option<u32>) {
+        self.run_generation_limit_override = tokens.filter(|value| *value > 0);
+    }
+
+    fn take_request_generation_limit(&mut self) -> Option<u32> {
+        self.run_generation_limit_override.take().filter(|value| *value > 0)
+    }
+
+    pub fn set_pending_user_images(&mut self, images: Vec<String>) {
+        self.pending_user_images = images
+            .into_iter()
+            .filter(|image| !image.trim().is_empty())
+            .collect();
+    }
+
+    fn push_user_turn(&mut self, message: &str, extra_images: &[String]) {
+        let mut images = std::mem::take(&mut self.pending_user_images);
+        images.extend(
+            extra_images
+                .iter()
+                .filter(|image| !image.trim().is_empty())
+                .cloned(),
+        );
+        if images.is_empty() {
+            self.messages.push(ChatMessage::user(message));
+        } else {
+            self.messages
+                .push(ChatMessage::user_with_images(message, images));
+        }
+    }
+
 
     pub async fn process_message(&mut self, message: &str) -> Result<String> {
         self.process_message_with_images(message, &[]).await
@@ -86,6 +140,7 @@ impl Agent {
         images: &[String],
     ) -> Result<String> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -97,31 +152,22 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
+        self.compact_context_if_needed(request_max_output_tokens).await;
 
-        if images.is_empty() {
-            self.messages.push(ChatMessage::user(message));
-        } else {
-            self.messages
-                .push(ChatMessage::user_with_images(message, images.to_vec()));
-        }
+        self.push_user_turn(message, images);
+        self.refresh_candidate(request_max_output_tokens);
 
         // One budget spans the whole request: planner, executor and reflector
         // calls all draw from it.
         let budget = BudgetTracker::new(self.config.budget.clone());
 
         if self.config.planning.enabled {
-            self.run_plan_execute_reflect(message, &budget).await
+            self.run_plan_execute_reflect(message, &budget, request_max_output_tokens)
+                .await
         } else {
-            let dispatcher = AgentDispatcher::new(
-                self.provider.as_ref(),
-                &self.tools,
-                &self.tool_specs,
-                self.config.max_tool_iterations,
-                &self.security,
-                &budget,
-            );
-            dispatcher.run(&mut self.messages).await
+            agent_dispatcher!(self, &budget, request_max_output_tokens)
+                .run(&mut self.messages)
+                .await
         }
     }
 
@@ -132,6 +178,7 @@ impl Agent {
         message: &str,
     ) -> Result<(String, Vec<ToolExecutionEvent>)> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -143,20 +190,14 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
+        self.compact_context_if_needed(request_max_output_tokens).await;
+        self.push_user_turn(message, &[]);
+        self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
-        let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
-        );
-
-        let (reply, events) = dispatcher.run_with_events(&mut self.messages).await?;
+        let (reply, events) = agent_dispatcher!(self, &budget, request_max_output_tokens)
+            .run_with_events(&mut self.messages)
+            .await?;
 
         Ok((reply, events))
     }
@@ -180,6 +221,7 @@ impl Agent {
         cancel_token: AgentCancellationToken,
     ) -> Result<(String, Vec<AgentRunEvent>)> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -190,9 +232,6 @@ impl Agent {
                 None,
             )
             .await;
-
-        self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
 
         let budget = BudgetTracker::new(self.config.budget.clone());
 
@@ -215,24 +254,56 @@ impl Agent {
             drain_handle.drain().await;
         });
 
-        bus.run_started(self.config.name.clone(), external_session_id, None);
+        bus.run_started(self.config.name.clone(), external_session_id.clone(), None);
 
-        let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
+        let provider_name = self
+            .security
+            .audit()
+            .context()
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.name().to_string());
+        let model_name = self
+            .provider
+            .model()
+            .map(str::to_string)
+            .or_else(|| self.security.audit().context().model.clone())
+            .unwrap_or_default();
+        let sink: SharedSink = Arc::new(bus.clone());
+        let session_id = external_session_id.clone();
+        let dispatch_result = with_context_telemetry(
+            session_id,
+            Some(run_id.clone()),
+            provider_name,
+            model_name,
+            sink,
+            async {
+                crate::observability::set_exact_tokenizer(
+                    self.provider.exact_tokenizer().map(str::to_string),
+                );
+                self.compact_context_if_needed(request_max_output_tokens).await;
+                self.push_user_turn(message, &[]);
+                self.refresh_candidate(request_max_output_tokens);
+                crate::observability::emit_candidate_usage(
+                    &self.messages,
+                    &self.tool_specs,
+                    self.provider
+                        .context_budget()
+                        .map(|budget| {
+                            budget.with_request_generation_override(request_max_output_tokens)
+                        })
+                        .as_ref(),
+                );
+                let dispatcher = agent_dispatcher!(self, &budget, request_max_output_tokens)
+                    .with_event_bus(Some(bus.clone()))
+                    .with_cancel_token(Some(cancel_token.clone()));
+                tokio::select! {
+                    result = dispatcher.run_streaming_with_bus(&mut self.messages) => result,
+                    _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
+                }
+            },
         )
-        .with_event_bus(Some(bus.clone()))
-        .with_cancel_token(Some(cancel_token.clone()));
-
-        let run_future = dispatcher.run_streaming_with_bus(&mut self.messages);
-        let dispatch_result = tokio::select! {
-            result = run_future => result,
-            _ = cancel_token.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
-        };
+        .await;
 
         let reply_text = match dispatch_result {
             Ok(reply) => {
@@ -277,6 +348,7 @@ impl Agent {
         events: &tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
     ) -> Result<String> {
         self.apply_request_system_prompt();
+        let request_max_output_tokens = self.take_request_generation_limit();
 
         let _ = self
             .memory
@@ -288,19 +360,14 @@ impl Agent {
             )
             .await;
 
-        self.compact_context_if_needed().await;
-        self.messages.push(ChatMessage::user(message));
+        self.compact_context_if_needed(request_max_output_tokens).await;
+        self.push_user_turn(message, &[]);
+        self.refresh_candidate(request_max_output_tokens);
 
         let budget = BudgetTracker::new(self.config.budget.clone());
-        let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            &budget,
-        );
-        dispatcher.run_streaming(&mut self.messages, events).await
+        agent_dispatcher!(self, &budget, request_max_output_tokens)
+            .run_streaming(&mut self.messages, events)
+            .await
     }
 
     /// Plan-Execute-Reflect loop: a planner decomposes the task, the executor
@@ -310,6 +377,7 @@ impl Agent {
         &mut self,
         task: &str,
         budget: &BudgetTracker,
+        request_max_output_tokens: Option<u32>,
     ) -> Result<String> {
         let max_plan_steps = self.config.planning.max_plan_steps.max(1);
         let max_replans = self.config.planning.max_replans;
@@ -319,6 +387,7 @@ impl Agent {
             task,
             max_plan_steps,
             None,
+            request_max_output_tokens,
         )
         .await
         {
@@ -330,15 +399,9 @@ impl Agent {
                 // Planner unavailable: degrade to the plain ReAct loop rather
                 // than failing the request.
                 warn!("planner failed, falling back to ReAct: {e}");
-                let dispatcher = AgentDispatcher::new(
-                    self.provider.as_ref(),
-                    &self.tools,
-                    &self.tool_specs,
-                    self.config.max_tool_iterations,
-                    &self.security,
-                    budget,
-                );
-                return dispatcher.run(&mut self.messages).await;
+                return agent_dispatcher!(self, budget, request_max_output_tokens)
+                    .run(&mut self.messages)
+                    .await;
             }
         };
 
@@ -360,15 +423,10 @@ impl Agent {
                     step,
                     task
                 )));
-                let dispatcher = AgentDispatcher::new(
-                    self.provider.as_ref(),
-                    &self.tools,
-                    &self.tool_specs,
-                    self.config.max_tool_iterations,
-                    &self.security,
-                    budget,
-                );
-                let step_result = dispatcher.run(&mut self.messages).await?;
+                self.refresh_candidate(request_max_output_tokens);
+                let step_result = agent_dispatcher!(self, budget, request_max_output_tokens)
+                    .run(&mut self.messages)
+                    .await?;
                 executed.push((step.clone(), step_result));
 
                 if let Some(reason) = budget.check() {
@@ -377,13 +435,21 @@ impl Agent {
 
                 let transcript = render_transcript(&executed);
                 let remaining = current_plan.len() - idx - 1;
-                match planner::reflect(self.provider.as_ref(), task, &transcript, remaining).await
+                match planner::reflect(
+                    self.provider.as_ref(),
+                    task,
+                    &transcript,
+                    remaining,
+                    request_max_output_tokens,
+                )
+                .await
                 {
                     Ok((verdict, response)) => {
                         budget.record_call(response.usage.as_ref());
                         match verdict {
                             Reflection::Complete { final_answer } => {
                                 self.messages.push(ChatMessage::assistant(&final_answer));
+                                self.refresh_candidate(request_max_output_tokens);
                                 return Ok(final_answer);
                             }
                             Reflection::Continue => {}
@@ -398,6 +464,7 @@ impl Agent {
                                     task,
                                     max_plan_steps,
                                     Some(&feedback),
+                                    request_max_output_tokens,
                                 )
                                 .await
                                 {
@@ -426,15 +493,10 @@ impl Agent {
             "All planned steps have been executed. Based on the results above, provide the \
              final answer to the original task now. Original task: {task}"
         )));
-        let dispatcher = AgentDispatcher::new(
-            self.provider.as_ref(),
-            &self.tools,
-            &self.tool_specs,
-            self.config.max_tool_iterations,
-            &self.security,
-            budget,
-        );
-        dispatcher.run(&mut self.messages).await
+        self.refresh_candidate(request_max_output_tokens);
+        agent_dispatcher!(self, budget, request_max_output_tokens)
+            .run(&mut self.messages)
+            .await
     }
 
     /// Budget exhausted mid-plan: report partial progress instead of failing.
@@ -457,7 +519,19 @@ impl Agent {
             render_transcript(executed)
         );
         self.messages.push(ChatMessage::assistant(&text));
+        self.refresh_candidate(None);
         Ok(text)
+    }
+
+    fn refresh_candidate(&self, request_max_output_tokens: Option<u32>) {
+        let budget = self.provider.context_budget().map(|budget| {
+            budget.with_request_generation_override(request_max_output_tokens)
+        });
+        crate::observability::emit_candidate_usage(
+            &self.messages,
+            &self.tool_specs,
+            budget.as_ref(),
+        );
     }
 
     /// Condense older turns into a summary once history outgrows
@@ -465,39 +539,19 @@ impl Agent {
     ///
     /// A failed summarizer call degrades to truncation that still preserves the
     /// leading system messages, so a provider hiccup never blocks the turn.
-    async fn compact_context_if_needed(&mut self) {
+    async fn compact_context_if_needed(&mut self, request_max_output_tokens: Option<u32>) {
         if !self.config.compact_context {
             return;
         }
-        let max_history = self.config.max_history_messages;
-        let Some(plan) = plan_compaction(&self.messages, max_history) else {
-            return;
-        };
-
-        let request_messages = vec![
-            ChatMessage::system(SUMMARIZER_PROMPT),
-            ChatMessage::user(render_for_summary(&plan.summarize)),
-        ];
-        let summary = match self
-            .provider
-            .chat(ChatRequest {
-                messages: &request_messages,
-                tools: None,
-            })
-            .await
-        {
-            Ok(response) => response.text.unwrap_or_default(),
-            Err(error) => {
-                warn!("context compaction failed, truncating instead: {error}");
-                self.messages = truncate_history_preserving_system(
-                    std::mem::take(&mut self.messages),
-                    max_history,
-                );
-                return;
-            }
-        };
-
-        self.messages = apply_compaction(plan, &summary);
+        self.messages = maintain_context(
+            self.provider.as_ref(),
+            std::mem::take(&mut self.messages),
+            &self.tool_specs,
+            self.config.max_history_messages,
+            true,
+            request_max_output_tokens,
+        )
+        .await;
     }
 
     pub fn export_non_system_messages(&self) -> Vec<ChatMessage> {
@@ -528,20 +582,52 @@ impl Agent {
     /// Skill instructions are request-scoped working context. Rebuild the
     /// bootstrap system prompt from this request's config and drop leftover
     /// full SKILL.md payloads before the next model turn.
-    fn apply_request_system_prompt(&mut self) {
-        self.messages =
-            crate::skills::sanitize_skill_working_context(std::mem::take(&mut self.messages));
-        let bootstrap = bootstrap_system_messages(&self.config);
-        if bootstrap.is_empty() {
-            return;
-        }
-        if let Some(first) = self.messages.first() {
-            if first.role == "system" && !first.content.starts_with(SUMMARY_MARKER) {
-                self.messages[0] = bootstrap.into_iter().next().unwrap();
-                return;
-            }
-        }
-        self.messages.splice(0..0, bootstrap);
+    pub(crate) fn apply_request_system_prompt(&mut self) {
+        self.messages = reconstruct_model_visible_messages(
+            &self.config,
+            std::mem::take(&mut self.messages),
+        );
+    }
+
+    /// Restore ledger history and current system/tool surface for projection.
+    /// Does not prune, compact, append a user message, or call the Provider.
+    pub(crate) fn reconstruct_for_projection(&mut self, history: Vec<ChatMessage>) {
+        self.import_messages(history);
+        self.apply_request_system_prompt();
+    }
+
+    /// Measure the reconstructed model-visible context locally.
+    /// Never calls Provider, pruning, or compaction.
+    pub(crate) async fn project_open_context(
+        &self,
+        session_id: Option<String>,
+    ) -> crate::observability::ContextUsageSnapshot {
+        let provider_name = self
+            .security
+            .audit()
+            .context()
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.name().to_string());
+        let model_name = self
+            .security
+            .audit()
+            .context()
+            .model
+            .clone()
+            .or_else(|| self.provider.model().map(str::to_string))
+            .unwrap_or_default();
+        let budget = self.provider.context_budget();
+        crate::observability::measure_projected_context(
+            session_id,
+            &provider_name,
+            &model_name,
+            self.provider.exact_tokenizer().map(str::to_string),
+            budget.as_ref(),
+            &self.messages,
+            &self.tool_specs,
+        )
+        .await
     }
 }
 
@@ -576,7 +662,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::providers::{ChatResponse, MockProvider, TokenUsage, ToolCall};
+    use crate::providers::{ChatRequest, ChatResponse, MockProvider, TokenUsage, ToolCall};
     use crate::tools::ToolResult;
     use async_trait::async_trait;
     use serde_json::json;
@@ -586,6 +672,7 @@ mod tests {
     struct SequenceProvider {
         responses: Mutex<VecDeque<ChatResponse>>,
         requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        generation_limits: Arc<Mutex<Vec<Option<u32>>>>,
     }
 
     impl SequenceProvider {
@@ -595,8 +682,25 @@ mod tests {
                 Self {
                     responses: Mutex::new(responses.into()),
                     requests: requests.clone(),
+                    generation_limits: Arc::new(Mutex::new(Vec::new())),
                 },
                 requests,
+            )
+        }
+
+        fn with_limit_log(
+            responses: Vec<ChatResponse>,
+        ) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>, Arc<Mutex<Vec<Option<u32>>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let generation_limits = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: requests.clone(),
+                    generation_limits: generation_limits.clone(),
+                },
+                requests,
+                generation_limits,
             )
         }
     }
@@ -607,8 +711,16 @@ mod tests {
             "sequence"
         }
 
+        fn model(&self) -> Option<&str> {
+            Some("sequence-model")
+        }
+
         async fn chat(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
             self.requests.lock().unwrap().push(request.messages.to_vec());
+            self.generation_limits
+                .lock()
+                .unwrap()
+                .push(request.request_max_output_tokens);
             self.responses
                 .lock()
                 .unwrap()
@@ -906,5 +1018,217 @@ mod tests {
         let mut agent = mock_agent(cfg);
         let reply = agent.process_message("task").await.expect("reply");
         assert!(reply.contains("[budget exceeded]"), "got: {reply}");
+    }
+
+    fn usage_snapshots(events: &[AgentRunEvent]) -> Vec<crate::observability::ContextUsageSnapshot> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentRunEvent::context_usage { snapshot, .. } => Some(snapshot.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn h_tool_result_append_emits_candidate_immediately() {
+        let tools = vec![crate::tools::ToolSpec {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }];
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("run echo"),
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"call-echo","name":"echo","arguments":"{}"}]}"#,
+            ),
+        ];
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        crate::observability::with_context_telemetry(
+            Some("session-h".into()),
+            Some("run-h".into()),
+            "sequence",
+            "sequence-model",
+            sink.clone(),
+            async {
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                let tool_payload = serde_json::json!({
+                    "tool_call_id": "call-echo",
+                    "content": "T".repeat(3_000),
+                })
+                .to_string();
+                messages.push(ChatMessage::tool(tool_payload));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+            },
+        )
+        .await;
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|s| {
+            s.measurement_kind == crate::observability::MeasurementKind::CandidateEstimate
+        }));
+        assert!(snapshots[1].request_revision > snapshots[0].request_revision);
+        assert!(
+            snapshots[1].breakdown.tool_result_tokens > 1_000,
+            "appended tool result must appear in Candidate: {:?}",
+            snapshots[1].breakdown
+        );
+        assert!(snapshots[1].estimated_input_tokens > snapshots[0].estimated_input_tokens);
+        assert_eq!(snapshots[1].session_id.as_deref(), Some("session-h"));
+        assert_eq!(snapshots[1].model, "sequence-model");
+    }
+
+    #[tokio::test]
+    async fn h_user_assistant_tool_context_mutation_refreshes_candidate_revision() {
+        let tools = vec![crate::tools::ToolSpec {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }];
+        let mut messages = vec![ChatMessage::system("sys")];
+        let sink = Arc::new(crate::observability::VecContextTelemetry::new());
+        crate::observability::with_context_telemetry(
+            Some("session-h2".into()),
+            Some("run-h2".into()),
+            "sequence",
+            "sequence-model",
+            sink.clone(),
+            async {
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::user("run echo"));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::assistant(
+                    r#"{"tool_calls":[{"id":"call-echo","name":"echo","arguments":"{}"}]}"#,
+                ));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+                messages.push(ChatMessage::tool(
+                    serde_json::json!({"tool_call_id":"call-echo","content":"ok"}).to_string(),
+                ));
+                crate::observability::emit_candidate_usage(&messages, &tools, None);
+            },
+        )
+        .await;
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 4);
+        for window in snapshots.windows(2) {
+            assert!(window[1].request_revision > window[0].request_revision);
+            assert_eq!(
+                window[1].measurement_kind,
+                crate::observability::MeasurementKind::CandidateEstimate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn k_session_restore_emits_initial_candidate_after_assembly() {
+        let (provider, requests) = SequenceProvider::new(vec![response(
+            Some("next"),
+            Vec::new(),
+            "stop",
+        )]);
+        let mut config = AgentConfig::default();
+        config.compact_context = false;
+        config.system_prompt = Some("restored system".into());
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), config);
+        agent.import_messages(vec![
+            ChatMessage::system("restored system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer ".to_string() + &"z".repeat(200)),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::<AgentRunEvent>::new()));
+        let event_sink = events.clone();
+        agent
+            .process_message_with_events_streaming(
+                "follow up",
+                Box::new(move |event| event_sink.lock().unwrap().push(event)),
+                Some("run-k".into()),
+                Some("session-k".into()),
+                AgentCancellationToken::new(),
+            )
+            .await
+            .expect("restored session");
+        let snapshots = usage_snapshots(&events.lock().unwrap());
+        let first = snapshots.first().expect("restored session must emit Candidate");
+        assert_eq!(
+            first.measurement_kind,
+            crate::observability::MeasurementKind::CandidateEstimate
+        );
+        assert_eq!(first.session_id.as_deref(), Some("session-k"));
+        assert_eq!(first.run_id.as_deref(), Some("run-k"));
+        assert_eq!(first.provider, "sequence");
+        assert_eq!(first.model, "sequence-model");
+        assert_eq!(first.request_revision, 1);
+        assert!(first.estimated_input_tokens > 0);
+        let after_user = snapshots.iter().find(|s| {
+            s.measurement_kind == crate::observability::MeasurementKind::CandidateEstimate
+                && s.request_revision > 1
+        });
+        assert!(
+            after_user.is_some(),
+            "user append must emit a newer Candidate: {:?}",
+            snapshots
+                .iter()
+                .map(|s| (s.measurement_kind, s.request_revision))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first.breakdown.system_tokens > 0 || first.breakdown.conversation_tokens > 0,
+            "restored history missing from candidate: {:?}",
+            first.breakdown
+        );
+        assert!(
+            !requests.lock().unwrap().is_empty(),
+            "provider still runs after the restored candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn r241_k_next_unrelated_request_clears_override() {
+        let (provider, _requests, limits) = SequenceProvider::with_limit_log(vec![
+            response(Some("first"), Vec::new(), "stop"),
+            response(Some("second"), Vec::new(), "stop"),
+        ]);
+        let mut agent = agent_with_provider(Box::new(provider), Vec::new(), AgentConfig::default());
+        agent.set_request_max_output_tokens(Some(64_000));
+        let first = agent.process_message("long form").await.expect("first");
+        assert_eq!(first, "first");
+        let second = agent.process_message("follow up").await.expect("second");
+        assert_eq!(second, "second");
+        let captured = limits.lock().unwrap().clone();
+        assert_eq!(captured, vec![Some(64_000), None]);
+    }
+
+    #[tokio::test]
+    async fn r241_m_tool_loop_preserves_run_scoped_override() {
+        let (provider, _requests, limits) = SequenceProvider::with_limit_log(vec![
+            response(
+                None,
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "use_skill".into(),
+                    arguments: r#"{"skill_id":"skill:test"}"#.into(),
+                }],
+                "tool_calls",
+            ),
+            response(Some("done after tool"), Vec::new(), "stop"),
+        ]);
+        let mut agent = agent_with_provider(
+            Box::new(provider),
+            vec![Box::new(AlreadyActiveUseSkillTool)],
+            AgentConfig::default(),
+        );
+        agent.set_request_max_output_tokens(Some(64_000));
+        let reply = agent.process_message("use a skill").await.expect("run");
+        assert_eq!(reply, "done after tool");
+        let captured = limits.lock().unwrap().clone();
+        assert!(
+            captured.len() >= 2,
+            "tool loop must make at least two model turns: {captured:?}"
+        );
+        assert!(
+            captured.iter().all(|limit| *limit == Some(64_000)),
+            "every turn in the run must keep the override: {captured:?}"
+        );
     }
 }

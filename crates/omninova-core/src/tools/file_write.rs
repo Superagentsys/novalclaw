@@ -1,4 +1,4 @@
-use crate::security::sandbox::resolve_workspace_relative;
+use crate::security::sandbox::resolve_tool_path;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -33,13 +33,20 @@ struct FileWriteOutput {
 
 pub struct FileWriteTool {
     workspace_dir: PathBuf,
+    full_access: bool,
 }
 
 impl FileWriteTool {
     pub fn new(workspace_dir: impl Into<PathBuf>) -> Self {
         Self {
             workspace_dir: workspace_dir.into(),
+            full_access: false,
         }
+    }
+
+    pub fn with_full_access(mut self, full_access: bool) -> Self {
+        self.full_access = full_access;
+        self
     }
 }
 
@@ -107,7 +114,7 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
-        let resolved = match resolve_workspace_relative(&self.workspace_dir, path).await {
+        let resolved = match resolve_tool_path(&self.workspace_dir, path, self.full_access).await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {
@@ -167,5 +174,39 @@ impl Tool for FileWriteTool {
             output: serde_json::to_string(&output)?,
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod full_access_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_access_writes_outside_workspace_while_restricted_stays_jailed() {
+        let root = std::env::temp_dir().join(format!(
+            "omninova-file-access-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside").join("proof.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let restricted = FileWriteTool::new(&workspace);
+        let blocked = restricted
+            .execute(json!({"path": outside.to_string_lossy(), "content": "blocked"}))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert!(!outside.exists());
+
+        let full_access = FileWriteTool::new(&workspace).with_full_access(true);
+        let written = full_access
+            .execute(json!({"path": outside.to_string_lossy(), "content": "allowed"}))
+            .await
+            .unwrap();
+        assert!(written.success, "{:?}", written.error);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "allowed");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

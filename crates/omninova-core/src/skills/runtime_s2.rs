@@ -6,7 +6,11 @@ use crate::skills::activation::{
     parse_skill_invocations, resolve_skill_from_store, sanitize_skill_working_context,
     SkillInvocation,
 };
-use crate::skills::catalog::{catalog_prompt_section, is_safe_skill_locator, MAX_ACTIVE_SKILLS};
+use crate::skills::catalog::{
+    cached_skill_catalog, catalog_prompt_section, catalog_prompt_section_with_limits,
+    invalidate_skill_catalog_cache, is_safe_skill_locator, search_skill_catalog,
+    DEFAULT_CATALOG_DESCRIPTION_LIMIT, DEFAULT_CATALOG_PROMPT_LIMIT, MAX_ACTIVE_SKILLS,
+};
 use crate::tools::{SkillActivationGate, Tool, UseSkillTool};
 use serde_json::json;
 use std::collections::HashMap;
@@ -43,6 +47,9 @@ fn write_skill(dir: &Path, slug: &str, name: &str, description: &str, body: &str
         format!("---\nname: {name}\ndescription: {description}\nversion: 1.0.0\n---\n{body}\n"),
     )
     .unwrap();
+    // Mirrors the real install paths: the catalog cache keys on this, so a
+    // fixture that skipped it could read a stale catalog.
+    bump_skills_generation();
 }
 
 fn write_skill_with_resources(dir: &Path, slug: &str, name: &str, body: &str) {
@@ -718,6 +725,249 @@ fn stale_removed_skill_does_not_fallback() {
     assert!(!prompt.contains("ALPHA_BODY"));
     assert!(!prompt.contains("BETA_BODY"));
     assert!(prompt.contains("skill:beta") || prompt.contains("Beta"));
+}
+
+/// Writes `count` marketplace-shaped skills with human-length descriptions,
+/// the shape that grew one real system prompt to 3.2 MB.
+fn write_bulk_skills(dir: &Path, count: usize) {
+    let long_description = "Comprehensive toolkit for the task with references, templates and \
+scripts covering ingestion, validation, transformation, reporting and archival, plus guidance on \
+when to prefer it over the built-in tools and how to recover from partial failures."
+        .to_string();
+    for index in 0..count {
+        write_skill(
+            dir,
+            &format!("vendor-{index:05}"),
+            &format!("Vendor Skill {index:05}"),
+            &long_description,
+            "BULK_BODY",
+        );
+    }
+}
+
+#[test]
+fn oversized_catalog_is_capped_in_the_prompt() {
+    let workspace = TempDir::new("s2-cap");
+    write_bulk_skills(&workspace.0.join("skills"), 400);
+    let config = config_with_workspace(&workspace.0, true);
+    let catalog = list_skill_catalog(&config);
+    assert_eq!(catalog.entries.len(), 400);
+
+    let capped = catalog_prompt_section_with_limits(&catalog, 150, 160);
+    let listed = capped.matches("- `skill:vendor-").count();
+    assert_eq!(listed, 150, "only the cap may be inlined");
+    assert!(
+        capped.contains("250 more installed skills are not listed above"),
+        "the model must be told the listing is partial: {capped:.400}"
+    );
+    assert!(capped.contains("use_skill` with a `query`"));
+
+    let uncapped = catalog_prompt_section_with_limits(&catalog, 0, 0);
+    assert_eq!(uncapped.matches("- `skill:vendor-").count(), 400);
+    assert!(
+        capped.len() < uncapped.len(),
+        "capping must shrink the prompt: {} vs {}",
+        capped.len(),
+        uncapped.len()
+    );
+
+    // The property that actually matters: the prompt stops tracking catalog
+    // size, so a mirrored marketplace cannot inflate it without bound.
+    let bigger = TempDir::new("s2-cap-grown");
+    write_bulk_skills(&bigger.0.join("skills"), 1200);
+    let grown_config = config_with_workspace(&bigger.0, true);
+    let grown = list_skill_catalog(&grown_config);
+    assert_eq!(grown.entries.len(), 1200);
+    let grown_prompt = catalog_prompt_section_with_limits(&grown, 150, 160);
+    assert_eq!(
+        grown_prompt.matches("- `skill:vendor-").count(),
+        150,
+        "tripling the catalog must not add listed entries"
+    );
+    assert!(
+        grown_prompt.len() < capped.len() + 200,
+        "capped prompt grew with catalog size: {} vs {}",
+        grown_prompt.len(),
+        capped.len()
+    );
+}
+
+#[test]
+fn catalog_descriptions_are_truncated_per_entry() {
+    let workspace = TempDir::new("s2-desc");
+    write_bulk_skills(&workspace.0.join("skills"), 2);
+    let config = config_with_workspace(&workspace.0, true);
+    let catalog = list_skill_catalog(&config);
+
+    let capped = catalog_prompt_section_with_limits(&catalog, 150, 60);
+    assert!(capped.contains('…'), "truncated entries need an ellipsis");
+    for line in capped.lines().filter(|line| line.starts_with("- `skill:")) {
+        assert!(
+            line.chars().count() < 200,
+            "entry line stayed long after truncation: {line}"
+        );
+    }
+    assert!(!capped.contains("how to recover from partial failures"));
+}
+
+#[tokio::test]
+async fn skills_beyond_the_prompt_cap_stay_reachable_by_search() {
+    let workspace = TempDir::new("s2-search");
+    let skills_dir = workspace.0.join("skills");
+    write_bulk_skills(&skills_dir, 300);
+    // Sorts last by display name, so a capped listing cannot include it.
+    write_skill(
+        &skills_dir,
+        "zz-radiology",
+        "ZZ Radiology Report Reader",
+        "解读放射科影像报告并生成结构化随访建议",
+        "RADIOLOGY_BODY",
+    );
+    let config = config_with_workspace(&workspace.0, true);
+    let catalog = list_skill_catalog(&config);
+
+    let capped = catalog_prompt_section_with_limits(&catalog, 150, 160);
+    assert!(
+        !capped.contains("skill:zz-radiology"),
+        "fixture must fall outside the cap"
+    );
+
+    let hits = search_skill_catalog(&catalog, "radiology", 25);
+    assert_eq!(hits.first().map(|entry| entry.id.as_str()), Some("skill:zz-radiology"));
+
+    let tool = UseSkillTool::new(config, Arc::new(SkillActivationGate::default()));
+    let found = tool.execute(json!({ "query": "radiology" })).await.unwrap();
+    assert!(found.success);
+    let payload: serde_json::Value = serde_json::from_str(&found.output).unwrap();
+    assert_eq!(payload["mode"], "search");
+    assert_eq!(payload["catalog_size"], 301);
+    assert_eq!(payload["results"][0]["skill_id"], "skill:zz-radiology");
+    // Search must not activate anything, only report candidates.
+    assert!(!found.output.contains("RADIOLOGY_BODY"));
+
+    let loaded = tool
+        .execute(json!({ "skill_id": "skill:zz-radiology" }))
+        .await
+        .unwrap();
+    assert!(loaded.success);
+    assert!(loaded.output.contains("RADIOLOGY_BODY"));
+}
+
+#[tokio::test]
+async fn a_guessed_skill_id_comes_back_with_candidates() {
+    let workspace = TempDir::new("s2-suggest");
+    write_skill(
+        &workspace.0.join("skills"),
+        "pdf-table-extract",
+        "PDF Table Extract",
+        "extract tables from pdf files",
+        "PDF_BODY",
+    );
+    let config = config_with_workspace(&workspace.0, true);
+    let tool = UseSkillTool::new(config, Arc::new(SkillActivationGate::default()));
+
+    let missed = tool
+        .execute(json!({ "skill_id": "skill:pdf_table" }))
+        .await
+        .unwrap();
+    assert!(!missed.success);
+    let payload: serde_json::Value = serde_json::from_str(&missed.output).unwrap();
+    assert_eq!(payload["did_you_mean"][0], "skill:pdf-table-extract");
+}
+
+#[test]
+fn catalog_prompt_defaults_are_bounded() {
+    // Guards the regression that made the catalog alone exceed every
+    // provider's input budget.
+    assert!(DEFAULT_CATALOG_PROMPT_LIMIT > 0);
+    assert!(DEFAULT_CATALOG_DESCRIPTION_LIMIT > 0);
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.skills.catalog_prompt_limit,
+        DEFAULT_CATALOG_PROMPT_LIMIT
+    );
+    assert_eq!(
+        defaults.skills.catalog_description_limit,
+        DEFAULT_CATALOG_DESCRIPTION_LIMIT
+    );
+}
+
+/// Cache-hit behaviour itself is covered by `catalog::cache_tests`, which
+/// tests the freshness predicate directly. It cannot be asserted here: the
+/// cache is one process-global slot, so a test running in parallel against a
+/// different store legitimately evicts this one's entry.
+#[test]
+fn repeated_catalog_reads_agree() {
+    let workspace = TempDir::new("s2-cache-hit");
+    write_bulk_skills(&workspace.0.join("skills"), 20);
+    let config = config_with_workspace(&workspace.0, true);
+
+    let first = cached_skill_catalog(&config);
+    let second = cached_skill_catalog(&config);
+    assert_eq!(first.entries.len(), 20);
+    assert_eq!(first.entries, second.entries);
+    assert_eq!(first.skills_dir, second.skills_dir);
+}
+
+#[test]
+fn installing_a_skill_invalidates_the_catalog_cache() {
+    let workspace = TempDir::new("s2-cache-gen");
+    let skills_dir = workspace.0.join("skills");
+    write_bulk_skills(&skills_dir, 5);
+    let config = config_with_workspace(&workspace.0, true);
+    let before = cached_skill_catalog(&config);
+    assert_eq!(before.entries.len(), 5);
+
+    write_skill(&skills_dir, "late-arrival", "Late Arrival", "加入得比较晚", "LATE_BODY");
+    let after = cached_skill_catalog(&config);
+    assert!(!Arc::ptr_eq(&before, &after), "generation bump must rebuild");
+    assert_eq!(after.entries.len(), 6);
+    assert!(after
+        .entries
+        .iter()
+        .any(|entry| entry.id == "skill:late-arrival"));
+}
+
+#[test]
+fn explicit_invalidation_forces_a_rebuild() {
+    let workspace = TempDir::new("s2-cache-drop");
+    write_bulk_skills(&workspace.0.join("skills"), 3);
+    let config = config_with_workspace(&workspace.0, true);
+
+    let before = cached_skill_catalog(&config);
+    invalidate_skill_catalog_cache();
+    let after = cached_skill_catalog(&config);
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(before.entries.len(), after.entries.len());
+}
+
+#[test]
+fn a_different_store_is_not_served_from_cache() {
+    let first_ws = TempDir::new("s2-cache-dir-a");
+    write_bulk_skills(&first_ws.0.join("skills"), 4);
+    let first_config = config_with_workspace(&first_ws.0, true);
+    let first = cached_skill_catalog(&first_config);
+    assert_eq!(first.entries.len(), 4);
+
+    let second_ws = TempDir::new("s2-cache-dir-b");
+    write_bulk_skills(&second_ws.0.join("skills"), 9);
+    let second_config = config_with_workspace(&second_ws.0, true);
+    let second = cached_skill_catalog(&second_config);
+    assert_eq!(second.entries.len(), 9, "must not serve another store's catalog");
+    assert_eq!(second.skills_dir, second_ws.0.join("skills"));
+}
+
+#[test]
+fn disabling_skills_is_not_served_from_cache() {
+    let workspace = TempDir::new("s2-cache-toggle");
+    write_bulk_skills(&workspace.0.join("skills"), 4);
+    let enabled = config_with_workspace(&workspace.0, true);
+    assert!(cached_skill_catalog(&enabled).open_skills_enabled);
+
+    let disabled = config_with_workspace(&workspace.0, false);
+    let catalog = cached_skill_catalog(&disabled);
+    assert!(!catalog.open_skills_enabled);
+    assert!(catalog.entries.iter().all(|entry| !entry.runtime_visible));
 }
 
 #[test]

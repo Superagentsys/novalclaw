@@ -9,11 +9,14 @@
 use crate::config::Config;
 use crate::memory::Memory;
 use crate::security::{is_tool_globally_allowed, resolve_shell_allowlist};
+use crate::tools::web_client::{
+    WebToolSettings, DEFAULT_WEB_MAX_RESPONSE_BYTES, DEFAULT_WEB_REQUEST_TIMEOUT_SECS,
+};
 use crate::tools::{
-    BrowserTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool, FileReadTool,
-    FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool, KnowledgeSearchTool,
-    MemoryRecallTool, MemoryStoreTool, PdfReadTool, ShellTool, TaskCheckpointTool, TodoWriteTool,
-    Tool, WebFetchTool, WebSearchTool,
+    BrowserTool, ComputerUseTool, ContentSearchTool, FileEditTool, FileListTool, FilePatchTool,
+    FileReadTool, FileWriteTool, GitOperationsTool, GlobSearchTool, HttpRequestTool,
+    KnowledgeSearchTool, MemoryRecallTool, MemoryStoreTool, OfficeCreateTool, PdfReadTool,
+    ShellTool, TaskCheckpointTool, TodoWriteTool, Tool, WebFetchTool, WebSearchTool,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -133,6 +136,14 @@ pub struct ToolBuildContext<'a> {
     /// the `/api/tools` endpoint. Memory-backed tools are skipped then.
     pub memory: Option<&'a Arc<dyn Memory>>,
     pub session_id: Option<&'a str>,
+    /// Optional assembly-owned slot for the exact BrowserRuntime handle used
+    /// by this toolset. Enumeration callers leave it unset.
+    pub browser_takeover_slot:
+        Option<&'a Arc<std::sync::Mutex<Option<crate::tools::browser_runtime::BrowserTakeoverHandle>>>>,
+    /// Exact active-run Personal Chrome authorization. Enumeration and
+    /// non-run callers leave this unset, keeping Personal Chrome fail-closed.
+    pub personal_chrome:
+        Option<&'a crate::tools::browser_personal_chrome::PersonalChromeFactoryContext>,
 }
 
 /// One row of the registry.
@@ -158,35 +169,67 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["read_file"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileReadTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileReadTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_write",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileWriteTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileWriteTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
+    },
+    ToolDef {
+        name: "office_create",
+        capabilities: ToolCapabilities::WORKSPACE_WRITE,
+        aliases: &["create_pptx", "create_docx", "create_xlsx"],
+        enabled: always,
+        build: |ctx| Some(Box::new(OfficeCreateTool::new(ctx.workspace.to_path_buf()))),
     },
     ToolDef {
         name: "file_edit",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(FileEditTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileEditTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_patch",
         capabilities: ToolCapabilities::WORKSPACE_WRITE,
         aliases: &["apply_patch"],
         enabled: always,
-        build: |ctx| Some(Box::new(FilePatchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FilePatchTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "file_list",
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["list_directory"],
         enabled: always,
-        build: |ctx| Some(Box::new(FileListTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(
+                FileListTool::new(ctx.workspace.to_path_buf())
+                    .with_full_access(ctx.config.permissions.is_full_access()),
+            ))
+        },
     },
     ToolDef {
         name: "glob_search",
@@ -200,14 +243,22 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &["grep_search", "grep", "search"],
         enabled: always,
-        build: |ctx| Some(Box::new(ContentSearchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(ContentSearchTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "git_operations",
         capabilities: ToolCapabilities::PROCESS,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(GitOperationsTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(GitOperationsTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "shell",
@@ -235,7 +286,11 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         capabilities: ToolCapabilities::READ_ONLY,
         aliases: &[],
         enabled: always,
-        build: |ctx| Some(Box::new(KnowledgeSearchTool::new(ctx.workspace.to_path_buf()))),
+        build: |ctx| {
+            Some(Box::new(KnowledgeSearchTool::new(
+                ctx.workspace.to_path_buf(),
+            )))
+        },
     },
     ToolDef {
         name: "memory_store",
@@ -287,8 +342,18 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.http_request.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.http_request.allowed_domains.clone()
+            };
             Some(Box::new(HttpRequestTool::new(
-                ctx.config.http_request.allowed_domains.clone(),
+                allowed_domains,
+                WebToolSettings::from_config(
+                    &ctx.config.proxy,
+                    ctx.config.http_request.timeout_secs,
+                    ctx.config.http_request.max_response_size,
+                ),
             )))
         },
     },
@@ -298,8 +363,18 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_fetch.enabled,
         build: |ctx| {
+            let allowed_domains = if ctx.config.permissions.is_full_access() {
+                vec!["*".to_string()]
+            } else {
+                ctx.config.web_fetch.allowed_domains.clone()
+            };
             Some(Box::new(WebFetchTool::new(
-                ctx.config.web_fetch.allowed_domains.clone(),
+                allowed_domains,
+                WebToolSettings::from_config(
+                    &ctx.config.proxy,
+                    ctx.config.web_fetch.timeout_secs,
+                    ctx.config.web_fetch.max_response_size,
+                ),
             )))
         },
     },
@@ -309,11 +384,21 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
         aliases: &[],
         enabled: |config| config.web_search.enabled,
         build: |ctx| {
-            ctx.config
+            let timeout_secs = ctx
+                .config
                 .web_search
-                .brave_api_key
-                .as_ref()
-                .map(|key| Box::new(WebSearchTool::new(key.clone())) as Box<dyn Tool>)
+                .timeout_secs
+                .unwrap_or(DEFAULT_WEB_REQUEST_TIMEOUT_SECS);
+            ctx.config.web_search.brave_api_key.as_ref().map(|key| {
+                Box::new(WebSearchTool::new(
+                    key.clone(),
+                    WebToolSettings::from_config(
+                        &ctx.config.proxy,
+                        timeout_secs,
+                        DEFAULT_WEB_MAX_RESPONSE_BYTES,
+                    ),
+                )) as Box<dyn Tool>
+            })
         },
     },
     ToolDef {
@@ -325,13 +410,110 @@ pub static TOOL_REGISTRY: &[ToolDef] = &[
             spawns_process: true,
         },
         aliases: &[],
-        enabled: |config| config.browser.enabled,
+        enabled: |config| {
+            crate::tools::browser_agent_backend::browser_backend_enabled(
+                config.browser.enabled,
+                &config.browser.backend,
+            )
+        },
         build: |ctx| {
-            Some(Box::new(BrowserTool::new(
-                ctx.config.browser.allowed_domains.clone(),
-                ctx.config.browser.native_headless,
-                ctx.config.browser.attach_only,
-                ctx.config.browser.cdp_url.clone(),
+            let (profile, installed_profile) = match crate::tools::browser_profile_manager::parse_browser_session_profile_config(
+                ctx.config.browser.profile.as_deref(),
+                ctx.config.browser.installed_profile.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidManaged) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid browser.profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::InvalidInstalled) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "invalid installed_profile config; browser tool not registered"
+                    );
+                    return None;
+                }
+                Err(crate::tools::browser_profile_manager::BrowserProfileConfigError::ConflictingModes) => {
+                    tracing::warn!(
+                        target: "browser",
+                        "browser.profile and browser.installed_profile cannot be combined; browser tool not registered"
+                    );
+                    return None;
+                }
+            };
+            let session_opts = crate::tools::browser_types::BrowserSessionOptions {
+                headless: ctx.config.browser.native_headless,
+                attach_only: ctx.config.browser.attach_only,
+                cdp_url: ctx.config.browser.cdp_url.clone(),
+                profile,
+                installed_profile,
+            };
+            let backend = match crate::tools::browser_agent_backend::backend_from_config_with_executable_and_personal_chrome_access(
+                &ctx.config.browser.backend,
+                None,
+                session_opts.clone(),
+                ctx.config.browser.executable_path.clone(),
+                ctx.personal_chrome.cloned(),
+                ctx.config.permissions.is_full_access(),
+            ) {
+                Ok(backend) => backend,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "browser",
+                        backend = %ctx.config.browser.backend,
+                        detail = %err.detail,
+                        "browser backend unavailable; tool not registered"
+                    );
+                    return None;
+                }
+            };
+            let policy = crate::tools::browser_runtime::BrowserRuntimePolicy {
+                allowed_domains: if ctx.config.permissions.is_full_access() {
+                    Vec::new()
+                } else {
+                    ctx.config.browser.allowed_domains.clone()
+                },
+                ..crate::tools::browser_runtime::BrowserRuntimePolicy::default()
+            };
+            let runtime = Arc::new(crate::tools::browser_runtime::BrowserRuntime::new(backend, policy));
+            let session_key = ctx
+                .session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| crate::tools::browser_types::BrowserSessionKey::new(s).ok());
+            if let (Some(slot), Some(key)) = (ctx.browser_takeover_slot, session_key.clone()) {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                    crate::tools::browser_runtime::BrowserTakeoverHandle::new(
+                        Arc::clone(&runtime),
+                        key,
+                        session_opts.clone(),
+                    ),
+                );
+            }
+            Some(Box::new(BrowserTool::from_shared_runtime(
+                runtime,
+                session_opts,
+                session_key,
+            )))
+        },
+    },
+    ToolDef {
+        name: "computer_use",
+        capabilities: ToolCapabilities {
+            read_only: false,
+            writes: WriteScope::Workspace,
+            network: false,
+            spawns_process: true,
+        },
+        aliases: &["computer", "desktop_use", "os_use"],
+        enabled: |config| config.computer_use.enabled,
+        build: |ctx| {
+            Some(Box::new(ComputerUseTool::new(
+                ctx.workspace.to_path_buf(),
+                ctx.config.computer_use.clone(),
             )))
         },
     },
@@ -418,6 +600,8 @@ mod tests {
             workspace: Path::new("/fake/workspace"),
             memory,
             session_id: None,
+            browser_takeover_slot: None,
+            personal_chrome: None,
         })
         .iter()
         .map(|tool| tool.name().to_string())
@@ -472,17 +656,183 @@ mod tests {
     }
 
     #[test]
+    fn browser_is_registered_only_when_configured_and_runtime_available() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+
+        let names = built_names(&config, None);
+        let present = contains(&names, "browser");
+        assert_eq!(
+            present,
+            crate::tools::browser_bin::agent_browser_runtime_available(),
+            "browser tool presence must follow runtime availability: names={names:?}"
+        );
+    }
+
+    #[test]
+    fn browser_tool_gets_stable_session_mapping_from_build_context() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.allowed_domains = Vec::new();
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+
+        let build = |session: Option<&str>| -> String {
+            let mut tools = build_tools(&ToolBuildContext {
+                config: &config,
+                workspace: Path::new("/fake/workspace"),
+                memory: Some(&memory),
+                session_id: session,
+                browser_takeover_slot: None,
+                personal_chrome: None,
+            });
+            let browser = tools
+                .iter_mut()
+                .find(|tool| tool.name() == "browser")
+                .expect("browser should be built when runtime available");
+            let browser = browser
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::tools::BrowserTool>())
+                .expect("browser tool should be a BrowserTool");
+            browser.session_id().unwrap_or("").to_string()
+        };
+
+        // If no runtime is available the tool is intentionally not built.
+        if !crate::tools::browser_bin::agent_browser_runtime_available() {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        }
+
+        let session_a = "chat/房间 1".to_string();
+        let session_b = "chat/房间 2".to_string();
+        let logical_a = build(Some(&session_a));
+        let logical_b = build(Some(&session_b));
+        assert_ne!(logical_a, logical_b);
+        assert_eq!(logical_a, session_a);
+        assert_eq!(logical_b, session_b);
+        let mapped_a = crate::tools::browser::browser_session_id(Some(&logical_a)).unwrap();
+        let mapped_b = crate::tools::browser::browser_session_id(Some(&logical_b)).unwrap();
+        assert_ne!(mapped_a, mapped_b);
+        assert!(mapped_a.starts_with("omninova-"));
+        assert!(mapped_b.starts_with("omninova-"));
+        assert_eq!(
+            logical_a,
+            build(Some(&session_a)),
+            "same session must map stable"
+        );
+        assert_eq!(
+            mapped_a,
+            crate::tools::browser::browser_session_id(Some(&session_a)).unwrap()
+        );
+
+        let mapped_none = build(None);
+        assert!(
+            mapped_none.is_empty(),
+            "missing session must not bind a shared browser session: {mapped_none}"
+        );
+        assert_ne!(mapped_none, "default");
+        assert!(!mapped_none.contains("anonymous"));
+
+        for blank in ["", "   "] {
+            let mapped_blank = build(Some(blank));
+            assert!(
+                mapped_blank.is_empty(),
+                "blank session {blank:?} must not bind a shared browser session: {mapped_blank}"
+            );
+        }
+
+        let long = format!("x{}y", "a".repeat(500));
+        let logical_long = build(Some(&long));
+        assert_eq!(logical_long, long);
+        let mapped_long = crate::tools::browser::browser_session_id(Some(&logical_long)).unwrap();
+        assert!(mapped_long.starts_with("omninova-"));
+        assert!(mapped_long.len() < 64);
+
+        let unicode = "会话-😀-中文-空格 end";
+        let logical_unicode = build(Some(unicode));
+        assert_eq!(logical_unicode, unicode);
+        let mapped_unicode = crate::tools::browser::browser_session_id(Some(unicode)).unwrap();
+        assert!(mapped_unicode
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit()));
+        assert_eq!(
+            mapped_unicode,
+            crate::tools::browser::browser_session_id(Some(&logical_unicode)).unwrap()
+        );
+    }
+
+    #[test]
+    fn browser_takeover_slot_captures_exact_runtime_for_active_session() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        if !crate::tools::browser_bin::agent_browser_runtime_available() {
+            eprintln!("skip runtime-dependent test: agent-browser unavailable");
+            return;
+        }
+        let memory: Arc<dyn Memory> = Arc::new(crate::InMemoryMemory::new());
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let _tools = build_tools(&ToolBuildContext {
+            config: &config,
+            workspace: Path::new("/fake/workspace"),
+            memory: Some(&memory),
+            session_id: Some("takeover-session"),
+            browser_takeover_slot: Some(&slot),
+            personal_chrome: None,
+        });
+        let handle = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active session must register a takeover handle");
+        assert_eq!(handle.session_id(), "takeover-session");
+        assert_eq!(handle.headless(), config.browser.native_headless);
+        assert_eq!(handle.state().generation, 0);
+    }
+
+    #[test]
+    fn browser_tool_is_not_registered_for_unsupported_backends() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.browser.backend = "personal-chrome".into();
+        assert!(
+            !contains(&built_names(&config, None), "browser"),
+            "personal-chrome must not silently fall back"
+        );
+        config.browser.backend = "unknown-backend".into();
+        assert!(
+            !contains(&built_names(&config, None), "browser"),
+            "unknown backend must not silently fall back"
+        );
+        config.browser.backend = "playwright".into();
+        assert_eq!(
+            contains(&built_names(&config, None), "browser"),
+            crate::tools::browser_bin::agent_browser_runtime_available()
+        );
+    }
+
+    #[test]
     fn disabled_features_are_not_built() {
         let mut config = Config::default();
         config.web_fetch.enabled = false;
         config.http_request.enabled = false;
         config.browser.enabled = false;
+        config.computer_use.enabled = false;
+        config.web_search.enabled = false;
 
         let names = built_names(&config, None);
 
         assert!(!contains(&names, "web_fetch"), "names={names:?}");
         assert!(!contains(&names, "http_request"), "names={names:?}");
         assert!(!contains(&names, "browser"), "names={names:?}");
+        assert!(!contains(&names, "computer_use"), "names={names:?}");
+        assert!(!contains(&names, "web_search"), "names={names:?}");
+    }
+
+    #[test]
+    fn computer_use_is_built_when_enabled() {
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
+        let names = built_names(&config, None);
+        assert!(contains(&names, "computer_use"), "names={names:?}");
     }
 
     #[test]
@@ -545,10 +895,12 @@ mod tests {
         for name in [
             "shell",
             "file_write",
+            "office_create",
             "file_edit",
             "file_patch",
             "git_operations",
             "browser",
+            "computer_use",
             "http_request",
         ] {
             assert!(
@@ -565,6 +917,7 @@ mod tests {
         assert!(names.contains(&"content_search"), "names={names:?}");
         for forbidden in [
             "file_write",
+            "office_create",
             "file_edit",
             "file_patch",
             "shell",
@@ -572,6 +925,7 @@ mod tests {
             "http_request",
             "web_search",
             "browser",
+            "computer_use",
             "todo_write",
             "task_checkpoint",
         ] {

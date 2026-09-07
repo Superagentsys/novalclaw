@@ -6,13 +6,14 @@ pub mod validation;
 
 pub use schema::{
     AgentConfig, AgentsIpcConfig, ArduinoConfig, AuditConfig, AudioConfig, AutonomyConfig,
-    BrowserConfig, CameraConfig, ChannelEntry, ChannelsConfig, ComposioConfig, Config,
+    BrowserConfig, CameraConfig, ChannelEntry, ChannelsConfig, ComposioConfig, ComputerUseConfig, Config,
     CoordinationConfig, CostConfig, CronConfig, CronJobConfig, DelegateAgentConfig, DriveConfig,
     EmbeddingConfig, EmbeddingRouteConfig, Esp32Config, EstopConfig, GatewayConfig,
     GatewayDingtalkConfig, GatewayPublicConfig, GatewayPublicMode, GoalLoopConfig, HardwareConfig,
     HeartbeatConfig, HooksConfig, HttpRequestConfig,
     IdentityConfig, MemoryConfig, ModelProviderConfig, ModelRouteConfig, MultimodalConfig,
-    ObservabilityConfig, OtpConfig, PeripheralsConfig, ProviderApiMode, ProviderBehaviorConfig,
+    ObservabilityConfig, OtpConfig, PeripheralsConfig, PermissionMode, PermissionsConfig,
+    ProviderApiMode, ProviderBehaviorConfig,
     ProviderConfig, ProviderRuntimeConfig, ProviderTransportConfig, ProxyConfig, QueryClassificationConfig, ReliabilityConfig, ResearchPhaseConfig,
     RobotConfig, RpiGpioConfig, RuntimeConfig, SafetyConfig, SandboxConfig, SchedulerConfig,
     SecretsConfig, SecurityConfig, SensorsConfig, SkillsConfig, Stm32Config,

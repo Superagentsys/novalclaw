@@ -1,5 +1,6 @@
 /* eslint-disable react-refresh/only-export-components -- shared model-selection helpers are intentionally colocated with the picker */
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { UiIcon } from "../UiIcon";
 import "./ModelPicker.css";
 
@@ -78,7 +79,15 @@ export function persistMaxMode(value: boolean) {
 
 function isLocalProvider(type?: string, id?: string): boolean {
   const key = (type || id || "").toLowerCase();
-  return ["ollama", "lmstudio", "vllm", "sglang", "llamacpp", "local"].includes(key);
+  return [
+    "ollama",
+    "lmstudio",
+    "omnirun",
+    "vllm",
+    "sglang",
+    "llamacpp",
+    "local",
+  ].includes(key);
 }
 
 function providerInitial(label: string): string {
@@ -118,6 +127,7 @@ export function ModelPicker({
   const [panelStyle, setPanelStyle] = useState<CSSProperties>();
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const normalized = useMemo(
@@ -168,7 +178,7 @@ export function ModelPicker({
     });
   }, [providers, query, defaultProvider, defaultModel]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
 
     const placePanel = () => {
@@ -180,10 +190,11 @@ export function ModelPicker({
       if (variant === "inline") {
         setPanelStyle({
           position: "fixed",
-          bottom: window.innerHeight - rect.top + 8,
+          bottom: Math.max(12, window.innerHeight - rect.top + 8),
           left,
           width,
           maxHeight: Math.min(440, Math.max(180, rect.top - 24)),
+          zIndex: 80,
         });
       } else {
         setPanelStyle({
@@ -192,14 +203,17 @@ export function ModelPicker({
           left,
           width,
           maxHeight: Math.min(440, window.innerHeight - rect.bottom - 24),
+          zIndex: 80,
         });
       }
     };
 
     const handlePointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) {
-        setOpen(false);
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target) || panelRef.current?.contains(target)) {
+        return;
       }
+      setOpen(false);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
@@ -249,107 +263,114 @@ export function ModelPicker({
         <span className="model-picker-chevron" aria-hidden />
       </button>
 
-      {open ? (
-        <div
-          className="model-picker-panel"
-          role="dialog"
-          aria-label="选择模型"
-          style={panelStyle}
-        >
-          <div className="model-picker-max">
-            <div>
-              <strong>Max 模式</strong>
-              <span>请求更强推理，适合复杂任务</span>
-            </div>
-            <button
-              type="button"
-              className={`model-picker-switch${maxMode ? " is-on" : ""}`}
-              role="switch"
-              aria-checked={maxMode}
-              onClick={() => {
-                const next = !maxMode;
-                onMaxModeChange(next);
-                persistMaxMode(next);
+      {open
+        ? createPortal(
+            <div
+              ref={panelRef}
+              className="model-picker-panel"
+              role="dialog"
+              aria-label="选择模型"
+              style={{
+                ...panelStyle,
+                visibility: panelStyle ? "visible" : "hidden",
               }}
             >
-              <span />
-            </button>
-          </div>
-
-          <label className="model-picker-search">
-            <UiIcon name="search" size={13} />
-            <input
-              ref={searchRef}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索模型或服务"
-            />
-          </label>
-
-          <div className="model-picker-list" role="listbox" aria-label="可用模型">
-            <button
-              type="button"
-              role="option"
-              aria-selected={normalized === "auto"}
-              className={`model-picker-row${normalized === "auto" ? " is-selected" : ""}`}
-              onClick={() => selectValue("auto")}
-            >
-              <span className="model-picker-avatar model-picker-avatar--auto">A</span>
-              <span className="model-picker-copy">
-                <strong>Auto</strong>
-                <em>按默认服务自动选择</em>
-              </span>
-            </button>
-
-            {rows.length === 0 ? (
-              <div className="model-picker-empty">
-                {providers.length === 0
-                  ? "还没有可用模型，先配置自定义服务。"
-                  : "没有匹配的模型。"}
-              </div>
-            ) : (
-              rows.map((row) => (
+              <div className="model-picker-max">
+                <div>
+                  <strong>Max 模式</strong>
+                  <span>请求更强推理，适合复杂任务</span>
+                </div>
                 <button
-                  key={row.key}
+                  type="button"
+                  className={`model-picker-switch${maxMode ? " is-on" : ""}`}
+                  role="switch"
+                  aria-checked={maxMode}
+                  onClick={() => {
+                    const next = !maxMode;
+                    onMaxModeChange(next);
+                    persistMaxMode(next);
+                  }}
+                >
+                  <span />
+                </button>
+              </div>
+
+              <label className="model-picker-search">
+                <UiIcon name="search" size={13} />
+                <input
+                  ref={searchRef}
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="搜索模型或服务"
+                />
+              </label>
+
+              <div className="model-picker-list" role="listbox" aria-label="可用模型">
+                <button
                   type="button"
                   role="option"
-                  aria-selected={normalized === row.key}
-                  className={`model-picker-row${normalized === row.key ? " is-selected" : ""}`}
-                  onClick={() => selectValue(row.key)}
+                  aria-selected={normalized === "auto"}
+                  className={`model-picker-row${normalized === "auto" ? " is-selected" : ""}`}
+                  onClick={() => selectValue("auto")}
                 >
-                  <span className="model-picker-avatar">{row.initial}</span>
+                  <span className="model-picker-avatar model-picker-avatar--auto">A</span>
                   <span className="model-picker-copy">
-                    <strong>
-                      {row.model}
-                      {row.tags.map((tag) => (
-                        <span
-                          key={tag.label}
-                          className={`model-picker-tag model-picker-tag--${tag.tone}`}
-                        >
-                          {tag.label}
-                        </span>
-                      ))}
-                    </strong>
-                    <em>{row.providerLabel}</em>
+                    <strong>Auto</strong>
+                    <em>按默认服务自动选择</em>
                   </span>
                 </button>
-              ))
-            )}
-          </div>
 
-          <button
-            type="button"
-            className="model-picker-custom"
-            onClick={() => {
-              setOpen(false);
-              onConfigureCustom();
-            }}
-          >
-            <UiIcon name="edit" size={14} />
-            配置自定义模型
-          </button>
-        </div>
-      ) : null}
+                {rows.length === 0 ? (
+                  <div className="model-picker-empty">
+                    {providers.length === 0
+                      ? "还没有可用模型，先配置自定义服务。"
+                      : "没有匹配的模型。"}
+                  </div>
+                ) : (
+                  rows.map((row) => (
+                    <button
+                      key={row.key}
+                      type="button"
+                      role="option"
+                      aria-selected={normalized === row.key}
+                      className={`model-picker-row${normalized === row.key ? " is-selected" : ""}`}
+                      onClick={() => selectValue(row.key)}
+                    >
+                      <span className="model-picker-avatar">{row.initial}</span>
+                      <span className="model-picker-copy">
+                        <strong>
+                          {row.model}
+                          {row.tags.map((tag) => (
+                            <span
+                              key={tag.label}
+                              className={`model-picker-tag model-picker-tag--${tag.tone}`}
+                            >
+                              {tag.label}
+                            </span>
+                          ))}
+                        </strong>
+                        <em>{row.providerLabel}</em>
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+
+              <button
+                type="button"
+                className="model-picker-custom"
+                onClick={() => {
+                  setOpen(false);
+                  onConfigureCustom();
+                }}
+              >
+                <UiIcon name="edit" size={14} />
+                配置自定义模型
+              </button>
+            </div>,
+            document.body
+          )
+        : null}
     </div>
   );
 }

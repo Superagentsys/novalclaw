@@ -1,5 +1,6 @@
 use crate::agent::budget::BudgetTracker;
 use crate::agent::event_bus::EventBus;
+use crate::agent::context::maintain_context;
 use crate::agent::history::sanitize_messages_for_provider;
 use crate::agent::tool_runner::ToolRunner;
 use crate::agent::{build_tool_prepare_summary, build_tool_summary, AgentCancellationToken, AgentEvent, ToolExecutionEvent};
@@ -8,7 +9,6 @@ use crate::security::SecurityContext;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::Result;
 use std::sync::Arc;
-use tracing;
 
 const EMPTY_MODEL_OUTPUT_ERROR: &str =
     "模型本次未返回可显示的内容，请重试或更换技能。";
@@ -16,6 +16,30 @@ const SKILL_PROVIDER_CONTENT_FILTER_ERROR: &str =
     "当前模型服务拒绝了该技能的提示内容。技能已成功加载，但与当前模型/服务的安全策略不兼容。请更换技能或模型。";
 const PROVIDER_CONTENT_FILTER_ERROR: &str =
     "当前模型服务拒绝了本次请求内容。请调整请求或更换模型。";
+
+const DESKTOP_OBSERVATION_TEXT: &str = "[computer_use] 当前屏幕观察。优先 snapshot 后按 name/ref 点击；坐标 x,y 必须相对此图像素，原点左上角。网页请用 browser。";
+const STALE_DESKTOP_FRAME_TEXT: &str =
+    "[computer_use] 早前的屏幕观察（截图已移出上下文，只保留最新一张）。";
+
+/// Keeps only the newest desktop frame model-visible.
+///
+/// Every iteration of a desktop run appends a fresh screenshot, and an older
+/// frame shows the same desktop a few clicks earlier — it is no longer
+/// actionable. Their base64 stays cheap to hold in memory but each one costs
+/// input budget on every later request, so a long run would eventually block
+/// itself on the context preflight.
+///
+/// Only frames this dispatcher pushed are stripped; images the user attached to
+/// their own message are left alone.
+fn drop_stale_desktop_frames(messages: &mut [ChatMessage]) {
+    for message in messages.iter_mut() {
+        if message.images.is_none() || message.content != DESKTOP_OBSERVATION_TEXT {
+            continue;
+        }
+        message.images = None;
+        message.content = STALE_DESKTOP_FRAME_TEXT.to_string();
+    }
+}
 
 fn waiting_approval_reply(tool_result: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(tool_result).ok()?;
@@ -29,6 +53,13 @@ fn waiting_approval_reply(tool_result: &str) -> Option<String> {
     Some(format!(
         "该操作需要你确认后才能继续（审批 ID：{id}）。批准后我会接着执行。"
     ))
+}
+
+/// Only a pending approval ends the loop. Desktop thrash is a wrong-target
+/// problem, so it is steered back into the conversation instead of aborting a
+/// long unattended run.
+fn tool_loop_interrupt(tool_result: &str) -> Option<String> {
+    waiting_approval_reply(tool_result)
 }
 
 fn has_active_skill(messages: &[ChatMessage]) -> bool {
@@ -190,9 +221,13 @@ pub struct AgentDispatcher<'a> {
     max_tool_iterations: usize,
     security: &'a SecurityContext,
     budget: &'a BudgetTracker,
+    max_history_messages: usize,
+    compact_context: bool,
     /// Optional EventBus for real-time structured events.
     event_bus: Option<EventBus>,
     cancel_token: Option<AgentCancellationToken>,
+    /// Ephemeral run-scoped generation cap. Not profile configuration.
+    request_max_output_tokens: Option<u32>,
 }
 
 impl<'a> Clone for AgentDispatcher<'a> {
@@ -204,8 +239,11 @@ impl<'a> Clone for AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
+            max_history_messages: self.max_history_messages,
+            compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
+            request_max_output_tokens: self.request_max_output_tokens,
         }
     }
 }
@@ -218,6 +256,8 @@ impl<'a> AgentDispatcher<'a> {
         max_tool_iterations: usize,
         security: &'a SecurityContext,
         budget: &'a BudgetTracker,
+        max_history_messages: usize,
+        compact_context: bool,
     ) -> Self {
         Self {
             provider,
@@ -226,9 +266,32 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations,
             security,
             budget,
+            max_history_messages,
+            compact_context,
             event_bus: None,
             cancel_token: None,
+            request_max_output_tokens: None,
         }
+    }
+
+    pub fn with_request_max_output_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.request_max_output_tokens = tokens.filter(|value| *value > 0);
+        self
+    }
+
+    fn chat_request<'b>(
+        &self,
+        messages: &'b [ChatMessage],
+        tools: Option<&'b [ToolSpec]>,
+    ) -> ChatRequest<'b> {
+        ChatRequest::new(messages, tools)
+            .with_request_max_output_tokens(self.request_max_output_tokens)
+    }
+
+    fn request_context_budget(&self) -> Option<crate::providers::context_budget::ContextBudget> {
+        self.provider
+            .context_budget()
+            .map(|budget| budget.with_request_generation_override(self.request_max_output_tokens))
     }
 
     /// Sets the EventBus for real-time structured events.
@@ -240,6 +303,85 @@ impl<'a> AgentDispatcher<'a> {
     pub fn with_cancel_token(mut self, cancel_token: Option<AgentCancellationToken>) -> Self {
         self.cancel_token = cancel_token;
         self
+    }
+
+    fn refresh_candidate(&self, messages: &[ChatMessage]) {
+        crate::observability::emit_candidate_usage(
+            messages,
+            self.tool_specs,
+            self.request_context_budget().as_ref(),
+        );
+    }
+
+    fn push_assistant(&self, messages: &mut Vec<ChatMessage>, content: impl Into<String>) {
+        messages.push(ChatMessage::assistant(content));
+        self.refresh_candidate(messages);
+    }
+
+    fn push_tool(&self, messages: &mut Vec<ChatMessage>, content: impl Into<String>) {
+        messages.push(ChatMessage::tool(content));
+        self.refresh_candidate(messages);
+    }
+
+    fn after_tool_result(&self, messages: &mut Vec<ChatMessage>, tool_result: &str) -> Option<String> {
+        if let Some(reply) = tool_loop_interrupt(tool_result) {
+            self.push_assistant(messages, &reply);
+            return Some(reply);
+        }
+        if let Some(reason) = crate::computer_use::hard_thrash_reply(tool_result) {
+            messages.push(ChatMessage::user(format!(
+                "[computer_use] {reason} 本轮任务没有结束：改用 action=snapshot 重新读控件，换一个 name/ref 或换一条路径继续。确实无路可走时用 task_checkpoint(status=blocked) 说明卡点。"
+            )));
+            self.refresh_candidate(messages);
+            return None;
+        }
+        if let Some(advice) = crate::computer_use::soft_thrash_advice(tool_result) {
+            messages.push(ChatMessage::user(advice));
+            self.refresh_candidate(messages);
+        }
+        None
+    }
+
+    /// Desktop screenshots follow `desktop_vision_enabled`; the generic
+    /// `vision_enabled` switch only governs user-attached chat images. Reading
+    /// the wrong one left the agent driving the desktop blind.
+    fn desktop_vision_available(&self) -> bool {
+        let multimodal = &self.security.config.multimodal;
+        if !multimodal.desktop_vision_enabled && !multimodal.vision_enabled {
+            return false;
+        }
+        let provider = self.security.audit().context().provider.clone();
+        crate::providers::provider_accepts_openai_images(provider.as_deref())
+    }
+
+    fn push_computer_use_observations(&self, messages: &mut Vec<ChatMessage>, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        drop_stale_desktop_frames(messages);
+        if !self.desktop_vision_available() {
+            messages.push(ChatMessage::user(format!(
+                "[computer_use] 当前模型未开视觉。截图已保存，请根据工具 JSON 的 nodes / path 行动，不要猜像素。paths={}",
+                paths.join(", ")
+            )));
+            self.refresh_candidate(messages);
+            return;
+        }
+        let max_dim = self
+            .security
+            .config
+            .computer_use
+            .max_dimension_px
+            .max(320);
+        let images = crate::computer_use::observation_data_urls(paths, max_dim);
+        if images.is_empty() {
+            return;
+        }
+        messages.push(ChatMessage::user_with_images(
+            DESKTOP_OBSERVATION_TEXT,
+            images,
+        ));
+        self.refresh_candidate(messages);
     }
 
     /// Run the tool-calling loop against `messages` and return final assistant text.
@@ -266,9 +408,19 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
+
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+                self.request_max_output_tokens,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -280,14 +432,14 @@ impl<'a> AgentDispatcher<'a> {
 
             let chat_result = self
                 .provider
-                .chat(ChatRequest {
+                .chat(self.chat_request(
                     messages,
-                    tools: if self.tool_specs.is_empty() {
+                    if self.tool_specs.is_empty() {
                         None
                     } else {
                         Some(self.tool_specs)
                     },
-                })
+                ))
                 .await;
 
             if let Ok(response) = &chat_result {
@@ -333,7 +485,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -343,8 +495,9 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -355,13 +508,14 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())
@@ -374,14 +528,14 @@ impl<'a> AgentDispatcher<'a> {
         with_tools: bool,
         tok_tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<ChatResponse> {
-        let request = ChatRequest {
+        let request = self.chat_request(
             messages,
-            tools: if with_tools && !self.tool_specs.is_empty() {
+            if with_tools && !self.tool_specs.is_empty() {
                 Some(self.tool_specs)
             } else {
                 None
             },
-        };
+        );
         self.provider.chat_stream(request, tok_tx).await
     }
 
@@ -408,12 +562,26 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 if let Some(ref bus) = self.event_bus {
                     bus.run_failed(format!("budget exceeded: {reason}"));
                 }
                 return Err(anyhow::anyhow!(text));
             }
+
+            // Mid-turn unified context maintenance: same policy as the
+            // turn-boundary path. It prunes oversized historical tool results,
+            // then performs bounded structured compaction if pressure remains.
+            // The Provider's C1 hard preflight still guards the final request.
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+                self.request_max_output_tokens,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -527,7 +695,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     skill_active,
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -537,8 +705,9 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 if let Some(token) = &self.cancel_token {
                     token.check()?;
@@ -579,13 +748,14 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())
@@ -615,10 +785,20 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 let _ = events.send(AgentEvent::Done(text.clone()));
                 return Ok(text);
             }
+
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+                self.request_max_output_tokens,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -672,7 +852,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 let _ = events.send(AgentEvent::Done(text.clone()));
                 return Ok(text);
             }
@@ -683,8 +863,9 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -705,14 +886,15 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     let _ = events.send(AgentEvent::Done(reply.clone()));
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         let _ = events.send(AgentEvent::Done(String::new()));
@@ -739,9 +921,19 @@ impl<'a> AgentDispatcher<'a> {
                         serde_json::json!({ "stage": "dispatcher_stream", "iteration": iteration }),
                     )
                     .await;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
+
+            *messages = maintain_context(
+                self.provider,
+                std::mem::take(messages),
+                self.tool_specs,
+                self.max_history_messages,
+                self.compact_context,
+                self.request_max_output_tokens,
+            )
+            .await;
 
             let provider_name = self
                 .security
@@ -789,7 +981,7 @@ impl<'a> AgentDispatcher<'a> {
                     response.finish_reason.as_deref(),
                     has_active_skill(messages),
                 )?;
-                messages.push(ChatMessage::assistant(&text));
+                self.push_assistant(messages, &text);
                 return Ok(text);
             }
 
@@ -799,8 +991,9 @@ impl<'a> AgentDispatcher<'a> {
                 "tool_calls": response.tool_calls,
             })
             .to_string();
-            messages.push(ChatMessage::assistant(assistant_payload));
+            self.push_assistant(messages, assistant_payload);
 
+            let mut observations = Vec::new();
             for tool_call in response.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                     .unwrap_or(serde_json::Value::Null);
@@ -814,13 +1007,14 @@ impl<'a> AgentDispatcher<'a> {
                     "content": tool_result,
                 })
                 .to_string();
-                messages.push(ChatMessage::tool(tool_payload));
+                self.push_tool(messages, tool_payload);
+                observations.extend(crate::computer_use::observation_paths_from_output(&tool_result));
                 push_skill_activation_if_needed(messages, &tool_call.name, &tool_result);
-                if let Some(reply) = waiting_approval_reply(&tool_result) {
-                    messages.push(ChatMessage::assistant(&reply));
+                if let Some(reply) = self.after_tool_result(messages, &tool_result) {
                     return Ok(reply);
                 }
             }
+            self.push_computer_use_observations(messages, &observations);
         }
 
         Ok("tool call loop limit reached".to_string())
@@ -847,8 +1041,11 @@ impl<'a> AgentDispatcher<'a> {
             max_tool_iterations: self.max_tool_iterations,
             security: self.security,
             budget: self.budget,
+            max_history_messages: self.max_history_messages,
+            compact_context: self.compact_context,
             event_bus: self.event_bus.clone(),
             cancel_token: self.cancel_token.clone(),
+            request_max_output_tokens: self.request_max_output_tokens,
         };
         let reply = dispatcher.run_streaming_no_tokens(messages).await?;
         let events = Arc::try_unwrap(collected)
@@ -1118,6 +1315,56 @@ mod output_tests {
     use super::*;
 
     #[test]
+    fn only_pending_approval_ends_the_tool_loop() {
+        let waiting = r#"{"status":"waiting_approval","approval_id":"a-1"}"#;
+        assert!(tool_loop_interrupt(waiting).is_some());
+
+        // Desktop thrash used to abort the whole run, which is exactly what
+        // stopped long unattended desktop tasks halfway through.
+        let hard_thrash = r#"{"ok":false,"action":"click","thrash":"hard","message":"same target failed"}"#;
+        assert!(tool_loop_interrupt(hard_thrash).is_none());
+        assert!(crate::computer_use::hard_thrash_reply(hard_thrash).is_some());
+    }
+
+    #[test]
+    fn only_the_newest_desktop_frame_keeps_its_screenshot() {
+        let frame = |n: &str| {
+            ChatMessage::user_with_images(
+                DESKTOP_OBSERVATION_TEXT,
+                vec![format!("data:image/jpeg;base64,{n}")],
+            )
+        };
+        let mut messages = vec![
+            ChatMessage::user_with_images("我的截图", vec!["data:image/png;base64,USER".into()]),
+            frame("ONE"),
+            frame("TWO"),
+        ];
+
+        drop_stale_desktop_frames(&mut messages);
+        messages.push(frame("THREE"));
+
+        let carrying: Vec<_> = messages
+            .iter()
+            .filter(|message| message.images.is_some())
+            .collect();
+        assert_eq!(carrying.len(), 2, "user attachment plus the newest frame");
+        assert_eq!(carrying[0].content, "我的截图");
+        assert_eq!(carrying[1].content, DESKTOP_OBSERVATION_TEXT);
+        assert_eq!(
+            carrying[1].images.as_ref().unwrap()[0],
+            "data:image/jpeg;base64,THREE"
+        );
+        // The trail stays readable even though the pixels are gone.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content == STALE_DESKTOP_FRAME_TEXT)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn content_filter_maps_to_specific_skill_error() {
         let error = ensure_visible_model_output(String::new(), Some("content_filter"), true)
             .unwrap_err()
@@ -1155,6 +1402,9 @@ mod output_tests {
         assert_eq!(messages.len(), 2);
         assert!(!messages[0].content.contains("PRIVATE_ACTIONABLE_INSTRUCTIONS"));
         assert!(!messages[0].content.contains("SAFE_PROVIDER_ENVELOPE"));
+        assert!(messages[0]
+            .content
+            .contains("instructions_loaded_into_active_context"));
         assert!(messages[1].content.contains("SAFE_PROVIDER_ENVELOPE"));
     }
 }

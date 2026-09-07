@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -49,6 +49,8 @@ screenshots.workspace = true
 png.workspace = true
 rusqlite = { version = "0.31", features = ["bundled"] }
 url.workspace = true
+scraper = "0.27"
+ego-tree = "0.11"
 axum = { version = "0.8.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures-util = "0.3"
@@ -58,11 +60,14 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
 pdf-extract = "0.10.0"
+anydoc = "=0.2.4"
 serde_yaml = "0.9.34"
 qrcode.workspace = true
 ratatui = "0.29"
 aes = "0.8"
 zip = { version = "2", features = ["deflate"] }
+tokenizers = { version = "0.21.4", default-features = false, features = ["fancy-regex"] }
+omninova-browser-host = { path = "../omninova-browser-host" }
 
 [dev-dependencies]
 # `test-util` is not part of tokio's `full` feature; it provides the paused

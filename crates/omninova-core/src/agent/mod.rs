@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod agent_event;
 pub mod budget;
+mod checkpoint_semantics;
+pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
 pub mod history;
@@ -9,7 +11,15 @@ pub mod prompt;
 pub mod run_control;
 pub mod tool_runner;
 
+#[cfg(test)]
+mod r3_e2e;
+#[cfg(test)]
+mod r4_semantic;
+#[cfg(test)]
+mod r5_acceptance;
+
 pub use agent::Agent;
+pub use prompt::{bootstrap_system_messages, reconstruct_model_visible_messages};
 pub use agent_event::{AgentRunEvent, DiffStats, StepStatus, ChangeType};
 pub use budget::BudgetTracker;
 pub use event_bus::{EventBus, EventBusDrainHandle, build_tool_summary, build_tool_prepare_summary, build_tool_start_summary, truncate_for_display, extract_diff_stats, compute_content_diff, TimedBlock};

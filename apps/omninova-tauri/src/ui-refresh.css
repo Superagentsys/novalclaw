@@ -691,10 +691,8 @@
 }
 
 .chat-permission-menu {
-  position: absolute;
+  position: fixed;
   z-index: 80;
-  bottom: calc(100% + 9px);
-  left: 0;
   width: min(370px, calc(100vw - 42px));
   padding: 7px;
   border: 1px solid var(--ui-border-strong);
@@ -1197,7 +1195,8 @@
   color: var(--ui-accent);
 }
 
-.market-card-icon img {
+.market-card-icon img,
+.skill-card-icon img {
   width: 100%;
   height: 100%;
   border-radius: inherit;
@@ -1536,6 +1535,82 @@
 .agent-run-hunk-lines,
 .agent-run-empty {
   color: var(--ui-text-muted) !important;
+}
+
+.agent-run-takeover {
+  border-bottom-color: var(--ui-border) !important;
+}
+
+.agent-run-takeover-copy strong {
+  color: var(--ui-text) !important;
+}
+
+.agent-run-takeover-copy small {
+  color: var(--ui-text-muted) !important;
+}
+
+.agent-run-takeover-actions button {
+  background: var(--ui-accent) !important;
+  color: #fff !important;
+}
+
+.agent-run-takeover-secondary {
+  background: var(--ui-surface-2) !important;
+  color: var(--ui-text-secondary) !important;
+}
+
+.agent-run-takeover--waiting {
+  background: var(--ui-accent-soft) !important;
+}
+
+.agent-run-takeover--human {
+  background: var(--ui-success-soft) !important;
+}
+
+.agent-run-takeover--warn {
+  background: var(--ui-warning-soft) !important;
+}
+
+.agent-run-takeover--error {
+  background: var(--ui-danger-soft) !important;
+}
+
+.agent-run-personal-chrome {
+  border-bottom-color: var(--ui-border) !important;
+}
+
+.agent-run-personal-chrome-copy strong {
+  color: var(--ui-text) !important;
+}
+
+.agent-run-personal-chrome-copy small {
+  color: var(--ui-text-muted) !important;
+}
+
+.agent-run-personal-chrome-actions button {
+  background: var(--ui-accent) !important;
+  color: #fff !important;
+}
+
+.agent-run-personal-chrome-secondary {
+  background: var(--ui-surface-2) !important;
+  color: var(--ui-text-secondary) !important;
+}
+
+.agent-run-personal-chrome--waiting {
+  background: var(--ui-accent-soft) !important;
+}
+
+.agent-run-personal-chrome--ready {
+  background: var(--ui-success-soft) !important;
+}
+
+.agent-run-personal-chrome--warn {
+  background: var(--ui-warning-soft) !important;
+}
+
+.agent-run-personal-chrome--error {
+  background: var(--ui-danger-soft) !important;
 }
 
 .agent-run-step--running .agent-run-step-title,
@@ -2164,6 +2239,7 @@
 .chat-composer-toolbar {
   display: grid;
   min-width: 0;
+  overflow: visible;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -2183,6 +2259,25 @@
 .chat-composer-tools-center {
   justify-content: flex-start;
   overflow: visible;
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.chat-composer-tools-center > .context-usage,
+.chat-composer-tools-center > .chat-composer-model-shell,
+.chat-composer-tools-center > .chat-approval-actions {
+  flex: 0 1 auto;
+}
+
+.chat-composer-tools-center > .chat-workspace-actions {
+  flex: 1 1 96px;
+  min-width: 96px;
+}
+
+.chat-composer-permission {
+  flex-shrink: 0;
+  min-width: max-content;
+  white-space: nowrap;
 }
 
 .chat-tool-approval {
@@ -2471,13 +2566,21 @@
 }
 
 .chat-composer-model-shell {
+  flex: 1 1 108px;
+  min-width: 108px;
+  max-width: 220px;
+}
+
+.chat-composer-model-shell .model-picker,
+.chat-composer-model-shell .model-picker-trigger {
+  width: 100%;
   min-width: 0;
+  max-width: 220px;
 }
 
 .chat-composer-model-shell .model-picker-trigger {
   min-height: 32px;
   height: 32px;
-  max-width: 180px;
   border-radius: var(--theme-control-radius);
   box-shadow: none;
 }
@@ -2555,23 +2658,10 @@
   .chat-composer-toolbar .chat-workspace-actions {
     max-width: 210px;
   }
-
-  .chat-composer-permission span,
-  .chat-workspace-pill-scope {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-  }
 }
 
 @media (max-width: 720px) {
   .chat-permission-menu {
-    position: fixed;
-    right: 14px;
-    bottom: 84px;
-    left: 14px;
     width: auto;
   }
 }

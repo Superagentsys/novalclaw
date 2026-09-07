@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { UiIcon } from "../UiIcon";
 import { invokeTauri } from "../../utils/tauri";
+import { parseModelSelection, readStoredModelSelection } from "../Chat/ModelPicker";
 import {
   AUTOMATION_TEMPLATES,
   WEEKDAY_OPTIONS,
@@ -30,6 +31,11 @@ interface EditorState {
   templateId?: string;
   enabled: boolean;
   schedule: ScheduleDraft;
+}
+
+function currentModelRoute(): { provider?: string; model?: string } {
+  const parsed = parseModelSelection(readStoredModelSelection());
+  return { provider: parsed.providerId, model: parsed.model };
 }
 
 function blankEditor(template?: AutomationTemplate): EditorState {
@@ -103,6 +109,7 @@ export function Automation() {
       templateId: editor.templateId,
       tzOffsetMinutes: localTzOffsetMinutes(),
       enabled: editor.enabled,
+      ...currentModelRoute(),
     };
     setBusyId("save");
     try {
@@ -122,6 +129,7 @@ export function Automation() {
       await invokeTauri("automation_set_enabled", {
         id: job.id,
         enabled: !job.enabled,
+        ...currentModelRoute(),
       });
       await loadAll();
     } catch (reason) {
@@ -134,7 +142,7 @@ export function Automation() {
   const runJob = async (job: AutomationJob) => {
     setBusyId(`${job.id}:run`);
     try {
-      await invokeTauri("automation_run_now", { id: job.id });
+      await invokeTauri("automation_run_now", { id: job.id, ...currentModelRoute() });
       setTab("runs");
       await loadAll();
     } catch (reason) {

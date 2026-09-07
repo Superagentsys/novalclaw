@@ -7,6 +7,7 @@
 //!   3. Collects all events for final replay.
 
 use crate::agent::agent_event::{AgentRunEvent, DiffStats};
+use crate::observability::{ContextLifecycleEvent, ContextTelemetrySink, ContextUsageSnapshot};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -489,6 +490,7 @@ impl EventBus {
         let type_name = event_type_name(&event);
         let content_preview = match &event {
             AgentRunEvent::run_started { agent_name, .. } => agent_name.clone(),
+            AgentRunEvent::browser_takeover_state_changed { phase, .. } => phase.clone(),
             AgentRunEvent::step_started { title, .. } => title.clone(),
             AgentRunEvent::model_started { title, .. } => title.clone(),
             AgentRunEvent::model_delta { content, .. } => content.clone(),
@@ -510,6 +512,10 @@ impl EventBus {
             AgentRunEvent::approval_approved { tool_name, .. } => tool_name.clone(),
             AgentRunEvent::approval_rejected { reason, .. } => reason.clone(),
             AgentRunEvent::approval_cancelled { tool_name, .. } => tool_name.clone(),
+            AgentRunEvent::context_usage { snapshot, .. } => {
+                format!("rev={}", snapshot.request_revision)
+            }
+            AgentRunEvent::context_lifecycle { event, .. } => event.operation_id.clone(),
         };
         tracing::debug!(target: "e2e", "[e2e-bus-emit] timestamp={} run_id={} type={} content=\"{}\"", now_ts(), self.inner.run_id, type_name, preview(&content_preview, 80));
 
@@ -535,6 +541,9 @@ impl EventBus {
 fn event_type_name(event: &AgentRunEvent) -> &'static str {
     match event {
         AgentRunEvent::run_started { .. } => "run_started",
+        AgentRunEvent::browser_takeover_state_changed { .. } => {
+            "browser_takeover_state_changed"
+        }
         AgentRunEvent::step_started { .. } => "step_started",
         AgentRunEvent::model_started { .. } => "model_started",
         AgentRunEvent::model_delta { .. } => "model_delta",
@@ -556,6 +565,8 @@ fn event_type_name(event: &AgentRunEvent) -> &'static str {
         AgentRunEvent::approval_approved { .. } => "approval_approved",
         AgentRunEvent::approval_rejected { .. } => "approval_rejected",
         AgentRunEvent::approval_cancelled { .. } => "approval_cancelled",
+        AgentRunEvent::context_usage { .. } => "context_usage",
+        AgentRunEvent::context_lifecycle { .. } => "context_lifecycle",
     }
 }
 
@@ -587,6 +598,9 @@ impl EventBusDrainHandle {
             while let Some(evt) = r.recv().await {
                 let type_name: &'static str = match &evt {
                     AgentRunEvent::run_started { .. } => "run_started",
+                    AgentRunEvent::browser_takeover_state_changed { .. } => {
+                        "browser_takeover_state_changed"
+                    }
                     AgentRunEvent::step_started { .. } => "step_started",
                     AgentRunEvent::model_started { .. } => "model_started",
                     AgentRunEvent::model_delta { .. } => "model_delta",
@@ -608,6 +622,8 @@ impl EventBusDrainHandle {
                     AgentRunEvent::approval_approved { .. } => "approval_approved",
                     AgentRunEvent::approval_rejected { .. } => "approval_rejected",
                     AgentRunEvent::approval_cancelled { .. } => "approval_cancelled",
+                    AgentRunEvent::context_usage { .. } => "context_usage",
+                    AgentRunEvent::context_lifecycle { .. } => "context_lifecycle",
                 };
                 tracing::debug!(target: "e2e", "[e2e-bus-drain] timestamp={} run_id={} type={}", now_ts(), run_id, type_name);
                 (self.emit_fn)(evt);
@@ -643,7 +659,7 @@ fn build_tool_phase_summary(tool_name: &str, args: &serde_json::Value, phase: &s
         "file_read" | "read_file" => path
             .map(|p| format!("{phase}读取文件：{p}"))
             .unwrap_or_else(|| format!("{phase}读取文件")),
-        "file_write" | "write_file" => path
+        "file_write" | "write_file" | "office_create" => path
             .map(|p| format!("{phase}写入文件：{p}"))
             .unwrap_or_else(|| format!("{phase}写入文件")),
         "file_edit" | "edit_file" | "str_replace_editor" => path
@@ -704,7 +720,7 @@ pub fn build_tool_summary(tool_name: &str, args: &serde_json::Value) -> String {
                 "正在读取文件".into()
             }
         }
-        "file_write" | "write_file" => {
+        "file_write" | "write_file" | "office_create" => {
             if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                 format!("正在写入文件：{}", p)
             } else {
@@ -781,7 +797,7 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
 
 /// Helper to extract diff stats from `git diff --numstat` output.
 pub fn extract_diff_stats(tool_name: &str, output: &str) -> Option<DiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor" | "git_operations" | "git") {
+    if !matches!(tool_name, "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor" | "git_operations" | "git") {
         return None;
     }
     for line in output.lines() {
@@ -799,7 +815,7 @@ pub fn extract_diff_stats(tool_name: &str, output: &str) -> Option<DiffStats> {
 
 /// Compute diff stats from written content when git is not available.
 pub fn compute_content_diff(tool_name: &str, args: &serde_json::Value, output: &str) -> Option<DiffStats> {
-    if !matches!(tool_name, "file_write" | "write_file" | "file_edit" | "edit_file" | "str_replace_editor") {
+    if !matches!(tool_name, "file_write" | "write_file" | "office_create" | "file_edit" | "edit_file" | "str_replace_editor") {
         return None;
     }
     if output.to_lowercase().contains("success")
@@ -838,6 +854,22 @@ impl TimedBlock {
 impl Default for TimedBlock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ContextTelemetrySink for EventBus {
+    fn emit_usage(&self, snapshot: ContextUsageSnapshot) {
+        self.emit(AgentRunEvent::context_usage {
+            run_id: self.inner.run_id.clone(),
+            snapshot,
+        });
+    }
+
+    fn emit_lifecycle(&self, event: ContextLifecycleEvent) {
+        self.emit(AgentRunEvent::context_lifecycle {
+            run_id: self.inner.run_id.clone(),
+            event,
+        });
     }
 }
 
@@ -894,5 +926,43 @@ mod tests {
             .collect::<Vec<_>>();
         events.sort();
         assert_eq!(events, vec!["model_delta", "run_completed", "run_started"]);
+    }
+
+    #[test]
+    fn context_events_serialize_without_prompt_or_secrets() {
+        let (bus, _drain) = EventBus::new("run-k".into(), |_| {});
+        let snapshot = crate::observability::build_snapshot(
+            Some("session-k".into()),
+            Some("run-k".into()),
+            1,
+            "openai",
+            "gpt-4o",
+            crate::observability::MeasurementKind::FinalRequestEstimate,
+            &[
+                crate::providers::ChatMessage::system("secret prompt bootstrap"),
+                crate::providers::ChatMessage::user("hello classified"),
+            ],
+            &[],
+            None,
+            Some("request-body-should-not-appear"),
+        );
+        bus.emit_usage(snapshot);
+        bus.emit_lifecycle(crate::observability::ContextLifecycleEvent::new(
+            "op-k",
+            Some("run-k".into()),
+            Some("session-k".into()),
+            crate::observability::ContextTelemetryMode::Proactive,
+            crate::observability::ContextLifecycleEventKind::ContextCompactionStarted {
+                mode: crate::observability::ContextTelemetryMode::Proactive,
+                estimated_before: 12,
+            },
+        ));
+        let json = serde_json::to_string(&bus.collect()).unwrap();
+        assert!(!json.contains("secret prompt"));
+        assert!(!json.contains("classified"));
+        assert!(!json.contains("request-body-should-not-appear"));
+        assert!(!json.contains("Authorization"));
+        assert!(json.contains("context_usage"));
+        assert!(json.contains("context_lifecycle"));
     }
 }

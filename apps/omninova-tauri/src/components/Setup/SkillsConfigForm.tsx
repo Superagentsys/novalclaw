@@ -17,6 +17,9 @@ interface SkillItem {
   name: string;
   description: string;
   subdomain?: string | null;
+  slug?: string | null;
+  icon?: string | null;
+  iconUrl?: string | null;
 }
 
 interface SkillsPackageSummary {
@@ -138,8 +141,22 @@ function prettyName(name: string): string {
 
 /** Restore the original local skill markers used before the visual refresh. */
 function iconFor(item: SkillItem): string {
-  const hay = `${item.subdomain ?? ""} ${item.name}`.toLowerCase();
+  const declaredIcon = item.icon?.trim();
+  if (declaredIcon && !/^https?:\/\//i.test(declaredIcon)) return declaredIcon;
+  const hay = `${item.subdomain ?? ""} ${item.slug ?? ""} ${item.name} ${item.description}`.toLowerCase();
   const table: [RegExp, string][] = [
+    [/speech|stt|whisper|transcri|语音|转文字/, "🎙️"],
+    [/slide|presentation|powerpoint|ppt|演示|幻灯/, "📽️"],
+    [/fraud|scam|防骗|反诈/, "🛡️"],
+    [/humaniz|writing|writer|写作|润色/, "✍️"],
+    [/architect|diagram|flowchart|架构|流程图|思维导图/, "🧭"],
+    [/kdocs|tencent.?docs|document|office|word|文档/, "📄"],
+    [/paperless|spreadsheet|excel|csv|表单|表格/, "🗂️"],
+    [/pdf|ocr|extract|识别|提取/, "🧾"],
+    [/prompt|提示词/, "✨"],
+    [/chart|analysis|统计|图表|数据/, "📊"],
+    [/dev|program|code|编程|开发/, "💻"],
+    [/ima|knowledge|note|笔记|知识/, "📚"],
     [/forensic|incident|dfir|memory|disk/, "🔬"],
     [/malware|reverse|rootkit|ransom/, "🦠"],
     [/network|packet|dns|traffic|firewall/, "🌐"],
@@ -207,6 +224,23 @@ function MarketBrandIcon({ item }: { item: SkillHubItem }) {
     );
   }
   return <span className="skill-original-marker">{marketIcon(item)}</span>;
+}
+
+function InstalledSkillIcon({ item, iconUrl }: { item: SkillItem; iconUrl?: string | null }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const safeUrl = safeSkillIconUrl(iconUrl ?? item.iconUrl);
+  if (safeUrl && !imageFailed) {
+    return (
+      <img
+        src={safeUrl}
+        alt=""
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
+  return <span className="skill-original-marker">{iconFor(item)}</span>;
 }
 
 function formatDownloads(n: number): string {
@@ -475,6 +509,15 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
     if (summary?.items?.length) return summary.items;
     return (summary?.names ?? []).map((name) => ({ name, description: "" }));
   }, [summary]);
+
+  const marketItemByIdentity = useMemo(() => {
+    const byIdentity = new Map<string, SkillHubItem>();
+    for (const item of [...featured, ...marketItems]) {
+      byIdentity.set(item.slug.toLowerCase(), item);
+      byIdentity.set(item.name.trim().toLowerCase(), item);
+    }
+    return byIdentity;
+  }, [featured, marketItems]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -845,7 +888,13 @@ export const SkillsConfigForm: React.FC<Props> = ({ config, onChange }) => {
                   {visible.map((s) => (
                     <div className="skill-card" key={s.name} title={s.name}>
                       <div className="skill-card-icon" aria-hidden>
-                        <span className="skill-original-marker">{iconFor(s)}</span>
+                        <InstalledSkillIcon
+                          item={s}
+                          iconUrl={
+                            marketItemByIdentity.get((s.slug ?? "").toLowerCase())?.iconUrl
+                              ?? marketItemByIdentity.get(s.name.trim().toLowerCase())?.iconUrl
+                          }
+                        />
                       </div>
                       <div className="skill-card-body">
                         <div className="skill-card-name">{prettyName(s.name)}</div>
