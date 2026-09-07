@@ -486,18 +486,30 @@ impl AgentBrowserBackend {
         if bound.executable.is_some() {
             return Ok(bound);
         }
-        if !cfg!(windows) && !self.executable_resolver.has_explicit() {
-            return Ok(bound);
-        }
-        let executable = self.executable_resolver.resolve().await.map_err(|error| {
-            let mut backend_error = BrowserBackendError::new(
-                BrowserErrorKind::BrowserUnavailable,
-                self.id_value(),
-                error.detail,
-            );
-            backend_error.retryable = false;
-            backend_error
-        })?;
+        let executable = match self.executable_resolver.resolve().await {
+            Ok(executable) => executable,
+            Err(error) => {
+                // A configured pin fails closed everywhere, and on Windows a
+                // failed scan leaves no browser at all. Off Windows the scan is
+                // only an attempt to bind the user's own Chrome: agent-browser
+                // can still resolve its own Chromium, so a machine without
+                // Chrome installed must keep working rather than lose sessions.
+                if !cfg!(windows) && !self.executable_resolver.has_explicit() {
+                    tracing::debug!(
+                        target: "browser",
+                        "no system browser to bind; leaving the choice to agent-browser"
+                    );
+                    return Ok(bound);
+                }
+                let mut backend_error = BrowserBackendError::new(
+                    BrowserErrorKind::BrowserUnavailable,
+                    self.id_value(),
+                    error.detail,
+                );
+                backend_error.retryable = false;
+                return Err(backend_error);
+            }
+        };
         let mut map = self
             .launch_by_session
             .lock()
@@ -3124,6 +3136,80 @@ mod tests {
             1,
             "backend selection must be launch-probed once and shared across sessions"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A backend whose only candidate does not exist, so resolution fails
+    /// before the probe ever runs.
+    fn scratch_backend_without_browser(
+        explicit: bool,
+    ) -> (AgentBrowserBackend, PathBuf, Arc<PassingExecutableProbe>) {
+        let root = std::env::temp_dir()
+            .join(format!("omninova-b33c-nobrowser-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let probe = Arc::new(PassingExecutableProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let source = if explicit {
+            BrowserExecutableSource::Configured
+        } else {
+            BrowserExecutableSource::SystemChrome
+        };
+        let executable_resolver = BrowserExecutableResolver::for_test(
+            vec![(root.join("absent/chrome"), source, explicit)],
+            probe.clone(),
+        );
+        let backend = AgentBrowserBackend::with_resolvers(
+            None,
+            BrowserSessionOptions::default(),
+            BrowserProfileResolver::new(root.join("profiles")),
+            executable_resolver,
+        );
+        (backend, root, probe)
+    }
+
+    async fn bind_scratch_session(
+        backend: &AgentBrowserBackend,
+        key: &str,
+    ) -> Result<BoundSessionLaunch, BrowserBackendError> {
+        let session = backend
+            .open_session(&BrowserSessionOpenRequest::new(
+                BrowserSessionKey::new(key).unwrap(),
+                BrowserSessionOptions::default(),
+            ))
+            .await
+            .unwrap();
+        backend.ensure_session_executable(session.token(), "open").await
+    }
+
+    #[tokio::test]
+    async fn an_automatic_scan_that_finds_nothing_is_fatal_only_on_windows() {
+        let (backend, root, probe) = scratch_backend_without_browser(false);
+        let outcome = bind_scratch_session(&backend, "b33c-noscan").await;
+        if cfg!(windows) {
+            let Err(error) = outcome else {
+                panic!("Windows has no other route to a browser, so this must fail closed");
+            };
+            assert_eq!(error.kind, BrowserErrorKind::BrowserUnavailable);
+            assert!(!error.retryable);
+        } else {
+            // agent-browser can still resolve its own Chromium, so a machine
+            // with no Chrome installed keeps its sessions instead of losing
+            // them to a scan that was only trying to bind the user's browser.
+            assert!(outcome.unwrap().executable.is_none());
+        }
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_missing_configured_pin_fails_closed_on_every_platform() {
+        let (backend, root, _probe) = scratch_backend_without_browser(true);
+        let Err(error) = bind_scratch_session(&backend, "b33c-pinned").await else {
+            panic!("a configured pin that is missing must never fall back silently");
+        };
+        assert_eq!(error.kind, BrowserErrorKind::BrowserUnavailable);
+        assert!(!error.retryable);
         let _ = std::fs::remove_dir_all(root);
     }
 

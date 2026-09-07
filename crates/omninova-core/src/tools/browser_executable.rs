@@ -2,7 +2,9 @@
 //!
 //! Foreign `~/.agent-browser/browsers` state is intentionally not searched.
 //! Automatic candidates fall through after a failed probe; an explicit trusted
-//! configuration pin fails closed.
+//! configuration pin fails closed. Exhausting the automatic candidates is fatal
+//! only on Windows, which ships no other route to a browser; elsewhere the
+//! caller may fall back to letting agent-browser choose.
 
 use crate::tools::browser_bin::{BrowserBinarySearch, BrowserBinarySearch as AgentBrowserSearch};
 use crate::tools::browser_lifecycle::{
@@ -357,6 +359,50 @@ fn process_candidates_with_environment(
     }
 
     candidates.extend(omninova_managed_candidates());
+    #[cfg(target_os = "macos")]
+    {
+        // Chrome ahead of Brave, and every Chrome root ahead of every Brave
+        // root, so the ordering matches the Windows scan below.
+        let user_applications = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Applications"));
+        let roots = [Some(PathBuf::from("/Applications")), user_applications];
+        for root in roots.iter().flatten() {
+            push_unique_candidate(
+                &mut candidates,
+                root.join("Google Chrome.app/Contents/MacOS/Google Chrome"),
+                BrowserExecutableSource::SystemChrome,
+            );
+        }
+        for root in roots.iter().flatten() {
+            push_unique_candidate(
+                &mut candidates,
+                root.join("Brave Browser.app/Contents/MacOS/Brave Browser"),
+                BrowserExecutableSource::SystemBrave,
+            );
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for path in [
+            "/opt/google/chrome/chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ] {
+            push_unique_candidate(
+                &mut candidates,
+                PathBuf::from(path),
+                BrowserExecutableSource::SystemChrome,
+            );
+        }
+        for path in ["/opt/brave.com/brave/brave", "/usr/bin/brave-browser"] {
+            push_unique_candidate(
+                &mut candidates,
+                PathBuf::from(path),
+                BrowserExecutableSource::SystemBrave,
+            );
+        }
+    }
     #[cfg(windows)]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -391,6 +437,15 @@ fn process_candidates_with_environment(
     candidates
 }
 
+/// Only the Windows bundle ships a managed browser, so the scan elsewhere
+/// starts at the system browsers. Probing the Windows-shaped paths on macOS or
+/// Linux would only add `missing` noise to the unavailability diagnostics.
+#[cfg(not(windows))]
+fn omninova_managed_candidates() -> Vec<BrowserExecutableCandidate> {
+    Vec::new()
+}
+
+#[cfg(windows)]
 fn omninova_managed_candidates() -> Vec<BrowserExecutableCandidate> {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
@@ -640,6 +695,25 @@ mod tests {
             .rposition(|candidate| candidate.source == BrowserExecutableSource::SystemChrome);
         if let (Some(first_brave), Some(last_chrome)) = (first_brave, last_chrome) {
             assert!(last_chrome < first_brave);
+        }
+    }
+
+    #[test]
+    fn the_automatic_scan_offers_a_system_browser_to_bind() {
+        let automatic = process_candidates_with_environment(None, None);
+        assert!(
+            !automatic.is_empty(),
+            "an empty scan would leave the user's own Chrome unbindable"
+        );
+        assert!(automatic.iter().all(|candidate| candidate.path.is_absolute()));
+        assert!(automatic.iter().all(|candidate| !candidate.explicit));
+        // Windows derives its paths from LOCALAPPDATA/PROGRAMFILES, which a
+        // stripped environment can drop; the managed browser still answers
+        // there, so only assert the system entry where paths are fixed.
+        if !cfg!(windows) {
+            assert!(automatic
+                .iter()
+                .any(|candidate| candidate.source == BrowserExecutableSource::SystemChrome));
         }
     }
 
